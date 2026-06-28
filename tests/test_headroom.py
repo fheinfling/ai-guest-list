@@ -120,6 +120,29 @@ def test_scoped_does_not_rebaseline_dirty_config(tmp_path, monkeypatch):
     assert cfg.read_text() == 'model = "gpt-5.5"\n'
 
 
+def test_harden_env_sets_telemetry_off():
+    e = headroom.harden_env({})
+    assert e["HEADROOM_TELEMETRY"] == "off"
+    assert e["LITELLM_TELEMETRY"] == "False"
+    assert e["DO_NOT_TRACK"] == "1"
+
+
+def test_package_pinned_to_audited_version():
+    assert headroom.PACKAGE.endswith("==" + headroom.PINNED_VERSION)
+
+
+def test_verify_rtk_tofu(tmp_path, monkeypatch):
+    fake = tmp_path / "rtk"
+    fake.write_bytes(b"rtk-binary-v1")
+    monkeypatch.setattr(headroom, "rtk_path", lambda: fake)
+    store = tmp_path / "store"
+    assert headroom.verify_rtk(store)[0] is True       # records on first sight
+    assert headroom.verify_rtk(store)[0] is True       # verifies unchanged
+    fake.write_bytes(b"rtk-binary-TAMPERED")
+    ok, msg = headroom.verify_rtk(store)
+    assert ok is False and "changed" in msg            # tamper detected
+
+
 def test_bridge_headroom_install(ctx):
     # headroom is already in the venv, so ensure_installed is a fast no-op returning available
     r = bridge.handle(ctx, {"action": "headroom_install"})

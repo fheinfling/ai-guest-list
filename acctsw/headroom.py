@@ -21,7 +21,52 @@ from pathlib import Path
 from . import paths as P
 
 WRAP_PREFIX = ("headroom", "wrap")
-PACKAGE = "headroom-ai[proxy]"
+PINNED_VERSION = "0.27.0"                       # pin: audited build (see docs/SECURITY-headroom.md)
+PACKAGE = f"headroom-ai[proxy]=={PINNED_VERSION}"
+
+# Hardening env applied to every wrapped session: telemetry off, no third-party tracing/analytics,
+# stay local-only. (All of headroom's cloud features are already opt-in via unset keys; this is
+# belt-and-suspenders so nothing can phone home even if a default ever changes.)
+HARDENING_ENV = {
+    "HEADROOM_TELEMETRY": "off",     # anonymous usage telemetry (already off by default)
+    "LITELLM_TELEMETRY": "False",    # disable litellm's own telemetry
+    "DO_NOT_TRACK": "1",             # honored by litellm + others
+}
+
+
+def harden_env(env: dict | None = None) -> dict:
+    """Return env with hardening flags applied (does not mutate the input)."""
+    import os as _os
+    e = dict(_os.environ if env is None else env)
+    e.update(HARDENING_ENV)
+    return e
+
+
+def rtk_path() -> Path:
+    return Path.home() / ".headroom" / "bin" / "rtk"
+
+
+def verify_rtk(record_dir: Path | None) -> tuple[bool, str]:
+    """TOFU checksum-pin the runtime-downloaded `rtk` binary.
+
+    Records rtk's sha256 on first sight; on later runs, verifies it's unchanged. Returns
+    (ok, message). ok=False means rtk changed unexpectedly (possible supply-chain tamper) → caller
+    should refuse to run with Headroom until the user re-confirms.
+    """
+    from .util import sha256_text
+    rtk = rtk_path()
+    if not rtk.exists():
+        return True, "rtk not present yet (downloaded on first wrap)"
+    digest = sha256_text(rtk.read_bytes().hex())
+    store = (record_dir or (Path.home() / ".account-switcher")) / "rtk.sha256"
+    if store.exists():
+        recorded = store.read_text().strip()
+        if recorded != digest:
+            return False, f"rtk checksum changed ({recorded[:12]}… → {digest[:12]}…)"
+        return True, "rtk checksum verified"
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text(digest)
+    return True, f"rtk checksum recorded ({digest[:12]}…)"
 
 # Markers Headroom leaves in the tool config — used to detect a still-injected (dirty) config.
 INJECT_MARKERS = ("Headroom", 'model_provider = "headroom"', "headroom:rtk-instructions")

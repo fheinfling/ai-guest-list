@@ -294,6 +294,11 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
     elif save_credit:
         # ensure the spawned child can resolve `headroom` even if the venv bin isn't on PATH
         os.environ["PATH"] = headroom_mod.venv_bin_dir() + os.pathsep + os.environ.get("PATH", "")
+        os.environ.update(headroom_mod.HARDENING_ENV)   # telemetry off / no tracking / local-only
+        ok, msg = headroom_mod.verify_rtk(ctx.data_dir)  # TOFU checksum-pin the rtk helper binary
+        if not ok:
+            notify(f"save-credit off: headroom rtk integrity check failed — {msg}")
+            save_credit = False
 
     # Headroom's `wrap` injects (persistently) into the tool's config; scope it to this session so
     # the user's setup is restored exactly afterwards (non-destructive).
