@@ -6,14 +6,27 @@ export const TOOL_META = {
   claude: { label: "Claude", sub: "claude code", accent: "var(--claude)" },
 };
 
-// The menu-bar dot — copy straight from the design.
+const DOT_COPY = {
+  switched: { emoji: "🔵", label: "just switched you" },
+  hello: { emoji: "🌸", label: "needs a hello" },
+  resting: { emoji: "🟡", label: "a seat's resting" },
+  fresh: { emoji: "🟢", label: "everyone's fresh" },
+};
+
+// The menu-bar dot. The Python bridge is the source of truth (state.dot); this JS computation is
+// only a browser-preview fallback when state.dot is absent. (Parity is guarded by a golden fixture.)
 export function dotState(state) {
+  const key = state?.dot || dotKey(state);
+  return { key, ...DOT_COPY[key] };
+}
+
+export function dotKey(state) {
   const tools = state?.tools || {};
   const seats = [...(tools.codex?.seats || []), ...(tools.claude?.seats || [])];
-  if (state?.recently_switched) return { key: "switched", emoji: "🔵", label: "just switched you" };
-  if (seats.some(needsHello)) return { key: "hello", emoji: "🌸", label: "needs a hello" };
-  if (seats.some((s) => s.active && s.limited)) return { key: "resting", emoji: "🟡", label: "a seat's resting" };
-  return { key: "fresh", emoji: "🟢", label: "everyone's fresh" };
+  if (state?.recently_switched) return "switched";
+  if (seats.some(needsHello)) return "hello";
+  if (seats.some((s) => s.active && s.limited)) return "resting";
+  return "fresh";
 }
 
 // A seat "needs a hello" when its creds can't authenticate (usage came back unauthorized).
@@ -95,11 +108,46 @@ function toggle(id, label, on, hint = "") {
 }
 
 // Full popover body for a given state.
+const THEMES = new Set(["dark", "light"]);
+
+// Build the "add a seat" method picker from a login plan (pure → unit-tested).
+export function buildPicker(plan) {
+  const methods = (plan?.methods || []).map((m) =>
+    m.command
+      ? `<button class="picker-method" data-action="login" data-tool="${esc(plan.tool)}" data-command="${esc(m.command)}">${esc(m.label)}</button>`
+      : `<button class="picker-method" data-action="paste-open" data-tool="${esc(plan.tool)}">${esc(m.label)}</button>`
+  ).join("");
+  return `<div class="picker-backdrop" data-action="picker-close"><div class="picker">
+    <h3>${esc(plan?.title || "who's joining the list?")}</h3>
+    <p class="sub">how should i sign you in?</p>
+    ${methods}
+    <button class="link" data-action="picker-close">cancel</button>
+  </div></div>`;
+}
+
+export function buildSaveSeat(tool) {
+  return `<div class="picker-backdrop"><div class="picker">
+    <h3>signed in?</h3><p class="sub">i'll keep your ${esc(tool)} seat warm</p>
+    <button class="picker-method" data-action="snapshot" data-tool="${esc(tool)}">save my seat 🎟️</button>
+    <button class="link" data-action="picker-close">not yet</button>
+  </div></div>`;
+}
+
+export function buildPaste(tool) {
+  return `<div class="picker-backdrop"><div class="picker">
+    <h3>paste auth.json</h3><p class="sub">no browser dance</p>
+    <textarea id="paste-blob" class="paste" placeholder="{ ... }"></textarea>
+    <button class="picker-method" data-action="paste-save" data-tool="${esc(tool)}">save my seat 🎟️</button>
+    <button class="link" data-action="picker-close">cancel</button>
+  </div></div>`;
+}
+
 export function buildHTML(state) {
   const s = state?.settings || {};
   const dot = dotState(state);
   const hr = state?.headroom_available;
-  return `<div class="app theme-${s.theme || "dark"}">
+  const theme = THEMES.has(s.theme) ? s.theme : "dark";
+  return `<div class="app theme-${theme}">
     <header class="top">
       <span class="brand">ai guest list <span class="dot ${dot.key}">${dot.emoji}</span></span>
       <span class="dot-copy">${dot.label}</span>

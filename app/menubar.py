@@ -31,16 +31,6 @@ USAGE_POLL_SECONDS = 180.0
 DOT_GLYPH = {"fresh": "🟢", "resting": "🟡", "switched": "🔵", "hello": "🌸"}
 
 
-def _push_state(webview, result: dict) -> None:
-    """Send a bridge result's state into the web view via window.AGL.update()."""
-    if not webview or "state" not in result:
-        return
-    payload = json.dumps(result["state"])
-    webview.evaluateJavaScript_completionHandler_(f"window.AGL.update({payload});", None)
-    if result.get("celebrate"):
-        webview.evaluateJavaScript_completionHandler_("window.AGL.celebrate&&window.AGL.celebrate();", None)
-
-
 if objc is not None:
 
     class AGLDelegate(NSObject):
@@ -94,8 +84,17 @@ if objc is not None:
                 self.popover.showRelativeToRect_ofView_preferredEdge_(btn.bounds(), btn, 1)
 
         def pollUsage_(self, _timer):
+            # Run the network refresh OFF the main thread so the menubar UI never freezes.
+            self.performSelectorInBackground_withObject_(
+                objc.selector(self.pollBg_, signature=b"v@:@"), None)
+
+        def pollBg_(self, _arg):
             result = bridge.handle(self.ctx, {"action": "usage"})
-            _push_state(self.webview, result)
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
+
+        def applyResult_(self, result):
+            self._pushResult(result)
             self._updateDot(result.get("state"))
 
         # --- JS → Python (WKScriptMessageHandler) -------------------------------------------
@@ -108,39 +107,42 @@ if objc is not None:
             if action == "quit":
                 NSApplication.sharedApplication().terminate_(self)
                 return
-            if action == "add":
-                self._handleAdd(msg)
+            if action == "settings":
+                return  # reserved
+            if action == "login":
+                # native: sync-back-before-login (invariant) + run the chosen flow in Terminal
+                from .terminal import prepare_then_login
+                prepare_then_login(self.ctx, msg["tool"], msg.get("command"))
+                self._notify("finish signing in", "then tap ‘save my seat’ 🎟️")
+                self._pushResult({"ok": True, "await_snapshot": True, "tool": msg["tool"]})
                 return
-            if action == "headroom_install":
-                from .terminal import open_in_terminal
-                from acctsw.headroom import INSTALL_COMMAND
-                open_in_terminal(INSTALL_COMMAND)
-                self._notify("installing headroom", "i'll enable save-credit once it's ready ✨")
-                return
+
             result = bridge.handle(self.ctx, msg)
             if action == "dot":
                 self._updateDot(result.get("state"))
                 return
-            _push_state(self.webview, result)
+            if result.get("command"):  # headroom_install → run in Terminal
+                from .terminal import open_in_terminal
+                open_in_terminal(result["command"])
+                self._notify("installing headroom", "i'll enable save-credit once it's ready ✨")
+            self._pushResult(result)
             self._updateDot(result.get("state"))
-            if action == "switch" and result.get("ok") and self.ctx.load_state().settings().get("notify", True):
-                self._notify("just switched you ✨", f"{msg.get('email')} is on the floor")
-
-        @objc.python_method
-        def _handleAdd(self, msg):
-            plan = bridge.login_plan(msg["tool"])
-            # Sync-back the active seat FIRST (invariant), then run the official login in Terminal.
-            from .terminal import prepare_then_login
-            prepare_then_login(self.ctx, msg["tool"], plan["methods"][0].get("command"))
-            self._notify("finish signing in", "come back and i'll save the seat 🎟️")
+            if action in ("switch", "snapshot", "paste") and result.get("ok") \
+                    and self.ctx.load_state().settings().get("notify", True):
+                self._notify("just switched you ✨", "your seat's on the floor")
 
         # --- helpers ------------------------------------------------------------------------
+        @objc.python_method
+        def _pushResult(self, result):
+            if self.webview:
+                self.webview.evaluateJavaScript_completionHandler_(
+                    f"window.AGL.result({json.dumps(result)});", None)
+
         @objc.python_method
         def _updateDot(self, state):
             if not state:
                 return
-            from .web_state import dot_for  # pure python mirror of render.dotState
-            self.statusItem.button().setTitle_(DOT_GLYPH.get(dot_for(state), "🎟️"))
+            self.statusItem.button().setTitle_(DOT_GLYPH.get(state.get("dot", "fresh"), "🎟️"))
 
         @objc.python_method
         def _notify(self, title, text):

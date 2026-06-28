@@ -1,12 +1,14 @@
 // Live glue: render state into the DOM and forward user actions to the Python bridge.
 // All rendering logic lives in render.mjs (pure, unit-tested); this file is the thin wiring.
-import { buildHTML, dotState } from "./render.mjs";
+import { buildHTML, buildPicker, buildSaveSeat, buildPaste } from "./render.mjs";
 
 const root = document.getElementById("root");
+const overlay = document.createElement("div");
+overlay.id = "overlay";
+document.body.appendChild(overlay);
 let state = { settings: { theme: "dark" }, tools: {} };
 
 // --- bridge -----------------------------------------------------------------------------------
-// JS → Python via WKScriptMessageHandler named "agl". In a browser (tests/preview) we no-op.
 function send(action, payload = {}) {
   const msg = { action, ...payload };
   try {
@@ -16,38 +18,63 @@ function send(action, payload = {}) {
   }
 }
 
-// Python → JS: the app calls window.AGL.update(stateJson) after every engine change.
+// Python → JS: the shell calls window.AGL.result(result) after every action.
 window.AGL = {
-  update(next) {
-    state = typeof next === "string" ? JSON.parse(next) : next;
-    render();
+  result(res) {
+    res = typeof res === "string" ? JSON.parse(res) : res;
+    if (res.state) { state = res.state; render(); }
+    if (res.error) flash(res.error);
+    if (res.login) { overlay.innerHTML = buildPicker(res.login); }
+    if (res.await_snapshot) { overlay.innerHTML = buildSaveSeat(res.tool); }
+    if (res.celebrate) celebrate();
   },
-  celebrate() {
-    root.firstElementChild?.classList.add("celebrate");
-    setTimeout(() => root.firstElementChild?.classList.remove("celebrate"), 600);
-  },
+  // legacy single-arg state push (kept for the poll path / older callers)
+  update(next) { this.result({ state: typeof next === "string" ? JSON.parse(next) : next }); },
+  celebrate,
 };
+
+function celebrate() {
+  root.firstElementChild?.classList.add("celebrate");
+  setTimeout(() => root.firstElementChild?.classList.remove("celebrate"), 600);
+}
+function flash(text) {
+  overlay.innerHTML = `<div class="toast">${text}</div>`;
+  setTimeout(() => { if (overlay.querySelector(".toast")) overlay.innerHTML = ""; }, 3000);
+}
+function closeOverlay() { overlay.innerHTML = ""; }
 
 function render() {
   root.innerHTML = buildHTML(state);
-  // report the menu-bar dot so the native side can update the status item glyph
-  send("dot", dotState(state));
 }
 
-// --- event delegation -------------------------------------------------------------------------
-root.addEventListener("click", (e) => {
+// --- event delegation (whole document, so overlay buttons work too) ---------------------------
+document.addEventListener("click", (e) => {
   const el = e.target.closest("[data-action]");
   if (!el) return;
-  const { action, tool, email, key } = el.dataset;
+  const { action, tool, email, key, command } = el.dataset;
   switch (action) {
     case "switch": send("switch", { tool, email }); break;
     case "remove": if (confirm(`wave goodbye to ${email}?`)) send("remove", { tool, email }); break;
     case "add": send("add", { tool }); break;
+    case "login": closeOverlay(); send("login", { tool, command }); break;
+    case "paste-open": overlay.innerHTML = buildPaste(tool); break;
+    case "paste-save": {
+      const blob = document.getElementById("paste-blob")?.value?.trim();
+      if (blob) { closeOverlay(); send("paste", { tool, blob }); }
+      break;
+    }
+    case "snapshot": closeOverlay(); send("snapshot", { tool }); break;
     case "headroom_install": send("headroom_install"); break;
+    case "picker-close": closeOverlay(); break;
     case "settings": send("settings"); break;
     case "quit": send("quit"); break;
-    case "toggle": send("toggle", { key, value: el.checked }); break;
   }
+});
+
+// toggles fire 'change' (clicking the switch graphic doesn't bubble a data-action click)
+document.addEventListener("change", (e) => {
+  const inp = e.target.closest('input[data-action="toggle"]');
+  if (inp) send("toggle", { key: inp.dataset.key, value: inp.checked });
 });
 
 // initial paint + ask the native side for fresh state

@@ -1,31 +1,20 @@
-"""Tests for the native shell's pure helpers: dot glyph selection + sync-back-before-login."""
+"""Tests for the native shell's pure helpers: dot selection + sync-back-before-login."""
 import json
+from pathlib import Path
 
 from acctsw import accounts as acct
-from app import terminal, web_state
+from acctsw.web_dot import dot_for
+from app import terminal
 from tests.conftest import make_codex_blob
 
-
-def _state(seats_codex):
-    return {"tools": {"codex": {"seats": seats_codex}, "claude": {"seats": []}}}
+FIXTURE = Path(__file__).parent / "fixtures" / "dot_cases.json"
 
 
-def test_dot_for_fresh():
-    assert web_state.dot_for(_state([{"active": True, "limited": False}])) == "fresh"
-
-
-def test_dot_for_resting():
-    assert web_state.dot_for(_state([{"active": True, "limited": True}])) == "resting"
-
-
-def test_dot_for_hello_on_unauthorized():
-    assert web_state.dot_for(_state([{"usage": {"error": "unauthorized"}}])) == "hello"
-
-
-def test_dot_for_switched_precedence():
-    s = _state([{"active": True, "limited": True}])
-    s["recently_switched"] = True
-    assert web_state.dot_for(s) == "switched"
+def test_dot_for_golden_fixture():
+    """The SAME fixture is asserted by the node UI tests → python/JS dot logic can't drift."""
+    cases = json.loads(FIXTURE.read_text())
+    for c in cases:
+        assert dot_for(c["state"]) == c["expected"], c["name"]
 
 
 def test_prepare_then_login_syncs_back_active_before_login(ctx, monkeypatch):

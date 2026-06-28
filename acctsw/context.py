@@ -6,6 +6,8 @@ writes real credentials.
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import os
 import pwd
 import shutil
@@ -76,6 +78,23 @@ class Context:
 
     def load_state(self) -> State:
         return State.load(self.state_file)
+
+    @contextlib.contextmanager
+    def locked(self):
+        """Exclusive cross-process lock for read-modify-write of state.json.
+
+        The menubar (a long-running writer) and ``acctsw run``/CLI both mutate state; an flock
+        around load→mutate→save prevents lost updates (atomic_write alone only prevents torn files).
+        Hold it ONLY around quick state mutations — never across a spawned agent session.
+        """
+        self.ensure_dirs()
+        f = open(self.data_dir / ".lock", "w")
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+            f.close()
 
     def snapshot_key(self, tool: str, email: str) -> str:
         """Keychain account name for our snapshot of a seat: ``<tool>:<email>``."""

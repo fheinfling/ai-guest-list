@@ -1,7 +1,8 @@
-"""Pure-Python mirror of render.mjs `dotState` — used to pick the menu-bar glyph natively.
+"""Single source of truth for the menu-bar dot state (Python).
 
-Kept in lock-step with app/web/render.mjs (the JS is the source of truth for the popover; this is
-only for the status-item title). Unit-tested in tests/test_web_state.py.
+Both the native glyph (via ``state["dot"]`` from the bridge) and the JS preview render the same
+value. render.mjs keeps a JS copy only as a browser-preview fallback; a golden fixture
+(tests/fixtures/dot_cases.json) is asserted by BOTH the python and node tests so they can't drift.
 """
 from __future__ import annotations
 
@@ -9,8 +10,7 @@ from typing import Any
 
 
 def _needs_hello(seat: dict) -> bool:
-    usage = seat.get("usage") or {}
-    return usage.get("error") == "unauthorized"
+    return (seat.get("usage") or {}).get("error") == "unauthorized"
 
 
 def dot_for(state: dict[str, Any]) -> str:

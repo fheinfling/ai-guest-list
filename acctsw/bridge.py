@@ -13,7 +13,23 @@ from . import accounts as acct
 from . import usage as usage_mod
 from .context import Context
 from .errors import AcctswError
+from .switch import sync_back
 from .switch import switch as do_switch
+from .util import now, iso, parse_iso
+from .web_dot import dot_for
+
+# Settings the UI may toggle (boolean only) — a whitelist so a stray key can't clobber e.g. theme.
+TOGGLE_KEYS = {"auto_switch", "headroom", "notify", "restart_app", "celebrations", "same_tool_only"}
+
+# Actions handled entirely by the native shell (app quit / run the chosen login in Terminal).
+# Everything else goes through the bridge; the shell then acts on result fields (login/command).
+NATIVE_ACTIONS = {"quit", "login", "settings"}
+
+SWITCH_FRESH_SECONDS = 8  # how long the "just switched you" dot lingers
+
+
+def is_native(action: str | None) -> bool:
+    return action in NATIVE_ACTIONS
 
 
 def headroom_available() -> bool:
@@ -24,6 +40,9 @@ def snapshot_state(ctx: Context) -> dict[str, Any]:
     state = ctx.load_state()
     data = acct.status(ctx, state)
     data["headroom_available"] = headroom_available()
+    last = parse_iso(state.data.get("last_switch_at"))
+    data["recently_switched"] = bool(last and (now() - last).total_seconds() < SWITCH_FRESH_SECONDS)
+    data["dot"] = dot_for(data)  # single source of truth for the dot (JS + native both read this)
     return data
 
 
@@ -49,24 +68,33 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
             return {"ok": True, "state": snapshot_state(ctx)}
 
         if action == "toggle":
-            state = ctx.load_state()
-            state.set_setting(str(message["key"]), bool(message["value"]))
-            state.save()
+            key = str(message["key"])
+            if key not in TOGGLE_KEYS:
+                return {"ok": False, "error": f"not a toggle: {key}"}
+            with ctx.locked():
+                state = ctx.load_state()
+                state.set_setting(key, bool(message["value"]))
+                state.save()
             return {"ok": True, "state": snapshot_state(ctx)}
 
         if action == "switch":
-            state = ctx.load_state()
-            do_switch(ctx, state, message["tool"], message["email"])
+            with ctx.locked():
+                state = ctx.load_state()
+                do_switch(ctx, state, message["tool"], message["email"])
+                state.data["last_switch_at"] = iso(now())
+                state.save()
             return {"ok": True, "celebrate": True, "state": snapshot_state(ctx)}
 
         if action == "remove":
-            state = ctx.load_state()
-            acct.remove(ctx, state, message["tool"], message["email"])
+            with ctx.locked():
+                state = ctx.load_state()
+                acct.remove(ctx, state, message["tool"], message["email"])
             return {"ok": True, "state": snapshot_state(ctx)}
 
         if action == "usage":
-            state = ctx.load_state()
-            usage_mod.refresh(ctx, state, message.get("tool"))
+            with ctx.locked():
+                state = ctx.load_state()
+                usage_mod.refresh(ctx, state, message.get("tool"))
             return {"ok": True, "state": snapshot_state(ctx)}
 
         if action == "add":
@@ -77,16 +105,25 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
             return {"ok": True, "command": headroom.INSTALL_COMMAND,
                     "available": headroom.available()}
 
-        if action == "snapshot":
-            # called after the user completed the official login in Terminal
-            state = ctx.load_state()
-            seat = acct.add(ctx, state, message["tool"],
-                            name=message.get("name"), email=message.get("email"))
+        if action == "paste":
+            # codex no-browser path: install a pasted auth.json, then register it as a seat.
+            tool = message["tool"]
+            with ctx.locked():
+                state = ctx.load_state()
+                sync_back(ctx, state, tool)         # preserve the outgoing seat's rotated token
+                ctx.cred[tool].set_live(message["blob"])
+                seat = acct.add(ctx, state, tool, name=message.get("name"))
             return {"ok": True, "celebrate": True, "added": seat["email"],
                     "state": snapshot_state(ctx)}
 
-        if action in ("settings", "quit"):
-            return {"ok": True}  # handled natively by the shell
+        if action == "snapshot":
+            # called after the user completed the official login in Terminal
+            with ctx.locked():
+                state = ctx.load_state()
+                seat = acct.add(ctx, state, message["tool"],
+                                name=message.get("name"), email=message.get("email"))
+            return {"ok": True, "celebrate": True, "added": seat["email"],
+                    "state": snapshot_state(ctx)}
 
         return {"ok": False, "error": f"unknown action: {action}"}
     except AcctswError as e:

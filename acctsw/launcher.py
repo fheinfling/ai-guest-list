@@ -288,9 +288,12 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         save_credit = False
 
     try:
-        sel = choose(state, tool)
-        if sel.email and sel.email != state.active(tool):
-            switch(ctx, state, tool, sel.email)
+        # Initial selection + switch, under the state lock (brief; never held across a spawn).
+        with ctx.locked():
+            state = ctx.load_state()
+            sel = choose(state, tool)
+            if sel.email and sel.email != state.active(tool):
+                switch(ctx, state, tool, sel.email)
         if sel.all_limited and sel.unlocks_at:
             notify(f"all {tool} seats are resting — {sel.email} unlocks at "
                    f"{sel.unlocks_at:%H:%M}; starting anyway")
@@ -312,7 +315,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     return True
                 return False
 
-            status = spawn(argv, on_output)
+            status = spawn(argv, on_output)  # NO lock held during the session
 
             if not hit["v"]:
                 return status  # clean exit — child's real exit code
@@ -321,12 +324,17 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 notify(f"hit the switch limit ({max_switches}); stopping")
                 return EXIT_GAVE_UP
 
-            active = state.active(tool)
-            dec = handle_limit(ctx, state, tool, get=get)
+            with ctx.locked():
+                state = ctx.load_state()
+                active = state.active(tool)
+                dec = handle_limit(ctx, state, tool, get=get)
+                if dec.action == "switch":
+                    switch(ctx, state, tool, dec.email)
+                    state.data["last_switch_at"] = iso(now())
+                    state.save()
             if dec.action == "switch":
                 notify(f"{active} needs a rest 💤 — hopping to {dec.email}, "
                        f"your work's coming with you ✨")
-                switch(ctx, state, tool, dec.email)
                 switches += 1
                 resuming = True
                 continue
@@ -337,7 +345,9 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         # Mandatory sync-back on EVERY exit path (incl. exceptions): the just-run seat may carry a
         # rotated refresh token. The Codex live-vs-active guard prevents clobbering on a half-swap.
         try:
-            sync_back(ctx, state, tool)
-            state.save()
+            with ctx.locked():
+                st = ctx.load_state()
+                if sync_back(ctx, st, tool):
+                    st.save()
         except Exception:
             pass

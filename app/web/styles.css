@@ -85,6 +85,24 @@ html, body { background: transparent; }
 .foot .link { color: var(--muted); }
 .foot .link:hover { color: var(--ink); }
 
+/* overlays: add-a-seat picker / paste / toast */
+#overlay:empty { display: none; }
+.picker-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.45);
+  display: flex; align-items: center; justify-content: center; padding: 16px; }
+.picker { background: var(--card); color: var(--ink); border: 1px solid var(--line);
+  border-radius: 12px; padding: 16px; width: 100%; max-width: 280px; text-align: center; }
+.picker h3 { font-size: 14px; margin-bottom: 2px; }
+.picker .sub { margin-bottom: 12px; }
+.picker-method { display: block; width: 100%; margin: 6px 0; padding: 9px; border: none;
+  border-radius: 8px; background: var(--fresh); color: #06231c; font: inherit; font-weight: 600;
+  cursor: pointer; }
+.picker-method:hover { filter: brightness(1.05); }
+.paste { width: 100%; height: 90px; margin-bottom: 10px; border-radius: 8px; border: 1px solid var(--line);
+  background: var(--track); color: var(--ink); font-family: "Space Mono", monospace; font-size: 11px; padding: 8px; }
+.hr-install { display: block; margin: -2px 0 2px 43px; font-size: 11px; }
+.toast { position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%);
+  background: var(--love); color: #2a0d15; padding: 8px 14px; border-radius: 8px; font-size: 12px; }
+
 /* little celebration */
 .celebrate { animation: pop .5s ease; }
 @keyframes pop { 0% { transform: scale(.96); } 50% { transform: scale(1.03); } 100% { transform: scale(1); } }

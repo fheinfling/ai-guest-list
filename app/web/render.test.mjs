@@ -2,7 +2,12 @@
 // so we assert structure/state-reflection directly. dotState/creditLeft/fmtCountdown are pure.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildHTML, dotState, creditLeft, pct, fmtCountdown, needsHello } from "./render.mjs";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import {
+  buildHTML, dotState, dotKey, creditLeft, pct, fmtCountdown, needsHello,
+  buildPicker, buildSaveSeat, buildPaste,
+} from "./render.mjs";
 
 function seat(over = {}) {
   return { email: "a@x.com", name: "work", active: false, limited: false,
@@ -91,4 +96,34 @@ test("buildHTML headroom toggle disabled hint when unavailable", () => {
 test("buildHTML escapes seat names", () => {
   const s = state({ tools: { codex: { active: null, seats: [seat({ name: "<script>x" })] }, claude: { seats: [] } } });
   assert.match(buildHTML(s), /&lt;script&gt;x/);
+});
+
+test("buildHTML uses a safe theme class for unknown themes", () => {
+  const html = buildHTML(state({ settings: { theme: "evil\" onload=x" } }));
+  assert.match(html, /class="app theme-dark"/);  // unknown theme → default, no injection
+});
+
+test("dotState reads the bridge-provided state.dot (source of truth)", () => {
+  assert.equal(dotState({ dot: "resting" }).key, "resting");
+  assert.equal(dotState({ dot: "hello" }).emoji, "🌸");
+});
+
+test("dotKey golden parity with python fixture", () => {
+  const path = fileURLToPath(new URL("../../tests/fixtures/dot_cases.json", import.meta.url));
+  const cases = JSON.parse(readFileSync(path, "utf8"));
+  for (const c of cases) assert.equal(dotKey(c.state), c.expected, c.name);
+});
+
+test("buildPicker renders command + paste methods with actions", () => {
+  const html = buildPicker({ tool: "codex", title: "who's joining the list?", methods: [
+    { id: "browser", label: "ChatGPT sign-in", command: "codex login" },
+    { id: "paste", label: "paste auth.json", command: null },
+  ]});
+  assert.match(html, /data-action="login"[^>]*data-command="codex login"/);
+  assert.match(html, /data-action="paste-open"[^>]*data-tool="codex"/);
+});
+
+test("buildSaveSeat + buildPaste wire snapshot/paste-save", () => {
+  assert.match(buildSaveSeat("claude"), /data-action="snapshot"[^>]*data-tool="claude"/);
+  assert.match(buildPaste("codex"), /data-action="paste-save"[^>]*data-tool="codex"/);
 });

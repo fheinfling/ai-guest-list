@@ -66,3 +66,40 @@ def test_missing_field_error(ctx):
 def test_unknown_action(ctx):
     r = bridge.handle(ctx, {"action": "frobnicate"})
     assert r["ok"] is False and "unknown action" in r["error"]
+
+
+def test_toggle_rejects_non_whitelisted_key(ctx):
+    r = bridge.handle(ctx, {"action": "toggle", "key": "theme", "value": True})
+    assert r["ok"] is False and "not a toggle" in r["error"]
+    # theme remains its default string, not clobbered to a bool
+    assert ctx.load_state().settings()["theme"] == "dark"
+
+
+def test_state_includes_dot_and_recently_switched(ctx):
+    _add(ctx, "a@x.com")
+    r = bridge.handle(ctx, {"action": "status"})
+    assert r["state"]["dot"] in {"fresh", "resting", "hello", "switched"}
+    assert r["state"]["recently_switched"] is False
+
+
+def test_switch_sets_recently_switched_dot(ctx):
+    _add(ctx, "a@x.com")
+    _add(ctx, "b@x.com")
+    r = bridge.handle(ctx, {"action": "switch", "tool": "codex", "email": "a@x.com"})
+    assert r["state"]["recently_switched"] is True
+    assert r["state"]["dot"] == "switched"
+
+
+def test_paste_installs_and_registers_codex(ctx):
+    blob = make_codex_blob("pasted@x.com")
+    r = bridge.handle(ctx, {"action": "paste", "tool": "codex", "blob": blob})
+    assert r["ok"] and r["added"] == "pasted@x.com"
+    assert "pasted@x.com" in ctx.load_state().accounts("codex")
+    import json
+    assert json.loads(ctx.cred["codex"].get_live())  # live creds installed
+
+
+def test_is_native_routing():
+    assert bridge.is_native("quit") and bridge.is_native("login") and bridge.is_native("settings")
+    assert not bridge.is_native("switch") and not bridge.is_native("status")
+    assert not bridge.is_native("headroom_install")  # engine-routed (returns command)
