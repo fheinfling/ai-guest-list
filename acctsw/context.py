@@ -6,7 +6,9 @@ writes real credentials.
 """
 from __future__ import annotations
 
-import getpass
+import os
+import pwd
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,16 +27,18 @@ class Context:
     keychain: KeychainBackend
     keychain_service: str          # service for OUR snapshots
     cred: dict[str, CredLocation]  # tool -> canonical location
+    claude_bin: str | None = None  # path to the official `claude` CLI (for identity/usage)
+    codex_bin: str | None = None   # path to the official `codex` CLI (for the launcher)
 
     # --- factory: real system ----------------------------------------------------------------
     @classmethod
     def default(cls) -> "Context":
         keychain = SecurityKeychain()
+        # macOS short username from the passwd db (robust under sudo/launchd, unlike $USER).
+        username = pwd.getpwuid(os.getuid()).pw_name
         cred = {
             "codex": CodexCredLocation(P.CODEX_AUTH),
-            "claude": ClaudeCredLocation(
-                keychain, P.CLAUDE_KEYCHAIN_SERVICE, getpass.getuser()
-            ),
+            "claude": ClaudeCredLocation(keychain, P.CLAUDE_KEYCHAIN_SERVICE, username),
         }
         return cls(
             data_dir=P.DATA_DIR,
@@ -43,6 +47,8 @@ class Context:
             keychain=keychain,
             keychain_service=P.KEYCHAIN_SERVICE,
             cred=cred,
+            claude_bin=shutil.which("claude"),
+            codex_bin=shutil.which("codex"),
         )
 
     # --- factory: tests ----------------------------------------------------------------------

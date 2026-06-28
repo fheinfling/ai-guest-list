@@ -17,11 +17,11 @@ def live_email(ctx: Context, tool: str) -> str | None:
         blob = ctx.cred["codex"].get_live()
         return ctx.cred["codex"].email_of(blob) if blob else None
     if tool == "claude":
-        return _claude_status_email()
+        return claude_status_email(ctx.claude_bin)
     raise ValueError(f"unknown tool: {tool}")
 
 
-def _claude_status_email(claude_bin: str | None = None) -> str | None:
+def claude_status_email(claude_bin: str | None = None) -> str | None:
     exe = claude_bin or shutil.which("claude")
     if not exe:
         return None

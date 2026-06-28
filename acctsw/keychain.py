@@ -8,6 +8,8 @@ from __future__ import annotations
 import subprocess
 from typing import Protocol
 
+from .errors import AcctswError
+
 
 class KeychainBackend(Protocol):
     """Minimal generic-password store keyed by (service, account)."""
@@ -67,5 +69,5 @@ class InMemoryKeychain:
         return self._store.pop((service, account), None) is not None
 
 
-class KeychainError(RuntimeError):
-    pass
+class KeychainError(AcctswError):
+    """A `security` keychain operation failed (surfaced as a friendly error, not a traceback)."""

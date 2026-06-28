@@ -17,13 +17,22 @@ from .state import State
 
 
 def sync_back(ctx: Context, state: State, tool: str) -> bool:
-    """Persist the live creds of the currently-active seat into its snapshot. Returns True if done."""
+    """Persist the live creds of the currently-active seat into its snapshot. Returns True if done.
+
+    Guard: if the live creds clearly belong to a *different* account than ``state.active`` (e.g.
+    the user ran stock ``codex login`` or switched in the GUI — an in-scope scenario), we skip the
+    sync-back instead of corrupting the active seat's snapshot with foreign creds. Detectable for
+    Codex (email is in the JWT); best-effort for Claude (no email in the blob → proceed).
+    """
     active = state.active(tool)
     if not active:
         return False
     live = ctx.cred[tool].get_live()
     if not live:
         return False
+    live_email = ctx.cred[tool].email_of(live)
+    if live_email is not None and live_email != active:
+        return False  # mismatch — don't clobber the active seat's snapshot
     ctx.keychain.set(ctx.keychain_service, ctx.snapshot_key(tool, active), live)
     return True
 

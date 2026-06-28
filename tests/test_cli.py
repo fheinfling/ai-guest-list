@@ -56,3 +56,26 @@ def test_not_implemented_exit_code(isolated):
 def test_no_command_prints_help(capsys):
     assert cli.main([]) == 0
     assert "usage" in capsys.readouterr().out.lower()
+
+
+def test_remove_path(isolated, capsys):
+    isolated.cred["codex"].set_live(make_codex_blob("a@x.com"))
+    cli.main(["add", "codex"])
+    capsys.readouterr()
+    assert cli.main(["remove", "codex", "a@x.com"]) == 0
+    assert "goodbye" in capsys.readouterr().out
+    # removing again reports no-op, still exit 0
+    assert cli.main(["remove", "codex", "a@x.com"]) == 0
+
+
+def test_keychain_error_is_friendly(isolated, monkeypatch, capsys):
+    """A keychain failure surfaces as a friendly stderr line, not a traceback."""
+    from acctsw.keychain import KeychainError
+    isolated.cred["codex"].set_live(make_codex_blob("a@x.com"))
+
+    def boom(*a, **k):
+        raise KeychainError("security: boom")
+    monkeypatch.setattr(isolated.keychain, "set", boom)
+    rc = cli.main(["add", "codex"])
+    assert rc == cli.EXIT_ERR
+    assert "acctsw:" in capsys.readouterr().err

@@ -34,7 +34,17 @@ CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 CODEX_ACCOUNTS_URL = "https://chatgpt.com/backend-api/accounts"
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 # Required Claude headers — without these the endpoint returns 401 / aggressive 429s.
+#   anthropic-beta: oauth-2025-04-20      (else 401)
+#   User-Agent: claude-code/<version>     (else aggressive 429 bucket)
 CLAUDE_OAUTH_BETA = "oauth-2025-04-20"
+CLAUDE_USER_AGENT_FALLBACK = "claude-code/2.1.0"  # used if `claude --version` can't be read
+ANTHROPIC_VERSION = "2023-06-01"
+
+# Codex usage requires identifying the ChatGPT account via this header.
+CODEX_ACCOUNT_ID_HEADER = "ChatGPT-Account-Id"
+
+# Usage caching: don't poll more often than this (Claude's endpoint rate-limits hard).
+USAGE_MIN_REFRESH_SECONDS = 150  # ~2.5 min
 
 
 def ensure_data_dirs() -> None:

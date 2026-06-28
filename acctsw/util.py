@@ -6,6 +6,7 @@ they live in one place rather than being re-implemented per call site (per revie
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import tempfile
@@ -23,12 +24,19 @@ def iso(dt: datetime) -> str:
 
 
 def parse_iso(s: str | None) -> datetime | None:
+    """Parse an ISO timestamp, coercing naive values to UTC.
+
+    Usage endpoints may return naive timestamps; we compare against an aware ``now()`` in
+    ``selection``/usage, so a naive value would raise ``TypeError``. Coercing to UTC keeps all
+    datetime comparisons safe.
+    """
     if not s:
         return None
     try:
-        return datetime.fromisoformat(s)
+        dt = datetime.fromisoformat(s)
     except ValueError:
         return None
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
 
 
 def atomic_write_bytes(path: Path, data: bytes, *, mode: int = 0o600) -> None:
@@ -68,6 +76,10 @@ def chmod_dir(path: Path, mode: int = 0o700) -> None:
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
     os.chmod(path, mode)
+
+
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def jwt_payload(token: str) -> dict:

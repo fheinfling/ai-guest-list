@@ -121,6 +121,29 @@ def _cmd_switch(ctx: Context, ns) -> int:
     return EXIT_OK
 
 
+def _cmd_usage(ctx: Context, ns) -> int:
+    from . import usage as usage_mod
+    state = ctx.load_state()
+    summary = usage_mod.refresh(ctx, state, tool=getattr(ns, "tool", None))
+    if getattr(ns, "json", False):
+        out = {"refresh": summary, "status": acct.status(ctx, state)}
+        print(json.dumps(out, indent=2))
+        return EXIT_OK
+    for tool in (TOOLS if not ns.tool else [ns.tool]):
+        print(f"{tool}:")
+        for s in acct.list_seats(state, tool):
+            u = s.get("usage") or {}
+            wins = u.get("windows") or {}
+            parts = []
+            for key in ("5h", "weekly"):
+                w = wins.get(key) or {}
+                pct = w.get("used_pct")
+                parts.append(f"{key} {pct:.0f}%" if isinstance(pct, (int, float)) else f"{key} —")
+            tag = "resting" if s["limited"] else "ok"
+            print(f"  {s['email']}: {', '.join(parts)}  [{tag}]")
+    return EXIT_OK
+
+
 def _not_impl(ctx: Context, ns) -> int:
     print(f"acctsw: '{ns.command}' arrives in a later milestone.", file=sys.stderr)
     return EXIT_NOIMPL
@@ -132,7 +155,7 @@ HANDLERS = {
     "list": _cmd_list,
     "status": _cmd_status,
     "switch": _cmd_switch,
-    "usage": _not_impl,
+    "usage": _cmd_usage,
     "run": _not_impl,
     "install": _not_impl,
     "uninstall": _not_impl,

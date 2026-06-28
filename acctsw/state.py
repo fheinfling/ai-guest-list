@@ -19,6 +19,7 @@ A ``Seat`` is::
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -58,7 +59,6 @@ class State:
         path = Path(path)
         if not path.exists():
             return cls(path=path, data=_empty())
-        import json
         data = json.loads(path.read_text())
         # forward-compatible defaults
         data.setdefault("version", STATE_VERSION)

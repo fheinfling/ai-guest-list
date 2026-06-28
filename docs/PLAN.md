@@ -264,3 +264,18 @@ seats** + **reset** to simulate limits, and **"or peek at the list i've got"** t
    engine; notifications fire on auto-switch.
 9. `acctsw uninstall` → `~/.codex/auth.json` + Claude keychain match `backups/` originals;
    `--purge` leaves no trace (app, engine, state, keychain items all gone; Headroom left as-is).
+
+---
+
+## Implementation invariants (review-driven; honor in later milestones)
+- **Add-a-seat orchestration (M4/M6) MUST `sync_back(active)` BEFORE invoking the official login.**
+  The official `codex login` / `claude auth login` overwrites the live creds, so the previously
+  active seat's (possibly rotated) tokens must be snapshotted first or they are lost. `add()` runs
+  *after* login and cannot recover them.
+- **Unattended switching (M4 launcher) uses the Codex live-vs-active guard** in `switch.sync_back`
+  (skip sync-back when live creds belong to a different account than `state.active`).
+- **All timestamps are tz-aware** (`parse_iso` coerces naive→UTC) so selection comparisons never
+  raise.
+- **Real usage shapes (verified live):** Claude `oauth/usage` → `five_hour`/`seven_day`
+  `{utilization, resets_at}`. Codex `wham/usage` → `rate_limit.{primary,secondary}_window`
+  `{used_percent, reset_at(epoch)}` plus `rate_limit.limit_reached`.
