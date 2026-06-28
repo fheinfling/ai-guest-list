@@ -48,28 +48,51 @@ def _codex_cfg(tmp_path, monkeypatch, content='model = "gpt-5.5"\n'):
     return cfg
 
 
+def _fakerun(rc_apply=0, running=True):
+    import types
+    def run(args, **k):
+        out = "proxy running" if (running and "status" in args) else "ok"
+        rc = rc_apply if "apply" in args else 0
+        return types.SimpleNamespace(returncode=rc, stdout=out, stderr="")
+    return run
+
+
 def test_global_enable_snapshots_then_applies(tmp_path, monkeypatch):
     cfg = _codex_cfg(tmp_path, monkeypatch)
     monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
-    calls = []
-    def run(args, **k):
-        calls.append(args)
-        import types; return types.SimpleNamespace(returncode=0, stdout="applied", stderr="")
-    ok, msg = headroom.global_enable(tmp_path / "store", run=run)
-    assert ok
-    assert calls[-1][1:3] == ["install", "apply"]
+    ok, msg = headroom.global_enable(tmp_path / "store", run=_fakerun(rc_apply=0, running=True))
+    assert ok, msg
     assert (tmp_path / "store" / "headroom-global-backup" / "manifest.json").exists()  # snapshot taken
 
 
-def test_global_enable_rolls_back_on_failure(tmp_path, monkeypatch):
+def test_global_enable_rolls_back_when_proxy_not_running(tmp_path, monkeypatch):
+    """apply succeeds but proxy isn't healthy → full rollback (never leave a dead-proxy route)."""
     cfg = _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
     monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
-    def run(args, **k):
-        import types; return types.SimpleNamespace(returncode=1, stdout="", stderr="boom")
-    ok, _ = headroom.global_enable(tmp_path / "store", run=run)
+    ok, _ = headroom.global_enable(tmp_path / "store", run=_fakerun(rc_apply=0, running=False))
     assert ok is False
-    assert cfg.read_text() == 'model = "orig"\n'                # rolled back / untouched
-    assert not (tmp_path / "store" / "headroom-global-backup").exists()  # snapshot cleaned up
+    assert cfg.read_text() == 'model = "orig"\n'                # config untouched
+    assert not (tmp_path / "store" / "headroom-global-backup").exists()
+
+
+def test_global_enable_rolls_back_on_apply_failure(tmp_path, monkeypatch):
+    cfg = _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
+    monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
+    ok, _ = headroom.global_enable(tmp_path / "store", run=_fakerun(rc_apply=1, running=False))
+    assert ok is False
+    assert cfg.read_text() == 'model = "orig"\n'
+    assert not (tmp_path / "store" / "headroom-global-backup").exists()
+
+
+def test_snapshot_global_is_idempotent(tmp_path, monkeypatch):
+    """A 2nd enable must NOT re-snapshot a routed config (keeps the original backstop)."""
+    cfg = _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
+    headroom.snapshot_global(tmp_path / "store")
+    cfg.write_text('model_provider = "headroom"\n')   # now routed
+    headroom.snapshot_global(tmp_path / "store")       # idempotent: must keep the ORIGINAL
+    ok, failures = headroom.restore_global(tmp_path / "store")
+    assert ok and not failures
+    assert cfg.read_text() == 'model = "orig"\n'
 
 
 def test_global_disable_removes_and_restores(tmp_path, monkeypatch):
@@ -85,6 +108,7 @@ def test_global_disable_removes_and_restores(tmp_path, monkeypatch):
     assert ok
     assert calls[-1][1:3] == ["install", "remove"]
     assert cfg.read_text() == 'model = "orig"\n'                # backstop restored the original
+    assert not (tmp_path / "store" / "headroom-global-backup").exists()  # backup cleared on success
 
 
 def test_bridge_headroom_toggle_enables(ctx, monkeypatch):

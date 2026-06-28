@@ -110,9 +110,24 @@ if objc is not None:
                 objc.selector(self.pollBg_, signature=b"v@:@"), None)
 
         def pollBg_(self, _arg):
+            self._headroomHealthCheck()   # if routing is on but the proxy died, tear it down (fail-safe)
             result = bridge.handle(self.ctx, {"action": "usage"})
             self.performSelectorOnMainThread_withObject_waitUntilDone_(
                 objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
+
+        @objc.python_method
+        def _headroomHealthCheck(self):
+            """Critical fail-safe: if Headroom routing is on but the proxy isn't running, remove the
+            routing + restore config + clear the setting, so codex/claude never hit a dead proxy."""
+            try:
+                from acctsw import headroom
+                if self.ctx.load_state().settings().get("headroom") and not headroom.global_running():
+                    headroom.global_disable(self.ctx.data_dir)
+                    with self.ctx.locked():
+                        s = self.ctx.load_state(); s.set_setting("headroom", False); s.save()
+                    self._notify("Headroom turned off", "the proxy stopped — restored your setup")
+            except Exception:
+                pass
 
         def applyResult_(self, result):
             self._pushResult(result)
@@ -125,11 +140,14 @@ if objc is not None:
 
         @objc.python_method
         def _headroomTeardown(self):
-            """Remove global Headroom routing + restore config (auto-unwrap on quit / fail-safe)."""
+            """Remove global Headroom routing + restore config + clear the setting (auto-unwrap on
+            quit / fail-safe), so state and reality agree on next launch."""
             try:
                 from acctsw import headroom
                 if self.ctx.load_state().settings().get("headroom"):
                     headroom.global_disable(self.ctx.data_dir)
+                    with self.ctx.locked():
+                        s = self.ctx.load_state(); s.set_setting("headroom", False); s.save()
             except Exception:
                 pass
 

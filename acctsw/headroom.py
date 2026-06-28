@@ -13,7 +13,9 @@ from __future__ import annotations
 import base64
 import contextlib
 import json
+import os
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -146,7 +148,8 @@ def recover_stale(store: Path | None = None) -> None:
 # --- global (app-managed) mode: route plain codex/claude + GUI through Headroom ----------------
 # Driven by the app's "save credit" toggle. ON = `headroom install apply` (inject routing + run the
 # proxy) + an on-disk config backstop; OFF/quit/health-fail = `headroom install remove` + restore
-# the backstop. App-managed: removed on quit so codex/claude never point at a dead proxy.
+# the backstop. App-managed: removed on quit/health-fail so codex/claude never point at a dead proxy.
+# All ops are serialized by an flock op-lock so concurrent toggle/poll/recovery can't interleave.
 
 def _global_backup(store: Path | None) -> Path:
     return (store or P.DATA_DIR) / "headroom-global-backup"
@@ -156,42 +159,98 @@ def _global_files() -> list[Path]:
     return _touched("codex") + _touched("claude")
 
 
-def snapshot_global(store: Path | None = None) -> None:
+def _redact(text: str) -> str:
+    """Drop anything token/key/path-shaped before a message can reach the UI/state."""
+    import re
+    return re.sub(r"(sk-[A-Za-z0-9_-]+|rt\.[A-Za-z0-9_.-]+|/Users/[^\s]+|[A-Za-z0-9_-]{32,})",
+                  "[redacted]", text)
+
+
+def _log_full(store: Path | None, label: str, text: str) -> None:
+    """Write full (unredacted) headroom output to a private 0600 log for debugging."""
     from .util import atomic_write_text
-    import base64 as _b64
+    from .util import now, iso
+    try:
+        p = _store_dir(store).parent / "headroom.log"
+        prev = p.read_text() if p.exists() else ""
+        atomic_write_text(p, f"{prev}\n[{iso(now())}] {label}\n{text}\n", mode=0o600)
+    except OSError:
+        pass
+
+
+@contextlib.contextmanager
+def op_lock(store: Path | None = None):
+    """Exclusive cross-process lock for the whole enable/disable/recover operation (apply + snapshot
+    + restore), so a background toggle, usage poll, launch recovery, and quit teardown can't race."""
+    import fcntl
     bdir = _global_backup(store)
+    bdir.mkdir(parents=True, exist_ok=True)
+    f = open(bdir / ".oplock", "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(f, fcntl.LOCK_UN)
+        f.close()
+
+
+def has_backup(store: Path | None = None) -> bool:
+    return (_global_backup(store) / "manifest.json").exists()
+
+
+def snapshot_global(store: Path | None = None) -> None:
+    """Snapshot the user's ORIGINAL config (bytes + mode + symlink target). Idempotent: never
+    overwrites an existing backup, so a second enable can't capture the already-routed config."""
+    from .util import atomic_write_text
+    bdir = _global_backup(store)
+    if (bdir / "manifest.json").exists():
+        return  # original already captured — do NOT re-baseline a possibly-routed config
     bdir.mkdir(parents=True, exist_ok=True)
     manifest = {}
     for i, p in enumerate(_global_files()):
-        manifest[str(p)] = i
-        (bdir / f"{i}.b64").write_text(_b64.b64encode(p.read_bytes()).decode() if p.exists() else "")
-        (bdir / f"{i}.present").write_text("1" if p.exists() else "0")
+        if p.is_symlink():
+            entry = {"kind": "symlink", "target": os.readlink(p)}
+        elif p.exists():
+            entry = {"kind": "file", "b64": base64.b64encode(p.read_bytes()).decode(),
+                     "mode": stat.S_IMODE(p.lstat().st_mode)}
+        else:
+            entry = {"kind": "absent"}
+        entry["path"] = str(p)
+        (bdir / f"{i}.json").write_text(json.dumps(entry))
+        manifest[str(i)] = str(p)
     atomic_write_text(bdir / "manifest.json", json.dumps(manifest))
 
 
-def restore_global(store: Path | None = None) -> bool:
-    import base64 as _b64
+def restore_global(store: Path | None = None) -> tuple[bool, list[str]]:
+    """Atomically restore every snapshotted path to its ORIGINAL state (bytes/mode/symlink/absent).
+    Returns (ok, failures). The backup is deleted ONLY if every path restored cleanly."""
+    from .util import atomic_write_bytes
     bdir = _global_backup(store)
     mf = bdir / "manifest.json"
     if not mf.exists():
-        return False
-    manifest = json.loads(mf.read_text())
-    for path_s, i in manifest.items():
+        return True, []
+    try:
+        manifest = json.loads(mf.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        return False, [f"manifest unreadable: {e}"]
+    failures: list[str] = []
+    for i, path_s in manifest.items():
         p = Path(path_s)
-        present = (bdir / f"{i}.present").read_text().strip() == "1"
         try:
-            if not present:
-                if p.exists():
-                    p.unlink()
-            else:
-                data = _b64.b64decode((bdir / f"{i}.b64").read_text())
-                if not p.exists() or p.read_bytes() != data:
-                    p.write_bytes(data)
-        except OSError:
-            pass
-    import shutil as _sh
-    _sh.rmtree(bdir, ignore_errors=True)
-    return True
+            entry = json.loads((bdir / f"{i}.json").read_text())
+            if p.is_symlink() or p.exists():
+                p.unlink()
+            if entry["kind"] == "symlink":
+                p.symlink_to(entry["target"])
+            elif entry["kind"] == "file":
+                atomic_write_bytes(p, base64.b64decode(entry["b64"]), mode=entry.get("mode", 0o600))
+            # kind == "absent" → leave it removed
+        except OSError as e:
+            failures.append(f"{p}: {e}")
+    if not failures:
+        import shutil as _sh
+        _sh.rmtree(bdir, ignore_errors=True)
+    return (not failures), failures
 
 
 def _hr_run(args: list, *, run=subprocess.run, timeout: float = 120):
@@ -206,26 +265,38 @@ def _hr_run(args: list, *, run=subprocess.run, timeout: float = 120):
         return 1, str(e)
 
 
-def global_enable(store: Path | None = None, *, run=subprocess.run) -> tuple[bool, str]:
-    """Route plain codex/claude (+GUI) through Headroom. Snapshots config first (restore backstop)."""
-    snapshot_global(store)
-    rc, out = _hr_run(["install", "apply", "--providers", "auto"], run=run)
-    if rc != 0:
-        restore_global(store)   # roll back our snapshot if apply failed
-        return False, out.strip()[:300]
-    return True, "headroom routing enabled for codex & claude"
-
-
-def global_disable(store: Path | None = None, *, run=subprocess.run) -> tuple[bool, str]:
-    """Undo routing + stop the proxy, then restore our config backstop (belt-and-suspenders)."""
-    rc, out = _hr_run(["install", "remove"], run=run)
-    restored = restore_global(store)   # guarantee config is back even if `remove` missed anything
-    return True, f"headroom routing removed (remove rc={rc}; backstop_restored={restored})"
-
-
 def global_running(*, run=subprocess.run) -> bool:
     rc, out = _hr_run(["install", "status"], run=run, timeout=20)
     return rc == 0 and "running" in out.lower()
+
+
+def global_enable(store: Path | None = None, *, run=subprocess.run) -> tuple[bool, str]:
+    """Route plain codex/claude (+GUI) through Headroom. Snapshots the ORIGINAL config first, applies,
+    then VERIFIES the proxy is actually running — rolling back fully on any failure so clients are
+    never left pointing at a dead proxy. Serialized by op_lock."""
+    with op_lock(store):
+        if has_backup(store) and global_running(run=run):
+            return True, "headroom already on"
+        snapshot_global(store)                       # idempotent: keeps the original if already saved
+        rc, out = _hr_run(["install", "apply", "--providers", "auto"], run=run)
+        if rc != 0 or not global_running(run=run):    # apply failed OR proxy didn't come up healthy
+            _log_full(store, "global_enable failed", out)
+            _hr_run(["install", "remove"], run=run)   # undo any partial routing
+            restore_global(store)                     # restore the original config exactly
+            return False, "couldn't enable Headroom (see ~/.account-switcher/headroom.log)"
+        return True, "headroom routing enabled for codex & claude"
+
+
+def global_disable(store: Path | None = None, *, run=subprocess.run) -> tuple[bool, str]:
+    """Undo routing + stop the proxy, then restore our config backstop. Serialized by op_lock.
+    Reports failure (and KEEPS the backup) if the config couldn't be fully restored."""
+    with op_lock(store):
+        rc, out = _hr_run(["install", "remove"], run=run)
+        ok, failures = restore_global(store)          # guaranteed exact restore; backup kept on failure
+        if not ok:
+            _log_full(store, "global_disable restore failures", "\n".join(failures))
+            return False, "Headroom removed but config restore incomplete (see ~/.account-switcher/headroom.log)"
+        return True, "headroom routing removed; config restored"
 
 
 @contextlib.contextmanager
