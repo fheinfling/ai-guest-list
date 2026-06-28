@@ -19,7 +19,7 @@ try:
                         NSVariableStatusItemLength, NSApplicationActivationPolicyAccessory,
                         NSUserNotification, NSUserNotificationCenter)
     from WebKit import WKWebView, WKWebViewConfiguration, WKUserContentController
-    from Foundation import NSObject, NSURL, NSTimer, NSMakeRect
+    from Foundation import NSObject, NSURL, NSTimer, NSMakeRect, NSMakeSize
 except ImportError:  # allows importing this module's pure helpers without pyobjc installed
     objc = None
 
@@ -60,7 +60,7 @@ if objc is not None:
             ucc = WKUserContentController.alloc().init()
             ucc.addScriptMessageHandler_name_(self, "agl")
             cfg.setUserContentController_(ucc)
-            self.webview = WKWebView.alloc().initWithFrame_configuration_(NSMakeRect(0, 0, 348, 560), cfg)
+            self.webview = WKWebView.alloc().initWithFrame_configuration_(NSMakeRect(0, 0, 376, 600), cfg)
             self.webview.loadFileURL_allowingReadAccessToURL_(
                 NSURL.fileURLWithPath_(str(WEB_DIR / "index.html")),
                 NSURL.fileURLWithPath_(str(WEB_DIR)))
@@ -68,6 +68,7 @@ if objc is not None:
             vc.setView_(self.webview)
             self.popover = NSPopover.alloc().init()
             self.popover.setContentViewController_(vc)
+            self.popover.setContentSize_(NSMakeSize(376, 600))  # match the 376px popover width
             self.popover.setBehavior_(1)  # NSPopoverBehaviorTransient
 
         @objc.python_method

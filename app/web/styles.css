@@ -25,10 +25,10 @@
 }
 
 * { margin:0; padding:0; box-sizing:border-box; }
-html, body { background:transparent; }
+html, body { background:transparent; width:100%; overflow-x:hidden; }
 .app { font-family:var(--sans); background:var(--popover); color:var(--t1);
-  width:376px; padding:14px; border-radius:16px; font-size:13px; line-height:1.35;
-  -webkit-font-smoothing:antialiased; border:1px solid var(--line); }
+  width:100%; padding:14px; border-radius:16px; font-size:13px; line-height:1.35;
+  -webkit-font-smoothing:antialiased; }
 .mono { font-family:var(--mono); }
 .grow { flex:1; }
 
