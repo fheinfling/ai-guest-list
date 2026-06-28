@@ -43,6 +43,7 @@ root.addEventListener("click", (e) => {
     case "switch": send("switch", { tool, email }); break;
     case "remove": if (confirm(`wave goodbye to ${email}?`)) send("remove", { tool, email }); break;
     case "add": send("add", { tool }); break;
+    case "headroom_install": send("headroom_install"); break;
     case "settings": send("settings"); break;
     case "quit": send("quit"); break;
     case "toggle": send("toggle", { key, value: el.checked }); break;

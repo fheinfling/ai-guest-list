@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Callable
 
+from . import headroom as headroom_mod
 from . import usage as usage_mod
 from .context import Context
 from .errors import AcctswError
@@ -281,6 +282,11 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
     if not state.accounts(tool):
         raise NoSeats(f"no {tool} seats yet — add one first")
 
+    save_credit = bool(state.settings().get("headroom"))
+    if save_credit and not headroom_mod.available():
+        notify("save-credit is on but headroom isn't installed — running without it")
+        save_credit = False
+
     try:
         sel = choose(state, tool)
         if sel.email and sel.email != state.active(tool):
@@ -293,7 +299,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         resuming = False
         buf = bytearray()
         while True:
-            argv = resume_cmd(ctx, tool) if resuming else build_cmd(ctx, tool, args)
+            base = resume_cmd(ctx, tool) if resuming else build_cmd(ctx, tool, args)
+            argv = headroom_mod.wrap(base, enabled=save_credit, is_available=True)
             hit = {"v": False}
             buf.clear()
 

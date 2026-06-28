@@ -72,6 +72,11 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
         if action == "add":
             return {"ok": True, "login": login_plan(message["tool"])}
 
+        if action == "headroom_install":
+            from . import headroom
+            return {"ok": True, "command": headroom.INSTALL_COMMAND,
+                    "available": headroom.available()}
+
         if action == "snapshot":
             # called after the user completed the official login in Terminal
             state = ctx.load_state()

@@ -107,6 +107,7 @@ export function buildHTML(state) {
     <div class="toggles">
       ${toggle("auto_switch", "auto-switch", s.auto_switch, "switch by hand, or let auto do it for you")}
       ${toggle("headroom", "slow sips — make the credit last", s.headroom && hr, hr ? "compresses context to save tokens" : "install headroom to enable")}
+      ${hr ? "" : `<button class="link hr-install" data-action="headroom_install">install headroom →</button>`}
     </div>
     ${toolCard("codex", state?.tools?.codex)}
     ${toolCard("claude", state?.tools?.claude)}

@@ -111,6 +111,12 @@ if objc is not None:
             if action == "add":
                 self._handleAdd(msg)
                 return
+            if action == "headroom_install":
+                from .terminal import open_in_terminal
+                from acctsw.headroom import INSTALL_COMMAND
+                open_in_terminal(INSTALL_COMMAND)
+                self._notify("installing headroom", "i'll enable save-credit once it's ready ✨")
+                return
             result = bridge.handle(self.ctx, msg)
             if action == "dot":
                 self._updateDot(result.get("state"))
