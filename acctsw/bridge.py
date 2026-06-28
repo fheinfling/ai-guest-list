@@ -59,7 +59,6 @@ def snapshot_state(ctx: Context) -> dict[str, Any]:
     data["headroom_available"] = headroom_available()
     data["headroom_savings"] = headroom_savings() if data["headroom_available"] else None
     data["moved_note"] = state.data.get("moved_note")
-    data["headroom_log"] = (state.data.get("headroom_log") or [])[-5:]  # recent per-session savings
     last = parse_iso(state.data.get("last_switch_at"))
     data["recently_switched"] = bool(last and (now() - last).total_seconds() < SWITCH_FRESH_SECONDS)
     data["dot"] = dot_for(data)  # single source of truth for the dot (JS + native both read this)
@@ -91,10 +90,23 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
             key = str(message["key"])
             if key not in TOGGLE_KEYS:
                 return {"ok": False, "error": f"not a toggle: {key}"}
+            val = bool(message["value"])
             with ctx.locked():
                 state = ctx.load_state()
-                state.set_setting(key, bool(message["value"]))
+                state.set_setting(key, val)
                 state.save()
+            # the Headroom toggle drives global app-managed routing (apply/remove + proxy)
+            if key == "headroom":
+                from . import headroom
+                if val:
+                    ok, msg = headroom.global_enable(ctx.data_dir)
+                    if not ok:
+                        with ctx.locked():     # revert the toggle if we couldn't enable it
+                            s = ctx.load_state(); s.set_setting("headroom", False); s.save()
+                        return {"ok": False, "error": f"couldn't enable Headroom: {msg}",
+                                "state": snapshot_state(ctx)}
+                else:
+                    headroom.global_disable(ctx.data_dir)
             return {"ok": True, "state": snapshot_state(ctx)}
 
         if action == "set_theme":

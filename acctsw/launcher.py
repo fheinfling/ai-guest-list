@@ -28,7 +28,6 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Callable
 
-from . import headroom as headroom_mod
 from . import usage as usage_mod
 from .context import Context
 from .errors import AcctswError
@@ -282,29 +281,9 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
     if not state.accounts(tool):
         raise NoSeats(f"no {tool} seats yet — add one first")
 
-    # Recover from any prior wrapped session that was killed mid-flight before it could restore the
-    # tool config (otherwise stale Headroom injection would linger / become permanent).
-    headroom_mod.recover_stale(ctx.data_dir / "headroom-backup")
-
-    save_credit = bool(state.settings().get("headroom"))
-    hr_exe = headroom_mod.headroom_path() if save_credit else None
-    if save_credit and not hr_exe:
-        notify("save-credit is on but headroom isn't installed — running without it")
-        save_credit = False
-    elif save_credit:
-        # ensure the spawned child can resolve `headroom` even if the venv bin isn't on PATH
-        os.environ["PATH"] = headroom_mod.venv_bin_dir() + os.pathsep + os.environ.get("PATH", "")
-        os.environ.update(headroom_mod.HARDENING_ENV)   # telemetry off / no tracking / local-only
-        ok, msg = headroom_mod.verify_rtk(ctx.data_dir)  # TOFU checksum-pin the rtk helper binary
-        if not ok:
-            notify(f"save-credit off: headroom rtk integrity check failed — {msg}")
-            save_credit = False
-
-    # Headroom's `wrap` injects (persistently) into the tool's config; scope it to this session so
-    # the user's setup is restored exactly afterwards (non-destructive).
-    hr_scope = headroom_mod.scoped(tool, ctx.data_dir / "headroom-backup") if save_credit else None
-    if hr_scope:
-        hr_scope.__enter__()
+    # Headroom is GLOBAL/app-managed now (the app toggle runs `headroom install apply`, so plain
+    # codex, the GUI, AND cx all route through the proxy). cx/cl therefore do NOT per-session-wrap —
+    # global mode owns Headroom — so the launcher just runs the tool plain.
 
     def _activate_codex_home(email):
         """Point codex at the account's own home so it maintains that account's tokens in place."""
@@ -332,11 +311,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         resuming = False
         buf = bytearray()
         while True:
-            base = resume_cmd(ctx, tool) if resuming else build_cmd(ctx, tool, args)
-            # headroom launches the tool itself via its per-tool subcommand
-            # (headroom wrap codex -- resume --last); base[1:] drops our tool binary.
-            argv = headroom_mod.wrap(tool, base[1:], enabled=save_credit,
-                                     is_available=save_credit, exe=hr_exe or "headroom") or base
+            # Headroom is applied globally (app toggle), not per-session, so we run the tool plain.
+            argv = resume_cmd(ctx, tool) if resuming else build_cmd(ctx, tool, args)
             hit = {"v": False}
             buf.clear()
 
@@ -390,15 +366,5 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                         ctx.cred["codex"].set_live(blob)        # mirror → ~/.codex
                 elif sync_back(ctx, st, tool):
                     st.save()
-                # record per-session Headroom savings (spec: gather how much each session saved)
-                if save_credit:
-                    log = st.data.setdefault("headroom_log", [])
-                    log.append({"at": iso(now()), "tool": tool,
-                                "saved_pct": headroom_mod.output_savings_pct()})
-                    st.data["headroom_log"] = log[-20:]
-                    st.save()
         except Exception:
             pass
-        # restore any Headroom config injection → user's setup byte-identical to before
-        if hr_scope:
-            hr_scope.__exit__(None, None, None)

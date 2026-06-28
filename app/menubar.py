@@ -51,8 +51,26 @@ if objc is not None:
             self.statusItem.button().setTitle_("🎟️")
             self.statusItem.button().setTarget_(self)
             self.statusItem.button().setAction_(objc.selector(self.togglePopover_, signature=b"v@:@"))
+            self._recoverHeadroom()   # if a prior run left global routing on, reconcile it on launch
             self._buildPopover()
             self._startUsageTimer()
+
+        def applicationWillTerminate_(self, _notif):
+            self._headroomTeardown()  # safety net: never leave global routing dangling on exit
+
+        @objc.python_method
+        def _recoverHeadroom(self):
+            """On launch: if the setting says Headroom-on, ensure routing is actually applied (or
+            tear it down if the proxy isn't running) so state and reality agree."""
+            try:
+                from acctsw import headroom
+                on = self.ctx.load_state().settings().get("headroom")
+                if on and not headroom.global_running():
+                    headroom.global_disable(self.ctx.data_dir)   # restore config; clear stale routing
+                    with self.ctx.locked():
+                        s = self.ctx.load_state(); s.set_setting("headroom", False); s.save()
+            except Exception:
+                pass
 
         @objc.python_method
         def _buildPopover(self):
@@ -100,6 +118,21 @@ if objc is not None:
             self._pushResult(result)
             self._updateDot(result.get("state"))
 
+        def bgToggle_(self, msg):
+            result = bridge.handle(self.ctx, dict(msg))   # global enable/disable runs here, off-main
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
+
+        @objc.python_method
+        def _headroomTeardown(self):
+            """Remove global Headroom routing + restore config (auto-unwrap on quit / fail-safe)."""
+            try:
+                from acctsw import headroom
+                if self.ctx.load_state().settings().get("headroom"):
+                    headroom.global_disable(self.ctx.data_dir)
+            except Exception:
+                pass
+
         # --- JS → Python (WKScriptMessageHandler) -------------------------------------------
         def userContentController_didReceiveScriptMessage_(self, _ucc, message):
             try:
@@ -108,10 +141,17 @@ if objc is not None:
                 return
             action = msg.get("action")
             if action == "quit":
+                self._headroomTeardown()   # auto-unwrap global routing so codex/claude stay working
                 NSApplication.sharedApplication().terminate_(self)
                 return
             if action == "settings":
                 return  # reserved
+            if action == "toggle" and msg.get("key") == "headroom":
+                # global apply/remove is slow (subprocess) → run off the main thread
+                self._notify("Headroom", "turning on…" if msg.get("value") else "turning off…")
+                self.performSelectorInBackground_withObject_(
+                    objc.selector(self.bgToggle_, signature=b"v@:@"), msg)
+                return
             if action == "login":
                 # native: sync-back-before-login (invariant) + run the chosen flow in Terminal
                 from .terminal import prepare_then_login

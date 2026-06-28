@@ -20,7 +20,6 @@ from pathlib import Path
 
 from . import paths as P
 
-WRAP_PREFIX = ("headroom", "wrap")
 PINNED_VERSION = "0.27.0"                       # pin: audited build (see docs/SECURITY-headroom.md)
 PACKAGE = f"headroom-ai[proxy]=={PINNED_VERSION}"
 
@@ -144,6 +143,91 @@ def recover_stale(store: Path | None = None) -> None:
         _restore_snapshot(store, tool)
 
 
+# --- global (app-managed) mode: route plain codex/claude + GUI through Headroom ----------------
+# Driven by the app's "save credit" toggle. ON = `headroom install apply` (inject routing + run the
+# proxy) + an on-disk config backstop; OFF/quit/health-fail = `headroom install remove` + restore
+# the backstop. App-managed: removed on quit so codex/claude never point at a dead proxy.
+
+def _global_backup(store: Path | None) -> Path:
+    return (store or P.DATA_DIR) / "headroom-global-backup"
+
+
+def _global_files() -> list[Path]:
+    return _touched("codex") + _touched("claude")
+
+
+def snapshot_global(store: Path | None = None) -> None:
+    from .util import atomic_write_text
+    import base64 as _b64
+    bdir = _global_backup(store)
+    bdir.mkdir(parents=True, exist_ok=True)
+    manifest = {}
+    for i, p in enumerate(_global_files()):
+        manifest[str(p)] = i
+        (bdir / f"{i}.b64").write_text(_b64.b64encode(p.read_bytes()).decode() if p.exists() else "")
+        (bdir / f"{i}.present").write_text("1" if p.exists() else "0")
+    atomic_write_text(bdir / "manifest.json", json.dumps(manifest))
+
+
+def restore_global(store: Path | None = None) -> bool:
+    import base64 as _b64
+    bdir = _global_backup(store)
+    mf = bdir / "manifest.json"
+    if not mf.exists():
+        return False
+    manifest = json.loads(mf.read_text())
+    for path_s, i in manifest.items():
+        p = Path(path_s)
+        present = (bdir / f"{i}.present").read_text().strip() == "1"
+        try:
+            if not present:
+                if p.exists():
+                    p.unlink()
+            else:
+                data = _b64.b64decode((bdir / f"{i}.b64").read_text())
+                if not p.exists() or p.read_bytes() != data:
+                    p.write_bytes(data)
+        except OSError:
+            pass
+    import shutil as _sh
+    _sh.rmtree(bdir, ignore_errors=True)
+    return True
+
+
+def _hr_run(args: list, *, run=subprocess.run, timeout: float = 120):
+    exe = headroom_path()
+    if not exe:
+        return 1, "headroom not installed"
+    try:
+        p = run([exe, *args], capture_output=True, text=True, timeout=timeout,
+                env=harden_env())
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except (subprocess.SubprocessError, OSError) as e:
+        return 1, str(e)
+
+
+def global_enable(store: Path | None = None, *, run=subprocess.run) -> tuple[bool, str]:
+    """Route plain codex/claude (+GUI) through Headroom. Snapshots config first (restore backstop)."""
+    snapshot_global(store)
+    rc, out = _hr_run(["install", "apply", "--providers", "auto"], run=run)
+    if rc != 0:
+        restore_global(store)   # roll back our snapshot if apply failed
+        return False, out.strip()[:300]
+    return True, "headroom routing enabled for codex & claude"
+
+
+def global_disable(store: Path | None = None, *, run=subprocess.run) -> tuple[bool, str]:
+    """Undo routing + stop the proxy, then restore our config backstop (belt-and-suspenders)."""
+    rc, out = _hr_run(["install", "remove"], run=run)
+    restored = restore_global(store)   # guarantee config is back even if `remove` missed anything
+    return True, f"headroom routing removed (remove rc={rc}; backstop_restored={restored})"
+
+
+def global_running(*, run=subprocess.run) -> bool:
+    rc, out = _hr_run(["install", "status"], run=run, timeout=20)
+    return rc == 0 and "running" in out.lower()
+
+
 @contextlib.contextmanager
 def scoped(tool: str, store: Path | None = None):
     """Snapshot the files Headroom injects into (ON DISK), then restore them EXACTLY on exit.
@@ -178,20 +262,6 @@ def venv_bin_dir() -> str:
     return str(Path(sys.executable).parent)
 
 
-def output_savings_pct() -> int | None:
-    """Cumulative token-reduction % from `headroom output-savings` (None until it has data)."""
-    import re
-    exe = headroom_path()
-    if not exe:
-        return None
-    try:
-        out = subprocess.run([exe, "output-savings"], capture_output=True, text=True, timeout=10)
-        m = re.search(r"(\d+)\s*%", out.stdout or "")
-        return int(m.group(1)) if m else None
-    except (subprocess.SubprocessError, OSError):
-        return None
-
-
 def ensure_installed() -> bool:
     """Best-effort: install headroom into the current venv if missing. Returns availability."""
     if available():
@@ -204,18 +274,3 @@ def ensure_installed() -> bool:
     return available()
 
 
-def wrap(tool: str, tool_args: list, *, enabled: bool, is_available=None,
-         exe: str = "headroom") -> list | None:
-    """Return the Headroom command for ``tool`` (``headroom wrap codex -- <args>``), or None when
-    save-credit is off / Headroom is missing (caller then runs the tool directly).
-
-    Headroom uses a per-tool subcommand and launches the tool itself, so we pass the tool NAME
-    (not the binary) and forward the tool's args after ``--``. ``exe`` is the resolved headroom path.
-    """
-    ok = available() if is_available is None else is_available
-    if not (enabled and ok):
-        return None
-    cmd = [exe, "wrap", tool]
-    if tool_args:
-        cmd += ["--", *tool_args]
-    return cmd
