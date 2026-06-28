@@ -282,6 +282,10 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
     if not state.accounts(tool):
         raise NoSeats(f"no {tool} seats yet — add one first")
 
+    # Recover from any prior wrapped session that was killed mid-flight before it could restore the
+    # tool config (otherwise stale Headroom injection would linger / become permanent).
+    headroom_mod.recover_stale(ctx.data_dir / "headroom-backup")
+
     save_credit = bool(state.settings().get("headroom"))
     hr_exe = headroom_mod.headroom_path() if save_credit else None
     if save_credit and not hr_exe:
@@ -293,7 +297,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
 
     # Headroom's `wrap` injects (persistently) into the tool's config; scope it to this session so
     # the user's setup is restored exactly afterwards (non-destructive).
-    hr_scope = headroom_mod.scoped(tool) if save_credit else None
+    hr_scope = headroom_mod.scoped(tool, ctx.data_dir / "headroom-backup") if save_credit else None
     if hr_scope:
         hr_scope.__enter__()
 
