@@ -83,8 +83,13 @@ def test_set_theme(ctx):
 def test_state_includes_dot_and_recently_switched(ctx):
     _add(ctx, "a@x.com")
     r = bridge.handle(ctx, {"action": "status"})
-    assert r["state"]["dot"] in {"fresh", "resting", "hello", "switched"}
+    assert r["state"]["dot"] in {"green", "amber", "hello", "switched"}
     assert r["state"]["recently_switched"] is False
+
+
+def test_set_strategy(ctx):
+    assert bridge.handle(ctx, {"action": "set_strategy", "value": "most_headroom"})["state"]["settings"]["strategy"] == "most_headroom"
+    assert bridge.handle(ctx, {"action": "set_strategy", "value": "bogus"})["ok"] is False
 
 
 def test_switch_sets_recently_switched_dot(ctx):

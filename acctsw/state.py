@@ -29,6 +29,21 @@ from .util import now, iso, write_json
 
 STATE_VERSION = 1
 
+
+def _label_from_email(email: str) -> str:
+    """A short, human seat name from an email local-part (e.g. 'work@x.com' → 'Work').
+
+    Keeps a ``+tag`` so alias accounts stay distinguishable (a.b+codex@x → 'A B +codex').
+    """
+    local = (email or "").split("@")[0]
+    tag = ""
+    if "+" in local:
+        local, tag = local.split("+", 1)
+        tag = f" +{tag}" if tag else ""
+    parts = [p for p in local.replace(".", " ").replace("_", " ").replace("-", " ").split() if p]
+    base = " ".join(p.capitalize() for p in parts) or (local or "seat")
+    return base + tag
+
 DEFAULT_SETTINGS: dict[str, Any] = {
     "auto_switch": True,
     "same_tool_only": True,   # "keep me on the same tool"
@@ -36,6 +51,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "notify": True,           # "tell me when it switches"
     "restart_app": False,     # "restart Codex after a swap"
     "celebrations": True,     # "little celebrations"
+    "strategy": "soonest_back",  # "soonest_back" | "most_headroom"
     "theme": "light",         # the design default
 }
 
@@ -99,21 +115,28 @@ class State:
     def get_seat(self, tool: str, email: str) -> dict[str, Any] | None:
         return self.accounts(tool).get(email)
 
-    def upsert_seat(self, tool: str, email: str, name: str | None = None) -> dict[str, Any]:
+    def upsert_seat(self, tool: str, email: str, name: str | None = None,
+                    plan: str | None = None) -> dict[str, Any]:
         accts = self.accounts(tool)
         seat = accts.get(email)
         if seat is None:
             seat = {
                 "email": email,
-                "name": name or email,
+                "name": name or _label_from_email(email),  # short human name, not the raw email
+                "plan": plan,
                 "added_at": iso(now()),
+                "last_on_floor": None,
                 "limited_until": None,
                 "limit_source": None,   # "usage" (proactive) | "reactive" (caught mid-session)
                 "usage": None,
             }
             accts[email] = seat
-        elif name:
-            seat["name"] = name
+        else:
+            if name:
+                seat["name"] = name
+            if plan:
+                seat["plan"] = plan
+            seat.setdefault("last_on_floor", None)
         return seat
 
     def remove_seat(self, tool: str, email: str) -> bool:

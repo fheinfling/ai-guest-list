@@ -1,18 +1,19 @@
-// Pure render logic for the "ai guest list" popover — no DOM/bridge side effects, so it can be
-// unit-tested under node. app.mjs wires these outputs into the live WKWebView DOM + bridge.
+// Pure render logic for the "ai guest list" popover (spec-driven). No DOM/bridge side effects →
+// unit-testable under node. Type rule (spec §0/§3): humanist SANS for UI; MONO only for the
+// wordmark, emails, %, countdowns, plan codes and section meta. Status = flat colored dots, never
+// emoji; the only emoji is 💛.
 
 export const TOOL_META = {
-  codex: { label: "Codex", sub: "chatgpt business", plan: "CHATGPT BUSINESS", accent: "var(--codex)" },
-  claude: { label: "Claude", sub: "claude code", plan: "CLAUDE CODE", accent: "var(--claude)" },
+  codex: { label: "Codex", plan: "CHATGPT BUSINESS", accent: "var(--codex)" },   // teal
+  claude: { label: "Claude", plan: "CLAUDE CODE", accent: "var(--claude)" },     // coral
 };
 
+// menu-bar aggregate dot (spec §9): rose=needs a hello · gold=just switched · amber=a seat
+// resting · green=everyone fresh.
 const DOT_COPY = {
-  switched: { emoji: "🔵", label: "just switched you" },
-  hello: { emoji: "🌸", label: "needs a hello" },
-  resting: { emoji: "🟡", label: "a seat's resting" },
-  fresh: { emoji: "🟢", label: "everyone's fresh" },
+  hello: { label: "needs a hello" }, switched: { label: "just switched you" },
+  amber: { label: "a seat's resting" }, green: { label: "everyone's fresh" },
 };
-const THEMES = new Set(["dark", "light"]);
 
 export function dotState(state) {
   const key = state?.dot || dotKey(state);
@@ -20,21 +21,21 @@ export function dotState(state) {
 }
 
 export function dotKey(state) {
-  const tools = state?.tools || {};
-  const seats = [...(tools.codex?.seats || []), ...(tools.claude?.seats || [])];
+  const seats = ["codex", "claude"].flatMap((t) => state?.tools?.[t]?.seats || []);
+  if (seats.some((s) => (s.status || "") === "needs-login")) return "hello";
   if (state?.recently_switched) return "switched";
-  if (seats.some(needsHello)) return "hello";
-  if (seats.some((s) => s.active && s.limited)) return "resting";
-  return "fresh";
+  if (seats.some((s) => ["resting", "queued"].includes(s.status))) return "amber";
+  return "green";
 }
 
 export function needsHello(seat) {
-  return (seat.usage || {}).error === "unauthorized";
+  return (seat.status || "") === "needs-login" || (seat.usage || {}).error === "unauthorized";
 }
 
 export function pct(seat, win) {
-  const v = seat?.usage?.windows?.[win]?.used_pct;
-  return typeof v === "number" ? Math.max(0, Math.min(100, v)) : null;
+  const v = win === "5h" ? seat?.usage5h : seat?.usageWeek;
+  const raw = v != null ? v : (seat?.usage?.windows?.[win]?.used_pct);
+  return typeof raw === "number" ? Math.max(0, Math.min(100, raw)) : null;
 }
 
 export function creditLeft(seat) {
@@ -47,88 +48,104 @@ export function fmtCountdown(iso, now = Date.now()) {
   const ms = new Date(iso).getTime() - now;
   if (isNaN(ms) || ms <= 0) return "now";
   const mins = Math.round(ms / 60000);
-  if (mins < 60) return `in ${mins}m`;
+  if (mins < 60) return `${mins}m`;
   const hrs = Math.floor(mins / 60);
-  return `in ${hrs}h${mins % 60 ? ` ${mins % 60}m` : ""}`;
+  return `${hrs}h${mins % 60 ? ` ${mins % 60}m` : ""}`;
+}
+
+function fmtClock(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  let h = d.getHours(); const m = String(d.getMinutes()).padStart(2, "0");
+  const ap = h >= 12 ? "PM" : "AM"; h = h % 12 || 12;
+  return `${h}:${m} ${ap}`;
 }
 
 function esc(s) {
   return String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 }
 
-// --- pieces -----------------------------------------------------------------------------------
+// --- seat card --------------------------------------------------------------------------------
 
-function counts(state) {
-  const seats = ["codex", "claude"].flatMap((t) => state?.tools?.[t]?.seats || []);
-  const resting = seats.filter((s) => s.limited).length;
-  const ready = seats.filter((s) => !s.limited).length;
-  return { resting, ready };
+function statusBit(tool, seat) {
+  switch (seat.status) {
+    case "active": return `<span class="pill floor">on the floor</span>`;
+    case "queued": return `<span class="pill queued">up next 💛</span>`;
+    case "resting":
+      return `<span class="mono rest-count">back in ${fmtCountdown(seat.limited_until)}</span>`;
+    case "needs-login":
+      return `<button class="btn rose" data-action="add" data-tool="${tool}">log in</button>`;
+    default:
+      return `<button class="btn switch" data-action="switch" data-tool="${tool}" data-email="${esc(seat.email)}">switch</button>`;
+  }
 }
 
-function usageRow(seat) {
-  const five = pct(seat, "5h");
-  const week = pct(seat, "weekly");
-  const known = five !== null;
-  const wk = week !== null ? `<span class="usage-2">7d ${Math.round(week)}%</span>` : "";
-  return `<div class="usages">
-    <span class="usage-k">5h</span>
-    <span class="track"><span class="fill" style="width:${known ? five : 0}%"></span></span>
-    <span class="usage-v">${known ? `${Math.round(five)}%` : "—"}</span>${wk}</div>`;
+function bar(seat, win, label) {
+  const v = pct(seat, win);
+  const known = v !== null;
+  return `<div class="usage"><span class="mono u-k">${label}</span>
+    <span class="track"><span class="fill" style="width:${known ? v : 0}%"></span></span>
+    <span class="mono u-v">${known ? `${Math.round(v)}%` : "—"}</span></div>`;
 }
 
 function seatCard(tool, seat) {
-  const reauth = needsHello(seat);  // creds invalid → session ended, needs re-login
-  // 'limited' wins the card's look (tint/bar) even for the active seat, so a rate-limited seat
-  // never looks fresh; the status text still shows which seat is active.
-  const state = reauth ? "hello" : seat.limited ? "resting" : seat.active ? "on-floor" : "ready";
-  const plan = seat.plan ? `<span class="seat-plan">${esc(seat.plan)}</span>` : "";
-  let status;
-  if (reauth)
-    status = `<button class="status hello" data-action="add" data-tool="${tool}">re-add 🌸</button>`;
-  else if (seat.limited)
-    status = `<span class="status rest">resting · back ${fmtCountdown(seat.limited_until)}</span>`;
-  else if (seat.active) status = `<span class="status floor">on the floor</span>`;
-  else status = `<button class="status switch" data-action="switch" data-tool="${tool}" data-email="${esc(seat.email)}">switch</button>`;
-
-  const note = reauth
-    ? `<span class="seat-note hello">session ended — sign in again 🌸</span>`
-    : seat.limited
-      ? `<span class="seat-note rest">taking a breather 💛</span>`
-      : seat.active ? `<span class="seat-note floor">keeping it warm 💚</span>` : "";
-
-  return `<div class="seat-card ${state}">
+  const plan = seat.plan ? `<span class="mono chip">${esc(seat.plan)}</span>` : "";
+  const reassure = seat.status === "resting"
+    ? `<div class="reassure mono">taking a breather — back ${fmtClock(seat.limited_until)} 💛</div>` : "";
+  const credit = creditLeft(seat);
+  const expanded = `<div class="expand">
+    ${bar(seat, "weekly", "7d")}
+    ${credit !== null ? `<div class="x-row"><span>credit left</span><span class="mono">${credit}%</span></div>` : ""}
+    ${seat.last_on_floor ? `<div class="x-row"><span>last on the floor</span><span class="mono">${esc(fmtClock(seat.last_on_floor))}</span></div>` : ""}
+    <button class="logout" data-action="remove" data-tool="${tool}" data-email="${esc(seat.email)}">log out ↗</button>
+  </div>`;
+  return `<div class="seat seat--${seat.status}" data-card data-tool="${tool}" data-email="${esc(seat.email)}">
     <div class="seat-row">
-      <span class="seat-name">${esc(seat.name || seat.email)}</span>${plan}${status}
-      <button class="seat-x" title="wave goodbye" data-action="remove" data-tool="${tool}" data-email="${esc(seat.email)}">×</button>
+      <span class="dot dot--${seat.status}"></span>
+      <span class="seat-name">${esc(seat.name)}</span>${plan}
+      <span class="grow"></span>${statusBit(tool, seat)}
     </div>
-    ${usageRow(seat)}
-    <div class="seat-row bottom"><span class="seat-email">${esc(seat.email)}</span>${note}</div>
+    <div class="seat-email mono">${esc(seat.email)}</div>
+    ${bar(seat, "5h", "5h")}
+    ${reassure}
+    ${expanded}
   </div>`;
 }
 
-function toolSection(tool, t) {
+function toolGroup(tool, t) {
   const meta = TOOL_META[tool];
   const seats = t?.seats || [];
   const n = seats.length;
-  return `<section class="tool" data-tool="${tool}" style="--tool:${meta.accent}">
-    <div class="sec-head">
-      <span class="sec-dot"></span><span class="sec-name">${meta.label}</span>
-      <span class="sec-count">· ${n} seat${n === 1 ? "" : "s"}</span>
-      <span class="sec-spacer"></span><span class="sec-plan">${esc(t?.plan_label || meta.plan)}</span>
+  return `<section class="group" style="--accent:${meta.accent}">
+    <div class="g-head">
+      <span class="dot dot--accent"></span>
+      <span class="g-name">${meta.label}</span><span class="g-count">· ${n} seat${n === 1 ? "" : "s"}</span>
+      <span class="grow"></span><span class="mono g-meta">${esc(t?.plan_label || meta.plan)}</span>
     </div>
     ${seats.map((s) => seatCard(tool, s)).join("") || `<div class="empty">no seats yet</div>`}
     <button class="add-row" data-action="add" data-tool="${tool}">＋ add a seat</button>
   </section>`;
 }
 
-function pill(key, icon, title, sub, on, extra = "") {
-  return `<label class="pill"><span class="pill-ic">${icon}</span>
-    <span class="pill-tx"><span class="pill-t">${title}</span><span class="pill-s">${sub}</span></span>
-    <input type="checkbox" data-action="toggle" data-key="${key}" ${on ? "checked" : ""}>
-    <span class="sw"></span>${extra}</label>`;
+// funnel icon (three stacked bars narrowing) for Headroom — inline SVG, currentColor.
+const FUNNEL = `<svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><g fill="currentColor">
+  <rect x="2" y="3" width="12" height="2" rx="1"/><rect x="4" y="7" width="8" height="2" rx="1"/>
+  <rect x="6" y="11" width="4" height="2" rx="1"/></g></svg>`;
+const REFRESH = `<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="none"
+  stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+  d="M12.5 4.5a5 5 0 1 0 1.2 3.3"/><path fill="currentColor" d="M13.5 2.2l.6 2.8-2.8.2z"/></svg>`;
+
+function controlBar(opts) {
+  const { icon, title, chip, sub, key, on, accentClass } = opts;
+  return `<label class="ctl">
+    <span class="ctl-ic ${accentClass}">${icon}</span>
+    <span class="ctl-tx"><span class="ctl-t">${title}${chip ? ` <span class="mono ctl-chip">${chip}</span>` : ""}</span>
+      <span class="ctl-s">${sub}</span></span>
+    <input type="checkbox" data-action="toggle" data-key="${key}" ${on ? "checked" : ""}><span class="sw"></span>
+  </label>`;
 }
 
-// --- overlays (add-a-seat) --------------------------------------------------------------------
+// --- overlays (add-a-seat, settings) ----------------------------------------------------------
 
 export function buildPicker(plan) {
   const methods = (plan?.methods || []).map((m) =>
@@ -144,18 +161,19 @@ export function buildPicker(plan) {
 export function buildSaveSeat(tool) {
   return `<div class="backdrop"><div class="sheet"><h3>signed in?</h3>
     <p class="sub">i'll keep your ${esc(tool)} seat warm</p>
-    <button class="pk-m" data-action="snapshot" data-tool="${esc(tool)}">save my seat 🎟️</button>
+    <button class="pk-m" data-action="snapshot" data-tool="${esc(tool)}">save my seat 💛</button>
     <button class="link" data-action="picker-close">not yet</button></div></div>`;
 }
 
 export function buildPaste(tool) {
-  return `<div class="backdrop"><div class="sheet"><h3>paste auth.json</h3><p class="sub">no browser dance</p>
-    <textarea id="paste-blob" class="paste" placeholder="{ ... }"></textarea>
-    <button class="pk-m" data-action="paste-save" data-tool="${esc(tool)}">save my seat 🎟️</button>
+  const hint = tool === "claude" ? "paste a setup-token (sk-ant-oat…)" : "paste auth.json";
+  return `<div class="backdrop"><div class="sheet"><h3>${hint}</h3><p class="sub">no browser dance</p>
+    <textarea id="paste-blob" class="paste mono" placeholder="${tool === "claude" ? "sk-ant-oat…" : "{ ... }"}"></textarea>
+    <button class="pk-m" data-action="paste-save" data-tool="${esc(tool)}">save my seat 💛</button>
     <button class="link" data-action="picker-close">cancel</button></div></div>`;
 }
 
-function setRow(key, label, on) {
+function setToggle(key, label, on) {
   return `<label class="set-row"><span>${label}</span>
     <input type="checkbox" data-action="toggle" data-key="${key}" ${on ? "checked" : ""}><span class="sw"></span></label>`;
 }
@@ -163,16 +181,25 @@ function setRow(key, label, on) {
 export function buildSettings(state) {
   const s = state?.settings || {};
   const theme = s.theme === "dark" ? "dark" : "light";
-  const seg = (val, txt) => `<button class="seg ${theme === val ? "on" : ""}" data-action="set_theme" data-value="${val}">${txt}</button>`;
+  const strat = s.strategy === "most_headroom" ? "most_headroom" : "soonest_back";
+  const seg = (act, val, txt) => `<button class="seg ${act === val ? "on" : ""}" data-action="${act === "light" || act === "dark" ? "set_theme" : "set_strategy"}" data-value="${val}">${txt}</button>`;
   return `<div class="backdrop" data-action="picker-close"><div class="sheet settings">
     <h3>settings</h3>
-    ${setRow("same_tool_only", "keep me on the same tool", s.same_tool_only)}
-    ${setRow("notify", "tell me when it switches", s.notify)}
-    ${setRow("restart_app", "restart the app after a swap", s.restart_app)}
-    ${setRow("celebrations", "little celebrations", s.celebrations)}
-    <div class="set-row"><span>theme</span><span class="segs">${seg("light", "light")}${seg("dark", "dark")}</span></div>
-    <div class="legend"><span class="lg-t">what the dot means</span>
-      🟢 everyone's fresh · 🟡 a seat's resting · 🔵 just switched · 🌸 needs a hello</div>
+    <div class="set-row"><span>when one runs out</span><span class="segs">
+      <button class="seg ${strat === "soonest_back" ? "on" : ""}" data-action="set_strategy" data-value="soonest_back">soonest back</button>
+      <button class="seg ${strat === "most_headroom" ? "on" : ""}" data-action="set_strategy" data-value="most_headroom">most headroom</button></span></div>
+    ${setToggle("same_tool_only", "keep me on the same tool", s.same_tool_only)}
+    ${setToggle("notify", "notify when it switches", s.notify)}
+    ${setToggle("restart_app", "restart Codex after a swap", s.restart_app)}
+    ${setToggle("headroom", "Headroom by default", s.headroom)}
+    <div class="set-row"><span>theme</span><span class="segs">
+      <button class="seg ${theme === "light" ? "on" : ""}" data-action="set_theme" data-value="light">light</button>
+      <button class="seg ${theme === "dark" ? "on" : ""}" data-action="set_theme" data-value="dark">dark</button></span></div>
+    <div class="legend"><span class="lg-t">menu-bar dot</span>
+      <span class="lg"><span class="dot dot--ready"></span>everyone fresh</span>
+      <span class="lg"><span class="dot dot--queued"></span>just switched</span>
+      <span class="lg"><span class="dot dot--resting"></span>a seat resting</span>
+      <span class="lg"><span class="dot dot--needs-login"></span>needs a hello</span></div>
     <button class="link" data-action="picker-close">done</button>
   </div></div>`;
 }
@@ -181,30 +208,34 @@ export function buildSettings(state) {
 
 export function buildHTML(state) {
   const s = state?.settings || {};
-  const dot = dotState(state);
+  const theme = s.theme === "dark" ? "dark" : "light";
   const hr = state?.headroom_available;
-  const theme = THEMES.has(s.theme) ? s.theme : "light";
-  const c = counts(state);
-  const moved = state?.moved_note
-    ? `<div class="moved">↪ ${esc(state.moved_note)}</div>` : "";
+  const c = state?.counts || { resting: 0, ready: 0 };
+  const moved = state?.moved_note ? `<div class="event mono">↪ ${esc(state.moved_note)}</div>` : "";
+  const hrSub = hr
+    ? (state?.headroom_savings != null
+        ? `wrapping Codex &amp; Claude · ~${state.headroom_savings}% fewer tokens 💛`
+        : "wrapping Codex &amp; Claude 💛")
+    : "install Headroom to enable";
   return `<div class="app theme-${theme}">
     <header class="top">
       <span class="avatar"></span>
-      <span class="brand-tx"><span class="brand">ai guest list</span>
-        <span class="substatus">${c.resting} resting · ${c.ready} ready ${dot.emoji}</span></span>
+      <span class="brand-tx"><span class="brand mono">ai guest list</span>
+        <span class="substatus">${c.resting} resting · ${c.ready} ready 💛</span></span>
       <span class="top-actions">
         <button class="ibtn" data-action="settings" title="settings">⋯</button>
         <button class="ibtn" data-action="add" data-tool="codex" title="add a seat">＋</button>
       </span>
     </header>
-    ${pill("auto_switch", "↻", "auto-switch", "next ready seat · soonest-reset wins", s.auto_switch)}
-    ${pill("headroom", "🍃", "slow sips", hr ? "compress context · save credit" : "install to enable",
-           s.headroom && hr,
-           hr ? "" : `<button class="hr-install" data-action="headroom_install" title="install headroom">get</button>`)}
+    ${controlBar({ icon: REFRESH, title: "auto-switch", sub: "next ready seat · soonest-reset wins",
+                   key: "auto_switch", on: s.auto_switch, accentClass: "ic-auto" })}
+    ${controlBar({ icon: FUNNEL, title: "Headroom", chip: "COMPRESSES CONTEXT", sub: hrSub,
+                   key: "headroom", on: s.headroom && hr, accentClass: "ic-hr" })}
+    ${hr ? "" : `<button class="hr-install" data-action="headroom_install">install Headroom →</button>`}
     ${moved}
-    ${toolSection("codex", state?.tools?.codex)}
-    ${toolSection("claude", state?.tools?.claude)}
-    <footer class="foot"><span>made with <span class="heart">💚</span> keeps your seat warm</span>
+    ${toolGroup("codex", state?.tools?.codex)}
+    ${toolGroup("claude", state?.tools?.claude)}
+    <footer class="foot"><span>made with <span class="heart">💛</span></span>
       <button class="link" data-action="quit">quit</button></footer>
   </div>`;
 }

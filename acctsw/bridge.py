@@ -7,6 +7,7 @@ WKScriptMessage dicts here and pushes the returned ``state`` back into the web v
 from __future__ import annotations
 
 import shutil
+import subprocess
 from typing import Any
 
 from . import accounts as acct
@@ -37,10 +38,27 @@ def headroom_available() -> bool:
     return headroom.available()  # checks PATH and this app's venv bin
 
 
+def headroom_savings() -> int | None:
+    """Real compression figure from `headroom output-savings` (spec §8: don't fake a number)."""
+    from . import headroom
+    exe = headroom.headroom_path()
+    if not exe:
+        return None
+    try:
+        import re
+        out = subprocess.run([exe, "output-savings"], capture_output=True, text=True, timeout=10)
+        m = re.search(r"(\d+)\s*%", out.stdout or "")
+        return int(m.group(1)) if m else None
+    except (subprocess.SubprocessError, OSError):
+        return None
+
+
 def snapshot_state(ctx: Context) -> dict[str, Any]:
     state = ctx.load_state()
     data = acct.status(ctx, state)
     data["headroom_available"] = headroom_available()
+    data["headroom_savings"] = headroom_savings() if data["headroom_available"] else None
+    data["moved_note"] = state.data.get("moved_note")
     last = parse_iso(state.data.get("last_switch_at"))
     data["recently_switched"] = bool(last and (now() - last).total_seconds() < SWITCH_FRESH_SECONDS)
     data["dot"] = dot_for(data)  # single source of truth for the dot (JS + native both read this)
@@ -85,6 +103,16 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
             with ctx.locked():
                 state = ctx.load_state()
                 state.set_setting("theme", val)
+                state.save()
+            return {"ok": True, "state": snapshot_state(ctx)}
+
+        if action == "set_strategy":
+            val = message.get("value")
+            if val not in ("soonest_back", "most_headroom"):
+                return {"ok": False, "error": f"bad strategy: {val}"}
+            with ctx.locked():
+                state = ctx.load_state()
+                state.set_setting("strategy", val)
                 state.save()
             return {"ok": True, "state": snapshot_state(ctx)}
 

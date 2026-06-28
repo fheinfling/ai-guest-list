@@ -9,19 +9,15 @@ from __future__ import annotations
 from typing import Any
 
 
-def _needs_hello(seat: dict) -> bool:
-    return (seat.get("usage") or {}).get("error") == "unauthorized"
-
-
 def dot_for(state: dict[str, Any]) -> str:
-    """Return one of: 'switched' | 'hello' | 'resting' | 'fresh'."""
+    """Aggregate menu-bar dot (spec §9): 'hello' (rose) · 'switched' (gold) · 'amber' · 'green'."""
     tools = (state or {}).get("tools", {})
     seats = list((tools.get("codex") or {}).get("seats", [])) + \
         list((tools.get("claude") or {}).get("seats", []))
+    if any(s.get("status") == "needs-login" for s in seats):
+        return "hello"
     if state.get("recently_switched"):
         return "switched"
-    if any(_needs_hello(s) for s in seats):
-        return "hello"
-    if any(s.get("active") and s.get("limited") for s in seats):
-        return "resting"
-    return "fresh"
+    if any(s.get("status") in ("resting", "queued") for s in seats):
+        return "amber"
+    return "green"

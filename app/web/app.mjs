@@ -55,8 +55,13 @@ function render() {
 // --- event delegation (whole document, so overlay buttons work too) ---------------------------
 document.addEventListener("click", (e) => {
   const el = e.target.closest("[data-action]");
-  if (!el) return;
-  const { action, tool, email, key, command } = el.dataset;
+  if (!el) {
+    // tapping a seat card body (not an action) expands/collapses it (spec §6)
+    const card = e.target.closest("[data-card]");
+    if (card) card.classList.toggle("expanded");
+    return;
+  }
+  const { action, tool, email, key, command, value } = el.dataset;
   switch (action) {
     case "switch": send("switch", { tool, email }); break;
     case "remove": if (confirm(`wave goodbye to ${email}?`)) send("remove", { tool, email }); break;
@@ -76,7 +81,8 @@ document.addEventListener("click", (e) => {
       closeOverlay();
       break;
     case "settings": overlay.innerHTML = buildSettings(state); break;
-    case "set_theme": send("set_theme", { value: el.dataset.value }); break;
+    case "set_theme": send("set_theme", { value }); break;
+    case "set_strategy": send("set_strategy", { value }); break;
     case "quit": send("quit"); break;
   }
 });

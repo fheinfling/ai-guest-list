@@ -28,7 +28,7 @@ from acctsw.context import Context
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 USAGE_POLL_SECONDS = 180.0
-DOT_GLYPH = {"fresh": "🟢", "resting": "🟡", "switched": "🔵", "hello": "🌸"}
+DOT_GLYPH = {"green": "🟢", "amber": "🟡", "switched": "🟡", "hello": "🔴"}
 
 
 if objc is not None:
