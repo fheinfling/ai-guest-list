@@ -35,6 +35,12 @@ HARDENING_ENV = {
 }
 
 
+# The output shaper is what actually produces a token-savings number; it's env-gated and read by the
+# persistent proxy. We set it on the `install apply` env so the deployment runs with it on. (Whether
+# the persistent-service inherits this exact env is confirmed at M8 live test — see docs/VERIFY.md.)
+SHAPER_ENV = {"HEADROOM_OUTPUT_SHAPER": "1"}
+
+
 def harden_env(env: dict | None = None) -> dict:
     """Return env with hardening flags applied (does not mutate the input)."""
     e = dict(os.environ if env is None else env)
@@ -234,13 +240,15 @@ def restore_global(store: Path | None = None) -> tuple[bool, list[str]]:
     return (not failures), failures
 
 
-def _hr_run(args: list, *, run=subprocess.run, timeout: float = 120):
+def _hr_run(args: list, *, run=subprocess.run, timeout: float = 120, extra_env: dict | None = None):
     exe = headroom_path()
     if not exe:
         return 1, "headroom not installed"
     try:
-        p = run([exe, *args], capture_output=True, text=True, timeout=timeout,
-                env=harden_env())
+        env = harden_env()
+        if extra_env:
+            env.update(extra_env)
+        p = run([exe, *args], capture_output=True, text=True, timeout=timeout, env=env)
         return p.returncode, (p.stdout or "") + (p.stderr or "")
     except (subprocess.SubprocessError, OSError) as e:
         return 1, str(e)
@@ -303,7 +311,7 @@ def global_enable(store: Path | None = None, *, run=subprocess.run) -> tuple[boo
                 _log_full(store, "global_enable baseline dirty", "config still injected after remove")
                 return False, "couldn't establish a clean Headroom baseline (config already routed)"
         snapshot_global(store)                        # idempotent: keeps the original if already saved
-        rc, out = _hr_run(["install", "apply", "--providers", "auto"], run=run)
+        rc, out = _hr_run(["install", "apply", "--providers", "auto"], run=run, extra_env=SHAPER_ENV)
         if rc != 0 or not global_running(run=run):    # apply failed OR proxy didn't come up healthy
             _log_full(store, "global_enable failed", out)
             _hr_run(["install", "remove"], run=run)   # undo any partial routing
@@ -314,6 +322,31 @@ def global_enable(store: Path | None = None, *, run=subprocess.run) -> tuple[boo
                                "save-credit again to retry (see ~/.account-switcher/headroom.log)")
             return False, "couldn't enable Headroom (see ~/.account-switcher/headroom.log)"
         return True, "headroom routing enabled for codex & claude"
+
+
+def baseline_seeded(store: Path | None = None) -> bool:
+    return ((store or P.DATA_DIR) / "headroom-baseline-seeded").exists()
+
+
+def seed_baseline(store: Path | None = None, *, run=subprocess.run) -> tuple[bool, str]:
+    """Seed Headroom's verbosity baseline so output-savings can report a real number (the shaper's
+    'estimated' savings are measured against this baseline). Runs `headroom learn --verbosity --apply
+    --all` ONCE (guarded by a marker), best-effort and non-fatal — it's a slow, LLM-driven analysis
+    of your coding history, so callers run it in the background after enabling save-credit. Returns
+    (ok, msg)."""
+    marker = (store or P.DATA_DIR) / "headroom-baseline-seeded"
+    if marker.exists():
+        return True, "baseline already seeded"
+    rc, out = _hr_run(["learn", "--verbosity", "--apply", "--all"], run=run, timeout=600)
+    if rc != 0:
+        _log_full(store, "seed_baseline failed", out)
+        return False, "couldn't seed Headroom savings baseline (see ~/.account-switcher/headroom.log)"
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("seeded")
+    except OSError:
+        pass
+    return True, "headroom savings baseline seeded"
 
 
 def global_disable(store: Path | None = None, *, run=subprocess.run,

@@ -312,6 +312,37 @@ def test_op_lock_file_lives_outside_backup_dir(tmp_path):
     assert not (store / "headroom-global-backup" / ".oplock").exists()
 
 
+def test_global_enable_sets_shaper_env_on_apply(tmp_path, monkeypatch):
+    """Enabling save-credit must run `install apply` with HEADROOM_OUTPUT_SHAPER=1 so the proxy
+    actually shapes output (otherwise output-savings can never report a number)."""
+    _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
+    monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
+    envs = {}
+
+    def run(args, **k):
+        if "apply" in args:
+            envs["apply"] = k.get("env", {})
+        out = "proxy running" if "status" in args else "ok"
+        import types; return types.SimpleNamespace(returncode=0, stdout=out, stderr="")
+    ok, _ = headroom.global_enable(tmp_path / "store", run=run)
+    assert ok and envs["apply"].get("HEADROOM_OUTPUT_SHAPER") == "1"
+
+
+def test_seed_baseline_runs_learn_once(tmp_path, monkeypatch):
+    monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
+    calls = []
+
+    def run(args, **k):
+        calls.append(args)
+        import types; return types.SimpleNamespace(returncode=0, stdout="ok", stderr="")
+    store = tmp_path / "store"
+    ok, _ = headroom.seed_baseline(store, run=run)
+    assert ok and calls[-1][1:3] == ["learn", "--verbosity"] and headroom.baseline_seeded(store)
+    calls.clear()
+    ok2, msg = headroom.seed_baseline(store, run=run)        # marker → second call is a no-op
+    assert ok2 and "already" in msg and calls == []
+
+
 def test_harden_env_sets_telemetry_off():
     e = headroom.harden_env({})
     assert e["HEADROOM_TELEMETRY"] == "off"

@@ -214,6 +214,18 @@ if objc is not None:
             result = bridge.handle(self.ctx, dict(msg))   # global enable/disable runs here, off-main
             self.performSelectorOnMainThread_withObject_waitUntilDone_(
                 objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
+            # After save-credit turns ON, seed the savings baseline (slow LLM analysis) on this
+            # background thread, AFTER the toggle result is already shown so the UI isn't held up.
+            if msg.get("key") == "headroom" and msg.get("value") and result.get("ok"):
+                try:
+                    from acctsw import headroom
+                    if not headroom.baseline_seeded(self.ctx.data_dir):
+                        self._notify("Headroom", "learning your baseline so it can show savings…")
+                        ok, _ = headroom.seed_baseline(self.ctx.data_dir)
+                        if ok:
+                            self.pollUsage_(None)   # refresh so the savings figure can appear
+                except Exception:
+                    pass
 
         @objc.python_method
         def _headroomTeardown(self):

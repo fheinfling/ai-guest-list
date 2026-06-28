@@ -80,3 +80,10 @@ acctsw uninstall --purge       # also deletes the store + all our keychain items
   - **Headless rtk integrity**: `cx`/`cl` run with the menubar app closed don't re-verify rtk (the
     GUI poll does while it's open, and a closed app means the proxy is down → routing is healed
     away). If you rely on cx/cl with routing live but the app closed, add a `verify_rtk` gate there.
+  - **Savings seeding / shaper env**: enabling save-credit (a) runs `install apply` with
+    `HEADROOM_OUTPUT_SHAPER=1` and (b) seeds the baseline once via `headroom learn --verbosity
+    --apply --all` (background, best-effort). Confirm against a live install that: the persistent
+    deployment actually inherits `HEADROOM_OUTPUT_SHAPER` (if not, set it via the deployment's
+    config instead of the apply env), `headroom learn --verbosity` is the right baseline command,
+    and `output-savings` then returns a real number after some routed traffic. `learn --all` is a
+    slow, LLM-driven analysis of your coding history — verify its token/time cost is acceptable.
