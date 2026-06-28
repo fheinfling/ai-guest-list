@@ -284,13 +284,18 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
     # Headroom is GLOBAL/app-managed now (the app toggle runs `headroom install apply`, so plain
     # codex, the GUI, AND cx all route through the proxy). cx/cl therefore do NOT per-session-wrap —
     # global mode owns Headroom — so the launcher just runs the tool plain.
-    # But if routing is on while the proxy is down (e.g. the app isn't running), the tool would hit a
-    # dead proxy — surface that so the user can open the app or toggle it off.
-    if state.settings().get("headroom"):
+    # Self-heal: if a force-quit/crash left routing injected but the proxy dead, heal() (serialized,
+    # keyed off actual injection state) strips the dangling injection so the tool runs plain instead
+    # of hitting a dead proxy. heal() no-ops when the proxy is up or the config is clean.
+    try:
         from . import headroom as _hr
-        if _hr.headroom_path() and not _hr.global_running():
-            notify("Headroom routing is on but its proxy isn't running — open the ai guest list app, "
-                   "or turn save-credit off; otherwise codex/claude calls may fail.")
+        if _hr.headroom_path():
+            changed, _ = _hr.heal(ctx.data_dir)
+            if changed:
+                notify("Headroom's proxy wasn't running — removed its routing so this runs directly. "
+                       "Open the ai guest list app to turn save-credit back on.")
+    except Exception:
+        pass
 
     def _activate_codex_home(email):
         """Point codex at the account's own home so it maintains that account's tokens in place."""

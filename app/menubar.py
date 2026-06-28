@@ -51,25 +51,32 @@ if objc is not None:
             self.statusItem.button().setTitle_("🎟️")
             self.statusItem.button().setTarget_(self)
             self.statusItem.button().setAction_(objc.selector(self.togglePopover_, signature=b"v@:@"))
-            self._recoverHeadroom()   # if a prior run left global routing on, reconcile it on launch
+            self._teardownDone = False
             self._buildPopover()
             self._startUsageTimer()
+            # Reconcile a prior run's routing OFF the main thread — global_enable shells out to
+            # `headroom install apply` (slow); doing it inline would freeze the menubar on launch.
+            self.performSelectorInBackground_withObject_(
+                objc.selector(self.recoverBg_, signature=b"v@:@"), None)
 
         def applicationWillTerminate_(self, _notif):
             self._headroomTeardown()  # safety net: never leave global routing dangling on exit
 
-        @objc.python_method
-        def _recoverHeadroom(self):
-            """On launch: the toggle persists across restarts. If it's on but routing isn't actually
-            running (we tore it down on last quit, or it crashed), RE-APPLY it so the preference
-            sticks. If re-apply fails, clear the setting so state matches reality."""
+        def recoverBg_(self, _arg):
+            """On launch (background): the save-credit toggle persists across restarts. If it's on but
+            routing isn't actually running (torn down on last quit, or crashed), RE-APPLY it. If
+            re-apply fails, clear the setting so state matches reality. If it's OFF, heal() still
+            strips any injection a prior crash/force-quit may have left dangling."""
             try:
                 from acctsw import headroom
-                if self.ctx.load_state().settings().get("headroom") and not headroom.global_running():
-                    ok, _ = headroom.global_enable(self.ctx.data_dir)
-                    if not ok:
-                        with self.ctx.locked():
-                            s = self.ctx.load_state(); s.set_setting("headroom", False); s.save()
+                if self.ctx.load_state().settings().get("headroom"):
+                    if not headroom.global_running():
+                        ok, _ = headroom.global_enable(self.ctx.data_dir)
+                        if not ok:
+                            with self.ctx.locked():
+                                s = self.ctx.load_state(); s.set_setting("headroom", False); s.save()
+                else:
+                    headroom.heal(self.ctx.data_dir)   # clean an orphaned injection, if any
             except Exception:
                 pass
 
@@ -118,12 +125,17 @@ if objc is not None:
 
         @objc.python_method
         def _headroomHealthCheck(self):
-            """Critical fail-safe: if Headroom routing is on but the proxy isn't running, remove the
-            routing + restore config + clear the setting, so codex/claude never hit a dead proxy."""
+            """Critical fail-safe (runs on the poll's background thread). heal() is serialized and
+            keys off ACTUAL state: it removes routing + restores config ONLY if the proxy is truly
+            down while config is injected, and no-ops if the proxy is healthy. Because it re-checks
+            `global_running` inside the same op_lock the toggle holds, a health-check that fires while
+            an enable is still bringing the proxy up will NOT tear it down (closes the TOCTOU). We
+            clear the setting only when heal actually removed dead routing."""
             try:
                 from acctsw import headroom
-                if self.ctx.load_state().settings().get("headroom") and not headroom.global_running():
-                    headroom.global_disable(self.ctx.data_dir)
+                setting_on = self.ctx.load_state().settings().get("headroom")
+                changed, _ = headroom.heal(self.ctx.data_dir)
+                if changed and setting_on:
                     with self.ctx.locked():
                         s = self.ctx.load_state(); s.set_setting("headroom", False); s.save()
                     self._notify("Headroom turned off", "the proxy stopped — restored your setup")
@@ -143,11 +155,16 @@ if objc is not None:
         def _headroomTeardown(self):
             """On quit: remove global Headroom routing + restore config so codex/claude work while
             the app is closed. The `headroom` SETTING is intentionally KEPT so it re-applies on the
-            next launch (the preference persists across restarts)."""
+            next launch (the preference persists across restarts). Guarded so the quit action and
+            applicationWillTerminate_ don't both run it; uses a short timeout so quit can't beachball
+            for long — if remove doesn't finish, the next launch/cx/cl heal() strips the leftover."""
+            if getattr(self, "_teardownDone", False):
+                return
+            self._teardownDone = True
             try:
                 from acctsw import headroom
                 if self.ctx.load_state().settings().get("headroom"):
-                    headroom.global_disable(self.ctx.data_dir)
+                    headroom.global_disable(self.ctx.data_dir, timeout=15)
             except Exception:
                 pass
 

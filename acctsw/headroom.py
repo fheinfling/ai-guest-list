@@ -37,8 +37,7 @@ HARDENING_ENV = {
 
 def harden_env(env: dict | None = None) -> dict:
     """Return env with hardening flags applied (does not mutate the input)."""
-    import os as _os
-    e = dict(_os.environ if env is None else env)
+    e = dict(os.environ if env is None else env)
     e.update(HARDENING_ENV)
     return e
 
@@ -54,11 +53,11 @@ def verify_rtk(record_dir: Path | None) -> tuple[bool, str]:
     (ok, message). ok=False means rtk changed unexpectedly (possible supply-chain tamper) → caller
     should refuse to run with Headroom until the user re-confirms.
     """
-    from .util import sha256_text
+    import hashlib
     rtk = rtk_path()
     if not rtk.exists():
         return True, "rtk not present yet (downloaded on first wrap)"
-    digest = sha256_text(rtk.read_bytes().hex())
+    digest = hashlib.sha256(rtk.read_bytes()).hexdigest()
     store = (record_dir or (Path.home() / ".account-switcher")) / "rtk.sha256"
     if store.exists():
         recorded = store.read_text().strip()
@@ -90,12 +89,21 @@ def _store_dir(store: Path | None) -> Path:
 
 
 def _is_injected(tool: str) -> bool:
-    cfg = _touched(tool)[0]
-    try:
-        text = cfg.read_text()
-    except OSError:
-        return False
-    return any(m in text for m in INJECT_MARKERS)
+    """True if ANY file Headroom touches for this tool still carries an injection marker — not just
+    the first (Claude routing lands in settings.json, not CLAUDE.md), so we never mistake a
+    still-routed config for clean and delete the only backup."""
+    for cfg in _touched(tool):
+        try:
+            text = cfg.read_text()
+        except OSError:
+            continue
+        if any(m in text for m in INJECT_MARKERS):
+            return True
+    return False
+
+
+def _any_injected() -> bool:
+    return any(_is_injected(t) for t in ("codex", "claude"))
 
 
 # --- global (app-managed) mode: route plain codex/claude + GUI through Headroom ----------------
@@ -112,21 +120,19 @@ def _global_files() -> list[Path]:
     return _touched("codex") + _touched("claude")
 
 
-def _redact(text: str) -> str:
-    """Drop anything token/key/path-shaped before a message can reach the UI/state."""
-    import re
-    return re.sub(r"(sk-[A-Za-z0-9_-]+|rt\.[A-Za-z0-9_.-]+|/Users/[^\s]+|[A-Za-z0-9_-]{32,})",
-                  "[redacted]", text)
-
-
 def _log_full(store: Path | None, label: str, text: str) -> None:
-    """Write full (unredacted) headroom output to a private 0600 log for debugging."""
-    from .util import atomic_write_text
+    """Append full headroom output to a private 0600 log for debugging (append, not read+rewrite, so
+    repeated logging stays O(1) per call)."""
     from .util import now, iso
     try:
         p = _store_dir(store).parent / "headroom.log"
-        prev = p.read_text() if p.exists() else ""
-        atomic_write_text(p, f"{prev}\n[{iso(now())}] {label}\n{text}\n", mode=0o600)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        # create 0600 up-front so the log is never briefly world-readable
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, f"\n[{iso(now())}] {label}\n{text}\n".encode())
+        finally:
+            os.close(fd)
     except OSError:
         pass
 
@@ -136,15 +142,21 @@ def op_lock(store: Path | None = None):
     """Exclusive cross-process lock for the whole enable/disable/recover operation (apply + snapshot
     + restore), so a background toggle, usage poll, launch recovery, and quit teardown can't race."""
     import fcntl
-    bdir = _global_backup(store)
-    bdir.mkdir(parents=True, exist_ok=True)
-    f = open(bdir / ".oplock", "w")
+    # The lock file lives BESIDE the backup dir, never inside it — restore_global/_rm_backup rmtree
+    # the backup dir, which would otherwise swap the lock's inode mid-hold and break serialization.
+    base = _global_backup(store).parent
+    base.mkdir(parents=True, exist_ok=True)
+    f = open(base / ".headroom-oplock", "w")
     try:
         fcntl.flock(f, fcntl.LOCK_EX)
         yield
     finally:
         fcntl.flock(f, fcntl.LOCK_UN)
         f.close()
+
+
+def _rm_backup(store: Path | None = None) -> None:
+    shutil.rmtree(_global_backup(store), ignore_errors=True)
 
 
 def has_backup(store: Path | None = None) -> bool:
@@ -201,8 +213,7 @@ def restore_global(store: Path | None = None) -> tuple[bool, list[str]]:
         except OSError as e:
             failures.append(f"{p}: {e}")
     if not failures:
-        import shutil as _sh
-        _sh.rmtree(bdir, ignore_errors=True)
+        shutil.rmtree(bdir, ignore_errors=True)
     return (not failures), failures
 
 
@@ -230,48 +241,78 @@ def global_running(*, run=subprocess.run) -> bool:
     return "running" in low
 
 
+def _remove_and_restore(store: Path | None, *, run=subprocess.run,
+                        timeout: float = 45) -> tuple[bool, str]:
+    """Undo routing + stop the proxy. Prefer Headroom's own surgical `install remove` (which
+    preserves any user edits made while routing was on); fall back to our full snapshot restore ONLY
+    if remove failed or left injection markers. CALLER MUST HOLD op_lock (never takes it itself, so
+    it can be reused by global_disable and heal without deadlocking — flock isn't reentrant)."""
+    rc, out = _hr_run(["install", "remove"], run=run, timeout=timeout)
+    if rc == 0 and not _any_injected():
+        _rm_backup(store)                             # clean removal; keep user edits
+        return True, "headroom routing removed"
+    _log_full(store, "remove incomplete", out)
+    ok, failures = restore_global(store)              # backstop: exact restore; backup kept on failure
+    if not ok:
+        _log_full(store, "restore failures", "\n".join(failures))
+        return False, "Headroom removed but config restore incomplete (see ~/.account-switcher/headroom.log)"
+    return True, "headroom routing removed; config restored from backup"
+
+
 def global_enable(store: Path | None = None, *, run=subprocess.run) -> tuple[bool, str]:
     """Route plain codex/claude (+GUI) through Headroom. Verifies the rtk helper, snapshots the
     ORIGINAL config, applies, then VERIFIES the proxy is actually running — rolling back fully on any
     failure so clients are never left pointing at a dead proxy. Serialized by op_lock."""
     with op_lock(store):
+        ok_rtk, rtk_msg = verify_rtk(store)           # supply-chain TOFU check — BEFORE the early
+        if not ok_rtk:                                # return, so a tampered rtk is caught even when
+            return False, f"Headroom rtk integrity check failed — {rtk_msg}"   # routing's already up
         if has_backup(store) and global_running(run=run):
             return True, "headroom already on"
-        ok_rtk, rtk_msg = verify_rtk(store)           # supply-chain TOFU check (kept on the live path)
-        if not ok_rtk:
-            return False, f"Headroom rtk integrity check failed — {rtk_msg}"
         # If config is already injected without a backup (state desync), strip it first so the
         # snapshot we baseline is the user's ORIGINAL, not a routed config.
-        if not has_backup(store) and any(_is_injected(t) for t in ("codex", "claude")):
+        if not has_backup(store) and _any_injected():
             _hr_run(["install", "remove"], run=run)
         snapshot_global(store)                        # idempotent: keeps the original if already saved
         rc, out = _hr_run(["install", "apply", "--providers", "auto"], run=run)
         if rc != 0 or not global_running(run=run):    # apply failed OR proxy didn't come up healthy
             _log_full(store, "global_enable failed", out)
             _hr_run(["install", "remove"], run=run)   # undo any partial routing
-            restore_global(store)                     # restore the original config exactly
+            ok, failures = restore_global(store)      # restore the original config exactly
+            if not ok:
+                _log_full(store, "global_enable rollback restore failures", "\n".join(failures))
+                return False, ("couldn't enable Headroom and config restore is incomplete — run "
+                               "save-credit again to retry (see ~/.account-switcher/headroom.log)")
             return False, "couldn't enable Headroom (see ~/.account-switcher/headroom.log)"
         return True, "headroom routing enabled for codex & claude"
 
 
 def global_disable(store: Path | None = None, *, run=subprocess.run,
                    timeout: float = 45) -> tuple[bool, str]:
-    """Undo routing + stop the proxy. Prefer Headroom's own surgical `install remove` (which
-    preserves any user edits made while routing was on); fall back to our full snapshot restore
-    ONLY if remove failed or left injection markers. Serialized by op_lock."""
+    """Undo routing + stop the proxy. Serialized by op_lock."""
     with op_lock(store):
-        rc, out = _hr_run(["install", "remove"], run=run, timeout=timeout)
-        still_injected = any(_is_injected(t) for t in ("codex", "claude"))
-        if rc == 0 and not still_injected:
-            import shutil as _sh
-            _sh.rmtree(_global_backup(store), ignore_errors=True)   # clean removal; keep user edits
-            return True, "headroom routing removed"
-        _log_full(store, "global_disable remove incomplete", out)
-        ok, failures = restore_global(store)          # backstop: exact restore; backup kept on failure
-        if not ok:
-            _log_full(store, "global_disable restore failures", "\n".join(failures))
-            return False, "Headroom removed but config restore incomplete (see ~/.account-switcher/headroom.log)"
-        return True, "headroom routing removed; config restored from backup"
+        return _remove_and_restore(store, run=run, timeout=timeout)
+
+
+def heal(store: Path | None = None, *, run=subprocess.run) -> tuple[bool, str]:
+    """Serialized self-heal that keys off ACTUAL state, not any setting — so it fixes orphans left by
+    a failed enable/disable, a crash, or a force-quit, regardless of how the setting reads.
+
+    Inside op_lock:
+      • proxy running  → no-op (returns changed=False). Re-checking `global_running` here, under the
+        same lock the toggle holds, closes the enable/health-check TOCTOU: a heal that fires while an
+        enable is still bringing the proxy up blocks on the lock, then sees it running and leaves it.
+      • routing injected but proxy dead → remove routing + restore config (returns changed=True), so
+        codex/claude never keep hitting a dead proxy.
+      • nothing injected → no-op (returns changed=False).
+    """
+    with op_lock(store):
+        if global_running(run=run):
+            return False, "healthy"
+        if not (_any_injected() or has_backup(store)):
+            return False, "clean"
+        ok, msg = _remove_and_restore(store, run=run)
+        return True, msg
 
 
 def headroom_path() -> str | None:

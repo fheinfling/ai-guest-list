@@ -91,24 +91,29 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
             if key not in TOGGLE_KEYS:
                 return {"ok": False, "error": f"not a toggle: {key}"}
             val = bool(message["value"])
-            with ctx.locked():
-                state = ctx.load_state()
-                state.set_setting(key, val)
-                state.save()
-            # the Headroom toggle drives global app-managed routing (apply/remove + proxy)
+            # The Headroom toggle drives global app-managed routing (apply/remove + proxy). Run the
+            # op FIRST, then persist the setting to match what actually happened — so the setting is
+            # never out of step with reality. In particular a FAILED disable keeps the setting ON, so
+            # the launch/health-check recovery paths keep trying instead of abandoning a still-routed
+            # config pointed at a dying proxy.
             if key == "headroom":
                 from . import headroom
                 if val:
                     ok, msg = headroom.global_enable(ctx.data_dir)
-                    if not ok:
-                        with ctx.locked():     # revert the toggle if we couldn't enable it
-                            s = ctx.load_state(); s.set_setting("headroom", False); s.save()
-                        return {"ok": False, "error": f"couldn't enable Headroom: {msg}",
-                                "state": snapshot_state(ctx)}
+                    effective = bool(ok)               # enable failed → leave it OFF
                 else:
                     ok, msg = headroom.global_disable(ctx.data_dir)
-                    if not ok:
-                        return {"ok": False, "error": msg, "state": snapshot_state(ctx)}
+                    effective = not ok                 # disable failed → leave it ON (keep recovering)
+                with ctx.locked():
+                    s = ctx.load_state(); s.set_setting("headroom", effective); s.save()
+                if not ok:
+                    err = f"couldn't enable Headroom: {msg}" if val else msg
+                    return {"ok": False, "error": err, "state": snapshot_state(ctx)}
+                return {"ok": True, "state": snapshot_state(ctx)}
+            with ctx.locked():
+                state = ctx.load_state()
+                state.set_setting(key, val)
+                state.save()
             return {"ok": True, "state": snapshot_state(ctx)}
 
         if action == "set_theme":

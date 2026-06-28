@@ -31,6 +31,8 @@ def test_launcher_runs_plain_under_global_headroom(ctx, monkeypatch):
     """Headroom is global/app-managed now → cx/cl must NOT per-session-wrap (no double-route)."""
     _two_codex(ctx)
     st = ctx.load_state(); st.set_setting("headroom", True); st.save()
+    # don't let the launcher's self-heal shell out to / touch the real ~/.codex during this test
+    monkeypatch.setattr(headroom, "headroom_path", lambda: None)
     spawn = _Spawn()
     L.run(ctx, "codex", ["--foo"], spawn=spawn, get=fake_get({}), notify=lambda m: None)
     assert spawn.calls[0][1:2] != ["wrap"]          # not wrapped
@@ -128,6 +130,65 @@ def test_bridge_headroom_toggle_reverts_on_enable_failure(ctx, monkeypatch):
     r = bridge.handle(ctx, {"action": "toggle", "key": "headroom", "value": True})
     assert r["ok"] is False
     assert ctx.load_state().settings()["headroom"] is False     # toggle reverted
+
+
+def test_bridge_headroom_disable_failure_keeps_setting_on(ctx, monkeypatch):
+    """A FAILED disable must leave the setting ON so launch/health recovery keeps trying — never
+    abandon a still-routed config pointed at a dying proxy with the setting flipped off."""
+    monkeypatch.setattr(headroom, "global_enable", lambda store: (True, "ok"))
+    monkeypatch.setattr(headroom, "global_disable", lambda store: (False, "restore incomplete"))
+    bridge.handle(ctx, {"action": "toggle", "key": "headroom", "value": True})
+    r = bridge.handle(ctx, {"action": "toggle", "key": "headroom", "value": False})
+    assert r["ok"] is False
+    assert ctx.load_state().settings()["headroom"] is True      # stays ON → recovery keeps trying
+
+
+# --- heal(): serialized self-heal keyed off ACTUAL state (not the setting) ---------------------
+
+def test_heal_noop_when_proxy_running(tmp_path, monkeypatch):
+    _codex_cfg(tmp_path, monkeypatch)
+    monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
+    changed, msg = headroom.heal(tmp_path / "store", run=_fakerun(running=True))
+    assert changed is False and msg == "healthy"               # healthy proxy → never torn down
+
+
+def test_heal_strips_orphaned_injection_when_proxy_dead(tmp_path, monkeypatch):
+    cfg = _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
+    monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
+    headroom.snapshot_global(tmp_path / "store")               # original captured
+    cfg.write_text('model_provider = "headroom"\n')            # routing injected, proxy dead
+    changed, _ = headroom.heal(tmp_path / "store", run=_fakerun(running=False))
+    assert changed is True
+    assert cfg.read_text() == 'model = "orig"\n'               # restored from backup backstop
+    assert not (tmp_path / "store" / "headroom-global-backup").exists()
+
+
+def test_heal_noop_when_clean(tmp_path, monkeypatch):
+    _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
+    monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
+    changed, msg = headroom.heal(tmp_path / "store", run=_fakerun(running=False))
+    assert changed is False and msg == "clean"                # nothing injected → nothing to do
+
+
+def test_is_injected_detects_claude_settings_json(tmp_path, monkeypatch):
+    """Claude routing lands in settings.json, NOT CLAUDE.md — _is_injected must scan every touched
+    file or global_disable could delete the only backup while config is still routed."""
+    from acctsw import paths as P
+    monkeypatch.setattr(P, "CODEX_HOME", tmp_path / "codex")
+    monkeypatch.setattr(P, "CLAUDE_CONFIG_DIR", tmp_path / "claude")
+    (tmp_path / "codex").mkdir(); (tmp_path / "claude").mkdir()
+    (tmp_path / "claude" / "settings.json").write_text('{"env": {"X": "headroom:rtk-instructions"}}')
+    assert headroom._is_injected("claude") is True            # detected though CLAUDE.md is absent
+
+
+def test_op_lock_file_lives_outside_backup_dir(tmp_path):
+    """The op-lock must not live inside the backup dir, or rmtree-ing the backup mid-hold swaps the
+    lock's inode and silently breaks serialization."""
+    store = tmp_path / "store"
+    with headroom.op_lock(store):
+        pass
+    assert (store / ".headroom-oplock").exists()
+    assert not (store / "headroom-global-backup" / ".oplock").exists()
 
 
 def test_harden_env_sets_telemetry_off():
