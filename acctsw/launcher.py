@@ -284,13 +284,15 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
     # Headroom is GLOBAL/app-managed now (the app toggle runs `headroom install apply`, so plain
     # codex, the GUI, AND cx all route through the proxy). cx/cl therefore do NOT per-session-wrap —
     # global mode owns Headroom — so the launcher just runs the tool plain.
-    # Self-heal: if a force-quit/crash left routing injected but the proxy dead, heal() (serialized,
-    # keyed off actual injection state) strips the dangling injection so the tool runs plain instead
-    # of hitting a dead proxy. heal() no-ops when the proxy is up or the config is clean.
+    # Self-heal: if a force-quit/crash left routing injected but the proxy dead, reconcile() strips
+    # the dangling injection (and clears the setting) so the tool runs plain instead of hitting a
+    # dead proxy. A cheap, subprocess-free pre-check (needs_reconcile) keeps this off the hot path
+    # when save-credit was never used; reconcile()'s restore backstop works even if the headroom
+    # binary is gone, so it is NOT gated on headroom_path().
     try:
         from . import headroom as _hr
-        if _hr.headroom_path():
-            changed, _ = _hr.heal(ctx.data_dir)
+        if _hr.needs_reconcile(ctx):
+            changed, _ = _hr.reconcile(ctx)
             if changed:
                 notify("Headroom's proxy wasn't running — removed its routing so this runs directly. "
                        "Open the ai guest list app to turn save-credit back on.")

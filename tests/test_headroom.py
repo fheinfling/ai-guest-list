@@ -181,6 +181,55 @@ def test_is_injected_detects_claude_settings_json(tmp_path, monkeypatch):
     assert headroom._is_injected("claude") is True            # detected though CLAUDE.md is absent
 
 
+def test_verify_rtk_migrates_legacy_digest(tmp_path, monkeypatch):
+    """An upgrade that changes the digest algorithm must NOT read as a supply-chain tamper: a
+    recorded legacy (hex-of-hex) digest is silently migrated, not rejected."""
+    from acctsw.util import sha256_text
+    fake = tmp_path / "rtk"; fake.write_bytes(b"rtk-binary-v1")
+    monkeypatch.setattr(headroom, "rtk_path", lambda: fake)
+    store = tmp_path / "store"; store.mkdir()
+    (store / "rtk.sha256").write_text(sha256_text(fake.read_bytes().hex()))   # legacy format
+    ok, msg = headroom.verify_rtk(store)
+    assert ok and "migrated" in msg
+    ok2, msg2 = headroom.verify_rtk(store)                                    # now verifies clean
+    assert ok2 and "verified" in msg2
+
+
+def test_is_injected_ignores_bare_headroom_word(tmp_path, monkeypatch):
+    """A user's own config that merely mentions 'Headroom' must NOT count as injected — otherwise the
+    restore backstop would overwrite their edits (data loss)."""
+    cfg = _codex_cfg(tmp_path, monkeypatch, "# I love Headroom and headroomlabs is great\n")
+    # the AGENTS.md-style prose mentions the word but has no real injection marker
+    assert headroom._is_injected("codex") is True   # 'headroomlabs' IS a real marker → injected
+    cfg.write_text("# notes about the Headroom feature\n")
+    assert headroom._is_injected("codex") is False  # bare word alone is NOT treated as injected
+
+
+def test_reconcile_clears_setting_when_healed(ctx, monkeypatch):
+    """reconcile() unifies policy: if dead routing was stripped, the save-credit setting is cleared
+    so cx/cl and the GUI agree on state."""
+    monkeypatch.setattr(headroom, "heal", lambda store: (True, "removed"))
+    st = ctx.load_state(); st.set_setting("headroom", True); st.save()
+    changed, _ = headroom.reconcile(ctx)
+    assert changed and ctx.load_state().settings()["headroom"] is False
+
+
+def test_needs_reconcile_false_when_unused(ctx, monkeypatch):
+    """The cx/cl hot path must skip the status subprocess when save-credit was never used."""
+    from acctsw import paths as P
+    monkeypatch.setattr(P, "CODEX_HOME", ctx.data_dir / "nope-codex")
+    monkeypatch.setattr(P, "CLAUDE_CONFIG_DIR", ctx.data_dir / "nope-claude")
+    assert headroom.needs_reconcile(ctx) is False   # no setting, no backup, no injection
+
+
+def test_op_lock_nonblocking_returns_false_when_held(tmp_path):
+    store = tmp_path / "store"
+    with headroom.op_lock(store) as a:
+        assert a is True
+        with headroom.op_lock(store, blocking=False) as b:
+            assert b is False   # already held → non-blocking acquisition fails fast (no freeze)
+
+
 def test_op_lock_file_lives_outside_backup_dir(tmp_path):
     """The op-lock must not live inside the backup dir, or rmtree-ing the backup mid-hold swaps the
     lock's inode and silently breaks serialization."""

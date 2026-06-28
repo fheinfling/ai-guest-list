@@ -125,20 +125,26 @@ if objc is not None:
 
         @objc.python_method
         def _headroomHealthCheck(self):
-            """Critical fail-safe (runs on the poll's background thread). heal() is serialized and
-            keys off ACTUAL state: it removes routing + restores config ONLY if the proxy is truly
-            down while config is injected, and no-ops if the proxy is healthy. Because it re-checks
-            `global_running` inside the same op_lock the toggle holds, a health-check that fires while
-            an enable is still bringing the proxy up will NOT tear it down (closes the TOCTOU). We
-            clear the setting only when heal actually removed dead routing."""
+            """Critical fail-safe (runs on the poll's background thread). reconcile() is serialized
+            and keys off ACTUAL state: it removes routing + restores config + clears the setting ONLY
+            if the proxy is truly down while config is injected, and no-ops if the proxy is healthy.
+            Because heal() re-checks `global_running` inside the same op_lock the toggle holds, a
+            health-check firing while an enable is still bringing the proxy up will NOT tear it down
+            (closes the TOCTOU). While routing is up, also re-verify the rtk binary so a swapped
+            (tampered) rtk is caught between toggles, not only at enable time."""
             try:
                 from acctsw import headroom
-                setting_on = self.ctx.load_state().settings().get("headroom")
-                changed, _ = headroom.heal(self.ctx.data_dir)
-                if changed and setting_on:
-                    with self.ctx.locked():
-                        s = self.ctx.load_state(); s.set_setting("headroom", False); s.save()
+                changed, _ = headroom.reconcile(self.ctx)
+                if changed:
                     self._notify("Headroom turned off", "the proxy stopped — restored your setup")
+                    return
+                if self.ctx.load_state().settings().get("headroom"):
+                    ok_rtk, _ = headroom.verify_rtk(self.ctx.data_dir)
+                    if not ok_rtk:        # supply-chain tamper while routing was live → tear it down
+                        headroom.global_disable(self.ctx.data_dir)
+                        with self.ctx.locked():
+                            s = self.ctx.load_state(); s.set_setting("headroom", False); s.save()
+                        self._notify("Headroom turned off", "its helper binary changed unexpectedly")
             except Exception:
                 pass
 
@@ -164,7 +170,9 @@ if objc is not None:
             try:
                 from acctsw import headroom
                 if self.ctx.load_state().settings().get("headroom"):
-                    headroom.global_disable(self.ctx.data_dir, timeout=15)
+                    # non-blocking: if a background op holds the lock, don't freeze quit — the next
+                    # launch / cx / cl reconcile() strips any leftover routing.
+                    headroom.global_disable(self.ctx.data_dir, timeout=15, blocking=False)
             except Exception:
                 pass
 

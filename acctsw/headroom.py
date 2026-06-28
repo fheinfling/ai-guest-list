@@ -54,22 +54,31 @@ def verify_rtk(record_dir: Path | None) -> tuple[bool, str]:
     should refuse to run with Headroom until the user re-confirms.
     """
     import hashlib
+    from .util import sha256_text
     rtk = rtk_path()
     if not rtk.exists():
         return True, "rtk not present yet (downloaded on first wrap)"
-    digest = hashlib.sha256(rtk.read_bytes()).hexdigest()
+    raw = rtk.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
     store = (record_dir or (Path.home() / ".account-switcher")) / "rtk.sha256"
     if store.exists():
         recorded = store.read_text().strip()
-        if recorded != digest:
-            return False, f"rtk checksum changed ({recorded[:12]}… → {digest[:12]}…)"
-        return True, "rtk checksum verified"
+        if recorded == digest:
+            return True, "rtk checksum verified"
+        # An older version recorded sha256 of the hex STRING of the bytes; transparently migrate that
+        # to the raw-bytes digest so an upgrade isn't mistaken for a supply-chain tamper.
+        if recorded == sha256_text(raw.hex()):
+            store.write_text(digest)
+            return True, "rtk checksum migrated to new format"
+        return False, f"rtk checksum changed ({recorded[:12]}… → {digest[:12]}…)"
     store.parent.mkdir(parents=True, exist_ok=True)
     store.write_text(digest)
     return True, f"rtk checksum recorded ({digest[:12]}…)"
 
 # Markers Headroom leaves in the tool config — used to detect a still-injected (dirty) config.
-INJECT_MARKERS = ("Headroom", 'model_provider = "headroom"', "headroom:rtk-instructions")
+# Deliberately SPECIFIC (no bare "Headroom"): a loose substring would treat a user's own config that
+# merely mentions the word as still-routed and let the restore backstop overwrite their real edits.
+INJECT_MARKERS = ('model_provider = "headroom"', "headroom:rtk-instructions", "headroomlabs")
 
 
 def _config_dir(tool: str) -> Path:
@@ -82,10 +91,6 @@ def _touched(tool: str) -> list[Path]:
     if tool == "codex":
         return [d / "config.toml", d / "AGENTS.md"]
     return [d / "CLAUDE.md", d / "settings.json", d / "settings.local.json", d / ".mcp.json"]
-
-
-def _store_dir(store: Path | None) -> Path:
-    return (store or (P.DATA_DIR / "headroom-backup"))
 
 
 def _is_injected(tool: str) -> bool:
@@ -125,7 +130,7 @@ def _log_full(store: Path | None, label: str, text: str) -> None:
     repeated logging stays O(1) per call)."""
     from .util import now, iso
     try:
-        p = _store_dir(store).parent / "headroom.log"
+        p = (store or P.DATA_DIR) / "headroom.log"   # ~/.account-switcher/headroom.log (matches msgs)
         p.parent.mkdir(parents=True, exist_ok=True)
         # create 0600 up-front so the log is never briefly world-readable
         fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -138,20 +143,30 @@ def _log_full(store: Path | None, label: str, text: str) -> None:
 
 
 @contextlib.contextmanager
-def op_lock(store: Path | None = None):
+def op_lock(store: Path | None = None, *, blocking: bool = True):
     """Exclusive cross-process lock for the whole enable/disable/recover operation (apply + snapshot
-    + restore), so a background toggle, usage poll, launch recovery, and quit teardown can't race."""
+    + restore), so a background toggle, usage poll, launch recovery, and quit teardown can't race.
+
+    Yields True if the lock was acquired, False if ``blocking=False`` and another op holds it. The
+    blocking callers (enable/disable/heal) ignore the value (it's always True for them); only quit
+    teardown uses blocking=False so it can never freeze the UI waiting on a slow background op."""
     import fcntl
     # The lock file lives BESIDE the backup dir, never inside it — restore_global/_rm_backup rmtree
     # the backup dir, which would otherwise swap the lock's inode mid-hold and break serialization.
     base = _global_backup(store).parent
     base.mkdir(parents=True, exist_ok=True)
     f = open(base / ".headroom-oplock", "w")
+    acquired = False
     try:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        yield
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX if blocking else (fcntl.LOCK_EX | fcntl.LOCK_NB))
+            acquired = True
+        except BlockingIOError:
+            acquired = False
+        yield acquired
     finally:
-        fcntl.flock(f, fcntl.LOCK_UN)
+        if acquired:
+            fcntl.flock(f, fcntl.LOCK_UN)
         f.close()
 
 
@@ -238,7 +253,8 @@ def global_running(*, run=subprocess.run) -> bool:
     low = out.lower()
     if any(s in low for s in ("not running", "stopped", "not installed", "no deployment", "error")):
         return False
-    return "running" in low
+    # accept the common ways a healthy proxy is reported (real CLI wording confirmed at M8 live test)
+    return any(s in low for s in ("running", "active", "listening", "healthy", "serving", " up"))
 
 
 def _remove_and_restore(store: Path | None, *, run=subprocess.run,
@@ -288,10 +304,38 @@ def global_enable(store: Path | None = None, *, run=subprocess.run) -> tuple[boo
 
 
 def global_disable(store: Path | None = None, *, run=subprocess.run,
-                   timeout: float = 45) -> tuple[bool, str]:
-    """Undo routing + stop the proxy. Serialized by op_lock."""
-    with op_lock(store):
+                   timeout: float = 45, blocking: bool = True) -> tuple[bool, str]:
+    """Undo routing + stop the proxy. Serialized by op_lock. With blocking=False (quit teardown),
+    returns (False, 'busy') immediately rather than waiting on a concurrent op — the next launch /
+    cx / cl heal() is a reliable backstop, so quit never freezes on lock acquisition."""
+    with op_lock(store, blocking=blocking) as acquired:
+        if not acquired:
+            return False, "headroom busy (another operation in progress)"
         return _remove_and_restore(store, run=run, timeout=timeout)
+
+
+def reconcile(ctx) -> tuple[bool, str]:
+    """heal() + reflect the result in the save-credit setting, so the launcher (cx/cl) and the GUI
+    poll share ONE recovery policy (instead of each clearing/keeping the setting differently). If a
+    dead proxy's routing was stripped, the setting is cleared so it matches reality. ctx is
+    duck-typed: data_dir, locked(), load_state(). Returns heal()'s (changed, msg)."""
+    changed, msg = heal(ctx.data_dir)
+    if changed:
+        with ctx.locked():
+            s = ctx.load_state(); s.set_setting("headroom", False); s.save()
+    return changed, msg
+
+
+def needs_reconcile(ctx) -> bool:
+    """Cheap, subprocess-free pre-check: is there any reason routing might need healing? Lets the
+    cx/cl hot path skip the `headroom install status` round-trip entirely when save-credit was never
+    used (no setting, no backup, no on-disk injection)."""
+    try:
+        if ctx.load_state().settings().get("headroom"):
+            return True
+    except Exception:
+        pass
+    return has_backup(ctx.data_dir) or _any_injected()
 
 
 def heal(store: Path | None = None, *, run=subprocess.run) -> tuple[bool, str]:
