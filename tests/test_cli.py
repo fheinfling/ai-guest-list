@@ -49,9 +49,14 @@ def test_switch_unknown_returns_error(isolated):
     assert cli.main(["switch", "codex", "ghost@x.com"]) == cli.EXIT_ERR
 
 
-def test_not_implemented_exit_code(isolated):
-    # install/uninstall land in M5; until then they return the distinct not-implemented code
-    assert cli.main(["install"]) == cli.EXIT_NOIMPL
+def test_cli_install_uninstall_dry_run(isolated, tmp_path, monkeypatch):
+    """CLI install/uninstall wiring — dry-run must touch nothing on disk."""
+    import acctsw.install as inst
+    monkeypatch.setattr(inst, "BIN_DIR", tmp_path / "bin")
+    isolated.cred["codex"].set_live(make_codex_blob("a@x.com"))
+    assert cli.main(["install", "--dry-run"]) == 0
+    assert cli.main(["uninstall", "--dry-run"]) == 0
+    assert not (tmp_path / "bin").exists()  # dry-run wrote nothing
 
 
 def test_no_command_prints_help(capsys):

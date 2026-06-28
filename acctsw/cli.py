@@ -31,7 +31,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"acctsw {__version__}")
     sub = parser.add_subparsers(dest="command", metavar="<command>")
 
-    sub.add_parser("install", help="set up the engine (non-destructive, idempotent)")
+    ins = sub.add_parser("install", help="set up the engine (non-destructive, idempotent)")
+    ins.add_argument("--dry-run", action="store_true", help="print actions without doing them")
+    ins.add_argument("--no-register", action="store_true",
+                     help="don't auto-register the currently logged-in account")
     uni = sub.add_parser("uninstall", help="remove the engine and restore original creds")
     uni.add_argument("--purge", action="store_true", help="also delete the store + keychain items")
     uni.add_argument("--dry-run", action="store_true", help="print actions without doing them")
@@ -156,6 +159,26 @@ def _cmd_run(ctx: Context, ns) -> int:
     return launch(ctx, ns.tool, args, notify=notify)
 
 
+def _cmd_install(ctx: Context, ns) -> int:
+    from . import install as inst
+    plan = inst.install(ctx, dry_run=getattr(ns, "dry_run", False),
+                        register=not getattr(ns, "no_register", False))
+    for a in plan.actions:
+        print(f"  {a}")
+    print("✓ installed — add seats with `acctsw add codex` / `acctsw add claude`")
+    return EXIT_OK
+
+
+def _cmd_uninstall(ctx: Context, ns) -> int:
+    from . import install as inst
+    plan = inst.uninstall(ctx, purge=getattr(ns, "purge", False),
+                          dry_run=getattr(ns, "dry_run", False))
+    for a in plan.actions:
+        print(f"  {a}")
+    print("✓ uninstalled — originals restored")
+    return EXIT_OK
+
+
 def _not_impl(ctx: Context, ns) -> int:
     print(f"acctsw: '{ns.command}' arrives in a later milestone.", file=sys.stderr)
     return EXIT_NOIMPL
@@ -169,8 +192,8 @@ HANDLERS = {
     "switch": _cmd_switch,
     "usage": _cmd_usage,
     "run": _cmd_run,
-    "install": _not_impl,
-    "uninstall": _not_impl,
+    "install": _cmd_install,
+    "uninstall": _cmd_uninstall,
 }
 
 
