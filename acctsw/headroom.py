@@ -261,12 +261,17 @@ def global_running(*, run=subprocess.run) -> bool:
     if rc != 0:
         return False
     low = out.lower()
+    # Headroom's `install status` prints `Status: <state>` AND `Healthy: yes|no` (cli/install.py).
+    # A live-but-unready proxy is `Status: running` + `Healthy: no` — must NOT count as up just
+    # because "running" appears (Codex review P1).
+    if "healthy:" in low and "healthy: yes" not in low:
+        return False
     # "down" states. NB: deliberately NOT bare "error" — a healthy status line can say "errors: 0".
     if any(s in low for s in ("not running", "stopped", "not installed", "no deployment",
                               "not deployed", "failed", "crashed", " dead")):
         return False
     # accept the common ways a healthy proxy is reported (real CLI wording confirmed at M8 live test)
-    return any(s in low for s in ("running", "active", "listening", "healthy", "serving", " up"))
+    return any(s in low for s in ("running", "active", "listening", "serving", " up", "healthy: yes"))
 
 
 def _remove_and_restore(store: Path | None, *, run=subprocess.run,
@@ -311,7 +316,12 @@ def global_enable(store: Path | None = None, *, run=subprocess.run) -> tuple[boo
                 _log_full(store, "global_enable baseline dirty", "config still injected after remove")
                 return False, "couldn't establish a clean Headroom baseline (config already routed)"
         snapshot_global(store)                        # idempotent: keeps the original if already saved
-        rc, out = _hr_run(["install", "apply", "--providers", "auto"], run=run, extra_env=SHAPER_ENV)
+        # --scope provider: write routing into the tools' OWN config files (codex config.toml,
+        # claude settings.json) — the files we snapshot/detect/restore. Headroom's DEFAULT --scope
+        # user instead writes env blocks to shell rc files (~/.zshrc etc), which we don't track and
+        # which wouldn't affect the running app or current shells (Codex review P1).
+        rc, out = _hr_run(["install", "apply", "--providers", "auto", "--scope", "provider"],
+                          run=run, extra_env=SHAPER_ENV)
         if rc != 0 or not global_running(run=run):    # apply failed OR proxy didn't come up healthy
             _log_full(store, "global_enable failed", out)
             _hr_run(["install", "remove"], run=run)   # undo any partial routing

@@ -328,6 +328,36 @@ def test_global_enable_sets_shaper_env_on_apply(tmp_path, monkeypatch):
     assert ok and envs["apply"].get("HEADROOM_OUTPUT_SHAPER") == "1"
 
 
+def test_global_enable_uses_provider_scope(tmp_path, monkeypatch):
+    """apply must use --scope provider so routing lands in codex/claude config files (the ones we
+    snapshot/restore), not Headroom's default --scope user shell-rc env blocks (Codex review P1)."""
+    _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
+    monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
+    apply_args = {}
+
+    def run(args, **k):
+        if "apply" in args:
+            apply_args["args"] = args
+        out = "proxy running" if "status" in args else "ok"
+        import types; return types.SimpleNamespace(returncode=0, stdout=out, stderr="")
+    ok, _ = headroom.global_enable(tmp_path / "store", run=run)
+    assert ok and "--scope" in apply_args["args"]
+    assert apply_args["args"][apply_args["args"].index("--scope") + 1] == "provider"
+
+
+def test_global_running_false_when_unhealthy(monkeypatch):
+    """`Status: running` + `Healthy: no` must read as DOWN, not up (Codex review P1)."""
+    def run(args, **k):
+        import types
+        return types.SimpleNamespace(returncode=0, stdout="Status: running\nHealthy: no", stderr="")
+    assert headroom.global_running(run=run) is False
+
+    def run_ok(args, **k):
+        import types
+        return types.SimpleNamespace(returncode=0, stdout="Status: running\nHealthy: yes", stderr="")
+    assert headroom.global_running(run=run_ok) is True
+
+
 def test_seed_baseline_runs_learn_once(tmp_path, monkeypatch):
     monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
     calls = []
