@@ -196,6 +196,51 @@ def test_global_enable_aborts_on_dirty_baseline(tmp_path, monkeypatch):
     assert not (tmp_path / "store" / "headroom-global-backup" / "manifest.json").exists()
 
 
+def test_disable_reports_failure_when_still_injected_no_backup(tmp_path, monkeypatch):
+    """install remove fails and there's no backup → config still routed. Must NOT report success
+    (else reconcile clears the setting over a broken config)."""
+    _codex_cfg(tmp_path, monkeypatch, 'model_provider = "headroom"\n')   # injected, no backup
+    monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
+
+    def run(args, **k):
+        import types; return types.SimpleNamespace(returncode=1, stdout="not installed", stderr="")
+    ok, msg = headroom.global_disable(tmp_path / "store", run=run)
+    assert ok is False and "still present" in msg
+
+
+def test_teardown_removes_based_on_state_not_setting(tmp_path, monkeypatch):
+    """teardown() keys off actual injection/backup state, NOT the persisted setting — so a quit
+    during an in-flight enable (setting not yet written) still removes routing."""
+    cfg = _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
+    monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
+    headroom.snapshot_global(tmp_path / "store")
+    cfg.write_text('model_provider = "headroom"\n')      # injected; no setting consulted anywhere
+    ok, _ = headroom.teardown(tmp_path / "store", run=_fakerun(running=False))
+    assert ok and cfg.read_text() == 'model = "orig"\n'
+
+
+def test_teardown_noop_when_clean(tmp_path, monkeypatch):
+    _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
+    monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
+    ok, msg = headroom.teardown(tmp_path / "store", run=_fakerun(running=False))
+    assert ok and "nothing" in msg                       # no subprocess work when nothing's routed
+
+
+def test_is_injected_handles_non_utf8(tmp_path, monkeypatch):
+    cfg = _codex_cfg(tmp_path, monkeypatch)
+    cfg.write_bytes(b'\xff\xfe model_provider = "headroom"')   # invalid UTF-8 + a real marker
+    assert headroom._is_injected("codex") is True             # doesn't raise; still finds the marker
+
+
+def test_bridge_headroom_toggle_survives_exception(ctx, monkeypatch):
+    """A raised exception in global_enable must still return a result (toggle never hangs)."""
+    def boom(store): raise OSError("disk full")
+    monkeypatch.setattr(headroom, "global_enable", boom)
+    r = bridge.handle(ctx, {"action": "toggle", "key": "headroom", "value": True})
+    assert r["ok"] is False and "OSError" in r["error"]
+    assert ctx.load_state().settings()["headroom"] is False   # enable failed → setting OFF
+
+
 def test_heal_noop_when_clean(tmp_path, monkeypatch):
     _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
     monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")

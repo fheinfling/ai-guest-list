@@ -60,10 +60,12 @@ if objc is not None:
                 objc.selector(self.recoverBg_, signature=b"v@:@"), None)
 
         def applicationWillTerminate_(self, _notif):
-            self._headroomTeardown()  # safety net: never leave global routing dangling on exit
+            # Cmd-Q / Apple-menu Quit / logout land here on the MAIN thread. Best-effort, NON-blocking
+            # so a background op holding the lock can't beachball the quit; next launch reconciles.
+            self._headroomTeardown(blocking=False)
 
         def quitBg_(self, _arg):
-            self._headroomTeardown()  # blocking, but off the main thread → UI stays responsive
+            self._headroomTeardown(blocking=True)  # off the main thread → can block to finish restore
             self.performSelectorOnMainThread_withObject_waitUntilDone_(
                 objc.selector(self.doTerminate_, signature=b"v@:@"), None, False)
 
@@ -137,20 +139,22 @@ if objc is not None:
 
             • Setting OFF: only reconcile if there's actually something to clean (needs_reconcile is
               a cheap, subprocess-free pre-check) — strips any orphaned injection from a prior crash.
-            • Setting ON + proxy healthy: reset the down-streak and re-verify the rtk binary, so a
-              swapped (tampered) rtk is caught between toggles, not only at enable time.
-            • Setting ON + proxy reads down: DEBOUNCE — require two consecutive down readings before
-              the destructive teardown, so a single transient blip (restart/slow status) doesn't
-              silently turn save-credit off. reconcile()/heal() re-check `global_running` under the
-              op_lock, so a recovery in between is still honored (and the TOCTOU stays closed)."""
+              Non-blocking: never block the poll (and the usage refresh that follows) on a concurrent
+              enable holding the lock.
+            • Setting ON + proxy healthy: re-verify the rtk binary, so a swapped (tampered) rtk is
+              caught between toggles, not only at enable time.
+            • Setting ON + proxy reads down: DEBOUNCE with a short in-poll grace re-check (not a
+              multi-poll streak — that left up to a 180s dead-proxy window). One transient blip is
+              tolerated; a genuinely dead proxy is healed within seconds. reconcile()/heal() re-check
+              `global_running` under the op_lock, so a recovery in between is still honored."""
             try:
+                import time
                 from acctsw import headroom
                 if not self.ctx.load_state().settings().get("headroom"):
                     if headroom.needs_reconcile(self.ctx):
-                        headroom.reconcile(self.ctx)
+                        headroom.reconcile(self.ctx, blocking=False)
                     return
                 if headroom.global_running():
-                    self._hrDownStreak = 0
                     ok_rtk, _ = headroom.verify_rtk(self.ctx.data_dir)
                     if not ok_rtk:        # supply-chain tamper while routing was live → tear it down
                         if headroom.global_disable(self.ctx.data_dir)[0]:
@@ -158,12 +162,12 @@ if objc is not None:
                                 s = self.ctx.load_state(); s.set_setting("headroom", False); s.save()
                             self._notify("Headroom turned off", "its helper binary changed unexpectedly")
                     return
-                self._hrDownStreak = getattr(self, "_hrDownStreak", 0) + 1
-                if self._hrDownStreak < 2:
-                    return                # debounce a transient "down" before tearing anything down
-                healed, _ = headroom.reconcile(self.ctx)
+                # proxy reads down — short grace re-check to ride out a transient blip, then heal fast
+                time.sleep(3)
+                if headroom.global_running():
+                    return
+                healed, _ = headroom.reconcile(self.ctx, blocking=False)
                 if healed:
-                    self._hrDownStreak = 0
                     self._notify("Headroom turned off", "the proxy stopped — restored your setup")
             except Exception:
                 pass
@@ -178,20 +182,20 @@ if objc is not None:
                 objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
 
         @objc.python_method
-        def _headroomTeardown(self):
+        def _headroomTeardown(self, blocking=True):
             """On quit: remove global Headroom routing + restore config so codex/claude work while
             the app is closed. The `headroom` SETTING is intentionally KEPT so it re-applies on the
-            next launch (the preference persists across restarts). Guarded so the quit action and
-            applicationWillTerminate_ don't both run it. Called off the main thread (quitBg_), so it
-            can block on the lock to finish restore properly without freezing the UI; the next
-            launch/cx/cl reconcile() is still a backstop if the process is killed mid-teardown."""
+            next launch (the preference persists across restarts). Guarded so the in-app quit and
+            applicationWillTerminate_ don't both run it. Uses headroom.teardown(), which keys off the
+            ACTUAL injected/backup state under the lock (not the persisted setting) — so a quit during
+            an in-flight enable, whose setting isn't written yet, still removes the routing. The next
+            launch/cx/cl reconcile() backstops a non-blocking skip or a kill mid-teardown."""
             if getattr(self, "_teardownDone", False):
                 return
             self._teardownDone = True
             try:
                 from acctsw import headroom
-                if self.ctx.load_state().settings().get("headroom"):
-                    headroom.global_disable(self.ctx.data_dir)
+                headroom.teardown(self.ctx.data_dir, blocking=blocking)
             except Exception:
                 pass
 

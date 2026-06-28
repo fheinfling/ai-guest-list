@@ -101,7 +101,7 @@ def _is_injected(tool: str) -> bool:
     still-routed config for clean and delete the only backup."""
     for cfg in _touched(tool):
         try:
-            text = cfg.read_text()
+            text = cfg.read_text(errors="ignore")   # ValueError/UnicodeDecodeError-safe (markers ASCII)
         except OSError:
             continue
         if any(m in text for m in INJECT_MARKERS):
@@ -276,6 +276,11 @@ def _remove_and_restore(store: Path | None, *, run=subprocess.run,
     if not ok:
         _log_full(store, "restore failures", "\n".join(failures))
         return False, "Headroom removed but config restore incomplete (see ~/.account-switcher/headroom.log)"
+    if _any_injected():
+        # remove failed AND there was no backup to restore from → config is still routed. Don't
+        # report success: heal/reconcile must keep the setting on and keep trying, not clear it.
+        _log_full(store, "still injected after restore", "no backup; install remove left routing")
+        return False, "Headroom routing still present and no backup to restore (see ~/.account-switcher/headroom.log)"
     return True, "headroom routing removed; config restored from backup"
 
 
@@ -309,6 +314,21 @@ def global_enable(store: Path | None = None, *, run=subprocess.run) -> tuple[boo
                                "save-credit again to retry (see ~/.account-switcher/headroom.log)")
             return False, "couldn't enable Headroom (see ~/.account-switcher/headroom.log)"
         return True, "headroom routing enabled for codex & claude"
+
+
+def teardown(store: Path | None = None, *, run=subprocess.run,
+             blocking: bool = True) -> tuple[bool, str]:
+    """Quit-time removal. Acquires op_lock FIRST (so it waits out any in-flight enable rather than
+    racing the not-yet-persisted setting), then removes routing iff the config is actually injected
+    or a backup exists — keyed off real state, NOT the save-credit setting. No-op (no subprocess)
+    when clean. blocking=False (the Cmd-Q / applicationWillTerminate_ path on the main thread)
+    returns immediately if another op holds the lock; the next launch's reconcile() is the backstop."""
+    with op_lock(store, blocking=blocking) as acquired:
+        if not acquired:
+            return False, "busy"
+        if not (_any_injected() or has_backup(store)):
+            return True, "nothing to tear down"
+        return _remove_and_restore(store, run=run)
 
 
 def global_disable(store: Path | None = None, *, run=subprocess.run,
