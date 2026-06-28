@@ -106,7 +106,9 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
                         return {"ok": False, "error": f"couldn't enable Headroom: {msg}",
                                 "state": snapshot_state(ctx)}
                 else:
-                    headroom.global_disable(ctx.data_dir)
+                    ok, msg = headroom.global_disable(ctx.data_dir)
+                    if not ok:
+                        return {"ok": False, "error": msg, "state": snapshot_state(ctx)}
             return {"ok": True, "state": snapshot_state(ctx)}
 
         if action == "set_theme":

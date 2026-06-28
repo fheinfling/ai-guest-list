@@ -130,53 +130,6 @@ def test_bridge_headroom_toggle_reverts_on_enable_failure(ctx, monkeypatch):
     assert ctx.load_state().settings()["headroom"] is False     # toggle reverted
 
 
-def test_scoped_restores_injected_files(tmp_path, monkeypatch):
-    """headroom.scoped must restore files Headroom injects into, byte-for-byte (incl. deleting a
-    file that didn't exist before)."""
-    from acctsw import paths as P
-    cfg = tmp_path / "config.toml"
-    cfg.write_text('model = "gpt-5.5"\n')
-    agents = tmp_path / "AGENTS.md"  # doesn't exist initially
-    monkeypatch.setattr(P, "CODEX_HOME", tmp_path)
-    store = tmp_path / "hr-backup"
-    with headroom.scoped("codex", store):
-        cfg.write_text('model_provider = "headroom"\n')  # simulate injection
-        agents.write_text("rtk instructions\n")
-    assert cfg.read_text() == 'model = "gpt-5.5"\n'  # restored exactly
-    assert not agents.exists()                        # created-then-removed
-
-
-def test_recover_stale_undoes_crashed_session(tmp_path, monkeypatch):
-    """If a session is killed mid-flight (snapshot left on disk), recover_stale restores config."""
-    from acctsw import paths as P
-    cfg = tmp_path / "config.toml"
-    cfg.write_text('model = "gpt-5.5"\n')
-    monkeypatch.setattr(P, "CODEX_HOME", tmp_path)
-    store = tmp_path / "hr-backup"
-    # simulate a crash: write the snapshot, inject, but never restore
-    headroom._write_snapshot(store, "codex")
-    cfg.write_text('model_provider = "headroom"\n')
-    # next launcher start:
-    headroom.recover_stale(store)
-    assert cfg.read_text() == 'model = "gpt-5.5"\n'  # crash injection undone
-
-
-def test_scoped_does_not_rebaseline_dirty_config(tmp_path, monkeypatch):
-    """A stale snapshot (prior crash) must be recovered before capturing a new baseline, so an
-    already-injected config never becomes the 'pristine' baseline."""
-    from acctsw import paths as P
-    cfg = tmp_path / "config.toml"
-    cfg.write_text('model = "gpt-5.5"\n')
-    monkeypatch.setattr(P, "CODEX_HOME", tmp_path)
-    store = tmp_path / "hr-backup"
-    headroom._write_snapshot(store, "codex")          # prior session baseline (clean)
-    cfg.write_text('model_provider = "headroom"\n')   # then it crashed, leaving injection
-    # a new scoped() must restore the clean baseline first, not snapshot the dirty config
-    with headroom.scoped("codex", store):
-        pass
-    assert cfg.read_text() == 'model = "gpt-5.5"\n'
-
-
 def test_harden_env_sets_telemetry_off():
     e = headroom.harden_env({})
     assert e["HEADROOM_TELEMETRY"] == "off"

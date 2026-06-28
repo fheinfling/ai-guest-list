@@ -60,15 +60,16 @@ if objc is not None:
 
         @objc.python_method
         def _recoverHeadroom(self):
-            """On launch: if the setting says Headroom-on, ensure routing is actually applied (or
-            tear it down if the proxy isn't running) so state and reality agree."""
+            """On launch: the toggle persists across restarts. If it's on but routing isn't actually
+            running (we tore it down on last quit, or it crashed), RE-APPLY it so the preference
+            sticks. If re-apply fails, clear the setting so state matches reality."""
             try:
                 from acctsw import headroom
-                on = self.ctx.load_state().settings().get("headroom")
-                if on and not headroom.global_running():
-                    headroom.global_disable(self.ctx.data_dir)   # restore config; clear stale routing
-                    with self.ctx.locked():
-                        s = self.ctx.load_state(); s.set_setting("headroom", False); s.save()
+                if self.ctx.load_state().settings().get("headroom") and not headroom.global_running():
+                    ok, _ = headroom.global_enable(self.ctx.data_dir)
+                    if not ok:
+                        with self.ctx.locked():
+                            s = self.ctx.load_state(); s.set_setting("headroom", False); s.save()
             except Exception:
                 pass
 
@@ -140,14 +141,13 @@ if objc is not None:
 
         @objc.python_method
         def _headroomTeardown(self):
-            """Remove global Headroom routing + restore config + clear the setting (auto-unwrap on
-            quit / fail-safe), so state and reality agree on next launch."""
+            """On quit: remove global Headroom routing + restore config so codex/claude work while
+            the app is closed. The `headroom` SETTING is intentionally KEPT so it re-applies on the
+            next launch (the preference persists across restarts)."""
             try:
                 from acctsw import headroom
                 if self.ctx.load_state().settings().get("headroom"):
                     headroom.global_disable(self.ctx.data_dir)
-                    with self.ctx.locked():
-                        s = self.ctx.load_state(); s.set_setting("headroom", False); s.save()
             except Exception:
                 pass
 

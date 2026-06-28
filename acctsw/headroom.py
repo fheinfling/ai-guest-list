@@ -89,10 +89,6 @@ def _store_dir(store: Path | None) -> Path:
     return (store or (P.DATA_DIR / "headroom-backup"))
 
 
-def _snapshot_file(store: Path | None, tool: str) -> Path:
-    return _store_dir(store) / f"{tool}.snapshot.json"
-
-
 def _is_injected(tool: str) -> bool:
     cfg = _touched(tool)[0]
     try:
@@ -100,49 +96,6 @@ def _is_injected(tool: str) -> bool:
     except OSError:
         return False
     return any(m in text for m in INJECT_MARKERS)
-
-
-def _write_snapshot(store: Path | None, tool: str) -> None:
-    snap = {}
-    for p in _touched(tool):
-        snap[str(p)] = (base64.b64encode(p.read_bytes()).decode() if p.exists() else None)
-    sf = _snapshot_file(store, tool)
-    sf.parent.mkdir(parents=True, exist_ok=True)
-    sf.write_text(json.dumps(snap))
-
-
-def _restore_snapshot(store: Path | None, tool: str) -> bool:
-    """Restore files from the on-disk snapshot and delete it. Returns True if one existed."""
-    sf = _snapshot_file(store, tool)
-    if not sf.exists():
-        return False
-    try:
-        snap = json.loads(sf.read_text())
-    except (OSError, json.JSONDecodeError):
-        sf.unlink(missing_ok=True)
-        return False
-    for path_s, b64 in snap.items():
-        p = Path(path_s)
-        try:
-            if b64 is None:
-                if p.exists():
-                    p.unlink()
-            else:
-                data = base64.b64decode(b64)
-                if not p.exists() or p.read_bytes() != data:
-                    p.write_bytes(data)
-        except OSError:
-            pass
-    sf.unlink(missing_ok=True)
-    return True
-
-
-def recover_stale(store: Path | None = None) -> None:
-    """Called at launcher start: if a prior wrapped session crashed without cleanup, its on-disk
-    snapshot is still present — restore it so a SIGKILL can't leave the config permanently injected.
-    """
-    for tool in ("codex", "claude"):
-        _restore_snapshot(store, tool)
 
 
 # --- global (app-managed) mode: route plain codex/claude + GUI through Headroom ----------------
@@ -266,18 +219,32 @@ def _hr_run(args: list, *, run=subprocess.run, timeout: float = 120):
 
 
 def global_running(*, run=subprocess.run) -> bool:
+    """True only if the persistent deployment is actually running (robust to 'not running'/'stopped'
+    substrings in the status output)."""
     rc, out = _hr_run(["install", "status"], run=run, timeout=20)
-    return rc == 0 and "running" in out.lower()
+    if rc != 0:
+        return False
+    low = out.lower()
+    if any(s in low for s in ("not running", "stopped", "not installed", "no deployment", "error")):
+        return False
+    return "running" in low
 
 
 def global_enable(store: Path | None = None, *, run=subprocess.run) -> tuple[bool, str]:
-    """Route plain codex/claude (+GUI) through Headroom. Snapshots the ORIGINAL config first, applies,
-    then VERIFIES the proxy is actually running — rolling back fully on any failure so clients are
-    never left pointing at a dead proxy. Serialized by op_lock."""
+    """Route plain codex/claude (+GUI) through Headroom. Verifies the rtk helper, snapshots the
+    ORIGINAL config, applies, then VERIFIES the proxy is actually running — rolling back fully on any
+    failure so clients are never left pointing at a dead proxy. Serialized by op_lock."""
     with op_lock(store):
         if has_backup(store) and global_running(run=run):
             return True, "headroom already on"
-        snapshot_global(store)                       # idempotent: keeps the original if already saved
+        ok_rtk, rtk_msg = verify_rtk(store)           # supply-chain TOFU check (kept on the live path)
+        if not ok_rtk:
+            return False, f"Headroom rtk integrity check failed — {rtk_msg}"
+        # If config is already injected without a backup (state desync), strip it first so the
+        # snapshot we baseline is the user's ORIGINAL, not a routed config.
+        if not has_backup(store) and any(_is_injected(t) for t in ("codex", "claude")):
+            _hr_run(["install", "remove"], run=run)
+        snapshot_global(store)                        # idempotent: keeps the original if already saved
         rc, out = _hr_run(["install", "apply", "--providers", "auto"], run=run)
         if rc != 0 or not global_running(run=run):    # apply failed OR proxy didn't come up healthy
             _log_full(store, "global_enable failed", out)
@@ -287,33 +254,24 @@ def global_enable(store: Path | None = None, *, run=subprocess.run) -> tuple[boo
         return True, "headroom routing enabled for codex & claude"
 
 
-def global_disable(store: Path | None = None, *, run=subprocess.run) -> tuple[bool, str]:
-    """Undo routing + stop the proxy, then restore our config backstop. Serialized by op_lock.
-    Reports failure (and KEEPS the backup) if the config couldn't be fully restored."""
+def global_disable(store: Path | None = None, *, run=subprocess.run,
+                   timeout: float = 45) -> tuple[bool, str]:
+    """Undo routing + stop the proxy. Prefer Headroom's own surgical `install remove` (which
+    preserves any user edits made while routing was on); fall back to our full snapshot restore
+    ONLY if remove failed or left injection markers. Serialized by op_lock."""
     with op_lock(store):
-        rc, out = _hr_run(["install", "remove"], run=run)
-        ok, failures = restore_global(store)          # guaranteed exact restore; backup kept on failure
+        rc, out = _hr_run(["install", "remove"], run=run, timeout=timeout)
+        still_injected = any(_is_injected(t) for t in ("codex", "claude"))
+        if rc == 0 and not still_injected:
+            import shutil as _sh
+            _sh.rmtree(_global_backup(store), ignore_errors=True)   # clean removal; keep user edits
+            return True, "headroom routing removed"
+        _log_full(store, "global_disable remove incomplete", out)
+        ok, failures = restore_global(store)          # backstop: exact restore; backup kept on failure
         if not ok:
             _log_full(store, "global_disable restore failures", "\n".join(failures))
             return False, "Headroom removed but config restore incomplete (see ~/.account-switcher/headroom.log)"
-        return True, "headroom routing removed; config restored"
-
-
-@contextlib.contextmanager
-def scoped(tool: str, store: Path | None = None):
-    """Snapshot the files Headroom injects into (ON DISK), then restore them EXACTLY on exit.
-
-    Crash-safe: the snapshot lives on disk, so ``recover_stale`` can undo an injection left by a
-    SIGKILLed session on the next start. We never re-baseline a still-injected config — if a stale
-    snapshot exists we restore it first, guaranteeing the baseline we capture is clean.
-    """
-    if _snapshot_file(store, tool).exists():
-        _restore_snapshot(store, tool)  # prior crash → recover before capturing a clean baseline
-    _write_snapshot(store, tool)
-    try:
-        yield
-    finally:
-        _restore_snapshot(store, tool)
+        return True, "headroom routing removed; config restored from backup"
 
 
 def headroom_path() -> str | None:

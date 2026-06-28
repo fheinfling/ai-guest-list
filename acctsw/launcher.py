@@ -284,6 +284,13 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
     # Headroom is GLOBAL/app-managed now (the app toggle runs `headroom install apply`, so plain
     # codex, the GUI, AND cx all route through the proxy). cx/cl therefore do NOT per-session-wrap —
     # global mode owns Headroom — so the launcher just runs the tool plain.
+    # But if routing is on while the proxy is down (e.g. the app isn't running), the tool would hit a
+    # dead proxy — surface that so the user can open the app or toggle it off.
+    if state.settings().get("headroom"):
+        from . import headroom as _hr
+        if _hr.headroom_path() and not _hr.global_running():
+            notify("Headroom routing is on but its proxy isn't running — open the ai guest list app, "
+                   "or turn save-credit off; otherwise codex/claude calls may fail.")
 
     def _activate_codex_home(email):
         """Point codex at the account's own home so it maintains that account's tokens in place."""
