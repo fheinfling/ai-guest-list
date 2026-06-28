@@ -18,7 +18,7 @@ from acctsw import paths as P
 
 @pytest.mark.parametrize("text", [
     "Error: you've hit your usage limit", "rate limit exceeded", "5-hour limit reached",
-    "HTTP 429 Too Many Requests", "please try again in 2 hours",
+    "HTTP 429 Too Many Requests", "you are out of credits",
 ])
 def test_detect_limit_positive(text):
     assert detect_limit("codex", text) or detect_limit("claude", text)
@@ -26,6 +26,20 @@ def test_detect_limit_positive(text):
 
 def test_detect_limit_negative():
     assert not detect_limit("codex", "compiling project, running tests, all green")
+
+
+@pytest.mark.parametrize("benign", [
+    "the cache resets at midnight", "please try again in a moment",
+    "approaching the recursion limit", "rate limiting middleware installed",
+])
+def test_detect_limit_no_false_positive_on_benign(benign):
+    assert not detect_limit("codex", benign)
+    assert not detect_limit("claude", benign)
+
+
+def test_detect_limit_ignores_ansi_codes():
+    colored = "\x1b[31musage\x1b[0m \x1b[1mlimit\x1b[0m reached"
+    assert detect_limit("codex", colored)
 
 
 def test_build_and_resume_cmd(ctx):
@@ -135,3 +149,68 @@ def test_run_respects_max_switches(ctx):
     spawn = FakeSpawn([(b"usage limit\n", 1)] * 5)
     rc = run(ctx, "codex", [], spawn=spawn, get=get, max_switches=1, notify=lambda m: None)
     assert len(spawn.calls) == 2  # initial + one resume, then bail
+    assert rc == L.EXIT_GAVE_UP
+
+
+def test_run_propagates_nonzero_clean_exit(ctx):
+    _two_codex(ctx)
+    spawn = FakeSpawn([(b"build failed\n", 3)])  # no limit text → clean (failed) exit
+    assert run(ctx, "codex", [], spawn=spawn, get=fake_get({})) == 3
+
+
+def test_run_syncs_back_on_exception(ctx):
+    """B2: sync-back must run even if spawn raises mid-loop."""
+    state = _two_codex(ctx)  # active a
+    # rotate a's live token, then make spawn explode
+    rotated = make_codex_blob("a@x.com").replace('"refresh_token": "r"', '"refresh_token": "ROT"')
+    ctx.cred["codex"].set_live(rotated)
+
+    def boom(argv, on_output):
+        raise RuntimeError("pty exploded")
+
+    with pytest.raises(RuntimeError):
+        run(ctx, "codex", [], spawn=boom, get=fake_get({}))
+    # a's rotated token was synced back to its snapshot despite the crash
+    import json
+    snap = json.loads(ctx.keychain.get(ctx.keychain_service, "codex:a@x.com"))
+    assert snap["tokens"]["refresh_token"] == "ROT"
+
+
+def test_run_claude_resume_uses_continue(ctx):
+    for em in ("c1@x.com", "c2@x.com"):
+        ctx.cred["claude"].set_live(__import__("tests.conftest", fromlist=["make_claude_blob"]).make_claude_blob())
+        st = ctx.load_state()
+        acct.add(ctx, st, "claude", email=em)
+    from acctsw.switch import switch
+    switch(ctx, ctx.load_state(), "claude", "c1@x.com")
+    get = fake_get({P.CLAUDE_USAGE_URL: (429, "")})
+    spawn = FakeSpawn([(b"usage limit\n", 1), (b"resumed\n", 0)])
+    rc = run(ctx, "claude", [], spawn=spawn, get=get, notify=lambda m: None)
+    assert rc == 0
+    assert spawn.calls[1][-1] == "--continue"
+
+
+# --- real PTY smoke tests (would have caught the B1 reaping bug) -------------------------------
+
+def test_pty_spawn_clean_exit_captures_output():
+    seen = bytearray()
+    def cb(chunk):
+        seen.extend(chunk)
+        return False
+    rc = L.pty_spawn(["/bin/echo", "hello-pty"], cb)
+    assert rc == 0
+    assert b"hello-pty" in bytes(seen)
+
+
+def test_pty_spawn_stop_path_terminates_without_error():
+    """on_output returns True → child killed AND reaped exactly once (no ChildProcessError)."""
+    def cb(chunk):
+        return b"usage limit" in chunk
+    rc = L.pty_spawn(["/bin/sh", "-c", "echo usage limit; sleep 5"], cb)
+    # returns promptly with a signal-derived status; the key assertion is "does not raise"
+    assert rc != 0
+
+
+def test_pty_spawn_nonzero_exit_propagates():
+    rc = L.pty_spawn(["/bin/sh", "-c", "exit 7"], lambda c: False)
+    assert rc == 7
