@@ -312,6 +312,9 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         # Initial selection + switch, under the state lock (brief; never held across a spawn).
         with ctx.locked():
             state = ctx.load_state()
+            if tool == "codex":
+                from . import accounts as _acct
+                _acct.reconcile_codex(ctx, state)   # freshen home(s) from ~/.codex before using them
             sel = choose(state, tool)
             if sel.email and sel.email != state.active(tool):
                 switch(ctx, state, tool, sel.email, sync=(tool != "codex"))

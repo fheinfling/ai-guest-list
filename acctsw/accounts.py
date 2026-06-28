@@ -54,6 +54,27 @@ def add(ctx: Context, state: State, tool: str, *, name: str | None = None,
     return seat
 
 
+def reconcile_codex(ctx: Context, state: State) -> str | None:
+    """Capture a fresh/out-of-band ~/.codex into the matching account's home (ISO-B1).
+
+    Plain `codex`/the GUI rotate ~/.codex in place; before we use or switch homes we capture those
+    fresh creds into the owning account's home (it's the freshest copy), and adopt them as active if
+    the user signed into a different known seat out-of-band. Unknown identities are left untouched.
+    Returns the reconciled email, or None.
+    """
+    live = ctx.cred["codex"].get_live()
+    if not live:
+        return None
+    em = ctx.cred["codex"].email_of(live)
+    if not em or em not in state.accounts("codex"):
+        return None
+    ctx.snapshot_set("codex", em, live)            # ~/.codex is the freshest copy for `em`
+    if state.active("codex") != em:
+        state.set_active("codex", em)              # honor an out-of-band login/switch
+        state.save()
+    return em
+
+
 def remove(ctx: Context, state: State, tool: str, email: str) -> bool:
     """Remove a seat: delete its keychain snapshot and its state entry. Returns True if it existed."""
     ctx.snapshot_delete(tool, email)
@@ -78,7 +99,10 @@ def _seat_view(seat: dict, *, active: bool, at: datetime) -> dict[str, Any]:
         "active": active,
         "limited": limited,
         "limited_until": seat.get("limited_until") if limited else None,
-        "needs_login": usage.get("error") == "unauthorized",
+        # needs-login only when the ACTIVE seat's LIVE creds fail. A non-active seat's cached access
+        # token expiring (401) is normal — its refresh token still works when switched to — so we
+        # don't cry "logged out"; it shows as ready with last-known usage.
+        "needs_login": active and usage.get("error") == "unauthorized",
         "usage5h": _usage_pct(seat, "5h"),
         "usageWeek": _usage_pct(seat, "weekly"),
         "usage": usage or None,

@@ -134,6 +134,7 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
         if action == "usage":
             with ctx.locked():
                 state = ctx.load_state()
+                acct.reconcile_codex(ctx, state)   # capture a fresh/out-of-band ~/.codex into its home
                 usage_mod.refresh(ctx, state, message.get("tool"))
             return {"ok": True, "state": snapshot_state(ctx)}
 

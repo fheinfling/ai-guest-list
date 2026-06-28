@@ -106,3 +106,24 @@ def test_list_seats_marks_active_and_limited(ctx):
     seats = {s["email"]: s for s in acct.list_seats(state, "codex")}
     assert seats["b@x.com"]["active"] is True
     assert seats["a@x.com"]["limited"] is True
+
+
+def test_reconcile_codex_captures_fresh_live_into_home(ctx):
+    """ISO-B1: a fresh/out-of-band ~/.codex is captured into the owning account's home + adopted."""
+    _add_codex(ctx, "a@x.com")
+    state, _ = _add_codex(ctx, "b@x.com")          # active=b
+    # user logs into 'a' out-of-band (plain codex) with a rotated token
+    rotated = make_codex_blob("a@x.com").replace('"refresh_token": "r"', '"refresh_token": "FRESH"')
+    ctx.cred["codex"].set_live(rotated)
+    reconciled = acct.reconcile_codex(ctx, state)
+    assert reconciled == "a@x.com"
+    assert ctx.load_state().active("codex") == "a@x.com"        # adopted the out-of-band login
+    snap = json.loads(ctx.snapshot_get("codex", "a@x.com"))
+    assert snap["tokens"]["refresh_token"] == "FRESH"           # captured into a's home
+
+
+def test_reconcile_codex_ignores_unknown_identity(ctx):
+    state, _ = _add_codex(ctx, "a@x.com")
+    ctx.cred["codex"].set_live(make_codex_blob("stranger@x.com"))  # not a seat
+    assert acct.reconcile_codex(ctx, state) is None
+    assert ctx.load_state().active("codex") == "a@x.com"          # unchanged
