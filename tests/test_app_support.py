@@ -31,7 +31,7 @@ def test_prepare_then_login_syncs_back_active_before_login(ctx, monkeypatch):
     terminal.prepare_then_login(ctx, "codex", "codex login")
 
     # sync-back happened before the (mocked) login
-    snap = json.loads(ctx.keychain.get(ctx.keychain_service, "codex:a@x.com"))
+    snap = json.loads(ctx.snapshot_get("codex", "a@x.com"))
     assert snap["tokens"]["refresh_token"] == "ROT"
     assert opened["cmd"] == "codex login"
 

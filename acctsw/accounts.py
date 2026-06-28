@@ -47,7 +47,7 @@ def add(ctx: Context, state: State, tool: str, *, name: str | None = None,
     em = email or live_email(ctx, tool)
     if not em:
         raise CannotIdentify(f"could not determine the account email for {tool}")
-    ctx.keychain.set(ctx.keychain_service, ctx.snapshot_key(tool, em), live)
+    ctx.snapshot_set(tool, em, live)
     seat = state.upsert_seat(tool, em, name=name, plan=plan_of(tool, live))
     state.set_active(tool, em)  # the freshly signed-in account is what's live now
     state.save()
@@ -56,7 +56,7 @@ def add(ctx: Context, state: State, tool: str, *, name: str | None = None,
 
 def remove(ctx: Context, state: State, tool: str, email: str) -> bool:
     """Remove a seat: delete its keychain snapshot and its state entry. Returns True if it existed."""
-    ctx.keychain.delete(ctx.keychain_service, ctx.snapshot_key(tool, email))
+    ctx.snapshot_delete(tool, email)
     existed = state.remove_seat(tool, email)
     state.save()
     return existed

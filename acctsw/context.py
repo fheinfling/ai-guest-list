@@ -31,6 +31,16 @@ class Context:
     cred: dict[str, CredLocation]  # tool -> canonical location
     claude_bin: str | None = None  # path to the official `claude` CLI (for identity/usage)
     codex_bin: str | None = None   # path to the official `codex` CLI (for the launcher)
+    homes_root: Path | None = None  # per-account Codex homes root (None → P.CODEX_HOMES)
+    codex_real: Path | None = None  # the real shared ~/.codex (None → P.CODEX_HOME)
+
+    @property
+    def _homes_root(self) -> Path:
+        return self.homes_root or P.CODEX_HOMES
+
+    @property
+    def _codex_real(self) -> Path:
+        return self.codex_real or P.CODEX_HOME
 
     # --- factory: real system ----------------------------------------------------------------
     @classmethod
@@ -51,6 +61,8 @@ class Context:
             cred=cred,
             claude_bin=shutil.which("claude"),
             codex_bin=shutil.which("codex"),
+            homes_root=P.CODEX_HOMES,
+            codex_real=P.CODEX_HOME,
         )
 
     # --- factory: tests ----------------------------------------------------------------------
@@ -69,6 +81,8 @@ class Context:
             keychain=keychain,
             keychain_service="acct-switcher-test",
             cred=cred,
+            homes_root=root / "codex-homes",
+            codex_real=root / "codex",
         )
 
     # --- helpers -----------------------------------------------------------------------------
@@ -99,3 +113,28 @@ class Context:
     def snapshot_key(self, tool: str, email: str) -> str:
         """Keychain account name for our snapshot of a seat: ``<tool>:<email>``."""
         return f"{tool}:{email}"
+
+    # --- per-seat credential store (codex → on-disk per-account home; claude → keychain) -------
+    def codex_home(self, email: str) -> Path:
+        """The CODEX_HOME directory for a codex seat (used by the launcher)."""
+        from . import codexhome
+        return codexhome.home_dir(email, self._homes_root)
+
+    def snapshot_get(self, tool: str, email: str) -> str | None:
+        if tool == "codex":
+            from . import codexhome
+            return codexhome.load(email, root=self._homes_root)
+        return self.keychain.get(self.keychain_service, self.snapshot_key(tool, email))
+
+    def snapshot_set(self, tool: str, email: str, blob: str) -> None:
+        if tool == "codex":
+            from . import codexhome
+            codexhome.save(email, blob, codex_home=self._codex_real, root=self._homes_root)
+        else:
+            self.keychain.set(self.keychain_service, self.snapshot_key(tool, email), blob)
+
+    def snapshot_delete(self, tool: str, email: str) -> bool:
+        if tool == "codex":
+            from . import codexhome
+            return codexhome.delete(email, root=self._homes_root)
+        return self.keychain.delete(self.keychain_service, self.snapshot_key(tool, email))

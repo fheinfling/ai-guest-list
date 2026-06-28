@@ -15,6 +15,9 @@ STATE_FILE = DATA_DIR / "state.json"
 BACKUP_DIR = DATA_DIR / "backups"
 BACKUP_MANIFEST = BACKUP_DIR / "manifest.json"
 APP_SRC_DIR = DATA_DIR / "app"
+# Per-account Codex homes (each a CODEX_HOME with its own auth.json; shared state symlinked to the
+# real ~/.codex). Isolation so codex maintains each account's token lifecycle independently.
+CODEX_HOMES = DATA_DIR / "codex-homes"
 
 # Keychain service that holds our per-account credential snapshots.
 KEYCHAIN_SERVICE = "acct-switcher"  # accounts named "codex:<email>" / "claude:<email>"

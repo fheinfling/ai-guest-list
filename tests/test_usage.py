@@ -135,7 +135,7 @@ def _seed_two_codex(ctx):
     state = ctx.load_state()
     acct.add(ctx, state, "codex", email="a@x.com")
     # second seat snapshot stored directly
-    ctx.keychain.set(ctx.keychain_service, "codex:b@x.com", make_codex_blob("b@x.com"))
+    ctx.snapshot_set("codex", "b@x.com", make_codex_blob("b@x.com"))
     state.upsert_seat("codex", "b@x.com")
     state.save()
     return state

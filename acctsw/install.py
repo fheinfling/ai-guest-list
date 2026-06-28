@@ -170,8 +170,7 @@ def uninstall(ctx: Context, *, purge: bool = False, dry_run: bool = False,
                 plan.actions.append(f"{tool}: already on original {orig_email}; left as-is")
                 continue
             # (b) prefer the original identity's seat snapshot (kept fresh via sync-back).
-            snap = (ctx.keychain.get(ctx.keychain_service, ctx.snapshot_key(tool, orig_email))
-                    if orig_email else None)
+            snap = (ctx.snapshot_get(tool, orig_email) if orig_email else None)
             if snap is not None:
                 plan.do(f"restore original {tool}:{orig_email} (freshest snapshot)",
                         lambda t=tool, b=snap: ctx.cred[t].set_live(b))
@@ -205,9 +204,8 @@ def uninstall(ctx: Context, *, purge: bool = False, dry_run: bool = False,
         st = ctx.load_state()
         for tool in TOOLS:
             for email in list(st.accounts(tool)):
-                plan.do(f"delete keychain snapshot {tool}:{email}",
-                        lambda t=tool, e=email: ctx.keychain.delete(ctx.keychain_service,
-                                                                    ctx.snapshot_key(t, e)))
+                plan.do(f"delete stored creds {tool}:{email}",
+                        lambda t=tool, e=email: ctx.snapshot_delete(t, e))
             plan.do(f"delete factory image {tool}",
                     lambda t=tool: ctx.keychain.delete(ctx.keychain_service, _backup_account(t)))
 

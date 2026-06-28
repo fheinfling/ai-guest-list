@@ -133,6 +133,20 @@ def venv_bin_dir() -> str:
     return str(Path(sys.executable).parent)
 
 
+def output_savings_pct() -> int | None:
+    """Cumulative token-reduction % from `headroom output-savings` (None until it has data)."""
+    import re
+    exe = headroom_path()
+    if not exe:
+        return None
+    try:
+        out = subprocess.run([exe, "output-savings"], capture_output=True, text=True, timeout=10)
+        m = re.search(r"(\d+)\s*%", out.stdout or "")
+        return int(m.group(1)) if m else None
+    except (subprocess.SubprocessError, OSError):
+        return None
+
+
 def ensure_installed() -> bool:
     """Best-effort: install headroom into the current venv if missing. Returns availability."""
     if available():

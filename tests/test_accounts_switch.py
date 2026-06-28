@@ -22,7 +22,7 @@ def test_add_snapshots_and_activates(ctx):
     assert seat["email"] == "a@x.com"
     assert state.active("codex") == "a@x.com"
     # snapshot stored in our keychain
-    assert ctx.keychain.get(ctx.keychain_service, "codex:a@x.com") is not None
+    assert ctx.snapshot_get("codex", "a@x.com") is not None
 
 
 def test_add_without_live_creds_errors(ctx):
@@ -55,7 +55,7 @@ def test_switch_syncs_back_then_installs(ctx):
     live = json.loads(ctx.cred["codex"].get_live())
     assert live["tokens"]["id_token"].split(".")[1]  # is a-token (email a)
     # crucially: b's rotated creds were synced back to its snapshot, not lost
-    b_snap = json.loads(ctx.keychain.get(ctx.keychain_service, "codex:b@x.com"))
+    b_snap = json.loads(ctx.snapshot_get("codex", "b@x.com"))
     assert b_snap["tokens"]["refresh_token"] == "ROT"
 
 
@@ -75,7 +75,7 @@ def test_switch_missing_snapshot(ctx):
 def test_remove_deletes_snapshot_and_seat(ctx):
     state, _ = _add_codex(ctx, "a@x.com")
     assert acct.remove(ctx, state, "codex", "a@x.com") is True
-    assert ctx.keychain.get(ctx.keychain_service, "codex:a@x.com") is None
+    assert ctx.snapshot_get("codex", "a@x.com") is None
     assert state.get_seat("codex", "a@x.com") is None
     assert state.active("codex") is None
     assert acct.remove(ctx, state, "codex", "a@x.com") is False

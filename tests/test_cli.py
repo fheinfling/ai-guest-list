@@ -75,13 +75,17 @@ def test_remove_path(isolated, capsys):
 
 
 def test_keychain_error_is_friendly(isolated, monkeypatch, capsys):
-    """A keychain failure surfaces as a friendly stderr line, not a traceback."""
+    """A keychain failure surfaces as a friendly stderr line, not a traceback.
+
+    (Claude still uses the keychain for its snapshots; codex uses on-disk homes.)
+    """
     from acctsw.keychain import KeychainError
-    isolated.cred["codex"].set_live(make_codex_blob("a@x.com"))
+    from tests.conftest import make_claude_blob
+    isolated.cred["claude"].set_live(make_claude_blob())
 
     def boom(*a, **k):
         raise KeychainError("security: boom")
     monkeypatch.setattr(isolated.keychain, "set", boom)
-    rc = cli.main(["add", "codex"])
+    rc = cli.main(["add", "claude", "--email", "c@x.com"])
     assert rc == cli.EXIT_ERR
     assert "acctsw:" in capsys.readouterr().err

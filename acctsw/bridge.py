@@ -59,6 +59,7 @@ def snapshot_state(ctx: Context) -> dict[str, Any]:
     data["headroom_available"] = headroom_available()
     data["headroom_savings"] = headroom_savings() if data["headroom_available"] else None
     data["moved_note"] = state.data.get("moved_note")
+    data["headroom_log"] = (state.data.get("headroom_log") or [])[-5:]  # recent per-session savings
     last = parse_iso(state.data.get("last_switch_at"))
     data["recently_switched"] = bool(last and (now() - last).total_seconds() < SWITCH_FRESH_SECONDS)
     data["dot"] = dot_for(data)  # single source of truth for the dot (JS + native both read this)

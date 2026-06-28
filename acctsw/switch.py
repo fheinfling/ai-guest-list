@@ -32,23 +32,28 @@ def sync_back(ctx: Context, state: State, tool: str) -> bool:
         return False
     live_email = ctx.cred[tool].email_of(live)
     if live_email is not None and live_email != active:
-        return False  # mismatch — don't clobber the active seat's snapshot
-    ctx.keychain.set(ctx.keychain_service, ctx.snapshot_key(tool, active), live)
+        return False  # mismatch — don't clobber the active seat's store
+    ctx.snapshot_set(tool, active, live)   # codex → per-account home; claude → keychain
     return True
 
 
-def switch(ctx: Context, state: State, tool: str, email: str) -> None:
-    """Make ``email`` the active seat for ``tool``."""
+def switch(ctx: Context, state: State, tool: str, email: str, *, sync: bool = True) -> None:
+    """Make ``email`` the active seat for ``tool``.
+
+    ``sync=False`` skips the sync-back-from-mirror — used by the launcher for codex, where codex
+    maintains the account's own home directly (the home, not ~/.codex, is the source of truth).
+    """
     if email not in state.accounts(tool):
         raise UnknownSeat(f"no seat '{email}' for {tool}")
 
     # 1. sync-back outgoing (no-op if switching to the same / no active seat)
-    sync_back(ctx, state, tool)
+    if sync:
+        sync_back(ctx, state, tool)
 
-    # 2. install chosen snapshot into the canonical location
-    blob = ctx.keychain.get(ctx.keychain_service, ctx.snapshot_key(tool, email))
+    # 2. install chosen account's stored creds into the canonical location (the active mirror)
+    blob = ctx.snapshot_get(tool, email)
     if blob is None:
-        raise MissingSnapshot(f"snapshot for {tool}:{email} not found — re-add this seat")
+        raise MissingSnapshot(f"stored creds for {tool}:{email} not found — re-add this seat")
     ctx.cred[tool].set_live(blob)
 
     # 3. record active

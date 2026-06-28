@@ -110,7 +110,7 @@ def test_uninstall_prefers_fresh_snapshot_over_factory(ctx, tmp_path):
     install(ctx, bin_dir=tmp_path / "bin", register=True)
     # original's seat snapshot gets refreshed (rotated) during use
     rotated = make_codex_blob("orig@x.com").replace('"refresh_token": "r"', '"refresh_token": "ROT"')
-    ctx.keychain.set(ctx.keychain_service, "codex:orig@x.com", rotated)
+    ctx.snapshot_set("codex", "orig@x.com", rotated)
     # live is now a different account
     ctx.cred["codex"].set_live(make_codex_blob("other@x.com"))
     uninstall(ctx, bin_dir=tmp_path / "bin")
@@ -138,5 +138,5 @@ def test_purge_removes_store_and_keychain(ctx, tmp_path):
     install(ctx, bin_dir=tmp_path / "bin", register=True)
     uninstall(ctx, bin_dir=tmp_path / "bin", purge=True)
     assert ctx.keychain.get(ctx.keychain_service, _backup_account("codex")) is None
-    assert ctx.keychain.get(ctx.keychain_service, "codex:orig@x.com") is None
+    assert ctx.snapshot_get("codex", "orig@x.com") is None
     assert not ctx.data_dir.exists()

@@ -45,7 +45,7 @@ def test_missing_snapshot_preserves_outgoing_live(ctx):
         switch(ctx, state, "codex", "b@x.com")
     # a's live is intact and its snapshot still present
     assert ctx.cred["codex"].get_live() is not None
-    assert ctx.keychain.get(ctx.keychain_service, "codex:a@x.com") is not None
+    assert ctx.snapshot_get("codex", "a@x.com") is not None
 
 
 def test_claude_set_live_updates_same_item_no_duplicate(ctx):
@@ -61,9 +61,9 @@ def test_claude_set_live_updates_same_item_no_duplicate(ctx):
 def test_sync_back_skips_on_codex_account_mismatch(ctx):
     """If live creds belong to a different account than state.active, don't clobber the snapshot."""
     state = _add_codex(ctx, "a@x.com")  # active=a, snapshot a saved
-    a_snapshot_before = ctx.keychain.get(ctx.keychain_service, "codex:a@x.com")
+    a_snapshot_before = ctx.snapshot_get("codex", "a@x.com")
     # user logs in as a DIFFERENT account out-of-band → live is now c
     ctx.cred["codex"].set_live(make_codex_blob("c@x.com"))
     assert sync_back(ctx, state, "codex") is False
     # a's snapshot was NOT overwritten with c's creds
-    assert ctx.keychain.get(ctx.keychain_service, "codex:a@x.com") == a_snapshot_before
+    assert ctx.snapshot_get("codex", "a@x.com") == a_snapshot_before

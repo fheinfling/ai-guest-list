@@ -306,7 +306,7 @@ def _seat_blob(ctx, state, tool: str, email: str) -> str | None:
         live = ctx.cred[tool].get_live()
         if live:
             return live
-    return ctx.keychain.get(ctx.keychain_service, ctx.snapshot_key(tool, email))
+    return ctx.snapshot_get(tool, email)
 
 
 def _fetch_for(tool: str, blob: str, get: HttpGet, ua: str | None) -> Usage:

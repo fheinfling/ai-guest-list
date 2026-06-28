@@ -301,13 +301,21 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
     if hr_scope:
         hr_scope.__enter__()
 
+    def _activate_codex_home(email):
+        """Point codex at the account's own home so it maintains that account's tokens in place."""
+        if tool == "codex" and email:
+            from . import codexhome
+            codexhome.ensure_home(email, codex_home=ctx._codex_real, root=ctx._homes_root)
+            os.environ["CODEX_HOME"] = str(ctx.codex_home(email))
+
     try:
         # Initial selection + switch, under the state lock (brief; never held across a spawn).
         with ctx.locked():
             state = ctx.load_state()
             sel = choose(state, tool)
             if sel.email and sel.email != state.active(tool):
-                switch(ctx, state, tool, sel.email)
+                switch(ctx, state, tool, sel.email, sync=(tool != "codex"))
+            _activate_codex_home(state.active(tool))
         if sel.all_limited and sel.unlocks_at:
             notify(f"all {tool} seats are resting — {sel.email} unlocks at "
                    f"{sel.unlocks_at:%H:%M}; starting anyway")
@@ -346,7 +354,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 active = state.active(tool)
                 dec = handle_limit(ctx, state, tool, get=get)
                 if dec.action == "switch":
-                    switch(ctx, state, tool, dec.email)
+                    switch(ctx, state, tool, dec.email, sync=(tool != "codex"))
+                    _activate_codex_home(dec.email)
                     state.data["last_switch_at"] = iso(now())
                     state.save()
             if dec.action == "switch":
@@ -359,12 +368,26 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                    + (f"; soonest unlocks at {dec.unlocks_at}" if dec.unlocks_at else ""))
             return EXIT_GAVE_UP
     finally:
-        # Mandatory sync-back on EVERY exit path (incl. exceptions): the just-run seat may carry a
-        # rotated refresh token. The Codex live-vs-active guard prevents clobbering on a half-swap.
+        # On exit, reconcile the active account's creds (the just-run seat may carry a rotated token).
+        #  - codex: it maintained its own home via CODEX_HOME → mirror the home into ~/.codex so
+        #    plain codex / the GUI follow the active account.
+        #  - claude: sync the live keychain item back into the account's snapshot.
         try:
             with ctx.locked():
                 st = ctx.load_state()
-                if sync_back(ctx, st, tool):
+                active = st.active(tool)
+                if tool == "codex" and active:
+                    blob = ctx.snapshot_get("codex", active)   # home = source of truth
+                    if blob:
+                        ctx.cred["codex"].set_live(blob)        # mirror → ~/.codex
+                elif sync_back(ctx, st, tool):
+                    st.save()
+                # record per-session Headroom savings (spec: gather how much each session saved)
+                if save_credit:
+                    log = st.data.setdefault("headroom_log", [])
+                    log.append({"at": iso(now()), "tool": tool,
+                                "saved_pct": headroom_mod.output_savings_pct()})
+                    st.data["headroom_log"] = log[-20:]
                     st.save()
         except Exception:
             pass

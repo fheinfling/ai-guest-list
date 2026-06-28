@@ -158,22 +158,19 @@ def test_run_propagates_nonzero_clean_exit(ctx):
     assert run(ctx, "codex", [], spawn=spawn, get=fake_get({})) == 3
 
 
-def test_run_syncs_back_on_exception(ctx):
-    """B2: sync-back must run even if spawn raises mid-loop."""
-    state = _two_codex(ctx)  # active a
-    # rotate a's live token, then make spawn explode
-    rotated = make_codex_blob("a@x.com").replace('"refresh_token": "r"', '"refresh_token": "ROT"')
-    ctx.cred["codex"].set_live(rotated)
+def test_run_codex_home_preserved_on_exception(ctx):
+    """Codex isolation: a crash must not corrupt/lose the active account's per-account home
+    (the source of truth codex maintains); the finally mirrors home → ~/.codex."""
+    state = _two_codex(ctx)  # active a, home(a) populated
+    before = ctx.snapshot_get("codex", "a@x.com")
 
     def boom(argv, on_output):
         raise RuntimeError("pty exploded")
 
     with pytest.raises(RuntimeError):
         run(ctx, "codex", [], spawn=boom, get=fake_get({}))
-    # a's rotated token was synced back to its snapshot despite the crash
-    import json
-    snap = json.loads(ctx.keychain.get(ctx.keychain_service, "codex:a@x.com"))
-    assert snap["tokens"]["refresh_token"] == "ROT"
+    assert ctx.snapshot_get("codex", "a@x.com") == before        # home intact
+    assert ctx.cred["codex"].get_live() == before                # mirrored home → live
 
 
 def test_run_claude_resume_uses_continue(ctx):
