@@ -76,9 +76,11 @@ def verify_rtk(record_dir: Path | None) -> tuple[bool, str]:
     return True, f"rtk checksum recorded ({digest[:12]}…)"
 
 # Markers Headroom leaves in the tool config — used to detect a still-injected (dirty) config.
-# Deliberately SPECIFIC (no bare "Headroom"): a loose substring would treat a user's own config that
-# merely mentions the word as still-routed and let the restore backstop overwrite their real edits.
-INJECT_MARKERS = ('model_provider = "headroom"', "headroom:rtk-instructions", "headroomlabs")
+# Deliberately CONFIG-SYNTAX strings (not prose words like "Headroom" or "headroomlabs", which a
+# user could legitimately write): a loose substring would treat such a config as still-routed and
+# let the restore backstop overwrite their real edits. (Claude's exact settings.json marker is
+# confirmed against a live install in M8 — see docs/VERIFY.md; add it here once known.)
+INJECT_MARKERS = ('model_provider = "headroom"', "headroom:rtk-instructions")
 
 
 def _config_dir(tool: str) -> Path:
@@ -251,7 +253,9 @@ def global_running(*, run=subprocess.run) -> bool:
     if rc != 0:
         return False
     low = out.lower()
-    if any(s in low for s in ("not running", "stopped", "not installed", "no deployment", "error")):
+    # "down" states. NB: deliberately NOT bare "error" — a healthy status line can say "errors: 0".
+    if any(s in low for s in ("not running", "stopped", "not installed", "no deployment",
+                              "not deployed", "failed", "crashed", " dead")):
         return False
     # accept the common ways a healthy proxy is reported (real CLI wording confirmed at M8 live test)
     return any(s in low for s in ("running", "active", "listening", "healthy", "serving", " up"))
@@ -286,9 +290,13 @@ def global_enable(store: Path | None = None, *, run=subprocess.run) -> tuple[boo
         if has_backup(store) and global_running(run=run):
             return True, "headroom already on"
         # If config is already injected without a backup (state desync), strip it first so the
-        # snapshot we baseline is the user's ORIGINAL, not a routed config.
+        # snapshot we baseline is the user's ORIGINAL, not a routed config. If the strip doesn't
+        # clean it, ABORT — baselining a routed config would make a later restore reinstate routing.
         if not has_backup(store) and _any_injected():
             _hr_run(["install", "remove"], run=run)
+            if _any_injected():
+                _log_full(store, "global_enable baseline dirty", "config still injected after remove")
+                return False, "couldn't establish a clean Headroom baseline (config already routed)"
         snapshot_global(store)                        # idempotent: keeps the original if already saved
         rc, out = _hr_run(["install", "apply", "--providers", "auto"], run=run)
         if rc != 0 or not global_running(run=run):    # apply failed OR proxy didn't come up healthy
@@ -314,16 +322,18 @@ def global_disable(store: Path | None = None, *, run=subprocess.run,
         return _remove_and_restore(store, run=run, timeout=timeout)
 
 
-def reconcile(ctx) -> tuple[bool, str]:
+def reconcile(ctx, *, blocking: bool = True) -> tuple[bool, str]:
     """heal() + reflect the result in the save-credit setting, so the launcher (cx/cl) and the GUI
-    poll share ONE recovery policy (instead of each clearing/keeping the setting differently). If a
-    dead proxy's routing was stripped, the setting is cleared so it matches reality. ctx is
-    duck-typed: data_dir, locked(), load_state(). Returns heal()'s (changed, msg)."""
-    changed, msg = heal(ctx.data_dir)
-    if changed:
+    poll share ONE recovery policy (instead of each clearing/keeping the setting differently). The
+    setting is cleared ONLY on a successful heal (healed=True) — a failed restore leaves it ON so
+    recovery keeps retrying. blocking=False (cx/cl) skips healing when the GUI holds the lock (e.g.
+    mid-enable), so a launch never hangs waiting on a long `install apply`. ctx is duck-typed:
+    data_dir, locked(), load_state()."""
+    healed, msg = heal(ctx.data_dir, blocking=blocking)
+    if healed:
         with ctx.locked():
             s = ctx.load_state(); s.set_setting("headroom", False); s.save()
-    return changed, msg
+    return healed, msg
 
 
 def needs_reconcile(ctx) -> bool:
@@ -338,25 +348,32 @@ def needs_reconcile(ctx) -> bool:
     return has_backup(ctx.data_dir) or _any_injected()
 
 
-def heal(store: Path | None = None, *, run=subprocess.run) -> tuple[bool, str]:
+def heal(store: Path | None = None, *, run=subprocess.run,
+         blocking: bool = True) -> tuple[bool, str]:
     """Serialized self-heal that keys off ACTUAL state, not any setting — so it fixes orphans left by
     a failed enable/disable, a crash, or a force-quit, regardless of how the setting reads.
 
+    Returns (healed, msg) where healed=True ONLY when dead routing was found AND successfully removed
+    + restored. healed=False covers: lock busy, proxy healthy, config already clean, OR a restore
+    that FAILED (config still injected) — so callers never mistake an incomplete restore for success.
+
     Inside op_lock:
-      • proxy running  → no-op (returns changed=False). Re-checking `global_running` here, under the
-        same lock the toggle holds, closes the enable/health-check TOCTOU: a heal that fires while an
-        enable is still bringing the proxy up blocks on the lock, then sees it running and leaves it.
-      • routing injected but proxy dead → remove routing + restore config (returns changed=True), so
-        codex/claude never keep hitting a dead proxy.
-      • nothing injected → no-op (returns changed=False).
+      • busy (blocking=False, another op holds it) → (False, "busy"): let that op finish.
+      • proxy running → no-op. Re-checking `global_running` here, under the same lock the toggle
+        holds, closes the enable/health-check TOCTOU: a heal that fires while an enable is still
+        bringing the proxy up blocks on the lock, then sees it running and leaves it.
+      • routing injected but proxy dead → remove routing + restore config.
+      • nothing injected → no-op.
     """
-    with op_lock(store):
+    with op_lock(store, blocking=blocking) as acquired:
+        if not acquired:
+            return False, "busy"
         if global_running(run=run):
             return False, "healthy"
         if not (_any_injected() or has_backup(store)):
             return False, "clean"
         ok, msg = _remove_and_restore(store, run=run)
-        return True, msg
+        return ok, msg                            # ok=False ⇒ still injected; NOT a successful heal
 
 
 def headroom_path() -> str | None:

@@ -66,4 +66,17 @@ acctsw uninstall --purge       # also deletes the store + all our keychain items
   actual Codex/Claude limit output on a real cap.
 - Resume-by-id: currently `codex resume --last` / `claude --continue` (MVP); capture the session id
   at spawn to resume by id if you run multiple concurrent sessions.
-- `headroom wrap <agent>` exact CLI form: confirm against the installed Headroom version.
+- `headroom install apply/remove/status` exact CLI forms + output: confirm against the installed
+  Headroom version (global app-managed mode now uses these, not `headroom wrap`).
+- **Headroom global-mode live checks (deferred from code review, confirm against a real install):**
+  - **Injection markers** (`headroom.INJECT_MARKERS`): confirm the exact strings Headroom writes
+    into Codex `config.toml`/`AGENTS.md` AND Claude `settings.json`. We deliberately match only
+    config-syntax directives (`model_provider = "headroom"`, `headroom:rtk-instructions`) to avoid
+    false positives that would let the restore backstop overwrite user edits; if Claude's real
+    marker differs, add it so a still-routed Claude config is detected before the backup is dropped.
+  - **`global_running()` status wording**: confirm `headroom install status` prints one of
+    running/active/listening/healthy/serving/up when healthy and not a false "error"/"down"; adjust
+    the positive/negative substring sets to the real output.
+  - **Headless rtk integrity**: `cx`/`cl` run with the menubar app closed don't re-verify rtk (the
+    GUI poll does while it's open, and a closed app means the proxy is down → routing is healed
+    away). If you rely on cx/cl with routing live but the app closed, add a `verify_rtk` gate there.

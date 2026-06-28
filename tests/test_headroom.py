@@ -163,6 +163,39 @@ def test_heal_strips_orphaned_injection_when_proxy_dead(tmp_path, monkeypatch):
     assert not (tmp_path / "store" / "headroom-global-backup").exists()
 
 
+def test_heal_reports_failure_when_restore_incomplete(tmp_path, monkeypatch):
+    """heal() must NOT claim success when the restore failed — else reconcile clears the setting and
+    the UI shows 'restored' over a still-injected, dead-proxy config."""
+    cfg = _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
+    monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
+    headroom.snapshot_global(tmp_path / "store")
+    cfg.write_text('model_provider = "headroom"\n')
+    monkeypatch.setattr(headroom, "_remove_and_restore",
+                        lambda *a, **k: (False, "config restore incomplete"))
+    healed, msg = headroom.heal(tmp_path / "store", run=_fakerun(running=False))
+    assert healed is False and "incomplete" in msg
+
+
+def test_reconcile_keeps_setting_when_heal_fails(ctx, monkeypatch):
+    monkeypatch.setattr(headroom, "heal", lambda store, **k: (False, "config restore incomplete"))
+    st = ctx.load_state(); st.set_setting("headroom", True); st.save()
+    healed, _ = headroom.reconcile(ctx)
+    assert healed is False and ctx.load_state().settings()["headroom"] is True   # stays ON to retry
+
+
+def test_global_enable_aborts_on_dirty_baseline(tmp_path, monkeypatch):
+    """If config is already routed with no backup and the strip can't clean it, enable must abort —
+    never baseline a routed config as the user's 'original'."""
+    _codex_cfg(tmp_path, monkeypatch, 'model_provider = "headroom"\n')   # routed, no backup yet
+    monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
+
+    def run(args, **k):                                    # `install remove` that doesn't clean
+        import types; return types.SimpleNamespace(returncode=0, stdout="ok", stderr="")
+    ok, msg = headroom.global_enable(tmp_path / "store", run=run)
+    assert ok is False and "baseline" in msg
+    assert not (tmp_path / "store" / "headroom-global-backup" / "manifest.json").exists()
+
+
 def test_heal_noop_when_clean(tmp_path, monkeypatch):
     _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
     monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
@@ -195,20 +228,20 @@ def test_verify_rtk_migrates_legacy_digest(tmp_path, monkeypatch):
     assert ok2 and "verified" in msg2
 
 
-def test_is_injected_ignores_bare_headroom_word(tmp_path, monkeypatch):
-    """A user's own config that merely mentions 'Headroom' must NOT count as injected — otherwise the
-    restore backstop would overwrite their edits (data loss)."""
+def test_is_injected_ignores_prose_mentions(tmp_path, monkeypatch):
+    """A user's own config that merely mentions Headroom/headroomlabs in prose must NOT count as
+    injected — only the actual config-syntax routing directives do — else the restore backstop would
+    overwrite their edits (data loss)."""
     cfg = _codex_cfg(tmp_path, monkeypatch, "# I love Headroom and headroomlabs is great\n")
-    # the AGENTS.md-style prose mentions the word but has no real injection marker
-    assert headroom._is_injected("codex") is True   # 'headroomlabs' IS a real marker → injected
-    cfg.write_text("# notes about the Headroom feature\n")
-    assert headroom._is_injected("codex") is False  # bare word alone is NOT treated as injected
+    assert headroom._is_injected("codex") is False        # prose mentions, no real directive
+    cfg.write_text('model_provider = "headroom"\n')
+    assert headroom._is_injected("codex") is True         # actual routing directive → injected
 
 
 def test_reconcile_clears_setting_when_healed(ctx, monkeypatch):
     """reconcile() unifies policy: if dead routing was stripped, the save-credit setting is cleared
     so cx/cl and the GUI agree on state."""
-    monkeypatch.setattr(headroom, "heal", lambda store: (True, "removed"))
+    monkeypatch.setattr(headroom, "heal", lambda store, **k: (True, "removed"))
     st = ctx.load_state(); st.set_setting("headroom", True); st.save()
     changed, _ = headroom.reconcile(ctx)
     assert changed and ctx.load_state().settings()["headroom"] is False

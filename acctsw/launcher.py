@@ -292,7 +292,9 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
     try:
         from . import headroom as _hr
         if _hr.needs_reconcile(ctx):
-            changed, _ = _hr.reconcile(ctx)
+            # blocking=False: if the GUI is mid-enable holding the lock (`install apply` can take up
+            # to ~2min), skip self-heal rather than hang the launch — the GUI owns it right now.
+            changed, _ = _hr.reconcile(ctx, blocking=False)
             if changed:
                 notify("Headroom's proxy wasn't running — removed its routing so this runs directly. "
                        "Open the ai guest list app to turn save-credit back on.")
