@@ -7,18 +7,22 @@ from tests.conftest import make_codex_blob
 from tests.test_usage import fake_get
 
 
-def test_wrap_when_enabled_and_available():
+def test_wrap_uses_per_tool_subcommand():
     assert L  # ensure import
-    out = headroom.wrap(["codex", "exec"], enabled=True, is_available=True)
-    assert out == ["headroom", "wrap", "codex", "exec"]
+    out = headroom.wrap("codex", ["resume", "--last"], enabled=True, is_available=True, exe="headroom")
+    assert out == ["headroom", "wrap", "codex", "--", "resume", "--last"]
+
+
+def test_wrap_no_args_omits_separator():
+    assert headroom.wrap("claude", [], enabled=True, is_available=True) == ["headroom", "wrap", "claude"]
 
 
 def test_no_wrap_when_disabled():
-    assert headroom.wrap(["codex"], enabled=False, is_available=True) == ["codex"]
+    assert headroom.wrap("codex", ["x"], enabled=False, is_available=True) is None
 
 
 def test_no_wrap_when_unavailable():
-    assert headroom.wrap(["codex"], enabled=True, is_available=False) == ["codex"]
+    assert headroom.wrap("codex", ["x"], enabled=True, is_available=False) is None
 
 
 def _two_codex(ctx):
@@ -42,33 +46,50 @@ class _Spawn:
 def test_launcher_wraps_with_headroom_when_enabled(ctx, monkeypatch):
     _two_codex(ctx)
     st = ctx.load_state(); st.set_setting("headroom", True); st.save()
-    monkeypatch.setattr(L.headroom_mod, "available", lambda: True)
+    monkeypatch.setattr(L.headroom_mod, "headroom_path", lambda: "/fake/bin/headroom")
     spawn = _Spawn()
     L.run(ctx, "codex", ["--foo"], spawn=spawn, get=fake_get({}), notify=lambda m: None)
-    assert spawn.calls[0][:2] == ["headroom", "wrap"]
+    assert spawn.calls[0][0].endswith("headroom")
+    assert spawn.calls[0][1] == "wrap"
     assert spawn.calls[0][-1] == "--foo"
 
 
 def test_launcher_skips_headroom_when_unavailable(ctx, monkeypatch):
     _two_codex(ctx)
     st = ctx.load_state(); st.set_setting("headroom", True); st.save()
-    monkeypatch.setattr(L.headroom_mod, "available", lambda: False)
+    monkeypatch.setattr(L.headroom_mod, "headroom_path", lambda: None)
     msgs = []
     spawn = _Spawn()
     L.run(ctx, "codex", [], spawn=spawn, get=fake_get({}), notify=msgs.append)
-    assert spawn.calls[0][:2] != ["headroom", "wrap"]
+    assert spawn.calls[0][1:2] != ["wrap"]
     assert any("headroom isn't installed" in m for m in msgs)
 
 
 def test_launcher_no_headroom_when_toggle_off(ctx, monkeypatch):
     _two_codex(ctx)  # headroom defaults off
-    monkeypatch.setattr(L.headroom_mod, "available", lambda: True)
+    monkeypatch.setattr(L.headroom_mod, "headroom_path", lambda: "/fake/bin/headroom")
     spawn = _Spawn()
     L.run(ctx, "codex", [], spawn=spawn, get=fake_get({}), notify=lambda m: None)
-    assert spawn.calls[0][:2] != ["headroom", "wrap"]
+    assert spawn.calls[0][1:2] != ["wrap"]
 
 
-def test_bridge_headroom_install_returns_command(ctx):
+def test_scoped_restores_injected_files(tmp_path, monkeypatch):
+    """headroom.scoped must restore files Headroom injects into, byte-for-byte (incl. deleting a
+    file that didn't exist before)."""
+    from acctsw import paths as P
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('model = "gpt-5.5"\n')
+    agents = tmp_path / "AGENTS.md"  # doesn't exist initially
+    monkeypatch.setattr(P, "CODEX_HOME", tmp_path)
+    with headroom.scoped("codex"):
+        cfg.write_text('model_provider = "headroom"\n')  # simulate injection
+        agents.write_text("rtk instructions\n")
+    assert cfg.read_text() == 'model = "gpt-5.5"\n'  # restored exactly
+    assert not agents.exists()                        # created-then-removed
+
+
+def test_bridge_headroom_install(ctx):
+    # headroom is already in the venv, so ensure_installed is a fast no-op returning available
     r = bridge.handle(ctx, {"action": "headroom_install"})
-    assert r["ok"] and r["command"].startswith("pip install")
-    assert "available" in r
+    assert r["ok"] is True and r["installed"] is True
+    assert r["state"]["headroom_available"] is True

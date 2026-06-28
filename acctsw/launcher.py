@@ -283,9 +283,19 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         raise NoSeats(f"no {tool} seats yet — add one first")
 
     save_credit = bool(state.settings().get("headroom"))
-    if save_credit and not headroom_mod.available():
+    hr_exe = headroom_mod.headroom_path() if save_credit else None
+    if save_credit and not hr_exe:
         notify("save-credit is on but headroom isn't installed — running without it")
         save_credit = False
+    elif save_credit:
+        # ensure the spawned child can resolve `headroom` even if the venv bin isn't on PATH
+        os.environ["PATH"] = headroom_mod.venv_bin_dir() + os.pathsep + os.environ.get("PATH", "")
+
+    # Headroom's `wrap` injects (persistently) into the tool's config; scope it to this session so
+    # the user's setup is restored exactly afterwards (non-destructive).
+    hr_scope = headroom_mod.scoped(tool) if save_credit else None
+    if hr_scope:
+        hr_scope.__enter__()
 
     try:
         # Initial selection + switch, under the state lock (brief; never held across a spawn).
@@ -303,7 +313,10 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         buf = bytearray()
         while True:
             base = resume_cmd(ctx, tool) if resuming else build_cmd(ctx, tool, args)
-            argv = headroom_mod.wrap(base, enabled=save_credit, is_available=True)
+            # headroom launches the tool itself via its per-tool subcommand
+            # (headroom wrap codex -- resume --last); base[1:] drops our tool binary.
+            argv = headroom_mod.wrap(tool, base[1:], enabled=save_credit,
+                                     is_available=save_credit, exe=hr_exe or "headroom") or base
             hit = {"v": False}
             buf.clear()
 
@@ -351,3 +364,6 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     st.save()
         except Exception:
             pass
+        # restore any Headroom config injection → user's setup byte-identical to before
+        if hr_scope:
+            hr_scope.__exit__(None, None, None)

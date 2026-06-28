@@ -33,7 +33,8 @@ def is_native(action: str | None) -> bool:
 
 
 def headroom_available() -> bool:
-    return shutil.which("headroom") is not None
+    from . import headroom
+    return headroom.available()  # checks PATH and this app's venv bin
 
 
 def snapshot_state(ctx: Context) -> dict[str, Any]:
@@ -102,17 +103,25 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
 
         if action == "headroom_install":
             from . import headroom
-            return {"ok": True, "command": headroom.INSTALL_COMMAND,
-                    "available": headroom.available()}
+            installed = headroom.ensure_installed()  # pip-install into this venv, in-process
+            return {"ok": installed, "installed": installed,
+                    "error": None if installed else "couldn't install headroom",
+                    "state": snapshot_state(ctx)}
 
         if action == "paste":
             # codex no-browser path: install a pasted auth.json, then register it as a seat.
             tool = message["tool"]
+            blob = message["blob"]
+            # VALIDATE BEFORE WRITING: never overwrite the canonical auth.json with an unparseable
+            # paste — that would break stock `codex` (violates "stock keeps working").
+            email = ctx.cred[tool].email_of(blob)
+            if not email:
+                return {"ok": False, "error": "that doesn't look like a valid auth.json"}
             with ctx.locked():
                 state = ctx.load_state()
                 sync_back(ctx, state, tool)         # preserve the outgoing seat's rotated token
-                ctx.cred[tool].set_live(message["blob"])
-                seat = acct.add(ctx, state, tool, name=message.get("name"))
+                ctx.cred[tool].set_live(blob)
+                seat = acct.add(ctx, state, tool, name=message.get("name"), email=email)
             return {"ok": True, "celebrate": True, "added": seat["email"],
                     "state": snapshot_state(ctx)}
 

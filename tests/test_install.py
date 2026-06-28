@@ -55,9 +55,10 @@ def test_install_is_idempotent_keeps_original_factory_image(ctx, tmp_path):
 def test_dry_run_performs_nothing(ctx, tmp_path):
     _seed_live(ctx)
     plan = install(ctx, bin_dir=tmp_path / "bin", dry_run=True, register=True)
-    assert plan.actions and all(a.startswith(("DRY", "keep", "no ", "NOTE", "skip")) or "factory" in a
-                                for a in plan.actions)
+    assert plan.actions
+    # dry-run must change NOTHING: no factory image, no seats, no wrappers
     assert ctx.keychain.get(ctx.keychain_service, _backup_account("codex")) is None
+    assert ctx.load_state().accounts("codex") == {}
     assert not (tmp_path / "bin" / "acctsw").exists()
 
 

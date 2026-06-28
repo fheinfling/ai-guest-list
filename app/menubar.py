@@ -117,14 +117,12 @@ if objc is not None:
                 self._pushResult({"ok": True, "await_snapshot": True, "tool": msg["tool"]})
                 return
 
+            if action == "headroom_install":
+                self._notify("installing headroom…", "this takes a moment — i'll enable it when ready")
             result = bridge.handle(self.ctx, msg)
             if action == "dot":
                 self._updateDot(result.get("state"))
                 return
-            if result.get("command"):  # headroom_install → run in Terminal
-                from .terminal import open_in_terminal
-                open_in_terminal(result["command"])
-                self._notify("installing headroom", "i'll enable save-credit once it's ready ✨")
             self._pushResult(result)
             self._updateDot(result.get("state"))
             if action in ("switch", "snapshot", "paste") and result.get("ok") \

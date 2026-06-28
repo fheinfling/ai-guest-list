@@ -116,7 +116,14 @@ def install(ctx: Context, *, dry_run: bool = False, register: bool = True,
             t.chmod(0o755)
         plan.do(f"install {target}", _write)
 
-    # 4. PATH note (never edit rc silently).
+    # 4. bundle Headroom (save-credit) into this venv so the toggle just works — no separate install.
+    from . import headroom as hr
+    if hr.available():
+        plan.actions.append("headroom already installed (save-credit ready)")
+    else:
+        plan.do("install headroom (save-credit) into the app venv", hr.ensure_installed)
+
+    # 5. PATH note (never edit rc silently).
     if str(bin_dir) not in os.environ.get("PATH", "").split(os.pathsep):
         plan.actions.append(f"NOTE: add to PATH →  export PATH=\"{bin_dir}:$PATH\"")
 
