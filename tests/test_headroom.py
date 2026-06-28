@@ -208,23 +208,16 @@ def test_disable_reports_failure_when_still_injected_no_backup(tmp_path, monkeyp
     assert ok is False and "still present" in msg
 
 
-def test_spawn_detached_remove(tmp_path, monkeypatch):
-    """Quit fires a detached `install remove` that outlives the app (no blocking)."""
-    calls = {}
+def test_disable_is_op_lock_serialized(tmp_path, monkeypatch):
+    """Quit teardown goes through global_disable, which must hold op_lock (serialized vs enable/heal)
+    — not a detached, unserialized remove."""
+    _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
     monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
-
-    class _Popen:
-        def __init__(self, argv, **kw):
-            calls["argv"] = argv; calls["kw"] = kw
-    monkeypatch.setattr(headroom.subprocess, "Popen", _Popen)
-    assert headroom.spawn_detached_remove() is True
-    assert calls["argv"][1:3] == ["install", "remove"]
-    assert calls["kw"].get("start_new_session") is True       # detached → survives app exit
-
-
-def test_spawn_detached_remove_no_binary(monkeypatch):
-    monkeypatch.setattr(headroom, "headroom_path", lambda: None)
-    assert headroom.spawn_detached_remove() is False          # nothing to do without the binary
+    store = tmp_path / "store"
+    with headroom.op_lock(store):                              # hold the lock...
+        # ...a non-blocking disable must NOT proceed (proves it tries to acquire the same lock)
+        ok, msg = headroom.global_disable(store, run=_fakerun(running=False), blocking=False)
+    assert ok is False and msg == "headroom busy (another operation in progress)"
 
 
 def test_is_injected_handles_non_utf8(tmp_path, monkeypatch):

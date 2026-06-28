@@ -29,6 +29,8 @@ from acctsw.context import Context
 WEB_DIR = Path(__file__).resolve().parent / "web"
 USAGE_POLL_SECONDS = 180.0
 DOT_GLYPH = {"green": "🟢", "amber": "🟡", "switched": "🟡", "hello": "🔴"}
+NS_TERMINATE_NOW = 1      # NSApplicationTerminateReply.terminateNow
+NS_TERMINATE_LATER = 2    # NSApplicationTerminateReply.terminateLater (we reply when teardown done)
 
 
 if objc is not None:
@@ -60,8 +62,29 @@ if objc is not None:
             self.performSelectorInBackground_withObject_(
                 objc.selector(self.recoverBg_, signature=b"v@:@"), None)
 
-        def applicationWillTerminate_(self, _notif):
-            self._headroomTeardownDetached()  # safety net for OS-level quit (Cmd-Q / logout)
+        def applicationShouldTerminate_(self, _sender):
+            """Single quit gate for BOTH the in-app quit button (terminate_) AND OS-level quit
+            (Cmd-Q / Apple menu / logout). If there's routing to tear down, do it on a BACKGROUND
+            thread (serialized via op_lock, exact restore) and tell AppKit to wait (terminateLater),
+            replying once done — so quit never blocks the main thread (no beachball) and never races a
+            relaunch the way a detached remove did."""
+            try:
+                from acctsw import headroom
+                if not self._teardownDone and headroom.needs_reconcile(self.ctx):
+                    self.performSelectorInBackground_withObject_(
+                        objc.selector(self.quitBg_, signature=b"v@:@"), None)
+                    return NS_TERMINATE_LATER
+            except Exception:
+                pass
+            return NS_TERMINATE_NOW
+
+        def quitBg_(self, _arg):
+            self._headroomTeardown()   # blocking + serialized, but off the main thread
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                objc.selector(self.replyTerminate_, signature=b"v@:@"), None, False)
+
+        def replyTerminate_(self, _arg):
+            NSApplication.sharedApplication().replyToApplicationShouldTerminate_(True)
 
         def recoverBg_(self, _arg):
             """On launch (background): the save-credit toggle persists across restarts. If it's on but
@@ -147,6 +170,9 @@ if objc is not None:
               `global_running` under the op_lock, so a recovery in between is still honored."""
             if not getattr(self, "_hrRecovered", False):
                 return                     # launch recovery (recoverBg_) owns the first reconcile
+            if getattr(self, "_healthInFlight", False):
+                return                     # single-flight: rapid popover-opens can't stack probes/threads
+            self._healthInFlight = True
             try:
                 import time
                 from acctsw import headroom
@@ -161,6 +187,10 @@ if objc is not None:
                             with self.ctx.locked():
                                 s = self.ctx.load_state(); s.set_setting("headroom", False); s.save()
                             self._notify("Headroom turned off", "its helper binary changed unexpectedly")
+                        else:             # couldn't tear down → warn; routing may still use a bad rtk
+                            self._notify("Headroom may be unsafe",
+                                         "its helper binary changed and I couldn't turn routing off — "
+                                         "quit the app or run save-credit off")
                     return
                 # proxy reads down — grace re-check to ride out a transient blip (proxy restart,
                 # wake-from-sleep) before the destructive teardown, then heal fast. (8s is a balance
@@ -173,6 +203,8 @@ if objc is not None:
                     self._notify("Headroom turned off", "the proxy stopped — restored your setup")
             except Exception:
                 pass
+            finally:
+                self._healthInFlight = False
 
         def applyResult_(self, result):
             self._pushResult(result)
@@ -184,20 +216,18 @@ if objc is not None:
                 objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
 
         @objc.python_method
-        def _headroomTeardownDetached(self):
-            """On quit (in-app OR OS-level): fire a DETACHED `headroom install remove` that outlives
-            the app, so routing is removed without blocking quit on a multi-second subprocess (no
-            beachball, no thread juggling). Keyed off ACTUAL state (needs_reconcile) so it's a no-op
-            when nothing's routed. The `headroom` SETTING is intentionally KEPT so it re-applies next
-            launch; the next launch's reconcile() backstops an exact restore if remove is imperfect.
-            Guarded so the in-app quit and applicationWillTerminate_ don't both fire it."""
+        def _headroomTeardown(self):
+            """On quit (driven by applicationShouldTerminate_ on a background thread): remove global
+            routing + restore config via global_disable, which is SERIALIZED through op_lock (waits
+            out any in-flight enable/heal) and does an exact restore. The `headroom` SETTING is kept
+            so it re-applies next launch. Guarded against a double run."""
             if getattr(self, "_teardownDone", False):
                 return
             self._teardownDone = True
             try:
                 from acctsw import headroom
                 if headroom.needs_reconcile(self.ctx):
-                    headroom.spawn_detached_remove()
+                    headroom.global_disable(self.ctx.data_dir)   # blocking + op_lock-serialized
             except Exception:
                 pass
 
@@ -209,9 +239,9 @@ if objc is not None:
                 return
             action = msg.get("action")
             if action == "quit":
-                # Fire a detached `headroom install remove` (returns instantly) then terminate — no
-                # main-thread subprocess, so quit is snappy; next launch reconciles any residue.
-                self._headroomTeardownDetached()
+                # terminate_ routes through applicationShouldTerminate_, which tears routing down on
+                # a background thread (serialized) before actually quitting — one path for in-app and
+                # OS-level quit alike.
                 NSApplication.sharedApplication().terminate_(self)
                 return
             if action == "settings":
