@@ -8,4 +8,8 @@ echo "→ import check"
 $PY -c "import acctsw; print('acctsw', acctsw.__version__)"
 echo "→ pytest"
 $PY -m pytest -q
+if command -v node >/dev/null 2>&1; then
+  echo "→ node ui tests"
+  ( cd app/web && node --test )
+fi
 echo "✓ smoke ok"

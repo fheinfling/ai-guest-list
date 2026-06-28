@@ -80,11 +80,56 @@ def test_uninstall_restores_original_creds(ctx, tmp_path):
 
 def test_uninstall_skips_restore_on_sha_mismatch(ctx, tmp_path):
     _seed_live(ctx, codex_email="orig@x.com")
-    install(ctx, bin_dir=tmp_path / "bin", register=False)
+    install(ctx, bin_dir=tmp_path / "bin", register=False)  # no seat snapshot → factory is the only source
+    # live is now a different account (so restore must fall back to the factory image, path (c))
+    ctx.cred["codex"].set_live(make_codex_blob("someone-else@x.com"))
     # tamper the stored factory image so sha256 won't match the manifest
     ctx.keychain.set(ctx.keychain_service, _backup_account("codex"), make_codex_blob("tampered@x.com"))
     plan = uninstall(ctx, bin_dir=tmp_path / "bin")
     assert any("failed sha256" in a for a in plan.actions)
+
+
+def test_uninstall_leaves_original_if_already_live(ctx, tmp_path):
+    """M5-B1: if the original account is still live, never downgrade it to the frozen factory token."""
+    _seed_live(ctx, codex_email="orig@x.com")
+    install(ctx, bin_dir=tmp_path / "bin", register=True)
+    # original is still live; rotate its live token (simulating normal use)
+    rotated = make_codex_blob("orig@x.com").replace('"access_token": "a"', '"access_token": "FRESH"')
+    ctx.cred["codex"].set_live(rotated)
+    plan = uninstall(ctx, bin_dir=tmp_path / "bin")
+    assert any("already on original" in a for a in plan.actions)
+    # the freshest (rotated) original creds are preserved, not overwritten by the stale factory
+    import json
+    assert json.loads(ctx.cred["codex"].get_live())["tokens"]["access_token"] == "FRESH"
+
+
+def test_uninstall_prefers_fresh_snapshot_over_factory(ctx, tmp_path):
+    """When live is a different account, restore the original via its (fresher) seat snapshot."""
+    _seed_live(ctx, codex_email="orig@x.com")
+    install(ctx, bin_dir=tmp_path / "bin", register=True)
+    # original's seat snapshot gets refreshed (rotated) during use
+    rotated = make_codex_blob("orig@x.com").replace('"refresh_token": "r"', '"refresh_token": "ROT"')
+    ctx.keychain.set(ctx.keychain_service, "codex:orig@x.com", rotated)
+    # live is now a different account
+    ctx.cred["codex"].set_live(make_codex_blob("other@x.com"))
+    uninstall(ctx, bin_dir=tmp_path / "bin")
+    import json
+    restored = json.loads(ctx.cred["codex"].get_live())
+    assert restored["tokens"]["refresh_token"] == "ROT"  # fresh snapshot, not frozen factory
+
+
+def test_install_keychain_guard_protects_original_when_manifest_lost(ctx, tmp_path):
+    """If the manifest is lost but the keychain factory image survives, re-install must NOT
+    overwrite the original factory image with current (non-original) creds."""
+    _seed_live(ctx, codex_email="orig@x.com")
+    install(ctx, bin_dir=tmp_path / "bin", register=False)
+    original_factory = ctx.keychain.get(ctx.keychain_service, _backup_account("codex"))
+    # simulate manifest loss
+    (ctx.backup_dir / "manifest.json").unlink()
+    # user has since logged into a different account
+    ctx.cred["codex"].set_live(make_codex_blob("different@x.com"))
+    install(ctx, bin_dir=tmp_path / "bin", register=False)
+    assert ctx.keychain.get(ctx.keychain_service, _backup_account("codex")) == original_factory
 
 
 def test_purge_removes_store_and_keychain(ctx, tmp_path):

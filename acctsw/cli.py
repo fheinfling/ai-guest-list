@@ -165,7 +165,10 @@ def _cmd_install(ctx: Context, ns) -> int:
                         register=not getattr(ns, "no_register", False))
     for a in plan.actions:
         print(f"  {a}")
-    print("✓ installed — add seats with `acctsw add codex` / `acctsw add claude`")
+    if getattr(ns, "dry_run", False):
+        print("· dry run — nothing changed")
+    else:
+        print("✓ installed — add seats with `acctsw add codex` / `acctsw add claude`")
     return EXIT_OK
 
 
@@ -175,7 +178,10 @@ def _cmd_uninstall(ctx: Context, ns) -> int:
                           dry_run=getattr(ns, "dry_run", False))
     for a in plan.actions:
         print(f"  {a}")
-    print("✓ uninstalled — originals restored")
+    if getattr(ns, "dry_run", False):
+        print("· dry run — nothing changed")
+    else:
+        print("✓ uninstalled — originals restored")
     return EXIT_OK
 
 

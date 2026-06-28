@@ -1,0 +1,90 @@
+/* "ai guest list" — design tokens from the sample (Hanken Grotesk + Space Mono, warm club theme) */
+@font-face { font-family: "Hanken Grotesk"; src: local("Hanken Grotesk"); }
+@font-face { font-family: "Space Mono"; src: local("Space Mono"); }
+
+:root {
+  --codex: #e0795a;   /* coral */
+  --claude: #5b8def;  /* blue  */
+  --fresh: #46c2a8;   /* teal  */
+  --resting: #f3c969; /* yellow */
+  --love: #e2778f;    /* rose  */
+}
+.theme-light {
+  --bg: #eef1f6; --card: #ffffff; --ink: #1b212c; --muted: #626c7c;
+  --line: #e2e7ef; --track: #e9edf3;
+}
+.theme-dark {
+  --bg: #0c0f15; --card: #161a21; --card2: #212835; --ink: #e9edf3; --muted: #98a2b2;
+  --line: #232b38; --track: #161b24;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { background: transparent; }
+.app {
+  font-family: "Hanken Grotesk", -apple-system, system-ui, sans-serif;
+  background: var(--bg); color: var(--ink);
+  width: 320px; padding: 14px; border-radius: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+.mono { font-family: "Space Mono", ui-monospace, monospace; }
+
+.top { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 12px; }
+.brand { font-weight: 700; font-size: 15px; letter-spacing: -0.2px; }
+.dot { font-size: 11px; }
+.dot-copy { color: var(--muted); font-size: 12px; }
+
+.toggles { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
+.toggle { display: flex; align-items: center; gap: 9px; cursor: pointer; font-size: 13px; }
+.toggle input { display: none; }
+.toggle-ui { width: 34px; height: 20px; border-radius: 999px; background: var(--track);
+  position: relative; transition: background .18s; flex: none; }
+.toggle-ui::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
+  border-radius: 50%; background: #fff; transition: transform .18s; box-shadow: 0 1px 2px rgba(0,0,0,.25); }
+.toggle input:checked + .toggle-ui { background: var(--fresh); }
+.toggle input:checked + .toggle-ui::after { transform: translateX(14px); }
+.toggle-label { display: flex; flex-direction: column; line-height: 1.25; }
+.toggle-label small { color: var(--muted); font-size: 11px; }
+
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+  padding: 12px; margin-bottom: 10px; border-left: 3px solid var(--tool); }
+.card-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.card-head h2 { font-size: 14px; }
+.sub { color: var(--muted); font-size: 11px; }
+.credit { font-size: 11px; color: var(--tool); }
+
+.bars { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+.bar { display: grid; grid-template-columns: 42px 1fr 38px; align-items: center; gap: 8px; font-size: 11px; }
+.bar-label { color: var(--muted); }
+.track { height: 7px; border-radius: 4px; background: var(--track); overflow: hidden; }
+.fill { display: block; height: 100%; background: var(--tool); border-radius: 4px; transition: width .3s; }
+.bar-val { text-align: right; color: var(--muted); }
+
+.seats { display: flex; flex-direction: column; gap: 6px; }
+.seat { display: flex; align-items: stretch; gap: 6px; }
+.seat-main { flex: 1; display: flex; justify-content: space-between; align-items: center;
+  background: var(--track); border: none; border-radius: 8px; padding: 7px 10px;
+  color: var(--ink); font: inherit; cursor: pointer; text-align: left; }
+.seat-main:disabled { cursor: default; outline: 1.5px solid var(--fresh); }
+.seat.resting .seat-main { opacity: .7; }
+.seat-name { font-size: 12px; }
+.seat-tag { font-size: 11px; color: var(--muted); }
+.seat.on-floor .seat-tag { color: var(--fresh); }
+.seat-x { width: 26px; border: none; border-radius: 8px; background: var(--track);
+  color: var(--muted); cursor: pointer; font-size: 14px; }
+.seat-x:hover { color: var(--love); }
+
+.add-row { width: 100%; margin-top: 8px; padding: 7px; border: 1px dashed var(--line);
+  background: transparent; color: var(--muted); border-radius: 8px; cursor: pointer; font: inherit; font-size: 12px; }
+.add-row:hover { color: var(--ink); border-color: var(--tool); }
+.empty { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+.link { background: none; border: none; color: var(--tool); cursor: pointer; font: inherit; padding: 0; }
+
+.foot { display: flex; justify-content: space-between; align-items: center;
+  margin-top: 6px; color: var(--muted); font-size: 11px; }
+.heart { color: var(--love); }
+.foot .link { color: var(--muted); }
+.foot .link:hover { color: var(--ink); }
+
+/* little celebration */
+.celebrate { animation: pop .5s ease; }
+@keyframes pop { 0% { transform: scale(.96); } 50% { transform: scale(1.03); } 100% { transform: scale(1); } }
