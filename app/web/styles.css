@@ -15,7 +15,7 @@
 }
 .theme-light {
   --bg: #eef1f6; --card: #ffffff; --card2: #f6f8fc; --ink: #1b212c; --muted: #8a93a3;
-  --line: #e4e9f1; --track: #e9edf3; --tint: 0.10;
+  --line: #e4e9f1; --track: #e9edf3; --tint: 0.06;
 }
 .theme-dark {
   --bg: #0c0f15; --card: #161a21; --card2: #1c2230; --ink: #e9edf3; --muted: #8a93a3;
@@ -95,14 +95,14 @@ html, body { background: transparent; }
   cursor: pointer; font-size: 15px; border-radius: 6px; }
 .seat-x:hover { color: var(--love); }
 
-.usages { display: flex; gap: 12px; margin: 8px 0 6px; }
-.usage { display: flex; align-items: center; gap: 6px; flex: 1; font-size: 10.5px; }
-.usage-k { color: var(--muted); }
+.usages { display: flex; align-items: center; gap: 8px; margin: 8px 0 6px; font-size: 10.5px; }
+.usage-k { color: var(--muted); flex: none; }
 .track { flex: 1; height: 6px; border-radius: 4px; background: var(--track); overflow: hidden; }
 .fill { display: block; height: 100%; background: var(--tool); border-radius: 4px; }
 .seat-card.on-floor .fill { background: var(--fresh); }
 .seat-card.resting .fill { background: var(--rest); }
-.usage-v { color: var(--muted); min-width: 30px; text-align: right; }
+.usage-v { color: var(--ink); min-width: 34px; text-align: right; font-weight: 700; }
+.usage-2 { color: var(--muted); flex: none; }
 
 .seat-row.bottom { margin-top: 2px; }
 .seat-email { color: var(--muted); font-size: 11px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

@@ -65,11 +65,15 @@ function counts(state) {
   return { resting, ready };
 }
 
-function miniBar(label, value) {
-  const known = value !== null;
-  return `<div class="usage"><span class="usage-k">${label}</span>
-    <span class="track"><span class="fill" style="width:${known ? value : 0}%"></span></span>
-    <span class="usage-v">${known ? `${Math.round(value)}%` : "—"}</span></div>`;
+function usageRow(seat) {
+  const five = pct(seat, "5h");
+  const week = pct(seat, "weekly");
+  const known = five !== null;
+  const wk = week !== null ? `<span class="usage-2">7d ${Math.round(week)}%</span>` : "";
+  return `<div class="usages">
+    <span class="usage-k">5h</span>
+    <span class="track"><span class="fill" style="width:${known ? five : 0}%"></span></span>
+    <span class="usage-v">${known ? `${Math.round(five)}%` : "—"}</span>${wk}</div>`;
 }
 
 function seatCard(tool, seat) {
@@ -89,7 +93,7 @@ function seatCard(tool, seat) {
       <span class="seat-name">${esc(seat.name || seat.email)}</span>${plan}${status}
       <button class="seat-x" title="wave goodbye" data-action="remove" data-tool="${tool}" data-email="${esc(seat.email)}">×</button>
     </div>
-    <div class="usages">${miniBar("5h", pct(seat, "5h"))}${miniBar("7d", pct(seat, "weekly"))}</div>
+    ${usageRow(seat)}
     <div class="seat-row bottom"><span class="seat-email">${esc(seat.email)}</span>${note}</div>
   </div>`;
 }
