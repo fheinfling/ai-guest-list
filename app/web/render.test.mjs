@@ -82,15 +82,17 @@ test("buildHTML reflects seats, active marker and credit", () => {
   } });
   const html = buildHTML(s);
   assert.match(html, /on the floor/);
-  assert.match(html, /75% credit left/);          // 100 - max(25,10)
+  assert.match(html, /CHATGPT BUSINESS/);          // section plan label
+  assert.match(html, /25%/);                        // 5h usage shown
   assert.match(html, /data-action="switch"[^>]*data-email="b@x.com"/);
   assert.match(html, /add a seat/);
   assert.match(html, /made with/);
 });
 
-test("buildHTML headroom toggle disabled hint when unavailable", () => {
+test("buildHTML headroom hint + install button when unavailable", () => {
   const html = buildHTML(state({ headroom_available: false }));
-  assert.match(html, /install headroom to enable/);
+  assert.match(html, /install to enable/);
+  assert.match(html, /data-action="headroom_install"/);
 });
 
 test("buildHTML escapes seat names", () => {
@@ -98,9 +100,9 @@ test("buildHTML escapes seat names", () => {
   assert.match(buildHTML(s), /&lt;script&gt;x/);
 });
 
-test("buildHTML uses a safe theme class for unknown themes", () => {
+test("buildHTML uses a safe theme class for unknown themes (defaults to light)", () => {
   const html = buildHTML(state({ settings: { theme: "evil\" onload=x" } }));
-  assert.match(html, /class="app theme-dark"/);  // unknown theme → default, no injection
+  assert.match(html, /class="app theme-light"/);  // unknown theme → light default, no injection
 });
 
 test("dotState reads the bridge-provided state.dot (source of truth)", () => {

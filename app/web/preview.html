@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>ai guest list — preview</title>
+  <link rel="stylesheet" href="styles.css">
+  <style>body{background:#cdd5e2;padding:30px;display:flex;justify-content:center}</style>
+</head>
+<body>
+  <div id="root"></div>
+  <script src="bundle.js"></script>
+  <script>
+    // design-like mock so we can screenshot-compare against design-original.png
+    const iso = (mins) => new Date(Date.now() + mins * 60000).toISOString();
+    window.AGL.result({ state: {
+      settings: { theme: "light", auto_switch: true, headroom: true },
+      headroom_available: true,
+      recently_switched: true,
+      dot: "fresh",
+      tools: {
+        codex: { active: "personal@studio.dev", plan_label: "CHATGPT BUSINESS", seats: [
+          { email: "work@studio.dev", name: "Work", plan: "BUSINESS", active: false, limited: true,
+            limited_until: iso(101), usage: { windows: { "5h": { used_pct: 100 }, weekly: { used_pct: 80 } } } },
+          { email: "personal@studio.dev", name: "Personal", plan: "BUSINESS", active: true, limited: false,
+            usage: { windows: { "5h": { used_pct: 38 }, weekly: { used_pct: 22 } } } },
+        ]},
+        claude: { active: "studio@studio.dev", plan_label: "CLAUDE CODE", seats: [
+          { email: "studio@studio.dev", name: "Studio", plan: "MAX", active: true, limited: false,
+            usage: { windows: { "5h": { used_pct: 20 }, weekly: { used_pct: 12 } } } },
+          { email: "personal@me.dev", name: "Personal", plan: "PRO", active: false, limited: false,
+            usage: { windows: { "5h": { used_pct: 5 }, weekly: { used_pct: 3 } } } },
+        ]},
+      },
+    }});
+  </script>
+</body>
+</html>

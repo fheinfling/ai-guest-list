@@ -5,8 +5,8 @@
 // unit-tested under node. app.mjs wires these outputs into the live WKWebView DOM + bridge.
 
 const TOOL_META = {
-  codex: { label: "Codex", sub: "chatgpt business", accent: "var(--codex)" },
-  claude: { label: "Claude", sub: "claude code", accent: "var(--claude)" },
+  codex: { label: "Codex", sub: "chatgpt business", plan: "CHATGPT BUSINESS", accent: "var(--codex)" },
+  claude: { label: "Claude", sub: "claude code", plan: "CLAUDE CODE", accent: "var(--claude)" },
 };
 
 const DOT_COPY = {
@@ -15,9 +15,8 @@ const DOT_COPY = {
   resting: { emoji: "🟡", label: "a seat's resting" },
   fresh: { emoji: "🟢", label: "everyone's fresh" },
 };
+const THEMES = new Set(["dark", "light"]);
 
-// The menu-bar dot. The Python bridge is the source of truth (state.dot); this JS computation is
-// only a browser-preview fallback when state.dot is absent. (Parity is guarded by a golden fixture.)
 function dotState(state) {
   const key = state?.dot || dotKey(state);
   return { key, ...DOT_COPY[key] };
@@ -32,19 +31,16 @@ function dotKey(state) {
   return "fresh";
 }
 
-// A seat "needs a hello" when its creds can't authenticate (usage came back unauthorized).
 function needsHello(seat) {
-  return !!(seat.usage && seat.usage.error === "unauthorized");
+  return (seat.usage || {}).error === "unauthorized";
 }
 
 function pct(seat, win) {
-  const w = seat?.usage?.windows?.[win];
-  const v = w?.used_pct;
+  const v = seat?.usage?.windows?.[win]?.used_pct;
   return typeof v === "number" ? Math.max(0, Math.min(100, v)) : null;
 }
 
 function creditLeft(seat) {
-  // "credit left" = 100 - max(used across windows); null if unknown.
   const used = ["5h", "weekly"].map((w) => pct(seat, w)).filter((v) => v !== null);
   return used.length ? Math.round(100 - Math.max(...used)) : null;
 }
@@ -63,112 +59,123 @@ function esc(s) {
   return String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 }
 
-function bar(label, value) {
-  const known = value !== null;
-  const w = known ? value : 0;
-  return `<div class="bar"><span class="bar-label">${label}</span>
-    <span class="track"><span class="fill" style="width:${w}%"></span></span>
-    <span class="bar-val mono">${known ? `${Math.round(value)}%` : "—"}</span></div>`;
+// --- pieces -----------------------------------------------------------------------------------
+
+function counts(state) {
+  const seats = ["codex", "claude"].flatMap((t) => state?.tools?.[t]?.seats || []);
+  const resting = seats.filter((s) => s.limited).length;
+  const ready = seats.filter((s) => !s.limited).length;
+  return { resting, ready };
 }
 
-function seatLine(tool, seat) {
-  const cls = seat.active ? "on-floor" : seat.limited ? "resting" : "ready";
-  const tag = seat.active ? "on the floor" : seat.limited ? `💤 ${fmtCountdown(seat.limited_until)}` : "ready";
-  const action = seat.active ? "" : `data-action="switch" data-tool="${tool}" data-email="${esc(seat.email)}"`;
-  return `<div class="seat ${cls}">
-    <button class="seat-main" ${action} ${seat.active ? "disabled" : ""}>
-      <span class="seat-name">${esc(seat.name)}</span>
-      <span class="seat-tag">${tag}</span>
-    </button>
-    <button class="seat-x" title="wave goodbye" data-action="remove" data-tool="${tool}" data-email="${esc(seat.email)}">×</button>
+function miniBar(label, value) {
+  const known = value !== null;
+  return `<div class="usage"><span class="usage-k">${label}</span>
+    <span class="track"><span class="fill" style="width:${known ? value : 0}%"></span></span>
+    <span class="usage-v">${known ? `${Math.round(value)}%` : "—"}</span></div>`;
+}
+
+function seatCard(tool, seat) {
+  const state = seat.active ? "on-floor" : seat.limited ? "resting" : "ready";
+  const plan = seat.plan ? `<span class="seat-plan">${esc(seat.plan)}</span>` : "";
+  let status;
+  if (seat.active) status = `<span class="status floor">on the floor</span>`;
+  else if (seat.limited) status = `<span class="status rest">back ${fmtCountdown(seat.limited_until)}</span>`;
+  else status = `<button class="status switch" data-action="switch" data-tool="${tool}" data-email="${esc(seat.email)}">switch</button>`;
+
+  const note = seat.limited
+    ? `<span class="seat-note rest">taking a breather 💛</span>`
+    : seat.active ? `<span class="seat-note floor">keeping it warm 💚</span>` : "";
+
+  return `<div class="seat-card ${state}">
+    <div class="seat-row">
+      <span class="seat-name">${esc(seat.name || seat.email)}</span>${plan}
+      <span class="seat-spacer"></span>${status}
+      <button class="seat-x" title="wave goodbye" data-action="remove" data-tool="${tool}" data-email="${esc(seat.email)}">×</button>
+    </div>
+    <div class="usages">${miniBar("5h", pct(seat, "5h"))}${miniBar("7d", pct(seat, "weekly"))}</div>
+    <div class="seat-row bottom"><span class="seat-email">${esc(seat.email)}</span>${note}</div>
   </div>`;
 }
 
-function toolCard(tool, t) {
+function toolSection(tool, t) {
   const meta = TOOL_META[tool];
   const seats = t?.seats || [];
-  const active = seats.find((s) => s.active);
-  const credit = active ? creditLeft(active) : null;
-  const usage = active
-    ? `<div class="bars">${bar("5h", pct(active, "5h"))}${bar("weekly", pct(active, "weekly"))}</div>`
-    : `<div class="empty">no one on the floor — <button class="link" data-action="add" data-tool="${tool}">add a seat</button></div>`;
-  const creditLine = credit !== null
-    ? `<span class="credit mono">${credit}% credit left</span>` : "";
-  return `<section class="card" data-tool="${tool}" style="--tool:${meta.accent}">
-    <header class="card-head">
-      <div><h2>${meta.label}</h2><p class="sub">${meta.sub}</p></div>
-      ${creditLine}
-    </header>
-    ${usage}
-    <div class="seats">${seats.map((s) => seatLine(tool, s)).join("")}</div>
+  const n = seats.length;
+  return `<section class="tool" data-tool="${tool}" style="--tool:${meta.accent}">
+    <div class="sec-head">
+      <span class="sec-dot"></span><span class="sec-name">${meta.label}</span>
+      <span class="sec-count">· ${n} seat${n === 1 ? "" : "s"}</span>
+      <span class="sec-spacer"></span><span class="sec-plan">${esc(t?.plan_label || meta.plan)}</span>
+    </div>
+    ${seats.map((s) => seatCard(tool, s)).join("") || `<div class="empty">no seats yet</div>`}
     <button class="add-row" data-action="add" data-tool="${tool}">＋ add a seat</button>
   </section>`;
 }
 
-function toggle(id, label, on, hint = "") {
-  return `<label class="toggle"><input type="checkbox" data-action="toggle" data-key="${id}" ${on ? "checked" : ""}>
-    <span class="toggle-ui"></span><span class="toggle-label">${label}${hint ? `<small>${hint}</small>` : ""}</span></label>`;
+function pill(key, icon, title, sub, on, extra = "") {
+  return `<label class="pill"><span class="pill-ic">${icon}</span>
+    <span class="pill-tx"><span class="pill-t">${title}</span><span class="pill-s">${sub}</span></span>
+    <input type="checkbox" data-action="toggle" data-key="${key}" ${on ? "checked" : ""}>
+    <span class="sw"></span>${extra}</label>`;
 }
 
-// Full popover body for a given state.
-const THEMES = new Set(["dark", "light"]);
+// --- overlays (add-a-seat) --------------------------------------------------------------------
 
-// Build the "add a seat" method picker from a login plan (pure → unit-tested).
 function buildPicker(plan) {
   const methods = (plan?.methods || []).map((m) =>
     m.command
-      ? `<button class="picker-method" data-action="login" data-tool="${esc(plan.tool)}" data-command="${esc(m.command)}">${esc(m.label)}</button>`
-      : `<button class="picker-method" data-action="paste-open" data-tool="${esc(plan.tool)}">${esc(m.label)}</button>`
+      ? `<button class="pk-m" data-action="login" data-tool="${esc(plan.tool)}" data-command="${esc(m.command)}">${esc(m.label)}</button>`
+      : `<button class="pk-m" data-action="paste-open" data-tool="${esc(plan.tool)}">${esc(m.label)}</button>`
   ).join("");
-  return `<div class="picker-backdrop" data-action="picker-close"><div class="picker">
-    <h3>${esc(plan?.title || "who's joining the list?")}</h3>
-    <p class="sub">how should i sign you in?</p>
-    ${methods}
-    <button class="link" data-action="picker-close">cancel</button>
-  </div></div>`;
+  return `<div class="backdrop" data-action="picker-close"><div class="sheet">
+    <h3>${esc(plan?.title || "who's joining the list?")}</h3><p class="sub">how should i sign you in?</p>
+    ${methods}<button class="link" data-action="picker-close">cancel</button></div></div>`;
 }
 
 function buildSaveSeat(tool) {
-  return `<div class="picker-backdrop"><div class="picker">
-    <h3>signed in?</h3><p class="sub">i'll keep your ${esc(tool)} seat warm</p>
-    <button class="picker-method" data-action="snapshot" data-tool="${esc(tool)}">save my seat 🎟️</button>
-    <button class="link" data-action="picker-close">not yet</button>
-  </div></div>`;
+  return `<div class="backdrop"><div class="sheet"><h3>signed in?</h3>
+    <p class="sub">i'll keep your ${esc(tool)} seat warm</p>
+    <button class="pk-m" data-action="snapshot" data-tool="${esc(tool)}">save my seat 🎟️</button>
+    <button class="link" data-action="picker-close">not yet</button></div></div>`;
 }
 
 function buildPaste(tool) {
-  return `<div class="picker-backdrop"><div class="picker">
-    <h3>paste auth.json</h3><p class="sub">no browser dance</p>
+  return `<div class="backdrop"><div class="sheet"><h3>paste auth.json</h3><p class="sub">no browser dance</p>
     <textarea id="paste-blob" class="paste" placeholder="{ ... }"></textarea>
-    <button class="picker-method" data-action="paste-save" data-tool="${esc(tool)}">save my seat 🎟️</button>
-    <button class="link" data-action="picker-close">cancel</button>
-  </div></div>`;
+    <button class="pk-m" data-action="paste-save" data-tool="${esc(tool)}">save my seat 🎟️</button>
+    <button class="link" data-action="picker-close">cancel</button></div></div>`;
 }
+
+// --- popover ----------------------------------------------------------------------------------
 
 function buildHTML(state) {
   const s = state?.settings || {};
   const dot = dotState(state);
   const hr = state?.headroom_available;
-  const theme = THEMES.has(s.theme) ? s.theme : "dark";
+  const theme = THEMES.has(s.theme) ? s.theme : "light";
+  const c = counts(state);
+  const moved = state?.moved_note
+    ? `<div class="moved">↪ ${esc(state.moved_note)}</div>` : "";
   return `<div class="app theme-${theme}">
     <header class="top">
-      <span class="brand">ai guest list <span class="dot ${dot.key}">${dot.emoji}</span></span>
-      <span class="dot-copy">${dot.label}</span>
-    </header>
-    <div class="toggles">
-      ${toggle("auto_switch", "auto-switch", s.auto_switch, "switch by hand, or let auto do it for you")}
-      ${toggle("headroom", "slow sips — make the credit last", s.headroom && hr, hr ? "compresses context to save tokens" : "install headroom to enable")}
-      ${hr ? "" : `<button class="link hr-install" data-action="headroom_install">install headroom →</button>`}
-    </div>
-    ${toolCard("codex", state?.tools?.codex)}
-    ${toolCard("claude", state?.tools?.claude)}
-    <footer class="foot">
-      <span>made with <span class="heart">♥</span></span>
-      <span class="foot-actions">
-        <button class="link" data-action="settings">settings</button> ·
-        <button class="link" data-action="quit">quit</button>
+      <span class="avatar"></span>
+      <span class="brand-tx"><span class="brand">ai guest list</span>
+        <span class="substatus">${c.resting} resting · ${c.ready} ready ${dot.emoji}</span></span>
+      <span class="top-actions">
+        <button class="ibtn" data-action="settings" title="settings">⋯</button>
+        <button class="ibtn" data-action="add" data-tool="codex" title="add a seat">＋</button>
       </span>
-    </footer>
+    </header>
+    ${pill("auto_switch", "↻", "auto-switch", "next ready seat · soonest-reset wins", s.auto_switch)}
+    ${pill("headroom", "🍃", "slow sips", hr ? "compress context · save credit" : "install to enable",
+           s.headroom && hr,
+           hr ? "" : `<button class="hr-install" data-action="headroom_install" title="install headroom">get</button>`)}
+    ${moved}
+    ${toolSection("codex", state?.tools?.codex)}
+    ${toolSection("claude", state?.tools?.claude)}
+    <footer class="foot"><span>made with <span class="heart">💚</span> keeps your seat warm</span>
+      <button class="link" data-action="quit">quit</button></footer>
   </div>`;
 }
 
