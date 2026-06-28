@@ -86,8 +86,7 @@ function seatCard(tool, seat) {
 
   return `<div class="seat-card ${state}">
     <div class="seat-row">
-      <span class="seat-name">${esc(seat.name || seat.email)}</span>${plan}
-      <span class="seat-spacer"></span>${status}
+      <span class="seat-name">${esc(seat.name || seat.email)}</span>${plan}${status}
       <button class="seat-x" title="wave goodbye" data-action="remove" data-tool="${tool}" data-email="${esc(seat.email)}">×</button>
     </div>
     <div class="usages">${miniBar("5h", pct(seat, "5h"))}${miniBar("7d", pct(seat, "weekly"))}</div>
@@ -142,6 +141,28 @@ export function buildPaste(tool) {
     <textarea id="paste-blob" class="paste" placeholder="{ ... }"></textarea>
     <button class="pk-m" data-action="paste-save" data-tool="${esc(tool)}">save my seat 🎟️</button>
     <button class="link" data-action="picker-close">cancel</button></div></div>`;
+}
+
+function setRow(key, label, on) {
+  return `<label class="set-row"><span>${label}</span>
+    <input type="checkbox" data-action="toggle" data-key="${key}" ${on ? "checked" : ""}><span class="sw"></span></label>`;
+}
+
+export function buildSettings(state) {
+  const s = state?.settings || {};
+  const theme = s.theme === "dark" ? "dark" : "light";
+  const seg = (val, txt) => `<button class="seg ${theme === val ? "on" : ""}" data-action="set_theme" data-value="${val}">${txt}</button>`;
+  return `<div class="backdrop" data-action="picker-close"><div class="sheet settings">
+    <h3>settings</h3>
+    ${setRow("same_tool_only", "keep me on the same tool", s.same_tool_only)}
+    ${setRow("notify", "tell me when it switches", s.notify)}
+    ${setRow("restart_app", "restart the app after a swap", s.restart_app)}
+    ${setRow("celebrations", "little celebrations", s.celebrations)}
+    <div class="set-row"><span>theme</span><span class="segs">${seg("light", "light")}${seg("dark", "dark")}</span></div>
+    <div class="legend"><span class="lg-t">what the dot means</span>
+      🟢 everyone's fresh · 🟡 a seat's resting · 🔵 just switched · 🌸 needs a hello</div>
+    <button class="link" data-action="picker-close">done</button>
+  </div></div>`;
 }
 
 // --- popover ----------------------------------------------------------------------------------

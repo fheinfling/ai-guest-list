@@ -72,7 +72,12 @@ def test_toggle_rejects_non_whitelisted_key(ctx):
     r = bridge.handle(ctx, {"action": "toggle", "key": "theme", "value": True})
     assert r["ok"] is False and "not a toggle" in r["error"]
     # theme remains its default string, not clobbered to a bool
-    assert ctx.load_state().settings()["theme"] == "dark"
+    assert ctx.load_state().settings()["theme"] == "light"
+
+
+def test_set_theme(ctx):
+    assert bridge.handle(ctx, {"action": "set_theme", "value": "dark"})["state"]["settings"]["theme"] == "dark"
+    assert bridge.handle(ctx, {"action": "set_theme", "value": "bogus"})["ok"] is False
 
 
 def test_state_includes_dot_and_recently_switched(ctx):

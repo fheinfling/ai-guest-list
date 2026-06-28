@@ -89,8 +89,7 @@ function seatCard(tool, seat) {
 
   return `<div class="seat-card ${state}">
     <div class="seat-row">
-      <span class="seat-name">${esc(seat.name || seat.email)}</span>${plan}
-      <span class="seat-spacer"></span>${status}
+      <span class="seat-name">${esc(seat.name || seat.email)}</span>${plan}${status}
       <button class="seat-x" title="wave goodbye" data-action="remove" data-tool="${tool}" data-email="${esc(seat.email)}">×</button>
     </div>
     <div class="usages">${miniBar("5h", pct(seat, "5h"))}${miniBar("7d", pct(seat, "weekly"))}</div>
@@ -145,6 +144,28 @@ function buildPaste(tool) {
     <textarea id="paste-blob" class="paste" placeholder="{ ... }"></textarea>
     <button class="pk-m" data-action="paste-save" data-tool="${esc(tool)}">save my seat 🎟️</button>
     <button class="link" data-action="picker-close">cancel</button></div></div>`;
+}
+
+function setRow(key, label, on) {
+  return `<label class="set-row"><span>${label}</span>
+    <input type="checkbox" data-action="toggle" data-key="${key}" ${on ? "checked" : ""}><span class="sw"></span></label>`;
+}
+
+function buildSettings(state) {
+  const s = state?.settings || {};
+  const theme = s.theme === "dark" ? "dark" : "light";
+  const seg = (val, txt) => `<button class="seg ${theme === val ? "on" : ""}" data-action="set_theme" data-value="${val}">${txt}</button>`;
+  return `<div class="backdrop" data-action="picker-close"><div class="sheet settings">
+    <h3>settings</h3>
+    ${setRow("same_tool_only", "keep me on the same tool", s.same_tool_only)}
+    ${setRow("notify", "tell me when it switches", s.notify)}
+    ${setRow("restart_app", "restart the app after a swap", s.restart_app)}
+    ${setRow("celebrations", "little celebrations", s.celebrations)}
+    <div class="set-row"><span>theme</span><span class="segs">${seg("light", "light")}${seg("dark", "dark")}</span></div>
+    <div class="legend"><span class="lg-t">what the dot means</span>
+      🟢 everyone's fresh · 🟡 a seat's resting · 🔵 just switched · 🌸 needs a hello</div>
+    <button class="link" data-action="picker-close">done</button>
+  </div></div>`;
 }
 
 // --- popover ----------------------------------------------------------------------------------
@@ -202,10 +223,12 @@ function send(action, payload = {}) {
 window.AGL = {
   result(res) {
     res = typeof res === "string" ? JSON.parse(res) : res;
+    const settingsOpen = !!overlay.querySelector(".settings");
     if (res.state) { state = res.state; render(); }
     if (res.error) flash(res.error);
     if (res.login) { overlay.innerHTML = buildPicker(res.login); }
     if (res.await_snapshot) { overlay.innerHTML = buildSaveSeat(res.tool); }
+    if (res.settings_panel || (settingsOpen && res.state)) { overlay.innerHTML = buildSettings(state); }
     if (res.celebrate) celebrate();
   },
   // legacy single-arg state push (kept for the poll path / older callers)
@@ -225,6 +248,9 @@ function closeOverlay() { overlay.innerHTML = ""; }
 
 function render() {
   root.innerHTML = buildHTML(state);
+  // mirror the theme onto <body> so overlays (siblings of #root) get the same CSS vars
+  const theme = (state.settings && state.settings.theme === "dark") ? "dark" : "light";
+  document.body.className = "theme-" + theme;
 }
 
 // --- event delegation (whole document, so overlay buttons work too) ---------------------------
@@ -245,8 +271,13 @@ document.addEventListener("click", (e) => {
     }
     case "snapshot": closeOverlay(); send("snapshot", { tool }); break;
     case "headroom_install": send("headroom_install"); break;
-    case "picker-close": closeOverlay(); break;
-    case "settings": send("settings"); break;
+    case "picker-close":
+      // close on backdrop click or an explicit cancel/done button; ignore clicks inside the sheet
+      if (el.classList.contains("backdrop") && e.target !== el) break;
+      closeOverlay();
+      break;
+    case "settings": overlay.innerHTML = buildSettings(state); break;
+    case "set_theme": send("set_theme", { value: el.dataset.value }); break;
     case "quit": send("quit"); break;
   }
 });

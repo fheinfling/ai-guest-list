@@ -6,7 +6,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   buildHTML, dotState, dotKey, creditLeft, pct, fmtCountdown, needsHello,
-  buildPicker, buildSaveSeat, buildPaste,
+  buildPicker, buildSaveSeat, buildPaste, buildSettings,
 } from "./render.mjs";
 
 function seat(over = {}) {
@@ -128,4 +128,13 @@ test("buildPicker renders command + paste methods with actions", () => {
 test("buildSaveSeat + buildPaste wire snapshot/paste-save", () => {
   assert.match(buildSaveSeat("claude"), /data-action="snapshot"[^>]*data-tool="claude"/);
   assert.match(buildPaste("codex"), /data-action="paste-save"[^>]*data-tool="codex"/);
+});
+
+test("buildSettings renders toggles, theme segments and dot legend", () => {
+  const html = buildSettings({ settings: { theme: "light", notify: true, celebrations: false } });
+  assert.match(html, /data-action="toggle"[^>]*data-key="same_tool_only"/);
+  assert.match(html, /data-action="toggle"[^>]*data-key="notify"[^>]*checked/);
+  assert.match(html, /data-action="set_theme"[^>]*data-value="dark"/);
+  assert.match(html, /seg on[^>]*data-value="light"|data-value="light"[^>]*>/);  // light selected
+  assert.match(html, /what the dot means/);
 });

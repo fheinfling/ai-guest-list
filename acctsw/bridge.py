@@ -78,6 +78,16 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
                 state.save()
             return {"ok": True, "state": snapshot_state(ctx)}
 
+        if action == "set_theme":
+            val = message.get("value")
+            if val not in ("light", "dark"):
+                return {"ok": False, "error": f"bad theme: {val}"}
+            with ctx.locked():
+                state = ctx.load_state()
+                state.set_setting("theme", val)
+                state.save()
+            return {"ok": True, "state": snapshot_state(ctx)}
+
         if action == "switch":
             with ctx.locked():
                 state = ctx.load_state()

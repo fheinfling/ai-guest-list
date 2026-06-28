@@ -1,6 +1,6 @@
 // Live glue: render state into the DOM and forward user actions to the Python bridge.
 // All rendering logic lives in render.mjs (pure, unit-tested); this file is the thin wiring.
-import { buildHTML, buildPicker, buildSaveSeat, buildPaste } from "./render.mjs";
+import { buildHTML, buildPicker, buildSaveSeat, buildPaste, buildSettings } from "./render.mjs";
 
 const root = document.getElementById("root");
 const overlay = document.createElement("div");
@@ -22,10 +22,12 @@ function send(action, payload = {}) {
 window.AGL = {
   result(res) {
     res = typeof res === "string" ? JSON.parse(res) : res;
+    const settingsOpen = !!overlay.querySelector(".settings");
     if (res.state) { state = res.state; render(); }
     if (res.error) flash(res.error);
     if (res.login) { overlay.innerHTML = buildPicker(res.login); }
     if (res.await_snapshot) { overlay.innerHTML = buildSaveSeat(res.tool); }
+    if (res.settings_panel || (settingsOpen && res.state)) { overlay.innerHTML = buildSettings(state); }
     if (res.celebrate) celebrate();
   },
   // legacy single-arg state push (kept for the poll path / older callers)
@@ -45,6 +47,9 @@ function closeOverlay() { overlay.innerHTML = ""; }
 
 function render() {
   root.innerHTML = buildHTML(state);
+  // mirror the theme onto <body> so overlays (siblings of #root) get the same CSS vars
+  const theme = (state.settings && state.settings.theme === "dark") ? "dark" : "light";
+  document.body.className = "theme-" + theme;
 }
 
 // --- event delegation (whole document, so overlay buttons work too) ---------------------------
@@ -65,8 +70,13 @@ document.addEventListener("click", (e) => {
     }
     case "snapshot": closeOverlay(); send("snapshot", { tool }); break;
     case "headroom_install": send("headroom_install"); break;
-    case "picker-close": closeOverlay(); break;
-    case "settings": send("settings"); break;
+    case "picker-close":
+      // close on backdrop click or an explicit cancel/done button; ignore clicks inside the sheet
+      if (el.classList.contains("backdrop") && e.target !== el) break;
+      closeOverlay();
+      break;
+    case "settings": overlay.innerHTML = buildSettings(state); break;
+    case "set_theme": send("set_theme", { value: el.dataset.value }); break;
     case "quit": send("quit"); break;
   }
 });

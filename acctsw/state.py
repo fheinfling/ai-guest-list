@@ -36,7 +36,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "notify": True,           # "tell me when it switches"
     "restart_app": False,     # "restart Codex after a swap"
     "celebrations": True,     # "little celebrations"
-    "theme": "dark",
+    "theme": "light",         # the design default
 }
 
 
