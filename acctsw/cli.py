@@ -144,6 +144,18 @@ def _cmd_usage(ctx: Context, ns) -> int:
     return EXIT_OK
 
 
+def _cmd_run(ctx: Context, ns) -> int:
+    from .launcher import run as launch
+
+    def notify(msg: str) -> None:
+        print(f"· {msg}", file=sys.stderr)
+
+    args = list(ns.args or [])
+    if args and args[0] == "--":  # argparse REMAINDER keeps a leading separator
+        args = args[1:]
+    return launch(ctx, ns.tool, args, notify=notify)
+
+
 def _not_impl(ctx: Context, ns) -> int:
     print(f"acctsw: '{ns.command}' arrives in a later milestone.", file=sys.stderr)
     return EXIT_NOIMPL
@@ -156,7 +168,7 @@ HANDLERS = {
     "status": _cmd_status,
     "switch": _cmd_switch,
     "usage": _cmd_usage,
-    "run": _not_impl,
+    "run": _cmd_run,
     "install": _not_impl,
     "uninstall": _not_impl,
 }

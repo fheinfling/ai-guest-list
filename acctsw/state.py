@@ -108,6 +108,7 @@ class State:
                 "name": name or email,
                 "added_at": iso(now()),
                 "limited_until": None,
+                "limit_source": None,   # "usage" (proactive) | "reactive" (caught mid-session)
                 "usage": None,
             }
             accts[email] = seat
@@ -122,10 +123,12 @@ class State:
             self.set_active(tool, None)
         return existed
 
-    def set_limited_until(self, tool: str, email: str, until_iso: str | None) -> None:
+    def set_limited_until(self, tool: str, email: str, until_iso: str | None,
+                          source: str | None = None) -> None:
         seat = self.get_seat(tool, email)
         if seat is not None:
             seat["limited_until"] = until_iso
+            seat["limit_source"] = source if until_iso else None
 
     def set_usage(self, tool: str, email: str, usage: dict | None) -> None:
         seat = self.get_seat(tool, email)

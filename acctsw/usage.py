@@ -42,12 +42,14 @@ class Usage:
     ok: bool = False
     error: str | None = None  # "unauthorized" | "rate_limited" | "network" | "parse" | "no_token"
     windows: dict[str, Window] = field(default_factory=dict)  # "5h" / "weekly"
+    limit_reached: bool | None = None  # authoritative flag when the API provides one (Codex)
     fetched_at: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "ok": self.ok,
             "error": self.error,
+            "limit_reached": self.limit_reached,
             "fetched_at": self.fetched_at,
             "windows": {k: {"used_pct": w.used_pct, "resets_at": w.resets_at}
                         for k, w in self.windows.items()},
@@ -113,8 +115,16 @@ def claude_user_agent(claude_bin: str | None = None) -> str:
 
 def _num(d: dict, *keys) -> float | None:
     for k in keys:
-        if k in d and isinstance(d[k], (int, float)):
-            return float(d[k])
+        v = d.get(k)
+        if isinstance(v, bool):  # guard: bools are ints in Python
+            continue
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, str):  # undocumented shapes sometimes stringify numbers
+            try:
+                return float(v)
+            except ValueError:
+                pass
     return None
 
 
@@ -161,6 +171,12 @@ def parse_codex(payload: dict) -> dict[str, Window]:
     return {"5h": _window_from(primary), "weekly": _window_from(secondary)}
 
 
+def codex_limit_reached(payload: dict) -> bool | None:
+    src = payload.get("rate_limit") or payload.get("rate_limits") or {}
+    v = src.get("limit_reached")
+    return v if isinstance(v, bool) else None
+
+
 # --- fetchers ---------------------------------------------------------------------------------
 
 def _classify(status: int) -> str | None:
@@ -190,7 +206,9 @@ def fetch_codex(token: str | None, account_id: str | None, *,
         u.error = err
         return u
     try:
-        u.windows = parse_codex(json.loads(body))
+        payload = json.loads(body)
+        u.windows = parse_codex(payload)
+        u.limit_reached = codex_limit_reached(payload)
         u.ok = True
     except (json.JSONDecodeError, AttributeError, TypeError):
         u.error = "parse"
@@ -245,33 +263,53 @@ def _fetch_for(tool: str, blob: str, get: HttpGet, ua: str | None) -> Usage:
     return fetch_claude(token, user_agent=ua, get=get)
 
 
-def _due(prev_fetched_at: str | None, at, min_seconds: int) -> bool:
+MAX_BACKOFF_SECONDS = 3600
+
+
+def _backoff_seconds(prev_usage: dict | None, base: int) -> float:
+    """Exponential backoff: each consecutive error doubles the wait, capped at 1h.
+
+    Claude's usage endpoint rate-limits hard; sustained 429s must not be retried every `base`s.
+    """
+    streak = int((prev_usage or {}).get("error_streak", 0) or 0)
+    if streak <= 0:
+        return base
+    return min(base * (2 ** streak), MAX_BACKOFF_SECONDS)
+
+
+def _due(prev_usage: dict | None, at, base: int) -> bool:
     from .util import parse_iso
-    prev = parse_iso(prev_fetched_at)
+    prev = parse_iso((prev_usage or {}).get("fetched_at"))
     if prev is None:
         return True
-    return (at - prev).total_seconds() >= min_seconds
+    return (at - prev).total_seconds() >= _backoff_seconds(prev_usage, base)
 
 
-def refresh(ctx, state, tool: str | None = None, *, force: bool = False,
-            get: HttpGet = _default_get, min_seconds: int = P.USAGE_MIN_REFRESH_SECONDS,
+def refresh(ctx, state, tool: str | None = None, *, only: str | None = None,
+            force: bool = False, get: HttpGet = _default_get,
+            min_seconds: int = P.USAGE_MIN_REFRESH_SECONDS,
             user_agent: str | None = None) -> dict[str, Any]:
     """Refresh cached usage for seats and flag limited seats. Persists state. Returns a summary.
 
-    Caching: a seat is skipped if polled within ``min_seconds`` (unless ``force``) — Claude's
-    endpoint rate-limits aggressively, so we poll sparingly.
+    - Caching with EXPONENTIAL backoff: a seat is skipped if polled within its current backoff
+      window (grows on consecutive errors), unless ``force``.
+    - On error the last-known-good ``windows`` are PRESERVED (menubar keeps showing prior usage,
+      marked stale); only ``error``/``fetched_at``/``error_streak`` are updated.
     """
     at = now()
     tools = [tool] if tool else ["codex", "claude"]
-    ua = user_agent or (claude_user_agent(getattr(ctx, "claude_bin", None))
-                        if "claude" in tools else None)
+    # Lazily compute the Claude UA only if there is actually a Claude seat to poll.
+    need_claude = "claude" in tools and bool(state.accounts("claude"))
+    ua = user_agent or (claude_user_agent(getattr(ctx, "claude_bin", None)) if need_claude else None)
     summary: dict[str, Any] = {}
     for t in tools:
         summary[t] = {}
         for email in list(state.accounts(t)):
+            if only and email != only:
+                continue
             seat = state.get_seat(t, email)
-            prev = (seat.get("usage") or {}).get("fetched_at")
-            if not force and not _due(prev, at, min_seconds):
+            prev_usage = seat.get("usage") or {}
+            if not force and not _due(prev_usage, at, min_seconds):
                 summary[t][email] = "cached"
                 continue
             blob = _seat_blob(ctx, state, t, email)
@@ -279,19 +317,54 @@ def refresh(ctx, state, tool: str | None = None, *, force: bool = False,
                 summary[t][email] = "no_creds"
                 continue
             u = _fetch_for(t, blob, get, ua)
-            state.set_usage(t, email, u.to_dict())
-            # Flag / clear limit based on usage windows.
+            d = u.to_dict()
             if u.ok:
-                limited_reset = _limit_reset(u)
-                state.set_limited_until(t, email, limited_reset)
+                d["error_streak"] = 0
+                state.set_usage(t, email, d)
+                _apply_limit(state, t, email, u, at)
+            else:
+                # preserve last-known-good windows; bump the error streak for backoff
+                d["windows"] = prev_usage.get("windows", d["windows"])
+                d["stale"] = True
+                d["error_streak"] = int(prev_usage.get("error_streak", 0) or 0) + 1
+                state.set_usage(t, email, d)
             summary[t][email] = u.error or "ok"
     state.save()
     return summary
 
 
 def _limit_reset(u: Usage) -> str | None:
-    """If any window is maxed out, return the soonest reset among maxed windows; else None."""
+    """Return when a maxed-out seat unlocks, or None if it isn't limited.
+
+    When MULTIPLE windows are maxed (e.g. both 5h and weekly), the seat stays blocked until the
+    LATER reset, so we take ``max()`` over maxed windows (using ``min()`` would mark the seat
+    available too early and the launcher would switch back to a still-capped seat).
+    """
     maxed = [w.resets_at for w in u.windows.values()
-             if w.used_pct is not None and w.used_pct >= LIMIT_PCT]
-    maxed = [r for r in maxed if r]
-    return min(maxed) if maxed else None
+             if w.used_pct is not None and w.used_pct >= LIMIT_PCT and w.resets_at]
+    if maxed:
+        return max(maxed)
+    # Authoritative API flag with no window over 100 → use the latest known reset as best estimate.
+    if u.limit_reached:
+        allr = [w.resets_at for w in u.windows.values() if w.resets_at]
+        return max(allr) if allr else None
+    return None
+
+
+def _apply_limit(state, tool: str, email: str, u: Usage, at) -> None:
+    """Update limited_until from usage, WITHOUT prematurely clearing a reactive flag.
+
+    A still-future ``reactive`` flag (set when the launcher caught a real limit mid-session) is
+    authoritative over the usage endpoint, which can lag. We only clear it once it has expired.
+    """
+    from .util import parse_iso
+    maxed_reset = _limit_reset(u)
+    if maxed_reset:
+        state.set_limited_until(tool, email, maxed_reset, source="usage")
+        return
+    seat = state.get_seat(tool, email)
+    src = (seat or {}).get("limit_source")
+    until = parse_iso((seat or {}).get("limited_until"))
+    if src == "reactive" and until is not None and until > at:
+        return  # keep the reactive flag until it expires
+    state.set_limited_until(tool, email, None)

@@ -175,8 +175,93 @@ def test_refresh_rate_limited_records_error(ctx):
 
 def test_refresh_clears_stale_limit_when_usage_drops(ctx):
     state = _seed_two_codex(ctx)
-    # pre-mark limited
-    state.set_limited_until("codex", "a@x.com", iso(now() + timedelta(hours=1)))
+    # pre-mark limited (proactive source → may be cleared)
+    state.set_limited_until("codex", "a@x.com", iso(now() + timedelta(hours=1)), source="usage")
     get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=5.0, secondary=5.0))})
     U.refresh(ctx, state, "codex", force=True, get=get)
     assert state.get_seat("codex", "a@x.com")["limited_until"] is None
+
+
+def test_refresh_does_not_clear_active_reactive_limit(ctx):
+    """A still-future reactive flag must survive a proactive poll showing <100% (anti-flapping)."""
+    state = _seed_two_codex(ctx)
+    state.set_limited_until("codex", "a@x.com", iso(now() + timedelta(hours=2)), source="reactive")
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=5.0, secondary=5.0))})
+    U.refresh(ctx, state, "codex", force=True, get=get)
+    assert state.get_seat("codex", "a@x.com")["limited_until"] is not None
+
+
+def test_limit_reached_flag_is_authoritative(ctx):
+    """rate_limit.limit_reached=True flags the seat even if used_percent < 100."""
+    state = _seed_two_codex(ctx)
+    reset = iso(now() + timedelta(hours=3))
+    body = json.dumps({"rate_limit": {"limit_reached": True,
+        "primary_window": {"used_percent": 95, "reset_at": _epoch(reset)},
+        "secondary_window": {"used_percent": 40, "reset_at": _epoch(reset)}}})
+    U.refresh(ctx, state, "codex", force=True, get=fake_get({P.CODEX_USAGE_URL: (200, body)}))
+    assert state.get_seat("codex", "a@x.com")["limited_until"] is not None
+
+
+def test_both_windows_maxed_uses_later_reset():
+    early = "2026-01-01T00:00:00+00:00"
+    late = "2026-01-02T00:00:00+00:00"
+    u = U.Usage(ok=True, windows={
+        "5h": U.Window(used_pct=100.0, resets_at=early),
+        "weekly": U.Window(used_pct=100.0, resets_at=late)})
+    assert U._limit_reset(u) == late  # max(), not min()
+
+
+def test_error_preserves_last_known_windows(ctx):
+    state = _seed_two_codex(ctx)
+    # first good poll
+    U.refresh(ctx, state, "codex", force=True,
+              get=fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=42.0))}))
+    # then a 429 — windows must be preserved, marked stale
+    U.refresh(ctx, state, "codex", force=True, get=fake_get({P.CODEX_USAGE_URL: (429, "")}))
+    usage = state.get_seat("codex", "a@x.com")["usage"]
+    assert usage["error"] == "rate_limited"
+    assert usage["stale"] is True
+    assert usage["windows"]["5h"]["used_pct"] == 42.0
+    assert usage["error_streak"] == 1
+
+
+def test_exponential_backoff_skips_retry_after_error(ctx):
+    state = _seed_two_codex(ctx)
+    # an error sets streak=1 → backoff = base*2; a non-forced refresh within that window is skipped
+    U.refresh(ctx, state, "codex", force=True, get=fake_get({P.CODEX_USAGE_URL: (429, "")}))
+    summary = U.refresh(ctx, state, "codex", force=False, min_seconds=10,
+                        get=fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body())}))
+    assert summary["codex"]["a@x.com"] == "cached"
+
+
+def test_seat_blob_prefers_live_for_active(ctx):
+    state = _seed_two_codex(ctx)  # active = a@x.com
+    ctx.cred["codex"].set_live(make_codex_blob("a@x.com").replace('"access_token": "a"',
+                                                                  '"access_token": "LIVE"'))
+    tok, _ = U.codex_token_account(U._seat_blob(ctx, state, "codex", "a@x.com"))
+    assert tok == "LIVE"  # active seat uses live creds, not the snapshot
+    # non-active seat uses its snapshot
+    tok_b, _ = U.codex_token_account(U._seat_blob(ctx, state, "codex", "b@x.com"))
+    assert tok_b == "a"
+
+
+def test_claude_refresh_path(ctx):
+    ctx.cred["claude"].set_live(make_claude_blob())
+    state = ctx.load_state()
+    acct.add(ctx, state, "claude", email="c@x.com")
+    get = fake_get({P.CLAUDE_USAGE_URL: (200, claude_ok_body(five=20.0, week=60.0))})
+    summary = U.refresh(ctx, state, "claude", force=True, get=get, user_agent="claude-code/x")
+    assert summary["claude"]["c@x.com"] == "ok"
+    assert state.get_seat("claude", "c@x.com")["usage"]["windows"]["weekly"]["used_pct"] == 60.0
+
+
+def test_claude_user_agent_fallback(monkeypatch):
+    import acctsw.usage as um
+    monkeypatch.setattr(um.shutil, "which", lambda _: None)
+    assert U.claude_user_agent(None) == P.CLAUDE_USER_AGENT_FALLBACK
+
+
+def _epoch(iso_s):
+    import calendar
+    from datetime import datetime
+    return calendar.timegm(datetime.fromisoformat(iso_s).utctimetuple())

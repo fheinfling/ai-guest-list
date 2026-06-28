@@ -50,7 +50,8 @@ def test_switch_unknown_returns_error(isolated):
 
 
 def test_not_implemented_exit_code(isolated):
-    assert cli.main(["run", "codex"]) == cli.EXIT_NOIMPL
+    # install/uninstall land in M5; until then they return the distinct not-implemented code
+    assert cli.main(["install"]) == cli.EXIT_NOIMPL
 
 
 def test_no_command_prints_help(capsys):
