@@ -41,8 +41,10 @@ unauditable from source) and a full packet capture of in-flight provider traffic
    prefers Headroom's own surgical `install remove` (preserving any edits you made while it was on)
    and falls back to an exact byte-for-byte restore from the snapshot only if remove leaves markers.
    A serialized `heal()` (keyed off actual on-disk injection state, not a flag) strips any dangling
-   routing after a crash/force-quit on the next app launch or `cx`/`cl` run, so codex/claude never
-   keep hitting a dead proxy.
+   routing on the next app launch or `cx`/`cl` run. So after a crash/force-quit, the dangling
+   routing is healed the next time the app starts or you run `cx`/`cl`; a plain `codex`/`claude` run
+   in that gap (app force-killed, not yet relaunched, not via `cx`/`cl`) can still hit the dead proxy
+   until then. Normal quit removes routing on exit, so the gap only opens on an abnormal kill.
 
 ## Hardening we apply (`acctsw/headroom.py`)
 - **Version pinned** to the audited `0.27.0` (`PINNED_VERSION`).

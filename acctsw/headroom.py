@@ -316,19 +316,19 @@ def global_enable(store: Path | None = None, *, run=subprocess.run) -> tuple[boo
         return True, "headroom routing enabled for codex & claude"
 
 
-def teardown(store: Path | None = None, *, run=subprocess.run,
-             blocking: bool = True) -> tuple[bool, str]:
-    """Quit-time removal. Acquires op_lock FIRST (so it waits out any in-flight enable rather than
-    racing the not-yet-persisted setting), then removes routing iff the config is actually injected
-    or a backup exists — keyed off real state, NOT the save-credit setting. No-op (no subprocess)
-    when clean. blocking=False (the Cmd-Q / applicationWillTerminate_ path on the main thread)
-    returns immediately if another op holds the lock; the next launch's reconcile() is the backstop."""
-    with op_lock(store, blocking=blocking) as acquired:
-        if not acquired:
-            return False, "busy"
-        if not (_any_injected() or has_backup(store)):
-            return True, "nothing to tear down"
-        return _remove_and_restore(store, run=run)
+def spawn_detached_remove() -> bool:
+    """Fire-and-forget `headroom install remove` in a DETACHED process that outlives the app — used
+    at quit so the UI never blocks on the (multi-second) subprocess. Returns True if spawned. An
+    imperfect/failed remove is backstopped by the next launch's reconcile() (exact restore)."""
+    exe = headroom_path()
+    if not exe:
+        return False
+    try:
+        subprocess.Popen([exe, "install", "remove"], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=harden_env())
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def global_disable(store: Path | None = None, *, run=subprocess.run,

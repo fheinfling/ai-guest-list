@@ -52,6 +52,7 @@ if objc is not None:
             self.statusItem.button().setTarget_(self)
             self.statusItem.button().setAction_(objc.selector(self.togglePopover_, signature=b"v@:@"))
             self._teardownDone = False
+            self._hrRecovered = False     # gate: poll health-check waits until launch recovery is done
             self._buildPopover()
             self._startUsageTimer()
             # Reconcile a prior run's routing OFF the main thread — global_enable shells out to
@@ -60,23 +61,16 @@ if objc is not None:
                 objc.selector(self.recoverBg_, signature=b"v@:@"), None)
 
         def applicationWillTerminate_(self, _notif):
-            # Cmd-Q / Apple-menu Quit / logout land here on the MAIN thread. Best-effort, NON-blocking
-            # so a background op holding the lock can't beachball the quit; next launch reconciles.
-            self._headroomTeardown(blocking=False)
-
-        def quitBg_(self, _arg):
-            self._headroomTeardown(blocking=True)  # off the main thread → can block to finish restore
-            self.performSelectorOnMainThread_withObject_waitUntilDone_(
-                objc.selector(self.doTerminate_, signature=b"v@:@"), None, False)
-
-        def doTerminate_(self, _arg):
-            NSApplication.sharedApplication().terminate_(self)
+            self._headroomTeardownDetached()  # safety net for OS-level quit (Cmd-Q / logout)
 
         def recoverBg_(self, _arg):
             """On launch (background): the save-credit toggle persists across restarts. If it's on but
             routing isn't actually running (torn down on last quit, or crashed), RE-APPLY it. If
             re-apply fails, clear the setting so state matches reality. If it's OFF, heal() still
-            strips any injection a prior crash/force-quit may have left dangling."""
+            strips any injection a prior crash/force-quit may have left dangling. This is the SOLE
+            launch-time reconciler; the poll's health-check stays gated (self._hrRecovered) until this
+            finishes, so the two can't race opposite policies on the same (setting-on, proxy-down)
+            state."""
             try:
                 from acctsw import headroom
                 if self.ctx.load_state().settings().get("headroom"):
@@ -89,6 +83,8 @@ if objc is not None:
                     headroom.heal(self.ctx.data_dir)   # clean an orphaned injection, if any
             except Exception:
                 pass
+            finally:
+                self._hrRecovered = True
 
         @objc.python_method
         def _buildPopover(self):
@@ -128,10 +124,12 @@ if objc is not None:
                 objc.selector(self.pollBg_, signature=b"v@:@"), None)
 
         def pollBg_(self, _arg):
-            self._headroomHealthCheck()   # if routing is on but the proxy died, tear it down (fail-safe)
+            # Refresh usage + push the dot FIRST, so the (possibly slow: grace sleep + status probe)
+            # health-check never delays the usage/dot update.
             result = bridge.handle(self.ctx, {"action": "usage"})
             self.performSelectorOnMainThread_withObject_waitUntilDone_(
                 objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
+            self._headroomHealthCheck()   # if routing is on but the proxy died, tear it down (fail-safe)
 
         @objc.python_method
         def _headroomHealthCheck(self):
@@ -147,6 +145,8 @@ if objc is not None:
               multi-poll streak — that left up to a 180s dead-proxy window). One transient blip is
               tolerated; a genuinely dead proxy is healed within seconds. reconcile()/heal() re-check
               `global_running` under the op_lock, so a recovery in between is still honored."""
+            if not getattr(self, "_hrRecovered", False):
+                return                     # launch recovery (recoverBg_) owns the first reconcile
             try:
                 import time
                 from acctsw import headroom
@@ -162,8 +162,10 @@ if objc is not None:
                                 s = self.ctx.load_state(); s.set_setting("headroom", False); s.save()
                             self._notify("Headroom turned off", "its helper binary changed unexpectedly")
                     return
-                # proxy reads down — short grace re-check to ride out a transient blip, then heal fast
-                time.sleep(3)
+                # proxy reads down — grace re-check to ride out a transient blip (proxy restart,
+                # wake-from-sleep) before the destructive teardown, then heal fast. (8s is a balance
+                # between a too-eager teardown and a too-long dead-proxy window; tune at M8.)
+                time.sleep(8)
                 if headroom.global_running():
                     return
                 healed, _ = headroom.reconcile(self.ctx, blocking=False)
@@ -182,20 +184,20 @@ if objc is not None:
                 objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
 
         @objc.python_method
-        def _headroomTeardown(self, blocking=True):
-            """On quit: remove global Headroom routing + restore config so codex/claude work while
-            the app is closed. The `headroom` SETTING is intentionally KEPT so it re-applies on the
-            next launch (the preference persists across restarts). Guarded so the in-app quit and
-            applicationWillTerminate_ don't both run it. Uses headroom.teardown(), which keys off the
-            ACTUAL injected/backup state under the lock (not the persisted setting) — so a quit during
-            an in-flight enable, whose setting isn't written yet, still removes the routing. The next
-            launch/cx/cl reconcile() backstops a non-blocking skip or a kill mid-teardown."""
+        def _headroomTeardownDetached(self):
+            """On quit (in-app OR OS-level): fire a DETACHED `headroom install remove` that outlives
+            the app, so routing is removed without blocking quit on a multi-second subprocess (no
+            beachball, no thread juggling). Keyed off ACTUAL state (needs_reconcile) so it's a no-op
+            when nothing's routed. The `headroom` SETTING is intentionally KEPT so it re-applies next
+            launch; the next launch's reconcile() backstops an exact restore if remove is imperfect.
+            Guarded so the in-app quit and applicationWillTerminate_ don't both fire it."""
             if getattr(self, "_teardownDone", False):
                 return
             self._teardownDone = True
             try:
                 from acctsw import headroom
-                headroom.teardown(self.ctx.data_dir, blocking=blocking)
+                if headroom.needs_reconcile(self.ctx):
+                    headroom.spawn_detached_remove()
             except Exception:
                 pass
 
@@ -207,13 +209,10 @@ if objc is not None:
                 return
             action = msg.get("action")
             if action == "quit":
-                # Tear down global routing OFF the main thread, then terminate — so the (possibly
-                # multi-second) `headroom install remove` subprocess never beachballs the UI, yet
-                # restore still completes (it waits for any in-flight op via the blocking lock).
-                if self.popover and self.popover.isShown():
-                    self.popover.performClose_(self)
-                self.performSelectorInBackground_withObject_(
-                    objc.selector(self.quitBg_, signature=b"v@:@"), None)
+                # Fire a detached `headroom install remove` (returns instantly) then terminate — no
+                # main-thread subprocess, so quit is snappy; next launch reconciles any residue.
+                self._headroomTeardownDetached()
+                NSApplication.sharedApplication().terminate_(self)
                 return
             if action == "settings":
                 return  # reserved
@@ -258,9 +257,15 @@ if objc is not None:
 
         @objc.python_method
         def _notify(self, title, text):
+            # Always deliver on the main thread — _notify is called from background poll threads too,
+            # and AppKit/NSUserNotification UI off-main can silently drop or assert.
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                objc.selector(self.notifyMain_, signature=b"v@:@"), [title, text], False)
+
+        def notifyMain_(self, pair):
             n = NSUserNotification.alloc().init()
-            n.setTitle_(title)
-            n.setInformativeText_(text)
+            n.setTitle_(pair[0])
+            n.setInformativeText_(pair[1])
             NSUserNotificationCenter.defaultUserNotificationCenter().deliverNotification_(n)
 
 

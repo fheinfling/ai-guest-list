@@ -208,22 +208,23 @@ def test_disable_reports_failure_when_still_injected_no_backup(tmp_path, monkeyp
     assert ok is False and "still present" in msg
 
 
-def test_teardown_removes_based_on_state_not_setting(tmp_path, monkeypatch):
-    """teardown() keys off actual injection/backup state, NOT the persisted setting — so a quit
-    during an in-flight enable (setting not yet written) still removes routing."""
-    cfg = _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
+def test_spawn_detached_remove(tmp_path, monkeypatch):
+    """Quit fires a detached `install remove` that outlives the app (no blocking)."""
+    calls = {}
     monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
-    headroom.snapshot_global(tmp_path / "store")
-    cfg.write_text('model_provider = "headroom"\n')      # injected; no setting consulted anywhere
-    ok, _ = headroom.teardown(tmp_path / "store", run=_fakerun(running=False))
-    assert ok and cfg.read_text() == 'model = "orig"\n'
+
+    class _Popen:
+        def __init__(self, argv, **kw):
+            calls["argv"] = argv; calls["kw"] = kw
+    monkeypatch.setattr(headroom.subprocess, "Popen", _Popen)
+    assert headroom.spawn_detached_remove() is True
+    assert calls["argv"][1:3] == ["install", "remove"]
+    assert calls["kw"].get("start_new_session") is True       # detached → survives app exit
 
 
-def test_teardown_noop_when_clean(tmp_path, monkeypatch):
-    _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
-    monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
-    ok, msg = headroom.teardown(tmp_path / "store", run=_fakerun(running=False))
-    assert ok and "nothing" in msg                       # no subprocess work when nothing's routed
+def test_spawn_detached_remove_no_binary(monkeypatch):
+    monkeypatch.setattr(headroom, "headroom_path", lambda: None)
+    assert headroom.spawn_detached_remove() is False          # nothing to do without the binary
 
 
 def test_is_injected_handles_non_utf8(tmp_path, monkeypatch):
