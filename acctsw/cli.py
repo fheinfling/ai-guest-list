@@ -126,8 +126,9 @@ def _cmd_switch(ctx: Context, ns) -> int:
 
 def _cmd_usage(ctx: Context, ns) -> int:
     from . import usage as usage_mod
-    state = ctx.load_state()
-    summary = usage_mod.refresh(ctx, state, tool=getattr(ns, "tool", None))
+    with ctx.locked():  # refresh writes creds on the 401 path — must hold the cross-process lock
+        state = ctx.load_state()
+        summary = usage_mod.refresh(ctx, state, tool=getattr(ns, "tool", None))
     if getattr(ns, "json", False):
         out = {"refresh": summary, "status": acct.status(ctx, state)}
         print(json.dumps(out, indent=2))

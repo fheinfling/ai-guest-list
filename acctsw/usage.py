@@ -371,15 +371,11 @@ def refresh(ctx, state, tool: str | None = None, *, only: str | None = None,
                 summary[t][email] = "no_creds"
                 continue
             u = _fetch_for(t, blob, get, ua)
-            # Self-heal an expired codex token: refresh via refresh_token (like codex does) + retry.
-            if not u.ok and u.error == "unauthorized" and t == "codex":
-                new_blob, rerr = refresh_codex_blob(blob, post=post)
-                if new_blob:
-                    if state.active(t) == email:
-                        ctx.cred[t].set_live(new_blob)        # codex benefits from the fresh token too
-                    else:
-                        ctx.keychain.set(ctx.keychain_service, ctx.snapshot_key(t, email), new_blob)
-                    u = _fetch_for(t, new_blob, get, ua)       # retry with the fresh token
+            # NOTE: we deliberately do NOT auto-refresh/rotate the token here. Codex's refresh
+            # tokens are single-use; rotating one that codex itself owns (the active auth.json) can
+            # invalidate codex's own session (reviewer KR-B2). For usage display we report
+            # last-known/unauthorized instead. Per-account isolation (each account owning its home)
+            # makes codex maintain its own tokens — refresh moves there.
             d = u.to_dict()
             if u.ok:
                 d["error_streak"] = 0
