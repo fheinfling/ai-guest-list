@@ -5,10 +5,39 @@ and it is exactly what the official tools and the reference apps use.
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import subprocess
 from typing import Protocol
 
 from .errors import AcctswError
+
+
+def _encode(secret: str) -> str:
+    """base64 so the keychain only ever holds single-line printable ASCII.
+
+    `security find-generic-password -w` returns multi-line/binary passwords as a HEX string; codex's
+    pretty-printed auth.json has newlines, so storing it raw round-trips to hex and corrupts the
+    blob. base64 (no newlines) sidesteps that entirely.
+    """
+    return base64.b64encode(secret.encode("utf-8")).decode("ascii")
+
+
+def _decode(stored: str) -> str:
+    """Decode a value read back from the keychain, tolerating legacy/corrupted formats:
+    base64 (current), hex (old security round-trip corruption), or raw (legacy plain)."""
+    s = stored.strip()
+    try:
+        return base64.b64decode(s, validate=True).decode("utf-8")
+    except (binascii.Error, ValueError, UnicodeDecodeError):
+        pass
+    # security may have returned the password hex-encoded
+    if s and len(s) % 2 == 0 and all(c in "0123456789abcdefABCDEF" for c in s):
+        try:
+            return binascii.unhexlify(s).decode("utf-8")
+        except (binascii.Error, ValueError, UnicodeDecodeError):
+            pass
+    return stored  # legacy plain
 
 
 class KeychainBackend(Protocol):
@@ -33,13 +62,14 @@ class SecurityKeychain:
         if proc.returncode != 0:
             return None
         # `-w` prints the password with a trailing newline.
-        return proc.stdout.rstrip("\n")
+        return _decode(proc.stdout.rstrip("\n"))
 
     def set(self, service: str, account: str, secret: str) -> None:
         # -U updates if it already exists. -w passes the secret (avoids interactive prompt).
+        # base64-encode so security never hex-mangles multi-line blobs on read-back.
         proc = subprocess.run(
             [self._security, "add-generic-password", "-U",
-             "-s", service, "-a", account, "-w", secret],
+             "-s", service, "-a", account, "-w", _encode(secret)],
             capture_output=True, text=True,
         )
         if proc.returncode != 0:

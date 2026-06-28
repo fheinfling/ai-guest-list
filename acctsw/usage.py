@@ -80,6 +80,60 @@ def _default_get(url: str, headers: dict, timeout: float) -> tuple[int, str]:
 
 # --- token extraction -------------------------------------------------------------------------
 
+CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
+CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"  # codex's OAuth client (from id_token aud)
+
+
+def _default_post(url: str, payload: dict, timeout: float) -> tuple[int, str]:
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(url, data=data, method="POST",
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, e.read().decode("utf-8", "replace")
+        except Exception:
+            return e.code, ""
+    except (urllib.error.URLError, OSError, TimeoutError):
+        return 0, ""
+
+
+def refresh_codex_blob(blob: str, *, post=_default_post) -> tuple[str | None, str | None]:
+    """Use the refresh_token to mint a fresh codex auth.json blob (what codex does on its own).
+
+    Returns (new_blob, error). error == "invalidated" means the session ended (re-login needed).
+    """
+    from .util import jwt_payload
+    try:
+        d = json.loads(blob)
+    except (json.JSONDecodeError, TypeError):
+        return None, "parse"
+    t = d.get("tokens") or {}
+    rt = t.get("refresh_token")
+    if not rt:
+        return None, "no_refresh"
+    aud = jwt_payload(t.get("id_token", "")).get("aud") or CODEX_CLIENT_ID
+    client = aud[0] if isinstance(aud, list) and aud else (aud if isinstance(aud, str) else CODEX_CLIENT_ID)
+    status, body = post(CODEX_TOKEN_URL, {
+        "client_id": client, "grant_type": "refresh_token",
+        "refresh_token": rt, "scope": "openid profile email offline_access",
+    }, 20)
+    if status != 200:
+        return None, ("invalidated" if status in (400, 401) else f"http_{status}")
+    try:
+        out = json.loads(body)
+    except (json.JSONDecodeError, TypeError):
+        return None, "parse"
+    for k in ("access_token", "id_token", "refresh_token"):
+        if out.get(k):
+            t[k] = out[k]
+    d["tokens"] = t
+    d["last_refresh"] = iso(now())
+    return json.dumps(d, indent=2), None
+
+
 def codex_token_account(blob: str) -> tuple[str | None, str | None]:
     try:
         data = json.loads(blob)
@@ -286,7 +340,7 @@ def _due(prev_usage: dict | None, at, base: int) -> bool:
 
 
 def refresh(ctx, state, tool: str | None = None, *, only: str | None = None,
-            force: bool = False, get: HttpGet = _default_get,
+            force: bool = False, get: HttpGet = _default_get, post=_default_post,
             min_seconds: int = P.USAGE_MIN_REFRESH_SECONDS,
             user_agent: str | None = None) -> dict[str, Any]:
     """Refresh cached usage for seats and flag limited seats. Persists state. Returns a summary.
@@ -317,6 +371,15 @@ def refresh(ctx, state, tool: str | None = None, *, only: str | None = None,
                 summary[t][email] = "no_creds"
                 continue
             u = _fetch_for(t, blob, get, ua)
+            # Self-heal an expired codex token: refresh via refresh_token (like codex does) + retry.
+            if not u.ok and u.error == "unauthorized" and t == "codex":
+                new_blob, rerr = refresh_codex_blob(blob, post=post)
+                if new_blob:
+                    if state.active(t) == email:
+                        ctx.cred[t].set_live(new_blob)        # codex benefits from the fresh token too
+                    else:
+                        ctx.keychain.set(ctx.keychain_service, ctx.snapshot_key(t, email), new_blob)
+                    u = _fetch_for(t, new_blob, get, ua)       # retry with the fresh token
             d = u.to_dict()
             if u.ok:
                 d["error_streak"] = 0

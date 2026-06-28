@@ -74,6 +74,7 @@ if objc is not None:
         def _startUsageTimer(self):
             NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
                 USAGE_POLL_SECONDS, self, objc.selector(self.pollUsage_, signature=b"v@:@"), None, True)
+            self.pollUsage_(None)  # don't wait 180s for the first usage read
 
         # --- actions ------------------------------------------------------------------------
         def togglePopover_(self, sender):
@@ -82,6 +83,7 @@ if objc is not None:
             else:
                 btn = self.statusItem.button()
                 self.popover.showRelativeToRect_ofView_preferredEdge_(btn.bounds(), btn, 1)
+                self.pollUsage_(None)  # refresh usage each time the popover opens (cache-guarded)
 
         def pollUsage_(self, _timer):
             # Run the network refresh OFF the main thread so the menubar UI never freezes.

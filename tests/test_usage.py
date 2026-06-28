@@ -255,6 +255,42 @@ def test_claude_refresh_path(ctx):
     assert state.get_seat("claude", "c@x.com")["usage"]["windows"]["weekly"]["used_pct"] == 60.0
 
 
+def test_refresh_codex_blob_success():
+    blob = make_codex_blob("a@x.com")
+    def post(url, payload, timeout):
+        assert payload["grant_type"] == "refresh_token"
+        return 200, json.dumps({"access_token": "NEW", "id_token": "h.e.s", "refresh_token": "rt2"})
+    new, err = U.refresh_codex_blob(blob, post=post)
+    assert err is None
+    import json as _j
+    assert _j.loads(new)["tokens"]["access_token"] == "NEW"
+
+
+def test_refresh_codex_blob_invalidated():
+    new, err = U.refresh_codex_blob(make_codex_blob("a@x.com"),
+                                    post=lambda u, p, t: (401, '{"error":{"code":"refresh_token_invalidated"}}'))
+    assert new is None and err == "invalidated"
+
+
+def test_refresh_self_heals_expired_active_token(ctx):
+    """A 401 on the active seat triggers a token refresh + retry; new creds persisted to live."""
+    state = _seed_two_codex(ctx)  # active a@x.com
+    calls = {"n": 0}
+    def get(url, headers, timeout):
+        # first call (old token) 401; after refresh, the retry carries Bearer NEW → 200
+        if "NEW" in headers.get("Authorization", ""):
+            return 200, codex_ok_body(primary=12.0)
+        return 401, '{"error":{"code":"token_expired"}}'
+    def post(url, payload, timeout):
+        return 200, json.dumps({"access_token": "NEW", "id_token": "h.e.s", "refresh_token": "rt2"})
+    U.refresh(ctx, state, "codex", only="a@x.com", force=True, get=get, post=post)
+    seat = state.get_seat("codex", "a@x.com")
+    assert seat["usage"]["ok"] is True
+    assert seat["usage"]["windows"]["5h"]["used_pct"] == 12.0
+    import json as _j
+    assert _j.loads(ctx.cred["codex"].get_live())["tokens"]["access_token"] == "NEW"  # persisted
+
+
 def test_claude_user_agent_fallback(monkeypatch):
     import acctsw.usage as um
     monkeypatch.setattr(um.shutil, "which", lambda _: None)

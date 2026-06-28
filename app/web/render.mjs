@@ -77,16 +77,24 @@ function usageRow(seat) {
 }
 
 function seatCard(tool, seat) {
-  const state = seat.active ? "on-floor" : seat.limited ? "resting" : "ready";
+  const reauth = needsHello(seat);  // creds invalid → session ended, needs re-login
+  // 'limited' wins the card's look (tint/bar) even for the active seat, so a rate-limited seat
+  // never looks fresh; the status text still shows which seat is active.
+  const state = reauth ? "hello" : seat.limited ? "resting" : seat.active ? "on-floor" : "ready";
   const plan = seat.plan ? `<span class="seat-plan">${esc(seat.plan)}</span>` : "";
   let status;
-  if (seat.active) status = `<span class="status floor">on the floor</span>`;
-  else if (seat.limited) status = `<span class="status rest">back ${fmtCountdown(seat.limited_until)}</span>`;
+  if (reauth)
+    status = `<button class="status hello" data-action="add" data-tool="${tool}">re-add 🌸</button>`;
+  else if (seat.limited)
+    status = `<span class="status rest">resting · back ${fmtCountdown(seat.limited_until)}</span>`;
+  else if (seat.active) status = `<span class="status floor">on the floor</span>`;
   else status = `<button class="status switch" data-action="switch" data-tool="${tool}" data-email="${esc(seat.email)}">switch</button>`;
 
-  const note = seat.limited
-    ? `<span class="seat-note rest">taking a breather 💛</span>`
-    : seat.active ? `<span class="seat-note floor">keeping it warm 💚</span>` : "";
+  const note = reauth
+    ? `<span class="seat-note hello">session ended — sign in again 🌸</span>`
+    : seat.limited
+      ? `<span class="seat-note rest">taking a breather 💛</span>`
+      : seat.active ? `<span class="seat-note floor">keeping it warm 💚</span>` : "";
 
   return `<div class="seat-card ${state}">
     <div class="seat-row">

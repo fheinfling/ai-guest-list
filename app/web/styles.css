@@ -91,6 +91,11 @@ html, body { background: transparent; }
 .status.rest { color: var(--rest); font-weight: 700; }
 .status.switch { border: 1px solid var(--tool); color: var(--tool); background: transparent;
   padding: 2px 11px; border-radius: 999px; cursor: pointer; font: inherit; font-size: 11px; }
+.status.hello { border: 1px solid var(--love); color: var(--love); background: transparent;
+  padding: 2px 11px; border-radius: 999px; cursor: pointer; font: inherit; font-size: 11px; }
+.seat-card.hello { border-left-color: var(--love);
+  background: color-mix(in srgb, var(--love) 7%, var(--card)); }
+.seat-note.hello { color: var(--love); }
 .seat-x { flex: none; width: 20px; height: 20px; border: none; background: transparent; color: var(--muted);
   cursor: pointer; font-size: 15px; border-radius: 6px; }
 .seat-x:hover { color: var(--love); }

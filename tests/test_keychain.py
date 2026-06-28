@@ -1,4 +1,24 @@
-from acctsw.keychain import InMemoryKeychain
+import binascii
+
+from acctsw.keychain import InMemoryKeychain, _encode, _decode
+
+
+def test_encode_decode_roundtrip_multiline():
+    blob = '{\n  "auth_mode": "chatgpt",\n  "tokens": {"access_token": "abc"}\n}\n'
+    assert _decode(_encode(blob)) == blob
+    assert "\n" not in _encode(blob)  # single-line → security won't hex-mangle it
+
+
+def test_decode_legacy_hex():
+    blob = '{\n "x": 1}\n'
+    hexed = binascii.hexlify(blob.encode()).decode()  # how security returned multi-line data
+    assert _decode(hexed) == blob
+
+
+def test_decode_legacy_plain_json():
+    # a compact JSON blob that is neither base64 nor hex must pass through unchanged
+    blob = '{"claudeAiOauth":{"accessToken":"x"}}'
+    assert _decode(blob) == blob
 
 
 def test_set_get_delete_roundtrip():
