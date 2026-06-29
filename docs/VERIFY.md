@@ -66,24 +66,30 @@ acctsw uninstall --purge       # also deletes the store + all our keychain items
   actual Codex/Claude limit output on a real cap.
 - Resume-by-id: currently `codex resume --last` / `claude --continue` (MVP); capture the session id
   at spawn to resume by id if you run multiple concurrent sessions.
-- `headroom install apply/remove/status` exact CLI forms + output: confirm against the installed
-  Headroom version (global app-managed mode now uses these, not `headroom wrap`).
-- **Headroom global-mode live checks (deferred from code review, confirm against a real install):**
-  - **Injection markers** (`headroom.INJECT_MARKERS`): confirm the exact strings Headroom writes
-    into Codex `config.toml`/`AGENTS.md` AND Claude `settings.json`. We deliberately match only
-    config-syntax directives (`model_provider = "headroom"`, `headroom:rtk-instructions`) to avoid
-    false positives that would let the restore backstop overwrite user edits; if Claude's real
-    marker differs, add it so a still-routed Claude config is detected before the backup is dropped.
-  - **`global_running()` status wording**: confirm `headroom install status` prints one of
-    running/active/listening/healthy/serving/up when healthy and not a false "error"/"down"; adjust
-    the positive/negative substring sets to the real output.
+- We deliberately do NOT use `headroom install apply/remove/status` — its macOS launchd deploy is
+  broken (see [headroom-handover.md](headroom-handover.md)). Global app-managed mode instead runs the
+  proxy ourselves (`headroom proxy`, detached + PID-tracked) and hand-writes provider routing. Live
+  checks to confirm against a real install:
+  - **`headroom proxy` flags + `/readyz`**: confirm `headroom proxy --host 127.0.0.1 --port 8787
+    --mode token --backend anthropic --no-telemetry` starts and `GET /readyz` returns `ready:true`
+    (this is what `start_proxy`/`proxy_ready` rely on).
+  - **Routing actually works end-to-end**: with the proxy up and routing written, confirm a plain
+    `codex` and a plain `claude` run both reach the proxy (watch `~/.headroom/logs/proxy.log` for
+    `proxy_inbound_request`), and that Codex's OpenAI-format requests are handled by the
+    anthropic-backed proxy (if not, the codex side may need `--backend` adjusted or codex routing
+    dropped).
+  - **Injection markers** (`headroom.INJECT_MARKERS`): we now WRITE the routing ourselves, so the
+    markers are ours by construction — `model_provider = "headroom"` (Codex `config.toml`) and the
+    loopback proxy URL `http://127.0.0.1:8787` (Claude `settings.json` env `ANTHROPIC_BASE_URL`).
+    Confirm a real-world user config never legitimately contains the loopback URL (it would be
+    treated as our routing).
   - **Headless rtk integrity**: `cx`/`cl` run with the menubar app closed don't re-verify rtk (the
     GUI poll does while it's open, and a closed app means the proxy is down → routing is healed
-    away). If you rely on cx/cl with routing live but the app closed, add a `verify_rtk` gate there.
-  - **Savings seeding / shaper env**: enabling save-credit (a) runs `install apply` with
-    `HEADROOM_OUTPUT_SHAPER=1` and (b) seeds the baseline once via `headroom learn --verbosity
-    --apply --all` (background, best-effort). Confirm against a live install that: the persistent
-    deployment actually inherits `HEADROOM_OUTPUT_SHAPER` (if not, set it via the deployment's
-    config instead of the apply env), `headroom learn --verbosity` is the right baseline command,
-    and `output-savings` then returns a real number after some routed traffic. `learn --all` is a
-    slow, LLM-driven analysis of your coding history — verify its token/time cost is acceptable.
+    away). NB: the new path never runs `headroom wrap`, so `rtk` may never be downloaded at all and
+    `verify_rtk` is a no-op ("not present yet") — fine, but confirm savings don't depend on rtk.
+  - **Savings seeding / shaper env**: enabling save-credit (a) starts the proxy with
+    `HEADROOM_OUTPUT_SHAPER=1` + `HEADROOM_OUTPUT_HOLDOUT` directly in the child's env (we own it now,
+    so no plist workaround) and (b) seeds the baseline once via `headroom learn --verbosity --apply
+    --all` (background, best-effort). Confirm against a live install that `output-savings` returns a
+    real number after some routed traffic. `learn --all` is a slow, LLM-driven analysis of your
+    coding history — verify its token/time cost is acceptable.

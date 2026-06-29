@@ -35,16 +35,20 @@ unauditable from source) and a full packet capture of in-flight provider traffic
    assets and executed (supply-chain surface). Mitigated below.
 3. **Compiled `_core.abi3.so`** ships in the wheel — trust the PyPI build (not locally auditable).
 4. **`litellm`** transitive dep has its own telemetry — disabled below.
-5. **Invasive to config** — `headroom install apply` rewrites `~/.codex/config.toml` + `AGENTS.md`
-   (and Claude's `settings.json` etc.) to route through the proxy. Our integration is **global &
-   app-managed**: enabling snapshots the ORIGINAL files (bytes + mode + symlink target); disabling
-   prefers Headroom's own surgical `install remove` (preserving any edits you made while it was on)
-   and falls back to an exact byte-for-byte restore from the snapshot only if remove leaves markers.
-   A serialized `heal()` (keyed off actual on-disk injection state, not a flag) strips any dangling
-   routing on the next app launch or `cx`/`cl` run. So after a crash/force-quit, the dangling
-   routing is healed the next time the app starts or you run `cx`/`cl`; a plain `codex`/`claude` run
-   in that gap (app force-killed, not yet relaunched, not via `cx`/`cl`) can still hit the dead proxy
-   until then. Normal quit removes routing on exit, so the gap only opens on an abnormal kill.
+5. **Invasive to config** — routing through the proxy means writing `model_provider = "headroom"` +
+   a `[model_providers.headroom]` block into `~/.codex/config.toml` and an `ANTHROPIC_BASE_URL` env
+   entry into Claude's `settings.json`. We deliberately do **not** use `headroom install apply` (its
+   macOS launchd deploy is broken — see [headroom-handover.md](headroom-handover.md)); instead we run
+   the proxy ourselves as a detached, PID-tracked subprocess and hand-write that minimal routing
+   (`acctsw/headroom.py` `_route_all`). Our integration is **global & app-managed**: enabling
+   snapshots the ORIGINAL files (bytes + mode + symlink target); disabling does a surgical unroute
+   (strips only our marker block, preserving any edits you made while it was on) and falls back to an
+   exact byte-for-byte restore from the snapshot only if a marker survives. A serialized `heal()`
+   (keyed off actual on-disk injection state, not a flag) strips any dangling routing and stops the
+   proxy on the next app launch or `cx`/`cl` run. So after a crash/force-quit, the dangling routing is
+   healed the next time the app starts or you run `cx`/`cl`; a plain `codex`/`claude` run in that gap
+   (app force-killed, not yet relaunched, not via `cx`/`cl`) can still hit the dead proxy until then.
+   Normal quit removes routing on exit, so the gap only opens on an abnormal kill.
 
 ## Hardening we apply (`acctsw/headroom.py`)
 - **Version pinned** to the audited `0.27.0` (`PINNED_VERSION`).

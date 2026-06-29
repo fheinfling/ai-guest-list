@@ -281,9 +281,9 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
     if not state.accounts(tool):
         raise NoSeats(f"no {tool} seats yet — add one first")
 
-    # Headroom is GLOBAL/app-managed now (the app toggle runs `headroom install apply`, so plain
-    # codex, the GUI, AND cx all route through the proxy). cx/cl therefore do NOT per-session-wrap —
-    # global mode owns Headroom — so the launcher just runs the tool plain.
+    # Headroom is GLOBAL/app-managed now (the app toggle starts our own proxy + writes provider
+    # routing, so plain codex, the GUI, AND cx all route through the proxy). cx/cl therefore do NOT
+    # per-session-wrap — global mode owns Headroom — so the launcher just runs the tool plain.
     # Self-heal: if a force-quit/crash left routing injected but the proxy dead, reconcile() strips
     # the dangling injection (and clears the setting) so the tool runs plain instead of hitting a
     # dead proxy. A cheap, subprocess-free pre-check (needs_reconcile) keeps this off the hot path
@@ -292,8 +292,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
     try:
         from . import headroom as _hr
         if _hr.needs_reconcile(ctx):
-            # blocking=False: if the GUI is mid-enable holding the lock (`install apply` can take up
-            # to ~2min), skip self-heal rather than hang the launch — the GUI owns it right now.
+            # blocking=False: if the GUI is mid-enable holding the lock (starting the proxy + waiting
+            # on /readyz can take ~30s), skip self-heal rather than hang the launch — the GUI owns it.
             changed, _ = _hr.reconcile(ctx, blocking=False)
             if changed:
                 notify("Headroom's proxy wasn't running — removed its routing so this runs directly. "

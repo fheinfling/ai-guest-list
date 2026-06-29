@@ -17,7 +17,7 @@ try:
     import objc
     from AppKit import (NSApplication, NSStatusBar, NSPopover, NSViewController,
                         NSVariableStatusItemLength, NSApplicationActivationPolicyAccessory,
-                        NSUserNotification, NSUserNotificationCenter)
+                        NSUserNotification, NSUserNotificationCenter, NSImage)
     from WebKit import WKWebView, WKWebViewConfiguration, WKUserContentController
     from Foundation import NSObject, NSURL, NSTimer, NSMakeRect, NSMakeSize
 except ImportError:  # allows importing this module's pure helpers without pyobjc installed
@@ -28,7 +28,11 @@ from acctsw.context import Context
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 USAGE_POLL_SECONDS = 180.0
-DOT_GLYPH = {"green": "🟢", "amber": "🟡", "switched": "🟡", "hello": "🔴"}
+# The menu-bar mark is the door (icon handoff): open onto the disco when a model's free, shut when
+# every seat is resting. SF Symbols give a native, template (auto light/dark) glyph; emoji is the
+# fallback on older macOS where the symbol is missing (🪩 disco = open, 🚪 = shut).
+DOOR_SYMBOL = {"open": "door.left.hand.open", "shut": "door.left.hand.closed"}
+DOOR_EMOJI = {"open": "🪩", "shut": "🚪"}
 NS_TERMINATE_NOW = 1      # NSApplicationTerminateReply.terminateNow
 NS_TERMINATE_LATER = 2    # NSApplicationTerminateReply.terminateLater (we reply when teardown done)
 
@@ -50,15 +54,15 @@ if objc is not None:
         def applicationDidFinishLaunching_(self, _notif):
             bar = NSStatusBar.systemStatusBar()
             self.statusItem = bar.statusItemWithLength_(NSVariableStatusItemLength)
-            self.statusItem.button().setTitle_("🎟️")
+            self._setBarDoor("open")  # welcoming default until the first state push (fresh install = open)
             self.statusItem.button().setTarget_(self)
             self.statusItem.button().setAction_(objc.selector(self.togglePopover_, signature=b"v@:@"))
             self._teardownDone = False
             self._hrRecovered = False     # gate: poll health-check waits until launch recovery is done
             self._buildPopover()
             self._startUsageTimer()
-            # Reconcile a prior run's routing OFF the main thread — global_enable shells out to
-            # `headroom install apply` (slow); doing it inline would freeze the menubar on launch.
+            # Reconcile a prior run's routing OFF the main thread — global_enable starts the proxy and
+            # waits on /readyz (slow); doing it inline would freeze the menubar on launch.
             self.performSelectorInBackground_withObject_(
                 objc.selector(self.recoverBg_, signature=b"v@:@"), None)
 
@@ -259,7 +263,7 @@ if objc is not None:
             if action == "settings":
                 return  # reserved
             if action == "toggle" and msg.get("key") == "headroom":
-                # global apply/remove is slow (subprocess) → run off the main thread
+                # global enable/disable is slow (starts/stops the proxy) → run off the main thread
                 self._notify("Headroom", "turning on…" if msg.get("value") else "turning off…")
                 self.performSelectorInBackground_withObject_(
                     objc.selector(self.bgToggle_, signature=b"v@:@"), msg)
@@ -295,7 +299,25 @@ if objc is not None:
         def _updateDot(self, state):
             if not state:
                 return
-            self.statusItem.button().setTitle_(DOT_GLYPH.get(state.get("dot", "fresh"), "🎟️"))
+            self._setBarDoor(state.get("door", "open"))
+
+        @objc.python_method
+        def _setBarDoor(self, door):
+            """Set the bar mark to the open/shut door — SF Symbol (template) when available, emoji
+            fallback otherwise. Swaps live with availability."""
+            btn = self.statusItem.button()
+            img = None
+            name = DOOR_SYMBOL.get(door)
+            if name and hasattr(NSImage, "imageWithSystemSymbolName_accessibilityDescription_"):
+                img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                    name, "a model's free" if door == "open" else "every seat is resting")
+            if img is not None:
+                img.setTemplate_(True)
+                btn.setTitle_("")
+                btn.setImage_(img)
+            else:
+                btn.setImage_(None)
+                btn.setTitle_(DOOR_EMOJI.get(door, "🎟️"))
 
         @objc.python_method
         def _notify(self, title, text):

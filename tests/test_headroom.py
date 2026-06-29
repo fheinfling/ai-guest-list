@@ -1,5 +1,11 @@
-"""Tests for the Headroom integration (global app-managed mode)."""
+"""Tests for the Headroom integration (global app-managed mode).
+
+Routing no longer goes through `headroom install apply` (its launchd deploy is broken — see
+docs/headroom-handover.md). We run the proxy ourselves (start_proxy) and hand-write the provider
+routing (_route_all); these tests cover that path plus the snapshot/restore + heal safety nets."""
 import json
+
+import pytest
 
 from acctsw import accounts as acct
 from acctsw import bridge
@@ -7,6 +13,15 @@ from acctsw import headroom
 from acctsw import launcher as L
 from tests.conftest import make_codex_blob
 from tests.test_usage import fake_get
+
+_REAL_PUSH = headroom.push_runtime_knobs  # captured before the autouse no-op patch below
+
+
+@pytest.fixture(autouse=True)
+def _no_real_runtime_push(monkeypatch):
+    """Keep enable/heal tests hermetic: stub the loopback /admin/runtime-env push (real one is
+    exercised directly in test_push_runtime_knobs_* via the captured _REAL_PUSH)."""
+    monkeypatch.setattr(headroom, "push_runtime_knobs", lambda *a, **k: True)
 
 
 def _two_codex(ctx):
@@ -27,19 +42,23 @@ class _Spawn:
         return self.status
 
 
-def test_launcher_runs_plain_under_global_headroom(ctx, monkeypatch):
+def test_launcher_runs_plain_under_global_headroom(ctx, tmp_path, monkeypatch):
     """Headroom is global/app-managed now → cx/cl must NOT per-session-wrap (no double-route)."""
     _two_codex(ctx)
     st = ctx.load_state(); st.set_setting("headroom", True); st.save()
-    # don't let the launcher's self-heal shell out to / touch the real ~/.codex during this test
+    # keep the launcher's self-heal hermetic: no live proxy, and don't read/touch the real configs
+    from acctsw import paths as P
+    monkeypatch.setattr(P, "CODEX_HOME", tmp_path / "codex")
+    monkeypatch.setattr(P, "CLAUDE_CONFIG_DIR", tmp_path / "claude")
     monkeypatch.setattr(headroom, "headroom_path", lambda: None)
+    monkeypatch.setattr(headroom, "proxy_ready", lambda *a, **k: False)
     spawn = _Spawn()
     L.run(ctx, "codex", ["--foo"], spawn=spawn, get=fake_get({}), notify=lambda m: None)
     assert spawn.calls[0][1:2] != ["wrap"]          # not wrapped
     assert "headroom" not in " ".join(spawn.calls[0][:2])
 
 
-# --- global enable/disable (app-managed) ------------------------------------------------------
+# --- helpers -----------------------------------------------------------------------------------
 
 def _codex_cfg(tmp_path, monkeypatch, content='model = "gpt-5.5"\n'):
     from acctsw import paths as P
@@ -50,37 +69,232 @@ def _codex_cfg(tmp_path, monkeypatch, content='model = "gpt-5.5"\n'):
     return cfg
 
 
-def _fakerun(rc_apply=0, running=True):
-    import types
-    def run(args, **k):
-        out = "proxy running" if (running and "status" in args) else "ok"
-        rc = rc_apply if "apply" in args else 0
-        return types.SimpleNamespace(returncode=rc, stdout=out, stderr="")
-    return run
+def _patch_proxy(monkeypatch, *, ready=True, start=True):
+    """Stub the proxy lifecycle so enable/disable/heal tests never spawn a real proxy. Returns a dict
+    that counts start/stop calls."""
+    calls = {"start": 0, "stop": 0}
+    monkeypatch.setattr(headroom, "proxy_ready", lambda *a, **k: ready)
+
+    def _start(store=None, **k):
+        calls["start"] += 1
+        return start
+
+    def _stop(store=None, **k):
+        calls["stop"] += 1
+
+    monkeypatch.setattr(headroom, "start_proxy", _start)
+    monkeypatch.setattr(headroom, "stop_proxy", _stop)
+    return calls
 
 
-def test_global_enable_snapshots_then_applies(tmp_path, monkeypatch):
+# --- routing writers (hand-rolled provider config) ---------------------------------------------
+
+def test_route_codex_idempotent_preserves_body_and_orders_keys(tmp_path, monkeypatch):
+    """Re-applying must not duplicate our block, must keep the user's body, and must keep the
+    top-level model_provider key ABOVE any [table] header (TOML scoping — headroom #260)."""
+    cfg = _codex_cfg(tmp_path, monkeypatch, 'model = "gpt-5.5"\n[profiles.x]\nfoo = 1\n')
+    headroom._route_codex()
+    headroom._route_codex()                               # re-apply
+    body = cfg.read_text()
+    assert body.count('[model_providers.headroom]') == 1          # no dup table
+    assert body.count('model_provider = "headroom"') == 1        # no dup key
+    assert 'model = "gpt-5.5"' in body and 'foo = 1' in body     # user body preserved
+    assert body.index('model_provider') < body.index('[profiles.x]')
+    assert body.index('model_provider') < body.index('[model_providers.headroom]')
+    import tomllib
+    tomllib.loads(body)                                          # routed config is valid TOML
+
+
+def test_unroute_codex_restores_original_body(tmp_path, monkeypatch):
+    cfg = _codex_cfg(tmp_path, monkeypatch, 'model = "gpt-5.5"\n')
+    headroom._route_codex()
+    headroom._unroute_codex()
+    assert 'headroom' not in cfg.read_text()
+    assert cfg.read_text().strip() == 'model = "gpt-5.5"'
+
+
+def test_route_codex_requires_openai_auth_only_for_chatgpt(tmp_path, monkeypatch):
+    """requires_openai_auth restores the account menu but forces an OAuth login (headroom #406), so
+    it must appear ONLY for ChatGPT-OAuth users, never API-key users."""
+    cfg = _codex_cfg(tmp_path, monkeypatch, '')
+    from acctsw import paths as P
+    (P.CODEX_HOME / "auth.json").write_text(json.dumps({"auth_mode": "chatgpt"}))
+    headroom._route_codex()
+    assert 'requires_openai_auth = true' in cfg.read_text()
+    headroom._unroute_codex()
+    (P.CODEX_HOME / "auth.json").write_text(json.dumps({"auth_mode": "apikey"}))
+    headroom._route_codex()
+    assert 'requires_openai_auth' not in cfg.read_text()
+
+
+def test_route_unroute_claude_preserves_user_env(tmp_path, monkeypatch):
+    _codex_cfg(tmp_path, monkeypatch)
+    from acctsw import paths as P
+    settings = P.CLAUDE_CONFIG_DIR / "settings.json"
+    settings.write_text(json.dumps({"env": {"FOO": "bar"}, "other": 1}))
+    headroom._route_claude()
+    data = json.loads(settings.read_text())
+    assert data["env"]["ANTHROPIC_BASE_URL"] == f"http://127.0.0.1:{headroom.PROXY_PORT}"
+    assert data["env"]["ENABLE_TOOL_SEARCH"] == "true"   # GH#746
+    assert data["env"]["FOO"] == "bar" and data["other"] == 1
+    headroom._unroute_claude()
+    data2 = json.loads(settings.read_text())
+    assert "ANTHROPIC_BASE_URL" not in data2["env"]
+    assert data2["env"]["FOO"] == "bar" and data2["other"] == 1  # user keys untouched
+
+
+def test_unroute_claude_leaves_foreign_base_url_alone(tmp_path, monkeypatch):
+    """If ANTHROPIC_BASE_URL points somewhere that ISN'T our proxy, it's the user's — don't strip."""
+    _codex_cfg(tmp_path, monkeypatch)
+    from acctsw import paths as P
+    settings = P.CLAUDE_CONFIG_DIR / "settings.json"
+    settings.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}}))
+    headroom._unroute_claude()
+    assert json.loads(settings.read_text())["env"]["ANTHROPIC_BASE_URL"] == "https://api.anthropic.com"
+
+
+# --- proxy lifecycle ---------------------------------------------------------------------------
+
+def test_start_proxy_passes_shaper_env_and_tracks_pid(tmp_path, monkeypatch):
+    """start_proxy must launch `headroom proxy` with the shaper/holdout env (we own the child env now,
+    no env-less plist) and record the pid so stop_proxy can kill it later."""
+    monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
+    seen = {}
+
+    class _Proc:
+        pid = 4321
+
+    def fake_popen(argv, **k):
+        seen["argv"] = argv
+        seen["env"] = k.get("env", {})
+        seen["new_session"] = k.get("start_new_session")
+        return _Proc()
+
+    states = iter([False, True])   # not ready at first → starts; ready on the next poll
+    monkeypatch.setattr(headroom, "proxy_ready", lambda *a, **k: next(states, True))
+    ok = headroom.start_proxy(tmp_path / "store", popen=fake_popen, sleep=lambda *_: None)
+    assert ok
+    assert seen["argv"][1] == "proxy" and "--port" in seen["argv"]
+    assert seen["new_session"] is True
+    assert seen["env"]["HEADROOM_OUTPUT_SHAPER"] == "1"
+    assert float(seen["env"]["HEADROOM_OUTPUT_HOLDOUT"]) > 0
+    assert seen["env"]["HEADROOM_TELEMETRY"] == "off"     # hardening still applied
+    assert (tmp_path / "store" / "headroom-proxy.pid").read_text() == "4321"
+
+
+def test_start_proxy_returns_true_immediately_if_already_serving(tmp_path, monkeypatch):
+    monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
+    monkeypatch.setattr(headroom, "proxy_ready", lambda *a, **k: True)
+    called = []
+    assert headroom.start_proxy(tmp_path / "store", popen=lambda *a, **k: called.append(1)) is True
+    assert called == []                                   # idempotent: never spawned a second proxy
+
+
+def test_stop_proxy_kills_pid_and_clears_file(tmp_path, monkeypatch):
+    pidf = tmp_path / "store" / "headroom-proxy.pid"
+    pidf.parent.mkdir(parents=True)
+    pidf.write_text("4321")
+    killed = []
+    monkeypatch.setattr(headroom, "_pid_alive", lambda pid: pid == 4321 and not killed)
+    headroom.stop_proxy(tmp_path / "store",
+                        kill=lambda pid, sig: killed.append((pid, sig)), sleep=lambda *_: None)
+    assert killed and killed[0][0] == 4321
+    assert not pidf.exists()
+
+
+def test_proxy_ready_parses_readyz():
+    class _Resp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b'{"ready": true}'
+
+    assert headroom.proxy_ready(urlopen=lambda u, timeout=None: _Resp()) is True
+
+    class _NotReady(_Resp):
+        def read(self): return b'{"ready": false}'
+
+    assert headroom.proxy_ready(urlopen=lambda u, timeout=None: _NotReady()) is False
+
+    def boom(u, timeout=None):
+        raise OSError("connection refused")
+    assert headroom.proxy_ready(urlopen=boom) is False    # best-effort: never raises
+
+
+def test_global_running_reflects_readyz(monkeypatch):
+    monkeypatch.setattr(headroom, "proxy_ready", lambda *a, **k: True)
+    assert headroom.global_running() is True
+    monkeypatch.setattr(headroom, "proxy_ready", lambda *a, **k: False)
+    assert headroom.global_running() is False
+
+
+# --- global enable/disable (app-managed) -------------------------------------------------------
+
+def test_global_enable_snapshots_and_routes(tmp_path, monkeypatch):
     cfg = _codex_cfg(tmp_path, monkeypatch)
     monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
-    ok, msg = headroom.global_enable(tmp_path / "store", run=_fakerun(rc_apply=0, running=True))
+    _patch_proxy(monkeypatch)
+    ok, msg = headroom.global_enable(tmp_path / "store")
     assert ok, msg
     assert (tmp_path / "store" / "headroom-global-backup" / "manifest.json").exists()  # snapshot taken
+    assert 'model_provider = "headroom"' in cfg.read_text()                            # routed
 
 
-def test_global_enable_rolls_back_when_proxy_not_running(tmp_path, monkeypatch):
-    """apply succeeds but proxy isn't healthy → full rollback (never leave a dead-proxy route)."""
+def test_global_enable_routes_codex_and_claude(tmp_path, monkeypatch):
     cfg = _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
     monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
-    ok, _ = headroom.global_enable(tmp_path / "store", run=_fakerun(rc_apply=0, running=False))
+    _patch_proxy(monkeypatch)
+    ok, _ = headroom.global_enable(tmp_path / "store")
+    assert ok
+    from acctsw import paths as P
+    codex = cfg.read_text()
+    assert 'model_provider = "headroom"' in codex and 'model = "orig"' in codex
+    settings = json.loads((P.CLAUDE_CONFIG_DIR / "settings.json").read_text())
+    assert settings["env"]["ANTHROPIC_BASE_URL"] == f"http://127.0.0.1:{headroom.PROXY_PORT}"
+    assert settings["env"]["ENABLE_TOOL_SEARCH"] == "true"
+
+
+def test_global_enable_starts_proxy_before_routing(tmp_path, monkeypatch):
+    """Ordering invariant: the proxy must be confirmed healthy BEFORE any routing is written, or a
+    client could pick up the config and hit a dead port."""
+    cfg = _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
+    monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
+    order = []
+    monkeypatch.setattr(headroom, "proxy_ready", lambda *a, **k: False)
+    monkeypatch.setattr(headroom, "stop_proxy", lambda *a, **k: None)
+
+    def _start(store=None, **k):
+        order.append("start")
+        return True
+
+    def _route(*a, **k):
+        order.append("route")
+    monkeypatch.setattr(headroom, "start_proxy", _start)
+    monkeypatch.setattr(headroom, "_route_all", _route)
+    ok, _ = headroom.global_enable(tmp_path / "store")
+    assert ok and order == ["start", "route"]
+
+
+def test_global_enable_rolls_back_when_proxy_not_ready(tmp_path, monkeypatch):
+    """Proxy never comes up healthy → full rollback (never leave a dead-proxy route)."""
+    cfg = _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
+    monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
+    _patch_proxy(monkeypatch, start=False)
+    ok, _ = headroom.global_enable(tmp_path / "store")
     assert ok is False
     assert cfg.read_text() == 'model = "orig"\n'                # config untouched
     assert not (tmp_path / "store" / "headroom-global-backup").exists()
 
 
-def test_global_enable_rolls_back_on_apply_failure(tmp_path, monkeypatch):
+def test_global_enable_rolls_back_when_routing_fails(tmp_path, monkeypatch):
+    """Proxy healthy but writing the routing config raises → undo + restore original exactly."""
     cfg = _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
     monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
-    ok, _ = headroom.global_enable(tmp_path / "store", run=_fakerun(rc_apply=1, running=False))
+    _patch_proxy(monkeypatch)
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr(headroom, "_route_all", boom)
+    ok, _ = headroom.global_enable(tmp_path / "store")
     assert ok is False
     assert cfg.read_text() == 'model = "orig"\n'
     assert not (tmp_path / "store" / "headroom-global-backup").exists()
@@ -97,20 +311,35 @@ def test_snapshot_global_is_idempotent(tmp_path, monkeypatch):
     assert cfg.read_text() == 'model = "orig"\n'
 
 
-def test_global_disable_removes_and_restores(tmp_path, monkeypatch):
+def test_global_disable_unroutes_and_keeps_user_body(tmp_path, monkeypatch):
+    """Happy path: surgical unroute strips our block + stops the proxy while preserving the user's
+    own config, and clears the backup on a clean removal."""
     cfg = _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
     monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
-    headroom.snapshot_global(tmp_path / "store")                # pretend we'd enabled
-    cfg.write_text('model_provider = "headroom"\n')             # simulate injected routing
-    calls = []
-    def run(args, **k):
-        calls.append(args)
-        import types; return types.SimpleNamespace(returncode=0, stdout="removed", stderr="")
-    ok, _ = headroom.global_disable(tmp_path / "store", run=run)
+    calls = _patch_proxy(monkeypatch)
+    headroom.snapshot_global(tmp_path / "store")
+    headroom._route_codex()                                     # additive injection (keeps body)
+    assert headroom._is_injected("codex")
+    ok, _ = headroom.global_disable(tmp_path / "store")
     assert ok
-    assert calls[-1][1:3] == ["install", "remove"]
-    assert cfg.read_text() == 'model = "orig"\n'                # backstop restored the original
+    assert 'model_provider = "headroom"' not in cfg.read_text()
+    assert 'model = "orig"' in cfg.read_text()                  # user body preserved
+    assert calls["stop"] >= 1                                   # proxy torn down
     assert not (tmp_path / "store" / "headroom-global-backup").exists()  # backup cleared on success
+
+
+def test_disable_falls_back_to_snapshot_restore(tmp_path, monkeypatch):
+    """If surgical unroute can't clean the markers, the exact snapshot restore is the backstop."""
+    cfg = _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
+    monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
+    _patch_proxy(monkeypatch)
+    headroom.snapshot_global(tmp_path / "store")
+    cfg.write_text('model_provider = "headroom"\n')            # routed (crude overwrite)
+    monkeypatch.setattr(headroom, "_unroute_all", lambda *a, **k: None)   # surgical can't clean
+    ok, _ = headroom.global_disable(tmp_path / "store")
+    assert ok
+    assert cfg.read_text() == 'model = "orig"\n'               # snapshot backstop restored exactly
+    assert not (tmp_path / "store" / "headroom-global-backup").exists()
 
 
 def test_bridge_headroom_toggle_enables(ctx, monkeypatch):
@@ -147,19 +376,22 @@ def test_bridge_headroom_disable_failure_keeps_setting_on(ctx, monkeypatch):
 
 def test_heal_noop_when_proxy_running(tmp_path, monkeypatch):
     _codex_cfg(tmp_path, monkeypatch)
-    monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
-    changed, msg = headroom.heal(tmp_path / "store", run=_fakerun(running=True))
+    _patch_proxy(monkeypatch, ready=True)
+    changed, msg = headroom.heal(tmp_path / "store")
     assert changed is False and msg == "healthy"               # healthy proxy → never torn down
 
 
 def test_heal_strips_orphaned_injection_when_proxy_dead(tmp_path, monkeypatch):
     cfg = _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
     monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
-    headroom.snapshot_global(tmp_path / "store")               # original captured
-    cfg.write_text('model_provider = "headroom"\n')            # routing injected, proxy dead
-    changed, _ = headroom.heal(tmp_path / "store", run=_fakerun(running=False))
+    calls = _patch_proxy(monkeypatch, ready=False)
+    headroom.snapshot_global(tmp_path / "store")              # original captured
+    headroom._route_codex()                                   # routing injected, proxy dead
+    changed, _ = headroom.heal(tmp_path / "store")
     assert changed is True
-    assert cfg.read_text() == 'model = "orig"\n'               # restored from backup backstop
+    assert 'model_provider = "headroom"' not in cfg.read_text()
+    assert 'model = "orig"' in cfg.read_text()                # surgical unroute kept the user body
+    assert calls["stop"] >= 1                                 # dead proxy torn down
     assert not (tmp_path / "store" / "headroom-global-backup").exists()
 
 
@@ -168,12 +400,29 @@ def test_heal_reports_failure_when_restore_incomplete(tmp_path, monkeypatch):
     the UI shows 'restored' over a still-injected, dead-proxy config."""
     cfg = _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
     monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
+    _patch_proxy(monkeypatch, ready=False)
     headroom.snapshot_global(tmp_path / "store")
     cfg.write_text('model_provider = "headroom"\n')
     monkeypatch.setattr(headroom, "_remove_and_restore",
                         lambda *a, **k: (False, "config restore incomplete"))
-    healed, msg = headroom.heal(tmp_path / "store", run=_fakerun(running=False))
+    healed, msg = headroom.heal(tmp_path / "store")
     assert healed is False and "incomplete" in msg
+
+
+def test_heal_noop_when_clean(tmp_path, monkeypatch):
+    _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
+    _patch_proxy(monkeypatch, ready=False)
+    changed, msg = headroom.heal(tmp_path / "store")
+    assert changed is False and msg == "clean"                # nothing injected → nothing to do
+
+
+def test_heal_reasserts_knobs_when_proxy_running(tmp_path, monkeypatch):
+    """heal() runs on every poll; when the proxy is healthy it re-pushes the knobs (best-effort, in
+    case a proxy we didn't start is the one serving)."""
+    _patch_proxy(monkeypatch, ready=True)
+    pushed = []
+    headroom.heal(tmp_path / "store", push=lambda *a, **k: pushed.append(1) or True)
+    assert pushed == [1]
 
 
 def test_reconcile_keeps_setting_when_heal_fails(ctx, monkeypatch):
@@ -188,23 +437,21 @@ def test_global_enable_aborts_on_dirty_baseline(tmp_path, monkeypatch):
     never baseline a routed config as the user's 'original'."""
     _codex_cfg(tmp_path, monkeypatch, 'model_provider = "headroom"\n')   # routed, no backup yet
     monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
-
-    def run(args, **k):                                    # `install remove` that doesn't clean
-        import types; return types.SimpleNamespace(returncode=0, stdout="ok", stderr="")
-    ok, msg = headroom.global_enable(tmp_path / "store", run=run)
+    _patch_proxy(monkeypatch)
+    monkeypatch.setattr(headroom, "_unroute_all", lambda *a, **k: None)  # strip can't clean it
+    ok, msg = headroom.global_enable(tmp_path / "store")
     assert ok is False and "baseline" in msg
     assert not (tmp_path / "store" / "headroom-global-backup" / "manifest.json").exists()
 
 
 def test_disable_reports_failure_when_still_injected_no_backup(tmp_path, monkeypatch):
-    """install remove fails and there's no backup → config still routed. Must NOT report success
-    (else reconcile clears the setting over a broken config)."""
+    """Unroute fails and there's no backup → config still routed. Must NOT report success (else
+    reconcile clears the setting over a broken config)."""
     _codex_cfg(tmp_path, monkeypatch, 'model_provider = "headroom"\n')   # injected, no backup
     monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
-
-    def run(args, **k):
-        import types; return types.SimpleNamespace(returncode=1, stdout="not installed", stderr="")
-    ok, msg = headroom.global_disable(tmp_path / "store", run=run)
+    _patch_proxy(monkeypatch)
+    monkeypatch.setattr(headroom, "_unroute_all", lambda *a, **k: None)  # unroute can't clean
+    ok, msg = headroom.global_disable(tmp_path / "store")
     assert ok is False and "still present" in msg
 
 
@@ -213,10 +460,11 @@ def test_disable_is_op_lock_serialized(tmp_path, monkeypatch):
     — not a detached, unserialized remove."""
     _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
     monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
+    _patch_proxy(monkeypatch)
     store = tmp_path / "store"
     with headroom.op_lock(store):                              # hold the lock...
         # ...a non-blocking disable must NOT proceed (proves it tries to acquire the same lock)
-        ok, msg = headroom.global_disable(store, run=_fakerun(running=False), blocking=False)
+        ok, msg = headroom.global_disable(store, blocking=False)
     assert ok is False and msg == "headroom busy (another operation in progress)"
 
 
@@ -235,21 +483,15 @@ def test_bridge_headroom_toggle_survives_exception(ctx, monkeypatch):
     assert ctx.load_state().settings()["headroom"] is False   # enable failed → setting OFF
 
 
-def test_heal_noop_when_clean(tmp_path, monkeypatch):
-    _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
-    monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
-    changed, msg = headroom.heal(tmp_path / "store", run=_fakerun(running=False))
-    assert changed is False and msg == "clean"                # nothing injected → nothing to do
-
-
 def test_is_injected_detects_claude_settings_json(tmp_path, monkeypatch):
-    """Claude routing lands in settings.json, NOT CLAUDE.md — _is_injected must scan every touched
-    file or global_disable could delete the only backup while config is still routed."""
+    """Claude routing lands in settings.json (env.ANTHROPIC_BASE_URL), NOT CLAUDE.md — _is_injected
+    must scan every touched file or global_disable could delete the only backup while still routed."""
     from acctsw import paths as P
     monkeypatch.setattr(P, "CODEX_HOME", tmp_path / "codex")
     monkeypatch.setattr(P, "CLAUDE_CONFIG_DIR", tmp_path / "claude")
     (tmp_path / "codex").mkdir(); (tmp_path / "claude").mkdir()
-    (tmp_path / "claude" / "settings.json").write_text('{"env": {"X": "headroom:rtk-instructions"}}')
+    (tmp_path / "claude" / "settings.json").write_text(
+        json.dumps({"env": {"ANTHROPIC_BASE_URL": f"http://127.0.0.1:{headroom.PROXY_PORT}"}}))
     assert headroom._is_injected("claude") is True            # detected though CLAUDE.md is absent
 
 
@@ -287,7 +529,7 @@ def test_reconcile_clears_setting_when_healed(ctx, monkeypatch):
 
 
 def test_needs_reconcile_false_when_unused(ctx, monkeypatch):
-    """The cx/cl hot path must skip the status subprocess when save-credit was never used."""
+    """The cx/cl hot path must skip the readiness probe when save-credit was never used."""
     from acctsw import paths as P
     monkeypatch.setattr(P, "CODEX_HOME", ctx.data_dir / "nope-codex")
     monkeypatch.setattr(P, "CLAUDE_CONFIG_DIR", ctx.data_dir / "nope-claude")
@@ -312,50 +554,42 @@ def test_op_lock_file_lives_outside_backup_dir(tmp_path):
     assert not (store / "headroom-global-backup" / ".oplock").exists()
 
 
-def test_global_enable_sets_shaper_env_on_apply(tmp_path, monkeypatch):
-    """Enabling save-credit must run `install apply` with HEADROOM_OUTPUT_SHAPER=1 so the proxy
-    actually shapes output (otherwise output-savings can never report a number)."""
+def test_push_runtime_knobs_posts_shaper_and_holdout():
+    """The real push must POST both the shaper switch AND a >0 holdout to /admin/runtime-env on the
+    proxy port — that's what turns shaping on for the daemon and enables MEASURED savings."""
+    seen = {}
+
+    class _Resp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b"{}"
+
+    def fake_urlopen(req, timeout=None):
+        seen["url"] = req.full_url
+        seen["body"] = json.loads(req.data.decode())
+        return _Resp()
+
+    assert _REAL_PUSH(urlopen=fake_urlopen) is True
+    assert seen["url"] == f"http://127.0.0.1:{headroom.PROXY_PORT}/admin/runtime-env"
+    assert seen["body"]["HEADROOM_OUTPUT_SHAPER"] == "1"
+    assert float(seen["body"]["HEADROOM_OUTPUT_HOLDOUT"]) > 0
+
+
+def test_push_runtime_knobs_silent_when_proxy_down():
+    def boom(req, timeout=None):
+        raise OSError("connection refused")
+    assert _REAL_PUSH(urlopen=boom) is False  # best-effort: never raises
+
+
+def test_global_enable_pushes_knobs_after_routing(tmp_path, monkeypatch):
+    """A successful enable re-asserts the shaper/holdout on the live proxy (best-effort backstop)."""
     _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
     monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
-    envs = {}
-
-    def run(args, **k):
-        if "apply" in args:
-            envs["apply"] = k.get("env", {})
-        out = "proxy running" if "status" in args else "ok"
-        import types; return types.SimpleNamespace(returncode=0, stdout=out, stderr="")
-    ok, _ = headroom.global_enable(tmp_path / "store", run=run)
-    assert ok and envs["apply"].get("HEADROOM_OUTPUT_SHAPER") == "1"
-
-
-def test_global_enable_uses_provider_scope(tmp_path, monkeypatch):
-    """apply must use --scope provider so routing lands in codex/claude config files (the ones we
-    snapshot/restore), not Headroom's default --scope user shell-rc env blocks (Codex review P1)."""
-    _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
-    monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
-    apply_args = {}
-
-    def run(args, **k):
-        if "apply" in args:
-            apply_args["args"] = args
-        out = "proxy running" if "status" in args else "ok"
-        import types; return types.SimpleNamespace(returncode=0, stdout=out, stderr="")
-    ok, _ = headroom.global_enable(tmp_path / "store", run=run)
-    assert ok and "--scope" in apply_args["args"]
-    assert apply_args["args"][apply_args["args"].index("--scope") + 1] == "provider"
-
-
-def test_global_running_false_when_unhealthy(monkeypatch):
-    """`Status: running` + `Healthy: no` must read as DOWN, not up (Codex review P1)."""
-    def run(args, **k):
-        import types
-        return types.SimpleNamespace(returncode=0, stdout="Status: running\nHealthy: no", stderr="")
-    assert headroom.global_running(run=run) is False
-
-    def run_ok(args, **k):
-        import types
-        return types.SimpleNamespace(returncode=0, stdout="Status: running\nHealthy: yes", stderr="")
-    assert headroom.global_running(run=run_ok) is True
+    _patch_proxy(monkeypatch)
+    pushed = []
+    ok, _ = headroom.global_enable(tmp_path / "store",
+                                   push=lambda *a, **k: pushed.append(1) or True)
+    assert ok and pushed == [1]
 
 
 def test_seed_baseline_runs_learn_once(tmp_path, monkeypatch):
