@@ -503,6 +503,40 @@ def test_heal_strips_orphaned_injection_when_proxy_dead(tmp_path, monkeypatch):
     assert not (tmp_path / "store" / "headroom-global-backup").exists()
 
 
+def test_heal_reaps_orphan_proxy_when_app_gone(tmp_path, monkeypatch):
+    """Proxy UP but the app is GONE → orphan. heal(app_running=False) must strip the leftover routing
+    AND reap the proxy (a hard-killed app never ran its quit teardown)."""
+    cfg = _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
+    monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
+    calls = _patch_proxy(monkeypatch, ready=True)            # proxy still healthy...
+    headroom.snapshot_global(tmp_path / "store")
+    headroom._route_codex()                                  # ...with routing left injected
+    healed, _ = headroom.heal(tmp_path / "store", app_running=False)
+    assert healed is True
+    assert 'model_provider = "headroom"' not in cfg.read_text()
+    assert 'model = "orig"' in cfg.read_text()
+    assert calls["stop"] >= 1                                # orphan proxy reaped
+
+
+def test_heal_reaps_orphan_proxy_when_app_gone_clean_config(tmp_path, monkeypatch):
+    """Even with config already clean (graceful-OFF left the proxy alive), an app-gone proxy is an
+    orphan and must be stopped."""
+    _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
+    calls = _patch_proxy(monkeypatch, ready=True)
+    healed, _ = headroom.heal(tmp_path / "store", app_running=False)
+    assert healed is True
+    assert calls["stop"] >= 1
+
+
+def test_heal_keeps_running_proxy_when_app_alive(tmp_path, monkeypatch):
+    """The orphan-reap must NOT fire while the app is alive — a healthy managed proxy stays up."""
+    _codex_cfg(tmp_path, monkeypatch)
+    calls = _patch_proxy(monkeypatch, ready=True)
+    changed, msg = headroom.heal(tmp_path / "store", app_running=True)
+    assert changed is False and msg == "healthy"
+    assert calls["stop"] == 0
+
+
 def test_heal_reports_failure_when_restore_incomplete(tmp_path, monkeypatch):
     """heal() must NOT claim success when the restore failed — else reconcile clears the setting and
     the UI shows 'restored' over a still-injected, dead-proxy config."""

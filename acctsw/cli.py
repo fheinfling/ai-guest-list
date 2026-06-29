@@ -164,6 +164,18 @@ def _cmd_run(ctx: Context, ns) -> int:
     # The app is the master switch for supervision: when it's CLOSED, behave like the stock tool
     # (no auto-switch / no seat-hopping) — exec_stock replaces this process and never returns.
     if not appalive.app_running(ctx.data_dir):
+        # First self-heal Headroom: a hard-killed app never ran its quit teardown, so it can leave
+        # (a) routing injected — stock codex/claude would then hit a now-dead/foreign proxy and crash
+        # with ConnectionRefused — and/or (b) the proxy running with no owner to reap it. heal()
+        # strips any routing AND reaps an orphaned proxy so we exec TRULY stock. Cheap pre-check skips
+        # this entirely when Headroom was never used; blocking=False so a concurrent op never hangs the
+        # launch; app_running=False tells heal the live proxy is an orphan. The save-credit SETTING is
+        # kept (heal doesn't touch it), so it re-applies when the app is reopened.
+        from . import headroom as hr
+        if hr.needs_reconcile(ctx):
+            healed, _ = hr.heal(ctx.data_dir, blocking=False, app_running=False)
+            if healed:
+                notify(f"the app's closed — cleaned up Headroom; running stock {ns.tool}")
         return exec_stock(ctx, ns.tool, args)
     return launch(ctx, ns.tool, args, notify=notify)
 

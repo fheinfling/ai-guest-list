@@ -743,19 +743,27 @@ def needs_reconcile(ctx) -> bool:
     return has_backup(ctx.data_dir) or _any_injected()
 
 
-def heal(store: Path | None = None, *, blocking: bool = True, push=None) -> tuple[bool, str]:
+def heal(store: Path | None = None, *, blocking: bool = True, push=None,
+         app_running: bool = True) -> tuple[bool, str]:
     """Serialized self-heal that keys off ACTUAL state, not any setting — so it fixes orphans left by
     a failed enable/disable, a crash, or a force-quit, regardless of how the setting reads.
 
-    Returns (healed, msg) where healed=True ONLY when dead routing was found AND successfully removed
-    + restored. healed=False covers: lock busy, proxy healthy, config already clean, OR a restore
+    Returns (healed, msg) where healed=True ONLY when routing/proxy was found AND successfully cleaned
+    up. healed=False covers: lock busy, proxy healthy (app running), config already clean, OR a restore
     that FAILED (config still injected) — so callers never mistake an incomplete restore for success.
+
+    ``app_running`` is the master switch: the proxy's lifecycle belongs to the menubar app, so a
+    proxy that is up while the app is GONE is an ORPHAN (a hard-killed app never ran its quit teardown)
+    and must be reaped — otherwise it lingers and any session still pinned to its port keeps routing
+    through it. cx/cl pass app_running=False (the app is closed when they exec stock); the GUI poll /
+    launcher leave the default True.
 
     Inside op_lock:
       • busy (blocking=False, another op holds it) → (False, "busy"): let that op finish.
-      • proxy running → no-op. Re-checking `proxy_ready` here, under the same lock the toggle
-        holds, closes the enable/health-check TOCTOU: a heal that fires while an enable is still
-        bringing the proxy up blocks on the lock, then sees it ready and leaves it.
+      • proxy running, app alive → no-op. Re-checking `proxy_ready` here, under the same lock the
+        toggle holds, closes the enable/health-check TOCTOU: a heal that fires while an enable is
+        still bringing the proxy up blocks on the lock, then sees it ready and leaves it.
+      • proxy running, app GONE → orphan: strip any routing + restore config + reap the proxy.
       • routing injected but proxy dead → remove routing + restore config + stop the proxy.
       • nothing injected → no-op.
     """
@@ -763,8 +771,12 @@ def heal(store: Path | None = None, *, blocking: bool = True, push=None) -> tupl
         if not acquired:
             return False, "busy"
         if proxy_ready():
-            (push or push_runtime_knobs)()  # best-effort: re-assert knobs on a proxy we may not have started
-            return False, "healthy"
+            if app_running:
+                (push or push_runtime_knobs)()  # best-effort: re-assert knobs on a proxy we may not have started
+                return False, "healthy"
+            # App is gone but the proxy is still up → orphan. Reap it exactly as a graceful quit would
+            # have (strip/restore routing if any was left injected, then stop the proxy).
+            return _remove_and_restore(store)
         if not (_any_injected() or has_backup(store)):
             return False, "clean"
         ok, msg = _remove_and_restore(store)

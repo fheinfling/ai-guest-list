@@ -96,7 +96,9 @@ def isolated(tmp_path, monkeypatch):
 
 
 def test_run_gate_execs_stock_when_app_closed(isolated, monkeypatch):
+    from acctsw import headroom
     calls = {"stock": None, "supervised": False}
+    monkeypatch.setattr(headroom, "needs_reconcile", lambda ctx: False)  # Headroom never used → hermetic
     monkeypatch.setattr(launcher, "exec_stock",
                         lambda ctx, tool, args: calls.__setitem__("stock", (tool, args)) or 0)
     monkeypatch.setattr(launcher, "run",
@@ -105,6 +107,31 @@ def test_run_gate_execs_stock_when_app_closed(isolated, monkeypatch):
     cli.main(["run", "codex", "--", "exec", "hi"])
     assert calls["stock"] == ("codex", ["exec", "hi"])
     assert calls["supervised"] is False
+
+
+def test_run_gate_self_heals_headroom_before_exec_when_app_closed(isolated, monkeypatch):
+    """App closed + Headroom was used → strip dangling routing / reap an orphan proxy BEFORE running
+    stock, so codex/claude don't exec into a dead-or-foreign proxy (ConnectionRefused)."""
+    from acctsw import headroom
+    order = []
+    monkeypatch.setattr(headroom, "needs_reconcile", lambda ctx: True)
+    monkeypatch.setattr(headroom, "heal",
+                        lambda data_dir, **k: order.append(("heal", k)) or (True, "x"))
+    monkeypatch.setattr(launcher, "exec_stock",
+                        lambda *a, **k: order.append(("stock", None)) or 0)
+    cli.main(["run", "codex", "hi"])
+    assert order == [("heal", {"blocking": False, "app_running": False}), ("stock", None)]
+
+
+def test_run_gate_skips_heal_when_headroom_never_used(isolated, monkeypatch):
+    """Hot path: no Headroom state → skip the heal entirely and exec stock."""
+    from acctsw import headroom
+    called = {"heal": False}
+    monkeypatch.setattr(headroom, "needs_reconcile", lambda ctx: False)
+    monkeypatch.setattr(headroom, "heal", lambda *a, **k: called.__setitem__("heal", True) or (False, ""))
+    monkeypatch.setattr(launcher, "exec_stock", lambda *a, **k: 0)
+    cli.main(["run", "codex", "hi"])
+    assert called["heal"] is False
 
 
 def test_run_gate_supervises_when_app_open(isolated, monkeypatch):
