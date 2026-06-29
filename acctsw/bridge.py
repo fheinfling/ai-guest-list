@@ -17,7 +17,7 @@ from .errors import AcctswError
 from .switch import sync_back
 from .switch import switch as do_switch
 from .util import now, iso, parse_iso
-from .web_dot import dot_for
+from .web_dot import dot_for, door_for
 
 # Settings the UI may toggle (boolean only) — a whitelist so a stray key can't clobber e.g. theme.
 TOGGLE_KEYS = {"auto_switch", "headroom", "notify", "restart_app", "celebrations", "same_tool_only"}
@@ -62,6 +62,7 @@ def snapshot_state(ctx: Context) -> dict[str, Any]:
     last = parse_iso(state.data.get("last_switch_at"))
     data["recently_switched"] = bool(last and (now() - last).total_seconds() < SWITCH_FRESH_SECONDS)
     data["dot"] = dot_for(data)  # single source of truth for the dot (JS + native both read this)
+    data["door"] = door_for(data)  # shut/open door icon — same state feeds native glyph + web header
     return data
 
 

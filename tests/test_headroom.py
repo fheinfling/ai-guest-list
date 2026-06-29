@@ -185,9 +185,47 @@ def test_start_proxy_passes_shaper_env_and_tracks_pid(tmp_path, monkeypatch):
 def test_start_proxy_returns_true_immediately_if_already_serving(tmp_path, monkeypatch):
     monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
     monkeypatch.setattr(headroom, "proxy_ready", lambda *a, **k: True)
+    monkeypatch.setattr(headroom, "_port_listener_pid", lambda *a, **k: None)
     called = []
     assert headroom.start_proxy(tmp_path / "store", popen=lambda *a, **k: called.append(1)) is True
     assert called == []                                   # idempotent: never spawned a second proxy
+
+
+def test_start_proxy_adopts_foreign_pid_so_it_can_be_stopped(tmp_path, monkeypatch):
+    """If a proxy we didn't start (e.g. one that outlived a crash) already serves the port, start_proxy
+    must record its PID so a later stop_proxy/heal can still kill it — never leave it untracked."""
+    monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
+    monkeypatch.setattr(headroom, "proxy_ready", lambda *a, **k: True)
+    monkeypatch.setattr(headroom, "_port_listener_pid", lambda *a, **k: 9999)
+    assert headroom.start_proxy(tmp_path / "store", popen=lambda *a, **k: None) is True
+    assert headroom._proxy_pidfile(tmp_path / "store").read_text() == "9999"   # adopted, now stoppable
+
+
+def test_start_proxy_fails_fast_on_foreign_port(tmp_path, monkeypatch):
+    """A non-Headroom process on the port → fail fast (no 30s poll), and never spawn our proxy."""
+    monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
+    monkeypatch.setattr(headroom, "proxy_ready", lambda *a, **k: False)   # not our proxy
+    monkeypatch.setattr(headroom, "_port_busy", lambda *a, **k: True)     # but port is held
+    spawned = []
+    ok = headroom.start_proxy(tmp_path / "store", popen=lambda *a, **k: spawned.append(1))
+    assert ok is False and spawned == []
+
+
+def test_start_proxy_bounded_by_deadline(tmp_path, monkeypatch):
+    """Readiness polling is bounded by a wall-clock deadline, not attempts×timeout — it must give up
+    (and tear down) rather than block the op_lock for minutes when the proxy never answers."""
+    monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
+    monkeypatch.setattr(headroom, "proxy_ready", lambda *a, **k: False)   # never becomes ready
+    monkeypatch.setattr(headroom, "_port_busy", lambda *a, **k: False)
+    stopped = []
+    monkeypatch.setattr(headroom, "stop_proxy", lambda *a, **k: stopped.append(1))
+
+    class _Proc:
+        pid = 5
+    clock = iter([0.0, 10.0, 20.0, 31.0])                # advances past the 30s deadline
+    ok = headroom.start_proxy(tmp_path / "store", popen=lambda *a, **k: _Proc(),
+                              sleep=lambda *_: None, clock=lambda: next(clock))
+    assert ok is False and stopped == [1]                # gave up and tore down
 
 
 def test_stop_proxy_kills_pid_and_clears_file(tmp_path, monkeypatch):
@@ -328,18 +366,56 @@ def test_global_disable_unroutes_and_keeps_user_body(tmp_path, monkeypatch):
     assert not (tmp_path / "store" / "headroom-global-backup").exists()  # backup cleared on success
 
 
-def test_disable_falls_back_to_snapshot_restore(tmp_path, monkeypatch):
-    """If surgical unroute can't clean the markers, the exact snapshot restore is the backstop."""
+def test_enable_replaces_then_disable_restores_user_codex_provider(tmp_path, monkeypatch):
+    """A Codex user who already set model_provider/openai_base_url: enabling must REPLACE them (valid
+    TOML with a single key — not a duplicate that stops Codex launching), and disabling must restore
+    their originals verbatim from the snapshot."""
+    cfg = _codex_cfg(
+        tmp_path, monkeypatch,
+        'model_provider = "openai"\nopenai_base_url = "http://127.0.0.1:1234/v1"\nmodel = "o1"\n')
+    monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
+    _patch_proxy(monkeypatch)
+    ok, _ = headroom.global_enable(tmp_path / "store")
+    assert ok
+    routed = cfg.read_text()
+    import tomllib
+    tomllib.loads(routed)                                       # valid TOML — no duplicate key
+    assert routed.count("model_provider =") == 1               # ours REPLACED theirs, not appended
+    assert 'model_provider = "headroom"' in routed
+    ok, _ = headroom.global_disable(tmp_path / "store")
+    assert ok
+    assert cfg.read_text() == ('model_provider = "openai"\n'
+                               'openai_base_url = "http://127.0.0.1:1234/v1"\nmodel = "o1"\n')
+
+
+def test_enable_disable_restores_user_claude_env(tmp_path, monkeypatch):
+    """A Claude user who already had ENABLE_TOOL_SEARCH/other env set must get their exact original
+    values back after an enable/disable cycle (routing overwrites them while it's on)."""
+    _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
+    from acctsw import paths as P
+    settings = P.CLAUDE_CONFIG_DIR / "settings.json"
+    settings.write_text(json.dumps({"env": {"ENABLE_TOOL_SEARCH": "false", "FOO": "bar"}}))
+    monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
+    _patch_proxy(monkeypatch)
+    ok, _ = headroom.global_enable(tmp_path / "store")
+    assert ok
+    routed = json.loads(settings.read_text())["env"]
+    assert routed["ANTHROPIC_BASE_URL"] == f"http://127.0.0.1:{headroom.PROXY_PORT}"
+    assert routed["ENABLE_TOOL_SEARCH"] == "true"              # forced on while routed (GH#746)
+    ok, _ = headroom.global_disable(tmp_path / "store")
+    assert ok
+    assert json.loads(settings.read_text())["env"] == {"ENABLE_TOOL_SEARCH": "false", "FOO": "bar"}
+
+
+def test_disable_no_backup_uses_surgical_strip(tmp_path, monkeypatch):
+    """Orphan/desync with no snapshot: surgical unroute is the fallback and still clears routing."""
     cfg = _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
     monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
     _patch_proxy(monkeypatch)
-    headroom.snapshot_global(tmp_path / "store")
-    cfg.write_text('model_provider = "headroom"\n')            # routed (crude overwrite)
-    monkeypatch.setattr(headroom, "_unroute_all", lambda *a, **k: None)   # surgical can't clean
+    headroom._route_codex()                                    # routed, but NO snapshot taken
+    assert not headroom.has_backup(tmp_path / "store")
     ok, _ = headroom.global_disable(tmp_path / "store")
-    assert ok
-    assert cfg.read_text() == 'model = "orig"\n'               # snapshot backstop restored exactly
-    assert not (tmp_path / "store" / "headroom-global-backup").exists()
+    assert ok and "headroom" not in cfg.read_text() and 'model = "orig"' in cfg.read_text()
 
 
 def test_bridge_headroom_toggle_enables(ctx, monkeypatch):

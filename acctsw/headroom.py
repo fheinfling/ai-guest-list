@@ -167,11 +167,15 @@ def _any_injected() -> bool:
 
 _CODEX_MARK_START = "# --- acctsw headroom routing ---"
 _CODEX_MARK_END = "# --- end acctsw headroom routing ---"
-# Top-level Codex keys we own. They MUST precede any [table] header or TOML scopes them into it
-# (headroom #260), so _route_codex writes them as the first lines of the file.
+# Top-level Codex keys routing owns. Codex honours a single top-level model_provider/openai_base_url,
+# so to route we must REPLACE the user's (not append) — otherwise a user who already set either key
+# gets a duplicate top-level key, which is invalid TOML and stops Codex launching. So we strip ANY
+# value of these keys before writing ours; the user's original is captured in the pre-routing snapshot
+# and restored verbatim on disable (restore_global). They MUST precede any [table] header or TOML
+# scopes them into it (headroom #260), so _route_codex writes them as the first lines of the file.
 _CODEX_TOP_KEYS = (
-    re.compile(r'(?m)^[ \t]*model_provider[ \t]*=[ \t]*"headroom".*\r?\n'),
-    re.compile(r'(?m)^[ \t]*openai_base_url[ \t]*=[ \t]*"http://127\.0\.0\.1:\d+/v1".*\r?\n'),
+    re.compile(r'(?m)^[ \t]*model_provider[ \t]*=.*\r?\n'),
+    re.compile(r'(?m)^[ \t]*openai_base_url[ \t]*=.*\r?\n'),
 )
 
 
@@ -306,14 +310,14 @@ def _proxy_logfile(store: Path | None) -> Path:
     return (store or P.DATA_DIR) / "headroom-proxy.log"
 
 
-def proxy_ready(port: int = PROXY_PORT, *, urlopen=None) -> bool:
+def proxy_ready(port: int = PROXY_PORT, *, urlopen=None, timeout: float = 2.0) -> bool:
     """True iff the proxy answers GET /readyz with ready:true. Cross-process (plain HTTP), so a cx/cl
     launcher in another process can check the GUI-started proxy."""
     import urllib.error
     import urllib.request
     opener = urlopen or urllib.request.urlopen
     try:
-        with opener(f"http://127.0.0.1:{port}/readyz", timeout=2) as resp:
+        with opener(f"http://127.0.0.1:{port}/readyz", timeout=timeout) as resp:
             data = json.loads(resp.read().decode())
     except (OSError, urllib.error.URLError, ValueError):
         return False
@@ -328,17 +332,63 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _port_busy(port: int = PROXY_PORT) -> bool:
+    """True iff something is accepting TCP connections on the loopback port (may not be our proxy)."""
+    import socket
+    with socket.socket() as s:
+        s.settimeout(0.3)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _port_listener_pid(port: int = PROXY_PORT) -> int | None:
+    """PID of whatever is LISTENing on the loopback port (via lsof), or None if unknown/none."""
+    try:
+        out = subprocess.run(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    pids = [int(p) for p in out.split() if p.strip().isdigit()]
+    return pids[0] if pids else None
+
+
+def _adopt_proxy_pid(store: Path | None, port: int = PROXY_PORT) -> None:
+    """Ensure the pidfile points at the live listener so stop_proxy can kill a proxy we didn't start
+    THIS run (e.g. one that outlived a crash). No-op if we already track a live pid — without this,
+    start_proxy's idempotent early-return would leave an untracked proxy we can never tear down."""
+    pidf = _proxy_pidfile(store)
+    try:
+        cur = int(pidf.read_text().strip())
+    except (OSError, ValueError):
+        cur = 0
+    if cur > 0 and _pid_alive(cur):
+        return
+    adopted = _port_listener_pid(port)
+    if adopted:
+        try:
+            pidf.parent.mkdir(parents=True, exist_ok=True)
+            pidf.write_text(str(adopted))
+        except OSError:
+            pass
+
+
 def start_proxy(store: Path | None = None, *, port: int = PROXY_PORT, popen=None, sleep=None,
-                attempts: int = 60) -> bool:
-    """Start the proxy detached + PID-tracked and block until /readyz is healthy (≤~30s). Idempotent:
-    returns True at once if something already serves the port. Returns False if headroom is missing or
-    the proxy never becomes ready (caller rolls back)."""
+                ready_timeout: float = 30.0, clock=None) -> bool:
+    """Start the proxy detached + PID-tracked and block until /readyz is healthy (bounded by
+    ready_timeout, ~30s). Idempotent: if a proxy already serves the port, adopt its PID (so we can
+    still stop it) and return True. Fails fast if the port is held by a non-Headroom process. Returns
+    False if headroom is missing or the proxy never becomes ready (caller rolls back)."""
+    import time
+    _clock = clock or time.monotonic
     if proxy_ready(port):
+        _adopt_proxy_pid(store, port)     # so a proxy we didn't start this run is still stoppable
         return True
+    if _port_busy(port):                  # bound but not answering /readyz → foreign listener
+        _log_full(store, "start_proxy port busy",
+                  f"port {port} is held by a non-Headroom process; refusing to start")
+        return False
     exe = headroom_path()
     if not exe:
         return False
-    import time
     _popen = popen or subprocess.Popen
     _sleep = sleep or time.sleep
     env = harden_env()
@@ -365,8 +415,11 @@ def start_proxy(store: Path | None = None, *, port: int = PROXY_PORT, popen=None
         pidf.write_text(str(proc.pid))
     except OSError:
         pass
-    for _ in range(attempts):
-        if proxy_ready(port):
+    # Poll until a wall-clock deadline (not attempts*timeout, which could balloon to minutes when each
+    # probe hits its own timeout) so start_proxy never blocks the op_lock far longer than advertised.
+    deadline = _clock() + ready_timeout
+    while _clock() < deadline:
+        if proxy_ready(port, timeout=1.0):
             return True
         _sleep(0.5)
     _log_full(store, "start_proxy timeout", f"pid={getattr(proc, 'pid', '?')} never reached /readyz")
@@ -542,29 +595,30 @@ def global_running() -> bool:
 
 
 def _remove_and_restore(store: Path | None) -> tuple[bool, str]:
-    """Undo routing + stop our proxy. Surgically strip our routing first (_unroute_all — preserves any
-    user edits made while routing was on); fall back to the exact snapshot restore ONLY if a marker
-    survives. Always stop the proxy at the end. CALLER MUST HOLD op_lock (never takes it itself, so it
-    can be reused by global_disable and heal without deadlocking — flock isn't reentrant)."""
-    _unroute_all()
-    if not _any_injected():
-        _rm_backup(store)                             # clean removal; keep user edits
-        stop_proxy(store)
+    """Undo routing + stop our proxy. Routing REPLACES user keys (codex model_provider/openai_base_url,
+    claude ANTHROPIC_BASE_URL/ENABLE_TOOL_SEARCH), so a surgical strip can't bring the user's original
+    values back — only the exact pre-routing snapshot can. So restore from the snapshot when we have
+    one; fall back to a surgical strip ONLY for an orphan/desync with no backup. Always stop the proxy.
+    CALLER MUST HOLD op_lock (never takes it itself, so it can be reused by global_disable and heal
+    without deadlocking — flock isn't reentrant)."""
+    try:
+        if has_backup(store):
+            ok, failures = restore_global(store)      # exact original, incl. any keys routing overwrote
+            if not ok:
+                _log_full(store, "restore failures", "\n".join(failures))
+                return False, "Headroom removed but config restore incomplete (see ~/.account-switcher/headroom.log)"
+            if _any_injected():                       # snapshot itself was routed (shouldn't happen) → don't lie
+                _log_full(store, "still injected after restore", "snapshot restore left routing")
+                return False, "Headroom routing still present after restore (see ~/.account-switcher/headroom.log)"
+            return True, "headroom routing removed; config restored from backup"
+        # No backup (orphan/desync left by a crash): surgical strip is the best we can do.
+        _unroute_all()
+        if _any_injected():
+            _log_full(store, "still injected, no backup", "surgical unroute left routing and no backup to restore")
+            return False, "Headroom routing still present and no backup to restore (see ~/.account-switcher/headroom.log)"
         return True, "headroom routing removed"
-    _log_full(store, "unroute incomplete", "surgical unroute left a marker; restoring snapshot")
-    ok, failures = restore_global(store)              # backstop: exact restore; backup kept on failure
-    if not ok:
-        _log_full(store, "restore failures", "\n".join(failures))
+    finally:
         stop_proxy(store)
-        return False, "Headroom removed but config restore incomplete (see ~/.account-switcher/headroom.log)"
-    if _any_injected():
-        # unroute failed AND there was no backup to restore from → config is still routed. Don't
-        # report success: heal/reconcile must keep the setting on and keep trying, not clear it.
-        _log_full(store, "still injected after restore", "no backup; unroute left routing")
-        stop_proxy(store)
-        return False, "Headroom routing still present and no backup to restore (see ~/.account-switcher/headroom.log)"
-    stop_proxy(store)
-    return True, "headroom routing removed; config restored from backup"
 
 
 def global_enable(store: Path | None = None, *, push=None) -> tuple[bool, str]:
