@@ -137,8 +137,10 @@ class Decision:
     unlocks_at: str | None = None
 
 
-def handle_limit(ctx: Context, state, tool: str, *, get=usage_mod._default_get) -> Decision:
-    """A limit was caught for the active seat. Flag it, then choose the next seat."""
+def handle_limit(ctx: Context, state, tool: str, *, get=usage_mod._default_get,
+                 exclude: set | frozenset = frozenset()) -> Decision:
+    """A limit was caught for the active seat. Flag it, then choose the next seat. ``exclude`` carries
+    seats that already failed auth this run, so a limit never re-selects a known-dead-token seat."""
     active = state.active(tool)
     # Authoritative reset from the usage endpoint for the seat that just hit the limit (only the
     # active seat — others keep their known state; their stale snapshot tokens would 401 anyway).
@@ -150,7 +152,7 @@ def handle_limit(ctx: Context, state, tool: str, *, get=usage_mod._default_get) 
         state.set_limited_until(tool, active, iso(now() + DEFAULT_COOLDOWN), source="reactive")
     state.save()
 
-    sel = choose(state, tool)
+    sel = choose(state, tool, exclude=exclude)
     if sel.email and sel.available and sel.email != active:
         return Decision("switch", sel.email)
     return Decision("give_up", sel.email,
@@ -417,7 +419,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                         auth_failed.add(active)
                     dec = handle_auth_dead(ctx, state, tool, exclude=auth_failed)
                 else:
-                    dec = handle_limit(ctx, state, tool, get=get)
+                    dec = handle_limit(ctx, state, tool, get=get, exclude=auth_failed)
                 if dec.action == "switch":
                     switch(ctx, state, tool, dec.email, sync=(tool != "codex"))
                     _activate_codex_home(dec.email)

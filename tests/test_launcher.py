@@ -158,6 +158,16 @@ def test_detect_auth_dead_negative_and_not_a_limit():
     assert not detect_auth_dead("codex", "to fix this, please sign in again via the portal")
 
 
+def test_handle_limit_honors_auth_failed_exclude(ctx):
+    # after an auth hop, a later limit must NOT re-select the seat that already died this run
+    state = _two_codex(ctx)  # active a, b available
+    dec = handle_limit(ctx, state, "codex", get=fake_get({}), exclude={"b@x.com"})
+    assert dec.action == "give_up"          # b excluded, a just limited → nothing to switch to
+    # sanity: without the exclude it WOULD switch to b
+    state2 = _two_codex(ctx)
+    assert handle_limit(ctx, state2, "codex", get=fake_get({})).action == "switch"
+
+
 def test_handle_auth_dead_switches_excluding_active(ctx):
     state = _two_codex(ctx)  # active a
     dec = handle_auth_dead(ctx, state, "codex")

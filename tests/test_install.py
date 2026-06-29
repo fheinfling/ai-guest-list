@@ -211,6 +211,18 @@ def test_ensure_launchers_writes_wrappers_and_wires_rc(tmp_path, monkeypatch):
     assert not changed2
 
 
+def test_ensure_launchers_never_overwrites_existing_wrapper(tmp_path, monkeypatch):
+    rc = tmp_path / ".zshrc"
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    monkeypatch.setattr(inst, "shell_rc_path", lambda: rc)
+    (bindir / "cx").write_text("#!/bin/sh\n# good wrapper from `acctsw install`\n")
+    inst.ensure_launchers(bin_dir=bindir)
+    # an existing wrapper (e.g. written by the system-python install) must NOT be rewritten to a
+    # bundle-interpreter path that can't run from a terminal
+    assert "good wrapper" in (bindir / "cx").read_text()
+
+
 def test_uninstall_removes_only_our_block(ctx, tmp_path, monkeypatch):
     _seed_live(ctx)
     rc = tmp_path / ".zshrc"

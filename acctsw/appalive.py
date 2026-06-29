@@ -36,10 +36,16 @@ def _alive(pid: int) -> bool:
 
 
 def mark_alive(data_dir: Path) -> None:
-    """Record this process as the running app (called by the menubar app on launch + each poll)."""
+    """Record this process as the running app (called by the menubar app on launch + each poll).
+
+    Writes atomically (temp file + os.replace) so a concurrent ``app_running`` read during the
+    periodic refresh never sees a truncated/empty pidfile (which would make cx/cl wrongly run stock).
+    """
     f = _pidfile(data_dir)
     f.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    f.write_text(str(os.getpid()))
+    tmp = f.with_name(f"{f.name}.{os.getpid()}.tmp")
+    tmp.write_text(str(os.getpid()))
+    os.replace(tmp, f)
 
 
 def mark_dead(data_dir: Path) -> None:

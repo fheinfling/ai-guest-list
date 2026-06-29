@@ -224,13 +224,16 @@ def ensure_launchers(*, bin_dir: Path | None = None, python: str | None = None,
     changed, msgs = False, []
     for name in BIN_NAMES:
         target = bin_dir / name
-        script = _wrapper_script(name, python, pkg_root, bin_dir)
-        if not target.exists() or target.read_text() != script:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(script)
-            target.chmod(0o755)
-            changed = True
-            msgs.append(f"installed {target}")
+        # Only CREATE missing wrappers — never overwrite an existing one. `acctsw install` (run under
+        # the user's system python) is the authoritative writer; the app bootstrap must not rewrite a
+        # working wrapper to point at the bundle interpreter, which isn't invokable from a terminal.
+        if target.exists():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(_wrapper_script(name, python, pkg_root, bin_dir))
+        target.chmod(0o755)
+        changed = True
+        msgs.append(f"installed {target}")
     did, msg = ensure_shell_setup(bin_dir, aliases=aliases)
     msgs.append(msg)
     return (changed or did), msgs
