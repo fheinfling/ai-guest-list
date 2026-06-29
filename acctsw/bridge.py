@@ -104,7 +104,10 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
                         ok, msg = headroom.global_enable(ctx.data_dir)
                         effective = bool(ok)           # enable failed → leave it OFF
                     else:
-                        ok, msg = headroom.global_disable(ctx.data_dir)
+                        # graceful OFF: unroute new sessions but KEEP the proxy alive so an already-
+                        # open Claude/Codex session pinned to it doesn't drop. The proxy is reaped on
+                        # quit/health-fail, not by the user toggle.
+                        ok, msg = headroom.global_disable(ctx.data_dir, reap_proxy=False)
                         effective = not ok             # disable failed → leave it ON (keep recovering)
                 except Exception as e:                 # never let the toggle hang with no result
                     ok, msg, effective = False, f"{type(e).__name__}: {e}", (not val)

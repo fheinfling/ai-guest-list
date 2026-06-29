@@ -236,14 +236,18 @@ if objc is not None:
             """On quit (driven by applicationShouldTerminate_ on a background thread): remove global
             routing + restore config via global_disable, which is SERIALIZED through op_lock (waits
             out any in-flight enable/heal) and does an exact restore. The `headroom` SETTING is kept
-            so it re-applies next launch. Guarded against a double run."""
+            so it re-applies next launch. The proxy's lifecycle is the APP's, so quit also reaps a
+            graceful-OFF proxy that was left running for open sessions (needs_reconcile is false then,
+            since routing is already direct). Guarded against a double run."""
             if getattr(self, "_teardownDone", False):
                 return
             self._teardownDone = True
             try:
                 from acctsw import headroom
                 if headroom.needs_reconcile(self.ctx):
-                    headroom.global_disable(self.ctx.data_dir)   # blocking + op_lock-serialized
+                    headroom.global_disable(self.ctx.data_dir)   # blocking + op_lock-serialized (unroute + reap)
+                elif headroom.proxy_ready():
+                    headroom.stop_proxy(self.ctx.data_dir)       # reap a graceful-OFF proxy kept alive for open sessions
             except Exception:
                 pass
 
