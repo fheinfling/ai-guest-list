@@ -17,7 +17,7 @@ from .errors import AcctswError
 from .switch import sync_back
 from .switch import switch as do_switch
 from .util import now, iso, parse_iso
-from .web_dot import dot_for
+from .web_dot import dot_for, door_for
 
 # Settings the UI may toggle (boolean only) — a whitelist so a stray key can't clobber e.g. theme.
 TOGGLE_KEYS = {"auto_switch", "headroom", "notify", "restart_app", "celebrations", "same_tool_only"}
@@ -59,10 +59,10 @@ def snapshot_state(ctx: Context) -> dict[str, Any]:
     data["headroom_available"] = headroom_available()
     data["headroom_savings"] = headroom_savings() if data["headroom_available"] else None
     data["moved_note"] = state.data.get("moved_note")
-    data["headroom_log"] = (state.data.get("headroom_log") or [])[-5:]  # recent per-session savings
     last = parse_iso(state.data.get("last_switch_at"))
     data["recently_switched"] = bool(last and (now() - last).total_seconds() < SWITCH_FRESH_SECONDS)
     data["dot"] = dot_for(data)  # single source of truth for the dot (JS + native both read this)
+    data["door"] = door_for(data)  # shut/open door icon — same state feeds native glyph + web header
     return data
 
 
@@ -91,9 +91,32 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
             key = str(message["key"])
             if key not in TOGGLE_KEYS:
                 return {"ok": False, "error": f"not a toggle: {key}"}
+            val = bool(message["value"])
+            # The Headroom toggle drives global app-managed routing (apply/remove + proxy). Run the
+            # op FIRST, then persist the setting to match what actually happened — so the setting is
+            # never out of step with reality. In particular a FAILED disable keeps the setting ON, so
+            # the launch/health-check recovery paths keep trying instead of abandoning a still-routed
+            # config pointed at a dying proxy.
+            if key == "headroom":
+                from . import headroom
+                try:
+                    if val:
+                        ok, msg = headroom.global_enable(ctx.data_dir)
+                        effective = bool(ok)           # enable failed → leave it OFF
+                    else:
+                        ok, msg = headroom.global_disable(ctx.data_dir)
+                        effective = not ok             # disable failed → leave it ON (keep recovering)
+                except Exception as e:                 # never let the toggle hang with no result
+                    ok, msg, effective = False, f"{type(e).__name__}: {e}", (not val)
+                with ctx.locked():
+                    s = ctx.load_state(); s.set_setting("headroom", effective); s.save()
+                if not ok:
+                    err = f"couldn't enable Headroom: {msg}" if val else msg
+                    return {"ok": False, "error": err, "state": snapshot_state(ctx)}
+                return {"ok": True, "state": snapshot_state(ctx)}
             with ctx.locked():
                 state = ctx.load_state()
-                state.set_setting(key, bool(message["value"]))
+                state.set_setting(key, val)
                 state.save()
             return {"ok": True, "state": snapshot_state(ctx)}
 

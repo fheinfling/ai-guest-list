@@ -28,6 +28,29 @@ export function dotKey(state) {
   return "green";
 }
 
+// Door open/shut — mirror of acctsw.web_dot.door_for (golden fixture keeps them in lockstep).
+export function doorKey(state) {
+  if (state?.door === "open" || state?.door === "shut") return state.door;
+  const seats = ["codex", "claude"].flatMap((t) => state?.tools?.[t]?.seats || []);
+  const free = seats.some((s) => ["ready", "active"].includes(s.status));
+  return free || seats.length === 0 ? "open" : "shut";
+}
+
+// The header door mark (same glyph the menu bar swaps), matching the handoff icon-states prototype:
+// open = warm room with a spinning disco ball + twinkles and the door swung ajar; shut = a closed
+// cream door with a gold knob. Animated purely in CSS; aria-label carries the meaning.
+export function doorMark(state) {
+  const key = doorKey(state);
+  const label = key === "open" ? "a model's free — come on in" : "every seat's resting";
+  const inner = key === "open"
+    ? `<span class="door-room"><span class="door-string"></span><span class="door-ball"></span>` +
+      `<span class="tw tw1"></span><span class="tw tw2"></span>` +
+      `<span class="tw tw3"></span><span class="tw tw4"></span></span>` +
+      `<span class="door-leaf"></span>`
+    : `<span class="door-room"></span><span class="door-panel"></span><span class="door-knob"></span>`;
+  return `<span class="avatar door door--${key}" role="img" aria-label="${label}">${inner}</span>`;
+}
+
 export function needsHello(seat) {
   return (seat.status || "") === "needs-login" || (seat.usage || {}).error === "unauthorized";
 }
@@ -219,7 +242,7 @@ export function buildHTML(state) {
     : "install Headroom to enable";
   return `<div class="app theme-${theme}">
     <header class="top">
-      <span class="avatar"></span>
+      ${doorMark(state)}
       <span class="brand-tx"><span class="brand mono">ai guest list</span>
         <span class="substatus">${c.resting} resting · ${c.ready} ready 💛</span></span>
       <span class="top-actions">

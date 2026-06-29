@@ -35,19 +35,33 @@ unauditable from source) and a full packet capture of in-flight provider traffic
    assets and executed (supply-chain surface). Mitigated below.
 3. **Compiled `_core.abi3.so`** ships in the wheel — trust the PyPI build (not locally auditable).
 4. **`litellm`** transitive dep has its own telemetry — disabled below.
-5. **Invasive to config** — `headroom wrap` rewrites `~/.codex/config.toml` + `AGENTS.md` + adds an
-   MCP server. Our integration runs it **session-scoped** (`headroom.scoped`) and restores those
-   files byte-for-byte on exit.
+5. **Invasive to config** — routing through the proxy means writing `model_provider = "headroom"` +
+   a `[model_providers.headroom]` block into `~/.codex/config.toml` and an `ANTHROPIC_BASE_URL` env
+   entry into Claude's `settings.json`. We deliberately do **not** use `headroom install apply` (its
+   macOS launchd deploy is broken — see [headroom-handover.md](headroom-handover.md)); instead we run
+   the proxy ourselves as a detached, PID-tracked subprocess and hand-write that minimal routing
+   (`acctsw/headroom.py` `_route_all`). Our integration is **global & app-managed**: enabling
+   snapshots the ORIGINAL files (bytes + mode + symlink target); disabling does a surgical unroute
+   (strips only our marker block, preserving any edits you made while it was on) and falls back to an
+   exact byte-for-byte restore from the snapshot only if a marker survives. A serialized `heal()`
+   (keyed off actual on-disk injection state, not a flag) strips any dangling routing and stops the
+   proxy on the next app launch or `cx`/`cl` run. So after a crash/force-quit, the dangling routing is
+   healed the next time the app starts or you run `cx`/`cl`; a plain `codex`/`claude` run in that gap
+   (app force-killed, not yet relaunched, not via `cx`/`cl`) can still hit the dead proxy until then.
+   Normal quit removes routing on exit, so the gap only opens on an abnormal kill.
 
 ## Hardening we apply (`acctsw/headroom.py`)
 - **Version pinned** to the audited `0.27.0` (`PINNED_VERSION`).
-- **Env on every wrapped session** (`HARDENING_ENV`): `HEADROOM_TELEMETRY=off`,
+- **Env on every Headroom subprocess** (`HARDENING_ENV`): `HEADROOM_TELEMETRY=off`,
   `LITELLM_TELEMETRY=False`, `DO_NOT_TRACK=1`.
 - **No cloud keys are ever set** by us (Langfuse/Qdrant/Headroom-API stay off).
 - **`rtk` checksum-pinning (TOFU)** — `verify_rtk()` records rtk's sha256 on first sight and refuses
-  to run with save-credit if it ever changes unexpectedly (supply-chain tamper guard).
-- **Off by default + session-scoped** — nothing routes through Headroom unless you toggle it and run
-  via `cx`/`cl`; config is restored afterward.
+  to enable save-credit if it ever changes unexpectedly (supply-chain tamper guard). It runs on the
+  enable path *before* the "already on" early-return, so a swapped binary is caught even when routing
+  is already up.
+- **Off by default** — nothing routes through Headroom unless you turn save-credit on. When you do,
+  routing applies globally (plain `codex`/`claude` + the GUI + `cx`/`cl`); turning it off, quitting
+  the app, or a dead-proxy health-check all restore your config.
 
 ## To re-verify later
 ```sh
