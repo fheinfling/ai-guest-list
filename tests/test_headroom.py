@@ -159,6 +159,7 @@ def test_start_proxy_passes_shaper_env_and_tracks_pid(tmp_path, monkeypatch):
     """start_proxy must launch `headroom proxy` with the shaper/holdout env (we own the child env now,
     no env-less plist) and record the pid so stop_proxy can kill it later."""
     monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
+    monkeypatch.setattr(headroom, "_port_busy", lambda *a, **k: False)   # hermetic vs a real local proxy
     seen = {}
 
     class _Proc:
@@ -407,6 +408,21 @@ def test_enable_disable_restores_user_claude_env(tmp_path, monkeypatch):
     assert json.loads(settings.read_text())["env"] == {"ENABLE_TOOL_SEARCH": "false", "FOO": "bar"}
 
 
+def test_global_disable_graceful_keeps_proxy_alive(tmp_path, monkeypatch):
+    """reap_proxy=False (graceful toggle-OFF): unroute the configs but DON'T stop the proxy, so a
+    session that pinned the port at launch keeps working while new sessions go direct."""
+    cfg = _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
+    monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
+    calls = _patch_proxy(monkeypatch)
+    headroom.snapshot_global(tmp_path / "store")
+    headroom._route_codex()
+    ok, _ = headroom.global_disable(tmp_path / "store", reap_proxy=False)
+    assert ok
+    assert 'model_provider = "headroom"' not in cfg.read_text()   # new sessions go direct
+    assert 'model = "orig"' in cfg.read_text()                    # user body restored
+    assert calls["stop"] == 0                                     # proxy LEFT alive for open sessions
+
+
 def test_disable_no_backup_uses_surgical_strip(tmp_path, monkeypatch):
     """Orphan/desync with no snapshot: surgical unroute is the fallback and still clears routing."""
     cfg = _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
@@ -421,7 +437,7 @@ def test_disable_no_backup_uses_surgical_strip(tmp_path, monkeypatch):
 def test_bridge_headroom_toggle_enables(ctx, monkeypatch):
     seen = {}
     def _on(store): seen["on"] = True; return (True, "ok")
-    def _off(store): seen["off"] = True; return (True, "ok")
+    def _off(store, **k): seen["off"] = True; return (True, "ok")
     monkeypatch.setattr(headroom, "global_enable", _on)
     monkeypatch.setattr(headroom, "global_disable", _off)
     r = bridge.handle(ctx, {"action": "toggle", "key": "headroom", "value": True})
@@ -441,11 +457,27 @@ def test_bridge_headroom_disable_failure_keeps_setting_on(ctx, monkeypatch):
     """A FAILED disable must leave the setting ON so launch/health recovery keeps trying — never
     abandon a still-routed config pointed at a dying proxy with the setting flipped off."""
     monkeypatch.setattr(headroom, "global_enable", lambda store: (True, "ok"))
-    monkeypatch.setattr(headroom, "global_disable", lambda store: (False, "restore incomplete"))
+    monkeypatch.setattr(headroom, "global_disable", lambda store, **k: (False, "restore incomplete"))
     bridge.handle(ctx, {"action": "toggle", "key": "headroom", "value": True})
     r = bridge.handle(ctx, {"action": "toggle", "key": "headroom", "value": False})
     assert r["ok"] is False
     assert ctx.load_state().settings()["headroom"] is True      # stays ON → recovery keeps trying
+
+
+def test_bridge_toggle_off_is_graceful(ctx, monkeypatch):
+    """User toggle-OFF must call global_disable with reap_proxy=False so an open session pinned to the
+    proxy isn't dropped (the proxy is only reaped on quit/health-fail)."""
+    seen = {}
+    monkeypatch.setattr(headroom, "global_enable", lambda store: (True, "ok"))
+
+    def _off(store, *, reap_proxy=True):
+        seen["reap_proxy"] = reap_proxy
+        return (True, "ok")
+
+    monkeypatch.setattr(headroom, "global_disable", _off)
+    bridge.handle(ctx, {"action": "toggle", "key": "headroom", "value": True})
+    bridge.handle(ctx, {"action": "toggle", "key": "headroom", "value": False})
+    assert seen["reap_proxy"] is False
 
 
 # --- heal(): serialized self-heal keyed off ACTUAL state (not the setting) ---------------------

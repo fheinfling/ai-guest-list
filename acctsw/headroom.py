@@ -604,13 +604,14 @@ def global_running() -> bool:
     return proxy_ready()
 
 
-def _remove_and_restore(store: Path | None) -> tuple[bool, str]:
-    """Undo routing + stop our proxy. Routing REPLACES user keys (codex model_provider/openai_base_url,
-    claude ANTHROPIC_BASE_URL/ENABLE_TOOL_SEARCH), so a surgical strip can't bring the user's original
-    values back — only the exact pre-routing snapshot can. So restore from the snapshot when we have
-    one; fall back to a surgical strip ONLY for an orphan/desync with no backup. Always stop the proxy.
-    CALLER MUST HOLD op_lock (never takes it itself, so it can be reused by global_disable and heal
-    without deadlocking — flock isn't reentrant)."""
+def _remove_and_restore(store: Path | None, *, reap_proxy: bool = True) -> tuple[bool, str]:
+    """Undo routing (and optionally stop our proxy). Routing REPLACES user keys (codex
+    model_provider/openai_base_url, claude ANTHROPIC_BASE_URL/ENABLE_TOOL_SEARCH), so a surgical strip
+    can't bring the user's original values back — only the exact pre-routing snapshot can. So restore
+    from the snapshot when we have one; fall back to a surgical strip ONLY for an orphan/desync with no
+    backup. reap_proxy=False keeps the proxy alive (graceful toggle-OFF: a Claude/Codex session that
+    pinned 127.0.0.1:PORT at launch can't be repointed, so killing the proxy would drop it — leaving it
+    up lets open sessions drain while new ones, now unrouted, go direct). CALLER MUST HOLD op_lock."""
     try:
         if has_backup(store):
             ok, failures = restore_global(store)      # exact original, incl. any keys routing overwrote
@@ -628,7 +629,8 @@ def _remove_and_restore(store: Path | None) -> tuple[bool, str]:
             return False, "Headroom routing still present and no backup to restore (see ~/.account-switcher/headroom.log)"
         return True, "headroom routing removed"
     finally:
-        stop_proxy(store)
+        if reap_proxy:
+            stop_proxy(store)
 
 
 def global_enable(store: Path | None = None, *, push=None) -> tuple[bool, str]:
@@ -699,14 +701,20 @@ def seed_baseline(store: Path | None = None, *, run=subprocess.run) -> tuple[boo
     return True, "headroom savings baseline seeded"
 
 
-def global_disable(store: Path | None = None, *, blocking: bool = True) -> tuple[bool, str]:
-    """Undo routing + stop the proxy. Serialized by op_lock. With blocking=False (quit teardown),
-    returns (False, 'busy') immediately rather than waiting on a concurrent op — the next launch /
-    cx / cl heal() is a reliable backstop, so quit never freezes on lock acquisition."""
+def global_disable(store: Path | None = None, *, blocking: bool = True,
+                   reap_proxy: bool = True) -> tuple[bool, str]:
+    """Undo routing (and, by default, stop the proxy). Serialized by op_lock. With blocking=False (quit
+    teardown), returns (False, 'busy') immediately rather than waiting on a concurrent op — the next
+    launch / cx / cl heal() is a reliable backstop, so quit never freezes on lock acquisition.
+
+    reap_proxy=False = graceful toggle-OFF: unroute (new codex/claude go direct) but LEAVE the proxy
+    running, so an already-open session that pinned 127.0.0.1:PORT at launch keeps working instead of
+    hitting ConnectionRefused. The proxy is reaped on quit/health-fail (reap_proxy=True) — its real
+    lifecycle is the app's, not the toggle's."""
     with op_lock(store, blocking=blocking) as acquired:
         if not acquired:
             return False, "headroom busy (another operation in progress)"
-        return _remove_and_restore(store)
+        return _remove_and_restore(store, reap_proxy=reap_proxy)
 
 
 def reconcile(ctx, *, blocking: bool = True) -> tuple[bool, str]:
