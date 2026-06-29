@@ -706,6 +706,44 @@ def test_verify_rtk_tofu(tmp_path, monkeypatch):
     assert ok is False and "changed" in msg            # tamper detected
 
 
+def test_headroom_path_prefers_managed_venv(tmp_path, monkeypatch):
+    """The packaged .app has no headroom on PATH/next to its frozen python — it must find the
+    on-demand managed venv (~/.account-switcher/hr-venv) first."""
+    from acctsw import paths as P
+    monkeypatch.setattr(P, "DATA_DIR", tmp_path)
+    binp = tmp_path / "hr-venv" / "bin"
+    binp.mkdir(parents=True)
+    (binp / "headroom").write_text("")
+    assert headroom.headroom_path() == str(binp / "headroom")
+
+
+def test_ensure_installed_creates_managed_venv_and_installs_pinned(tmp_path, monkeypatch):
+    """When headroom isn't available, ensure_installed builds the managed venv from a real base python
+    and pip-installs the PINNED headroom-ai[proxy] into it (not into the frozen app python)."""
+    from acctsw import paths as P
+    monkeypatch.setattr(P, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(headroom, "_base_python", lambda: "/opt/python3.11")
+    state = {"ok": False}
+    monkeypatch.setattr(headroom, "available", lambda: state["ok"])
+    calls = []
+
+    def fake_run(argv, **k):
+        calls.append(argv)
+        if argv[1:3] == ["-m", "venv"]:
+            (tmp_path / "hr-venv" / "bin").mkdir(parents=True, exist_ok=True)
+            (tmp_path / "hr-venv" / "bin" / "python").write_text("")
+        if "install" in argv and headroom.PACKAGE in argv:
+            (tmp_path / "hr-venv" / "bin" / "headroom").write_text("")
+            state["ok"] = True
+        import types
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(headroom.subprocess, "run", fake_run)
+    assert headroom.ensure_installed() is True
+    assert any(a[0] == "/opt/python3.11" and a[1:3] == ["-m", "venv"] for a in calls)  # built from base py
+    assert any(headroom.PACKAGE in a for a in calls)                                   # pinned pkg installed
+
+
 def test_bridge_headroom_install(ctx):
     # headroom is already in the venv, so ensure_installed is a fast no-op returning available
     r = bridge.handle(ctx, {"action": "headroom_install"})

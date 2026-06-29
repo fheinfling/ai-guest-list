@@ -753,8 +753,20 @@ def heal(store: Path | None = None, *, blocking: bool = True, push=None) -> tupl
         return ok, msg                            # ok=False ⇒ still injected; NOT a successful heal
 
 
+# Managed on-demand venv for the proxy. The packaged .app is intentionally slim — it does NOT freeze
+# the proxy stack (litellm/onnxruntime/transformers are huge native/ML wheels py2app can't freeze
+# cleanly, but pip handles them fine). On first enable we create this venv and pip-install
+# headroom-ai[proxy] into it; headroom_path() then finds its real `headroom` console script.
+def hr_venv_dir() -> Path:
+    return P.DATA_DIR / "hr-venv"
+
+
 def headroom_path() -> str | None:
-    """Absolute path to the `headroom` CLI: PATH first, then this venv's bin dir."""
+    """Absolute path to the `headroom` CLI. Checks, in order: the managed on-demand venv (used by the
+    packaged .app), then PATH, then the running interpreter's bin dir (the dev source venv)."""
+    managed = hr_venv_dir() / "bin" / "headroom"
+    if managed.exists():
+        return str(managed)
     found = shutil.which("headroom")
     if found:
         return found
@@ -770,15 +782,49 @@ def venv_bin_dir() -> str:
     return str(Path(sys.executable).parent)
 
 
+def _base_python() -> str | None:
+    """A real Python >=3.11 to build the managed venv from. Prefer a system python3.11/3.12 (handles
+    the native/ML wheels cleanly); fall back to our own interpreter (the dev venv is already 3.11; a
+    py2app-frozen python has venv+ensurepip too)."""
+    for name in ("python3.11", "python3.12", "python3.13"):
+        p = shutil.which(name)
+        if p:
+            return p
+    p = shutil.which("python3")
+    if p:
+        try:
+            out = subprocess.run([p, "-c", "import sys;print(sys.version_info[:2]>=(3,11))"],
+                                 capture_output=True, text=True, timeout=15)
+            if out.stdout.strip() == "True":
+                return p
+        except (subprocess.SubprocessError, OSError):
+            pass
+    return sys.executable
+
+
 def ensure_installed() -> bool:
-    """Best-effort: install headroom into the current venv if missing. Returns availability."""
+    """Make the `headroom` CLI available. No-op if already found. Otherwise create the managed venv
+    (~/.account-switcher/hr-venv) and pip-install headroom-ai[proxy] into it — a one-time, ~hundreds-
+    of-MB download (the proxy's litellm/onnxruntime/transformers wheels). Best-effort; returns
+    availability."""
     if available():
         return True
+    base = _base_python()
+    if not base:
+        return False
+    venv = hr_venv_dir()
+    vpy = venv / "bin" / "python"
     try:
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q", PACKAGE],
-                       capture_output=True, timeout=600)
-    except (subprocess.SubprocessError, OSError):
-        pass
+        if not vpy.exists():
+            venv.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.run([base, "-m", "venv", str(venv)], capture_output=True, timeout=180, check=True)
+        subprocess.run([str(vpy), "-m", "pip", "install", "-q", "--upgrade", "pip"],
+                       capture_output=True, timeout=300)
+        subprocess.run([str(vpy), "-m", "pip", "install", "-q", PACKAGE],
+                       capture_output=True, timeout=1800, check=True)
+    except (subprocess.SubprocessError, OSError) as e:
+        _log_full(None, "ensure_installed failed", str(e))
+        return False
     return available()
 
 
