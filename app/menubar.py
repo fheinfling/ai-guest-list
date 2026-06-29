@@ -269,8 +269,10 @@ if objc is not None:
                     objc.selector(self.bgToggle_, signature=b"v@:@"), msg)
                 return
             if action == "login":
-                # native: sync-back-before-login (invariant) + run the chosen flow in Terminal
-                from .terminal import prepare_then_login
+                # native: sync-back-before-login (invariant) + run the chosen flow in Terminal.
+                # Absolute import (not `.terminal`): under py2app the main script runs as top-level
+                # __main__ with no package context, so a relative import would fail in the .app.
+                from app.terminal import prepare_then_login
                 prepare_then_login(self.ctx, msg["tool"], msg.get("command"))
                 self._notify("finish signing in", "then tap ‘save my seat’ 🎟️")
                 self._pushResult({"ok": True, "await_snapshot": True, "tool": msg["tool"]})
