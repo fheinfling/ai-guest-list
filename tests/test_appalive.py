@@ -47,6 +47,19 @@ def test_garbage_heartbeat_reads_as_closed(ctx):
     assert appalive.app_running(ctx.data_dir) is False
 
 
+def test_recycled_pid_reads_as_closed(ctx):
+    """A live PID whose recorded start-time doesn't match (the OS recycled the PID for an unrelated
+    process after a crash) must read as closed — not as the app still running."""
+    (ctx.data_dir / "app.pid").write_text(f"{os.getpid()}\nNot The Real Start Time")
+    assert appalive.app_running(ctx.data_dir) is False
+
+
+def test_legacy_pidfile_without_start_falls_back_to_liveness(ctx):
+    """A heartbeat with only a PID (no recorded start-time) still works via liveness."""
+    (ctx.data_dir / "app.pid").write_text(str(os.getpid()))
+    assert appalive.app_running(ctx.data_dir) is True
+
+
 # --- exec_stock -------------------------------------------------------------------------------
 
 def test_exec_stock_execs_the_stock_binary(ctx, monkeypatch):
