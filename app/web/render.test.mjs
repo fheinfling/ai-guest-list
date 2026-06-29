@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
-  buildHTML, dotState, dotKey, creditLeft, pct, fmtCountdown, needsHello,
+  buildHTML, dotState, dotKey, doorKey, doorMark, creditLeft, pct, fmtCountdown, needsHello,
   buildPicker, buildSaveSeat, buildPaste, buildSettings,
 } from "./render.mjs";
 
@@ -32,6 +32,25 @@ test("dotKey golden parity with python fixture", () => {
 test("dotState reads bridge-provided state.dot", () => {
   assert.equal(dotState({ dot: "amber" }).key, "amber");
   assert.equal(dotState({ dot: "hello" }).label, "needs a hello");
+});
+
+test("doorKey golden parity with python fixture", () => {
+  const path = fileURLToPath(new URL("../../tests/fixtures/door_cases.json", import.meta.url));
+  for (const c of JSON.parse(readFileSync(path, "utf8"))) assert.equal(doorKey(c.state), c.expected, c.name);
+});
+
+test("doorKey prefers bridge-provided state.door, falls back to seats", () => {
+  assert.equal(doorKey({ door: "shut" }), "shut");
+  assert.equal(doorKey(state({ tools: { codex: { seats: [{ status: "active" }] }, claude: { seats: [] } } })), "open");
+});
+
+test("header renders the live door mark, not the old gradient avatar", () => {
+  const open = buildHTML(state({ door: "open" }));
+  assert.match(open, /class="avatar door door--open"/);
+  assert.match(open, /door-ball/);
+  const shut = buildHTML(state({ door: "shut" }));
+  assert.match(shut, /class="avatar door door--shut"/);
+  assert.doesNotMatch(doorMark({ door: "shut" }), /linear-gradient\(135deg/);
 });
 
 test("needsHello detects needs-login status", () => {

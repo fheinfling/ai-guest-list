@@ -3,11 +3,12 @@ import json
 from pathlib import Path
 
 from acctsw import accounts as acct
-from acctsw.web_dot import dot_for
+from acctsw.web_dot import dot_for, door_for
 from app import terminal
 from tests.conftest import make_codex_blob
 
 FIXTURE = Path(__file__).parent / "fixtures" / "dot_cases.json"
+DOOR_FIXTURE = Path(__file__).parent / "fixtures" / "door_cases.json"
 
 
 def test_dot_for_golden_fixture():
@@ -15,6 +16,13 @@ def test_dot_for_golden_fixture():
     cases = json.loads(FIXTURE.read_text())
     for c in cases:
         assert dot_for(c["state"]) == c["expected"], c["name"]
+
+
+def test_door_for_golden_fixture():
+    """Door open/shut — same fixture asserted by node UI tests so python/JS can't drift."""
+    cases = json.loads(DOOR_FIXTURE.read_text())
+    for c in cases:
+        assert door_for(c["state"]) == c["expected"], c["name"]
 
 
 def test_prepare_then_login_syncs_back_active_before_login(ctx, monkeypatch):
