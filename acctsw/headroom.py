@@ -80,9 +80,19 @@ def push_runtime_knobs(port: int = PROXY_PORT, *, knobs: dict | None = None, url
         return False
 
 
+# py2app injects PYTHONHOME/PYTHONPATH (and friends) pointing at the FROZEN app's stripped, zipped
+# stdlib. Every Headroom subprocess runs a DIFFERENT interpreter (the managed venv's headroom, or
+# `python -m venv`); if these leak in, that interpreter resolves stdlib against the app bundle and dies
+# (e.g. `ModuleNotFoundError: No module named 'uuid'`). Strip them so each child python uses its own.
+_PY_ENV_STRIP = ("PYTHONHOME", "PYTHONPATH", "PYTHONEXECUTABLE", "__PYVENV_LAUNCHER__")
+
+
 def harden_env(env: dict | None = None) -> dict:
-    """Return env with hardening flags applied (does not mutate the input)."""
+    """Return env with hardening flags applied + interpreter-redirect vars stripped (so a child python
+    uses its own stdlib, not the frozen app's). Does not mutate the input."""
     e = dict(os.environ if env is None else env)
+    for k in _PY_ENV_STRIP:
+        e.pop(k, None)
     e.update(HARDENING_ENV)
     return e
 
@@ -814,14 +824,16 @@ def ensure_installed() -> bool:
         return False
     venv = hr_venv_dir()
     vpy = venv / "bin" / "python"
+    env = harden_env()        # strip the frozen-app PYTHONHOME/PYTHONPATH so base/venv python is clean
     try:
         if not vpy.exists():
             venv.parent.mkdir(parents=True, exist_ok=True)
-            subprocess.run([base, "-m", "venv", str(venv)], capture_output=True, timeout=180, check=True)
+            subprocess.run([base, "-m", "venv", str(venv)], capture_output=True, timeout=180,
+                           check=True, env=env)
         subprocess.run([str(vpy), "-m", "pip", "install", "-q", "--upgrade", "pip"],
-                       capture_output=True, timeout=300)
+                       capture_output=True, timeout=300, env=env)
         subprocess.run([str(vpy), "-m", "pip", "install", "-q", PACKAGE],
-                       capture_output=True, timeout=1800, check=True)
+                       capture_output=True, timeout=1800, check=True, env=env)
     except (subprocess.SubprocessError, OSError) as e:
         _log_full(None, "ensure_installed failed", str(e))
         return False
