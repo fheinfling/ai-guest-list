@@ -133,6 +133,99 @@ def test_install_keychain_guard_protects_original_when_manifest_lost(ctx, tmp_pa
     assert ctx.keychain.get(ctx.keychain_service, _backup_account("codex")) == original_factory
 
 
+def test_ensure_shell_setup_adds_then_is_idempotent(tmp_path):
+    rc = tmp_path / ".zshrc"
+    bindir = tmp_path / "bin"
+    changed, _ = inst.ensure_shell_setup(bindir, rc)
+    assert changed
+    body = rc.read_text()
+    assert inst.BLOCK_BEGIN in body and inst.BLOCK_END in body
+    assert f'export PATH="{bindir}:$PATH"' in body
+    assert "alias codex=cx" in body and "alias claude=cl" in body
+    # second call is a no-op (block already present, identical)
+    changed2, _ = inst.ensure_shell_setup(bindir, rc)
+    assert not changed2
+    assert rc.read_text().count(inst.BLOCK_BEGIN) == 1
+
+
+def test_ensure_shell_setup_rewrites_block_in_place(tmp_path):
+    rc = tmp_path / ".zshrc"
+    inst.ensure_shell_setup(tmp_path / "bin", rc, aliases=True)
+    # re-running with aliases off rewrites OUR block (still exactly one), dropping the alias lines
+    changed, _ = inst.ensure_shell_setup(tmp_path / "bin", rc, aliases=False)
+    assert changed
+    body = rc.read_text()
+    assert body.count(inst.BLOCK_BEGIN) == 1
+    assert "alias codex=cx" not in body
+
+
+def test_ensure_shell_setup_preserves_existing_content(tmp_path):
+    rc = tmp_path / ".zshrc"
+    rc.write_text("alias ll='ls -la'")          # no trailing newline
+    inst.ensure_shell_setup(tmp_path / "bin", rc)
+    body = rc.read_text()
+    assert body.startswith("alias ll='ls -la'\n")   # original kept, newline inserted before our block
+
+
+def test_install_with_path_wires_rc(ctx, tmp_path, monkeypatch):
+    _seed_live(ctx)
+    rc = tmp_path / ".zshrc"
+    monkeypatch.setattr(inst, "shell_rc_path", lambda: rc)
+    monkeypatch.setenv("PATH", "/usr/bin")       # bin_dir not on PATH
+    bindir = tmp_path / "bin"
+    install(ctx, bin_dir=bindir, register=False, with_path=True)
+    body = rc.read_text()
+    assert f'export PATH="{bindir}:$PATH"' in body
+    assert "alias codex=cx" in body
+
+
+def test_install_default_warns_and_never_edits_rc(ctx, tmp_path, monkeypatch):
+    _seed_live(ctx)
+    rc = tmp_path / ".zshrc"
+    monkeypatch.setattr(inst, "shell_rc_path", lambda: rc)
+    monkeypatch.setenv("PATH", "/usr/bin")
+    plan = install(ctx, bin_dir=tmp_path / "bin", register=False)  # no with_path
+    assert not rc.exists()                                          # never edited silently
+    assert any("NOT on PATH" in a for a in plan.actions)
+
+
+def test_install_no_warning_when_already_on_path(ctx, tmp_path, monkeypatch):
+    _seed_live(ctx)
+    bindir = tmp_path / "bin"
+    monkeypatch.setenv("PATH", f"{bindir}:/usr/bin")
+    plan = install(ctx, bin_dir=bindir, register=False)
+    assert any("already on PATH" in a for a in plan.actions)
+    assert not any("NOT on PATH" in a for a in plan.actions)
+
+
+def test_ensure_launchers_writes_wrappers_and_wires_rc(tmp_path, monkeypatch):
+    rc = tmp_path / ".zshrc"
+    bindir = tmp_path / "bin"
+    monkeypatch.setattr(inst, "shell_rc_path", lambda: rc)
+    changed, _ = inst.ensure_launchers(bin_dir=bindir)
+    assert changed
+    assert (bindir / "cx").exists() and (bindir / "cl").exists()
+    assert "alias codex=cx" in rc.read_text()
+    # idempotent: nothing changes on a second call
+    changed2, _ = inst.ensure_launchers(bin_dir=bindir)
+    assert not changed2
+
+
+def test_uninstall_removes_only_our_block(ctx, tmp_path, monkeypatch):
+    _seed_live(ctx)
+    rc = tmp_path / ".zshrc"
+    rc.write_text("alias ll='ls -la'\n")
+    monkeypatch.setattr(inst, "shell_rc_path", lambda: rc)
+    bindir = tmp_path / "bin"
+    inst.ensure_shell_setup(bindir, rc)
+    assert inst.BLOCK_BEGIN in rc.read_text()
+    uninstall(ctx, bin_dir=bindir)
+    body = rc.read_text()
+    assert inst.BLOCK_BEGIN not in body
+    assert f'export PATH="{bindir}:$PATH"' not in body
+    assert "alias ll='ls -la'" in body            # untouched user content survives
+
+
 def test_purge_removes_store_and_keychain(ctx, tmp_path):
     _seed_live(ctx)
     install(ctx, bin_dir=tmp_path / "bin", register=True)

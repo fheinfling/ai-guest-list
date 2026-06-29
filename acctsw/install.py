@@ -11,6 +11,7 @@ Guarantees:
 from __future__ import annotations
 
 import os
+import re
 import stat
 import sys
 from dataclasses import dataclass, field
@@ -25,6 +26,76 @@ from .util import now, iso, sha256_text, write_json
 
 BIN_DIR = Path.home() / ".local" / "bin"
 BIN_NAMES = ("acctsw", "cx", "cl")
+
+# We manage a single, clearly-delimited block in the user's shell rc (conda-style begin/end markers)
+# so it can be rewritten in place and removed cleanly without touching anything else they wrote.
+BLOCK_BEGIN = "# >>> ai guest list (acctsw) >>>"
+BLOCK_END = "# <<< ai guest list (acctsw) <<<"
+_BLOCK_RE = re.compile(re.escape(BLOCK_BEGIN) + r".*?" + re.escape(BLOCK_END) + r"\n?", re.DOTALL)
+
+
+def shell_rc_path() -> Path:
+    """The shell rc to manage, inferred from $SHELL. zsh (macOS default) → ~/.zshrc;
+    bash → ~/.bashrc; anything else → ~/.profile."""
+    shell = os.environ.get("SHELL", "")
+    home = Path.home()
+    if shell.endswith("zsh"):
+        return home / ".zshrc"
+    if shell.endswith("bash"):
+        return home / ".bashrc"
+    return home / ".profile"
+
+
+def on_path(bin_dir: Path) -> bool:
+    """True if bin_dir is already on the current PATH."""
+    return str(bin_dir) in os.environ.get("PATH", "").split(os.pathsep)
+
+
+def shell_block(bin_dir: Path, *, aliases: bool = True) -> str:
+    """The exact rc block we manage: put cx/cl on PATH and (optionally) alias codex/claude → cx/cl
+    so a plain ``codex``/``claude`` is supervised (auto-switch + resume on limits)."""
+    lines = [
+        BLOCK_BEGIN,
+        "# cx/cl supervise codex/claude: auto-switch seats + resume your work on usage limits.",
+        f'export PATH="{bin_dir}:$PATH"',
+    ]
+    if aliases:
+        lines += ["alias codex=cx", "alias claude=cl"]
+    lines.append(BLOCK_END)
+    return "\n".join(lines) + "\n"
+
+
+def ensure_shell_setup(bin_dir: Path | None = None, rc_path: Path | None = None,
+                       *, aliases: bool = True) -> tuple[bool, str]:
+    """Idempotently install our managed block into the shell rc so cx/cl are runnable (and, with
+    aliases, so plain codex/claude are supervised). Rewrites our block in place if its contents
+    changed; never touches the user's other lines. Returns (changed, message)."""
+    bin_dir = bin_dir or BIN_DIR
+    rc_path = rc_path or shell_rc_path()
+    block = shell_block(bin_dir, aliases=aliases)
+    existing = rc_path.read_text() if rc_path.exists() else ""
+    if BLOCK_BEGIN in existing:
+        new = _BLOCK_RE.sub(block, existing, count=1)
+    else:
+        prefix = "" if (not existing or existing.endswith("\n")) else "\n"
+        new = existing + prefix + "\n" + block
+    if new == existing:
+        return False, f"{rc_path} already set up for cx/cl"
+    rc_path.parent.mkdir(parents=True, exist_ok=True)
+    rc_path.write_text(new)
+    return True, f"wired cx/cl into {rc_path} — open a NEW terminal (or `source {rc_path}`)"
+
+
+def remove_shell_setup(rc_path: Path | None = None) -> bool:
+    """Remove our managed block (only ours). Returns True if something was removed."""
+    rc_path = rc_path or shell_rc_path()
+    if not rc_path.exists():
+        return False
+    text = rc_path.read_text()
+    if BLOCK_BEGIN not in text:
+        return False
+    rc_path.write_text(_BLOCK_RE.sub("", text, count=1))
+    return True
 
 
 def _backup_account(tool: str) -> str:
@@ -55,7 +126,7 @@ class Plan:
 
 def install(ctx: Context, *, dry_run: bool = False, register: bool = True,
             bin_dir: Path | None = None, python: str | None = None,
-            pkg_root: Path | None = None) -> Plan:
+            pkg_root: Path | None = None, with_path: bool = False) -> Plan:
     plan = Plan(dry_run=dry_run)
     bin_dir = bin_dir or BIN_DIR
     python = python or sys.executable
@@ -123,11 +194,46 @@ def install(ctx: Context, *, dry_run: bool = False, register: bool = True,
     else:
         plan.do("install headroom (save-credit) into the app venv", hr.ensure_installed)
 
-    # 5. PATH note (never edit rc silently).
-    if str(bin_dir) not in os.environ.get("PATH", "").split(os.pathsep):
-        plan.actions.append(f"NOTE: add to PATH →  export PATH=\"{bin_dir}:$PATH\"")
+    # 5. shell setup: cx/cl are useless (autoswitch never fires) unless bin_dir is on PATH. With
+    #    --path we wire it (PATH + codex/claude aliases) so it "just works"; otherwise WARN loudly
+    #    (not a quiet NOTE) so the gap is never silent.
+    if with_path:
+        rc = shell_rc_path()
+        def _setup(b=bin_dir, r=rc):
+            ensure_shell_setup(b, r)
+        plan.do(f"wire cx/cl into {rc} (PATH + codex/claude aliases; open a new terminal after)", _setup)
+    elif on_path(bin_dir):
+        plan.actions.append(f"{bin_dir} already on PATH — cx/cl are ready")
+    else:
+        plan.actions.append(
+            f"WARNING: {bin_dir} is NOT on PATH, so cx/cl won't run and autoswitch can't work. "
+            f"Fix it with `acctsw path`, or add:  export PATH=\"{bin_dir}:$PATH\"")
 
     return plan
+
+
+def ensure_launchers(*, bin_dir: Path | None = None, python: str | None = None,
+                     pkg_root: Path | None = None, aliases: bool = True) -> tuple[bool, list[str]]:
+    """Make cx/cl usable end-to-end with zero manual steps: (re)write the bin wrappers if missing or
+    stale, and wire the shell rc (PATH + codex/claude aliases). Idempotent and cheap — safe to call
+    on every app launch so a fresh install "just works" and a deleted rc block self-heals. Returns
+    (changed, messages)."""
+    bin_dir = bin_dir or BIN_DIR
+    python = python or sys.executable
+    pkg_root = pkg_root or Path(__file__).resolve().parent.parent
+    changed, msgs = False, []
+    for name in BIN_NAMES:
+        target = bin_dir / name
+        script = _wrapper_script(name, python, pkg_root, bin_dir)
+        if not target.exists() or target.read_text() != script:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(script)
+            target.chmod(0o755)
+            changed = True
+            msgs.append(f"installed {target}")
+    did, msg = ensure_shell_setup(bin_dir, aliases=aliases)
+    msgs.append(msg)
+    return (changed or did), msgs
 
 
 def _wrapper_script(name: str, python: str, pkg_root: Path, bin_dir: Path) -> str:
@@ -197,7 +303,12 @@ def uninstall(ctx: Context, *, purge: bool = False, dry_run: bool = False,
     if app.exists():
         plan.actions.append(f"NOTE: remove the menubar app at {app} (drag to Trash)")
 
-    plan.actions.append(f"NOTE: if you added it, remove the PATH line for {bin_dir} from your shell rc")
+    # remove the managed block we added (only ours — delimited by our begin/end markers).
+    rc = shell_rc_path()
+    if rc.exists() and BLOCK_BEGIN in rc.read_text():
+        plan.do(f"remove our cx/cl block from {rc}", lambda r=rc: remove_shell_setup(r))
+    else:
+        plan.actions.append(f"NOTE: if you added it manually, remove the cx/cl block for {bin_dir} from your shell rc")
 
     # 4. purge: delete store + all our keychain items.
     if purge:

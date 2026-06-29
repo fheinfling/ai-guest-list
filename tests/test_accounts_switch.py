@@ -17,6 +17,31 @@ def _add_codex(ctx, email):
     return state, seat
 
 
+def test_add_clears_stale_auth_error(ctx):
+    """Re-capturing a seat (after re-login) must reset its usage error/backoff so the app
+    auto-recovers instead of staying stuck on 'log in' behind the error backoff."""
+    state, _ = _add_codex(ctx, "a@x.com")
+    u = state.get_seat("codex", "a@x.com").setdefault("usage", {})
+    u.update(error="unauthorized", error_streak=20, stale=True,
+             fetched_at="2026-01-01T00:00:00+00:00")
+    state.save()
+    ctx.cred["codex"].set_live(make_codex_blob("a@x.com"))
+    acct.add(ctx, ctx.load_state(), "codex", email="a@x.com")
+    u2 = ctx.load_state().get_seat("codex", "a@x.com")["usage"]
+    assert u2["error"] is None and u2["error_streak"] == 0
+    assert u2["stale"] is False and u2["fetched_at"] is None   # forces an immediate re-check
+
+
+def test_reconcile_codex_clears_error_on_changed_creds(ctx):
+    state, _ = _add_codex(ctx, "a@x.com")
+    state.get_seat("codex", "a@x.com").setdefault("usage", {})["error"] = "unauthorized"
+    state.save()
+    ctx.cred["codex"].set_live(make_codex_blob("a@x.com") + " ")  # different bytes, same account
+    em = acct.reconcile_codex(ctx, ctx.load_state())
+    assert em == "a@x.com"
+    assert ctx.load_state().get_seat("codex", "a@x.com")["usage"]["error"] is None
+
+
 def test_add_snapshots_and_activates(ctx):
     state, seat = _add_codex(ctx, "a@x.com")
     assert seat["email"] == "a@x.com"

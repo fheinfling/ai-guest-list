@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
 from . import APP_NAME, TOOLS, __version__
@@ -35,6 +36,9 @@ def build_parser() -> argparse.ArgumentParser:
     ins.add_argument("--dry-run", action="store_true", help="print actions without doing them")
     ins.add_argument("--no-register", action="store_true",
                      help="don't auto-register the currently logged-in account")
+    ins.add_argument("--path", action="store_true",
+                     help="wire cx/cl into your shell rc (PATH + codex/claude aliases) so it just works")
+    sub.add_parser("path", help="wire cx/cl into your shell rc (PATH + codex/claude aliases)")
     uni = sub.add_parser("uninstall", help="remove the engine and restore original creds")
     uni.add_argument("--purge", action="store_true", help="also delete the store + keychain items")
     uni.add_argument("--dry-run", action="store_true", help="print actions without doing them")
@@ -149,7 +153,8 @@ def _cmd_usage(ctx: Context, ns) -> int:
 
 
 def _cmd_run(ctx: Context, ns) -> int:
-    from .launcher import run as launch
+    from .launcher import run as launch, exec_stock
+    from . import appalive
 
     def notify(msg: str) -> None:
         print(f"· {msg}", file=sys.stderr)
@@ -157,13 +162,18 @@ def _cmd_run(ctx: Context, ns) -> int:
     args = list(ns.args or [])
     if args and args[0] == "--":  # argparse REMAINDER keeps a leading separator
         args = args[1:]
+    # The app is the master switch for supervision: when it's CLOSED, behave like the stock tool
+    # (no auto-switch / no seat-hopping) — exec_stock replaces this process and never returns.
+    if not appalive.app_running(ctx.data_dir):
+        return exec_stock(ctx, ns.tool, args)
     return launch(ctx, ns.tool, args, notify=notify)
 
 
 def _cmd_install(ctx: Context, ns) -> int:
     from . import install as inst
     plan = inst.install(ctx, dry_run=getattr(ns, "dry_run", False),
-                        register=not getattr(ns, "no_register", False))
+                        register=not getattr(ns, "no_register", False),
+                        with_path=getattr(ns, "path", False))
     for a in plan.actions:
         print(f"  {a}")
     if getattr(ns, "dry_run", False):
@@ -186,6 +196,13 @@ def _cmd_uninstall(ctx: Context, ns) -> int:
     return EXIT_OK
 
 
+def _cmd_path(ctx: Context, ns) -> int:
+    from . import install as inst
+    changed, msg = inst.ensure_shell_setup(inst.BIN_DIR)
+    print(f"{'✓' if changed else '·'} {msg}")
+    return EXIT_OK
+
+
 def _not_impl(ctx: Context, ns) -> int:
     print(f"acctsw: '{ns.command}' arrives in a later milestone.", file=sys.stderr)
     return EXIT_NOIMPL
@@ -201,6 +218,7 @@ HANDLERS = {
     "run": _cmd_run,
     "install": _cmd_install,
     "uninstall": _cmd_uninstall,
+    "path": _cmd_path,
 }
 
 

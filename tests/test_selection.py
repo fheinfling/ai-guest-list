@@ -63,6 +63,29 @@ def test_all_limited_tie_break_is_deterministic(tmp_path):
     assert choose(s, "codex", at=at).email == "a@x"
 
 
+def test_exclude_skips_seat(tmp_path):
+    s = _state_with(tmp_path, [("a@x", None), ("b@x", None)])
+    s.set_active("codex", "a@x")
+    sel = choose(s, "codex", exclude={"a@x"})   # launcher excluding a just-failed seat
+    assert sel.email == "b@x" and sel.available is True
+
+
+def test_exclude_all_returns_none(tmp_path):
+    s = _state_with(tmp_path, [("a@x", None)])
+    sel = choose(s, "codex", exclude={"a@x"})
+    assert sel.email is None and sel.available is False
+
+
+def test_unauthorized_seat_is_still_selectable(tmp_path):
+    # a non-active seat routinely shows usage.error=unauthorized (stale access token); selection
+    # must NOT treat that as unusable, or autoswitch would skip healthy backups.
+    s = _state_with(tmp_path, [("a@x", None), ("b@x", None)])
+    s.get_seat("codex", "b@x")["usage"] = {"error": "unauthorized"}
+    s.set_active("codex", "a@x")
+    sel = choose(s, "codex", exclude={"a@x"})
+    assert sel.email == "b@x" and sel.available is True
+
+
 def test_naive_reset_timestamp_does_not_crash(tmp_path):
     at = now()
     naive = (at + timedelta(hours=1)).replace(tzinfo=None).isoformat()  # no tz suffix

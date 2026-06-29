@@ -63,9 +63,19 @@ LIMIT_PATTERNS = {
 
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
+# Auth-death signals (token revoked / signed out). DISTINCT from a usage limit: switching+resuming on
+# the SAME seat can't help — the seat needs re-login — so we hop to a DIFFERENT seat. Kept to the
+# tools' SPECIFIC error wording (not loose phrases like "sign in again") because this buffer also
+# carries the model's own generated text; a loose match would kill a healthy session on benign output.
+AUTH_DEAD_PATTERNS = {
+    "codex": [r"refresh token (?:was |is )?revoked", r"log ?out and sign in again"],
+    "claude": [r"refresh token (?:was |is )?revoked", r"log ?out and sign in again",
+               r"oauth token (?:has )?expired"],
+}
 
-def _compiled(tool: str) -> list:
-    return [re.compile(p, re.IGNORECASE) for p in LIMIT_PATTERNS[tool]]
+# Compile once at import — detect_* runs once per PTY output chunk (a hot interactive path).
+_LIMIT_RE = {t: [re.compile(p, re.IGNORECASE) for p in pats] for t, pats in LIMIT_PATTERNS.items()}
+_AUTH_RE = {t: [re.compile(p, re.IGNORECASE) for p in pats] for t, pats in AUTH_DEAD_PATTERNS.items()}
 
 
 def detect_limit(tool: str, text: str) -> bool:
@@ -73,7 +83,14 @@ def detect_limit(tool: str, text: str) -> bool:
 
     ANSI escape codes are stripped first so a TUI's color codes can't split a phrase.
     """
-    return any(rx.search(_ANSI.sub("", text)) for rx in _compiled(tool))
+    clean = _ANSI.sub("", text)
+    return any(rx.search(clean) for rx in _LIMIT_RE[tool])
+
+
+def detect_auth_dead(tool: str, text: str) -> bool:
+    """True if recent output says the seat's credentials are dead (revoked / signed out)."""
+    clean = _ANSI.sub("", text)
+    return any(rx.search(clean) for rx in _AUTH_RE[tool])
 
 
 class NoSeats(AcctswError):
@@ -85,6 +102,22 @@ class NoSeats(AcctswError):
 def build_cmd(ctx: Context, tool: str, args: list) -> list:
     exe = (ctx.codex_bin if tool == "codex" else ctx.claude_bin) or tool
     return [exe, *args]
+
+
+def exec_stock(ctx: Context, tool: str, args: list) -> int:
+    """Replace this process with the STOCK tool — no supervision, no auto-switch.
+
+    Used when the menubar app is closed: terminal ``codex``/``claude`` must then behave exactly
+    like the real tool (against whatever account is currently in ~/.codex / the keychain). We
+    ``execvp`` rather than spawn so the tool fully owns the terminal (TTY, signals, exit code).
+    Returns 127 only if exec fails (binary missing); on success it never returns.
+    """
+    argv = build_cmd(ctx, tool, args)
+    try:
+        os.execvp(argv[0], argv)
+    except OSError:
+        return 127
+    return 127
 
 
 def resume_cmd(ctx: Context, tool: str) -> list:
@@ -119,6 +152,23 @@ def handle_limit(ctx: Context, state, tool: str, *, get=usage_mod._default_get) 
 
     sel = choose(state, tool)
     if sel.email and sel.available and sel.email != active:
+        return Decision("switch", sel.email)
+    return Decision("give_up", sel.email,
+                    sel.unlocks_at.isoformat() if sel.unlocks_at else None)
+
+
+def handle_auth_dead(ctx: Context, state, tool: str, *, exclude: set | frozenset = frozenset()) -> Decision:
+    """The active seat's credentials are dead (revoked/signed out) for THIS run. Choose a DIFFERENT
+    seat, skipping the active one plus any that already failed auth this session (``exclude``).
+
+    We deliberately do NOT persist a "dead" flag on the seat: a usage-poll ``unauthorized`` is not a
+    reliable health signal (a non-active seat shows it from a stale cached access token), and a benign
+    output match shouldn't disable a seat beyond the current run. Re-login is detected fresh next time.
+    """
+    active = state.active(tool)
+    skip = set(exclude) | ({active} if active else set())
+    sel = choose(state, tool, exclude=skip)
+    if sel.email and sel.available:
         return Decision("switch", sel.email)
     return Decision("give_up", sel.email,
                     sel.unlocks_at.isoformat() if sel.unlocks_at else None)
@@ -330,24 +380,29 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
 
         switches = 0
         resuming = False
+        auth_failed: set = set()   # seats whose token died THIS run — skip them for the rest of it
         buf = bytearray()
         while True:
             # Headroom is applied globally (app toggle), not per-session, so we run the tool plain.
             argv = resume_cmd(ctx, tool) if resuming else build_cmd(ctx, tool, args)
-            hit = {"v": False}
+            hit = {"reason": None}  # None | "limit" | "auth"
             buf.clear()
 
             def on_output(chunk: bytes) -> bool:
                 buf.extend(chunk)
                 del buf[:-4096]  # keep a rolling tail
-                if detect_limit(tool, buf.decode("utf-8", "replace")):
-                    hit["v"] = True
+                text = buf.decode("utf-8", "replace")
+                if detect_auth_dead(tool, text):   # check auth-death first; it's not a usage limit
+                    hit["reason"] = "auth"
+                    return True
+                if detect_limit(tool, text):
+                    hit["reason"] = "limit"
                     return True
                 return False
 
             status = spawn(argv, on_output)  # NO lock held during the session
 
-            if not hit["v"]:
+            if hit["reason"] is None:
                 return status  # clean exit — child's real exit code
 
             if switches >= max_switches:
@@ -357,18 +412,33 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             with ctx.locked():
                 state = ctx.load_state()
                 active = state.active(tool)
-                dec = handle_limit(ctx, state, tool, get=get)
+                if hit["reason"] == "auth":
+                    if active:
+                        auth_failed.add(active)
+                    dec = handle_auth_dead(ctx, state, tool, exclude=auth_failed)
+                else:
+                    dec = handle_limit(ctx, state, tool, get=get)
                 if dec.action == "switch":
                     switch(ctx, state, tool, dec.email, sync=(tool != "codex"))
                     _activate_codex_home(dec.email)
                     state.data["last_switch_at"] = iso(now())
                     state.save()
             if dec.action == "switch":
-                notify(f"{active} needs a rest 💤 — hopping to {dec.email}, "
+                reason_msg = ("needs you to sign in again 🔑" if hit["reason"] == "auth"
+                              else "needs a rest 💤")
+                notify(f"{active} {reason_msg} — hopping to {dec.email}, "
                        f"your work's coming with you ✨")
                 switches += 1
                 resuming = True
                 continue
+            if hit["reason"] == "auth":
+                if dec.unlocks_at:
+                    notify(f"{active} needs you to sign in again 🔑 — the only other {tool} seat is "
+                           f"resting until {dec.unlocks_at}")
+                else:
+                    notify(f"{active} needs you to sign in again (token revoked) and no other "
+                           f"{tool} seat is ready — re-add it via the app or `acctsw add {tool}`")
+                return EXIT_GAVE_UP
             notify(f"all {tool} seats are resting"
                    + (f"; soonest unlocks at {dec.unlocks_at}" if dec.unlocks_at else ""))
             return EXIT_GAVE_UP

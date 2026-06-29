@@ -50,8 +50,27 @@ def add(ctx: Context, state: State, tool: str, *, name: str | None = None,
     ctx.snapshot_set(tool, em, live)
     seat = state.upsert_seat(tool, em, name=name, plan=plan_of(tool, live))
     state.set_active(tool, em)  # the freshly signed-in account is what's live now
+    _creds_refreshed(state, tool, em)
     state.save()
     return seat
+
+
+def _creds_refreshed(state: State, tool: str, em: str) -> None:
+    """A seat's stored credentials just changed (re-login / capture / out-of-band login). Clear any
+    stale auth error and reset the usage backoff so the NEXT poll re-validates immediately and the
+    'log in' badge clears — instead of the seat staying stuck behind the (up to 1h) error backoff.
+    Without this, fixing a revoked seat never reflects in the app until the backoff expires."""
+    seat = state.get_seat(tool, em)
+    if seat is None:
+        return
+    u = seat.get("usage")
+    if not isinstance(u, dict):  # upsert_seat seeds usage as None until the first poll
+        u = {}
+        seat["usage"] = u
+    u["error"] = None
+    u["error_streak"] = 0
+    u["stale"] = False
+    u["fetched_at"] = None      # force the next refresh to actually run (not skipped as "cached")
 
 
 def reconcile_codex(ctx: Context, state: State) -> str | None:
@@ -68,9 +87,17 @@ def reconcile_codex(ctx: Context, state: State) -> str | None:
     em = ctx.cred["codex"].email_of(live)
     if not em or em not in state.accounts("codex"):
         return None
+    changed = ctx.snapshot_get("codex", em) != live
     ctx.snapshot_set("codex", em, live)            # ~/.codex is the freshest copy for `em`
+    dirty = False
+    if changed:
+        # creds rotated/re-logged out-of-band → clear any stale auth error so the app auto-recovers.
+        _creds_refreshed(state, "codex", em)
+        dirty = True
     if state.active("codex") != em:
         state.set_active("codex", em)              # honor an out-of-band login/switch
+        dirty = True
+    if dirty:
         state.save()
     return em
 
