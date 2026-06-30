@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
 from pathlib import Path
 
 
@@ -70,7 +71,10 @@ def mark_alive(data_dir: Path) -> None:
     body = f"{pid}\n{start}" if start else str(pid)
     f = _pidfile(data_dir)
     f.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    tmp = f.with_name(f"{f.name}.{pid}.tmp")
+    # Per-THREAD temp name: two overlapping mark_alive() calls in the same process (e.g. launch +
+    # first poll) must not share a temp path, else one os.replace() consumes the other's temp and the
+    # second raises FileNotFoundError. pid+thread-id is unique across concurrent writers.
+    tmp = f.with_name(f"{f.name}.{pid}.{threading.get_ident()}.tmp")
     tmp.write_text(body)
     os.replace(tmp, f)
 

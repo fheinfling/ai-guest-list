@@ -29,6 +29,24 @@ def test_mark_dead_clears(ctx):
     assert appalive.app_running(ctx.data_dir) is False
 
 
+def test_mark_alive_concurrent_writers_dont_race(ctx):
+    """Overlapping mark_alive() calls in one process must not collide on the temp file (each uses a
+    per-thread temp name); the heartbeat stays valid and no thread raises FileNotFoundError."""
+    import threading
+    errors = []
+    def worker():
+        try:
+            for _ in range(40):
+                appalive.mark_alive(ctx.data_dir)
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert errors == []
+    assert appalive.app_running(ctx.data_dir) is True
+
+
 def test_mark_dead_is_idempotent_when_missing(ctx):
     appalive.mark_dead(ctx.data_dir)  # no file yet → no error
     assert appalive.app_running(ctx.data_dir) is False
