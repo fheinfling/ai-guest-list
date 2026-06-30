@@ -223,6 +223,17 @@ def test_ensure_launchers_never_overwrites_existing_wrapper(tmp_path, monkeypatc
     assert "good wrapper" in (bindir / "cx").read_text()
 
 
+def test_shell_rc_path_bash_targets_bash_profile(tmp_path, monkeypatch):
+    """On macOS, bash login shells source ~/.bash_profile, not ~/.bashrc."""
+    monkeypatch.setenv("SHELL", "/bin/bash")
+    monkeypatch.setattr(inst.Path, "home", classmethod(lambda cls: tmp_path))
+    assert inst.shell_rc_path() == tmp_path / ".bash_profile"     # neither exists → login rc
+    (tmp_path / ".bashrc").write_text("")                          # only ~/.bashrc exists → respect it
+    assert inst.shell_rc_path() == tmp_path / ".bashrc"
+    (tmp_path / ".bash_profile").write_text("")                    # prefer ~/.bash_profile once present
+    assert inst.shell_rc_path() == tmp_path / ".bash_profile"
+
+
 def test_ensure_shell_setup_handles_regex_metachars_in_path(tmp_path):
     """A bin_dir whose path contains re-replacement metachars (\\g, \\1, backslash) must be written
     LITERALLY when our block is rewritten in place — not interpreted by re.sub."""
@@ -260,6 +271,17 @@ def test_uninstall_removes_only_our_block(ctx, tmp_path, monkeypatch):
     assert inst.BLOCK_BEGIN not in body
     assert f'export PATH="{bindir}:$PATH"' not in body
     assert "alias ll='ls -la'" in body            # untouched user content survives
+
+
+def test_uninstall_clears_bootstrap_sentinel(ctx, tmp_path, monkeypatch):
+    """Uninstall removes the wrappers/rc block, so it must also clear the .cli-bootstrapped sentinel —
+    otherwise reopening the app skips ensure_launchers() and never restores cx/cl."""
+    _seed_live(ctx)
+    monkeypatch.setattr(inst, "shell_rc_path", lambda: tmp_path / ".zshrc")
+    sentinel = ctx.data_dir / ".cli-bootstrapped"
+    sentinel.write_text("")
+    uninstall(ctx, bin_dir=tmp_path / "bin")
+    assert not sentinel.exists()
 
 
 def test_purge_removes_store_and_keychain(ctx, tmp_path):

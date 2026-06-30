@@ -36,13 +36,19 @@ _BLOCK_RE = re.compile(re.escape(BLOCK_BEGIN) + r".*?" + re.escape(BLOCK_END) + 
 
 
 def shell_rc_path() -> Path:
-    """The shell rc to manage, inferred from $SHELL. zsh (macOS default) → ~/.zshrc;
-    bash → ~/.bashrc; anything else → ~/.profile."""
+    """The shell rc to manage, inferred from $SHELL. zsh (macOS default) → ~/.zshrc; anything else
+    → ~/.profile. For bash we target ~/.bash_profile, NOT ~/.bashrc: on macOS Terminal opens LOGIN
+    shells, which source ~/.bash_profile (or ~/.profile) and never ~/.bashrc — writing ~/.bashrc
+    would report success yet never load in a new window. We respect an existing ~/.bashrc only if the
+    user has that but no ~/.bash_profile."""
     shell = os.environ.get("SHELL", "")
     home = Path.home()
     if shell.endswith("zsh"):
         return home / ".zshrc"
     if shell.endswith("bash"):
+        bash_profile = home / ".bash_profile"
+        if bash_profile.exists() or not (home / ".bashrc").exists():
+            return bash_profile
         return home / ".bashrc"
     return home / ".profile"
 
@@ -318,6 +324,13 @@ def uninstall(ctx: Context, *, purge: bool = False, dry_run: bool = False,
         plan.do(f"remove our cx/cl block from {rc}", lambda r=rc: remove_shell_setup(r))
     else:
         plan.actions.append(f"NOTE: if you added it manually, remove the cx/cl block for {bin_dir} from your shell rc")
+
+    # clear the first-launch bootstrap sentinel so reopening the app re-wires cx/cl (we just removed
+    # the wrappers + rc block; without this, the sentinel makes bootstrapBg_ skip ensure_launchers and
+    # a reinstall-by-relaunch would silently NOT restore them).
+    sentinel = ctx.data_dir / ".cli-bootstrapped"
+    if sentinel.exists():
+        plan.do(f"clear bootstrap sentinel {sentinel.name}", lambda s=sentinel: s.unlink(missing_ok=True))
 
     # 4. purge: delete store + all our keychain items.
     if purge:

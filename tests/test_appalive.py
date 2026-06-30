@@ -127,6 +127,18 @@ def test_run_gate_execs_stock_when_app_closed(isolated, monkeypatch):
     assert calls["supervised"] is False
 
 
+def test_run_gate_runs_stock_when_app_open_but_no_seats(isolated, monkeypatch):
+    """Fresh install: app open (aliases wired) but no seats yet. launch() raises NoSeats — we must
+    fall back to stock instead of erroring, so plain codex/claude still work."""
+    calls = {"stock": None}
+    monkeypatch.setattr(launcher, "exec_stock",
+                        lambda ctx, tool, args: calls.__setitem__("stock", (tool, args)) or 0)
+    appalive.mark_alive(isolated.data_dir)        # app open
+    # isolated Context has no seats → real launcher.run raises NoSeats
+    cli.main(["run", "codex", "hi"])
+    assert calls["stock"] == ("codex", ["hi"])
+
+
 def test_run_gate_self_heals_headroom_before_exec_when_app_closed(isolated, monkeypatch):
     """App closed + Headroom was used → strip dangling routing / reap an orphan proxy BEFORE running
     stock, so codex/claude don't exec into a dead-or-foreign proxy (ConnectionRefused)."""

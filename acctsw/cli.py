@@ -152,7 +152,7 @@ def _cmd_usage(ctx: Context, ns) -> int:
 
 
 def _cmd_run(ctx: Context, ns) -> int:
-    from .launcher import run as launch, exec_stock
+    from .launcher import run as launch, exec_stock, NoSeats as launcher_mod_NoSeats
     from . import appalive
 
     def notify(msg: str) -> None:
@@ -186,7 +186,12 @@ def _cmd_run(ctx: Context, ns) -> int:
             if healed:
                 notify(f"the app's closed — cleaned up Headroom; running stock {ns.tool}")
         return exec_stock(ctx, ns.tool, args)
-    return launch(ctx, ns.tool, args, notify=notify)
+    try:
+        return launch(ctx, ns.tool, args, notify=notify)
+    except launcher_mod_NoSeats:
+        # App is open but no seats are registered yet (fresh install). There's nothing to supervise,
+        # so behave like the stock tool instead of erroring out — plain codex/claude must still work.
+        return exec_stock(ctx, ns.tool, args)
 
 
 def _cmd_install(ctx: Context, ns) -> int:
