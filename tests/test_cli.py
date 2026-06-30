@@ -59,6 +59,27 @@ def test_cli_install_uninstall_dry_run(isolated, tmp_path, monkeypatch):
     assert not (tmp_path / "bin").exists()  # dry-run wrote nothing
 
 
+def test_cli_path_wires_rc(isolated, tmp_path, monkeypatch, capsys):
+    import acctsw.install as inst
+    rc = tmp_path / ".zshrc"
+    monkeypatch.setattr(inst, "BIN_DIR", tmp_path / "bin")
+    monkeypatch.setattr(inst, "shell_rc_path", lambda: rc)
+    assert cli.main(["path"]) == 0
+    body = rc.read_text()
+    assert inst.BLOCK_BEGIN in body and "alias codex=cx" in body
+    assert "✓" in capsys.readouterr().out
+
+
+def test_cli_path_idempotent(isolated, tmp_path, monkeypatch, capsys):
+    import acctsw.install as inst
+    rc = tmp_path / ".zshrc"
+    monkeypatch.setattr(inst, "BIN_DIR", tmp_path / "bin")
+    monkeypatch.setattr(inst, "shell_rc_path", lambda: rc)
+    cli.main(["path"]); capsys.readouterr()
+    assert cli.main(["path"]) == 0                  # second run: no-op
+    assert "·" in capsys.readouterr().out
+
+
 def test_no_command_prints_help(capsys):
     assert cli.main([]) == 0
     assert "usage" in capsys.readouterr().out.lower()

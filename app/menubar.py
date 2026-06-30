@@ -11,19 +11,20 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 from pathlib import Path
 
 try:
     import objc
     from AppKit import (NSApplication, NSStatusBar, NSPopover, NSViewController,
                         NSVariableStatusItemLength, NSApplicationActivationPolicyAccessory,
-                        NSUserNotification, NSUserNotificationCenter, NSImage)
+                        NSUserNotification, NSUserNotificationCenter, NSImage, NSWorkspace)
     from WebKit import WKWebView, WKWebViewConfiguration, WKUserContentController
     from Foundation import NSObject, NSURL, NSTimer, NSMakeRect, NSMakeSize
 except ImportError:  # allows importing this module's pure helpers without pyobjc installed
     objc = None
 
-from acctsw import bridge
+from acctsw import appalive, bridge
 from acctsw.context import Context
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
@@ -48,7 +49,25 @@ if objc is not None:
             self.statusItem = None
             self.popover = None
             self.webview = None
+            self._healthInFlight = False
+            self._healthLock = threading.Lock()   # makes the single-flight check-then-set atomic
             return self
+
+        @objc.python_method
+        def _claimHealthSlot(self):
+            """Atomically claim the single health/recovery slot shared by the periodic poll and the
+            wake handler (else both threads can pass the check before either sets the flag). Returns
+            True if claimed; caller must release via _releaseHealthSlot."""
+            with self._healthLock:
+                if self._healthInFlight:
+                    return False
+                self._healthInFlight = True
+                return True
+
+        @objc.python_method
+        def _releaseHealthSlot(self):
+            with self._healthLock:
+                self._healthInFlight = False
 
         # --- lifecycle ----------------------------------------------------------------------
         def applicationDidFinishLaunching_(self, _notif):
@@ -59,12 +78,44 @@ if objc is not None:
             self.statusItem.button().setAction_(objc.selector(self.togglePopover_, signature=b"v@:@"))
             self._teardownDone = False
             self._hrRecovered = False     # gate: poll health-check waits until launch recovery is done
+            # The app is the master switch: while it's alive, terminal codex/claude (cx/cl) supervise
+            # + auto-switch; when it's closed they run stock. Heartbeat is refreshed each usage poll.
+            appalive.mark_alive(self.ctx.data_dir)
             self._buildPopover()
             self._startUsageTimer()
             # Reconcile a prior run's routing OFF the main thread — global_enable starts the proxy and
             # waits on /readyz (slow); doing it inline would freeze the menubar on launch.
             self.performSelectorInBackground_withObject_(
                 objc.selector(self.recoverBg_, signature=b"v@:@"), None)
+            # The proxy is a plain detached subprocess (no KeepAlive), so it does NOT reliably survive
+            # sleep. On wake, re-assert it IMMEDIATELY rather than waiting up to one 180s poll — that
+            # window is exactly when an already-open session pinned to 127.0.0.1:PORT fails with
+            # ConnectionRefused. Register on NSWorkspace's OWN notification center (not the default one).
+            NSWorkspace.sharedWorkspace().notificationCenter().addObserver_selector_name_object_(
+                self, objc.selector(self.workspaceDidWake_, signature=b"v@:@"),
+                "NSWorkspaceDidWakeNotification", None)
+            # Make cx/cl work with no manual steps — having the app installed IS the install. Write the
+            # wrappers + wire the shell rc (PATH + codex/claude aliases) on launch (idempotent), so
+            # autoswitch works out of the box and a deleted rc block self-heals.
+            self.performSelectorInBackground_withObject_(
+                objc.selector(self.bootstrapBg_, signature=b"v@:@"), None)
+
+        def bootstrapBg_(self, _arg):
+            # Run ONCE (first launch), not every launch: a sentinel records that we've set up the
+            # shell. This respects a user who later removes our rc block / aliases — we won't fight
+            # them by re-adding it on the next launch.
+            try:
+                from acctsw import install
+                sentinel = self.ctx.data_dir / ".cli-bootstrapped"
+                if sentinel.exists():
+                    return
+                changed, _ = install.ensure_launchers()
+                sentinel.write_text("")   # mark done even if unchanged, so we never re-edit the rc
+                if changed:
+                    self._notify("ai guest list is ready",
+                                 "wired up codex/claude — open a new terminal to use them")
+            except Exception:
+                pass
 
         def applicationShouldTerminate_(self, _sender):
             """Single quit gate for BOTH the in-app quit button (terminate_) AND OS-level quit
@@ -72,9 +123,15 @@ if objc is not None:
             thread (serialized via op_lock, exact restore) and tell AppKit to wait (terminateLater),
             replying once done — so quit never blocks the main thread (no beachball) and never races a
             relaunch the way a detached remove did."""
+            appalive.mark_dead(self.ctx.data_dir)   # app is going away → terminal codex/claude revert to stock
             try:
                 from acctsw import headroom
-                if not self._teardownDone and headroom.needs_reconcile(self.ctx):
+                # Run the teardown when there's routing/backup to undo OR a proxy still alive. The
+                # proxy_maybe_running check matters for the graceful-OFF state (routing+backup already
+                # gone, needs_reconcile False) — without it _headroomTeardown's reap branch is
+                # unreachable and the proxy outlives the app until a later cx/cl cleans it up.
+                if not self._teardownDone and (headroom.needs_reconcile(self.ctx)
+                                               or headroom.proxy_maybe_running(self.ctx.data_dir)):
                     self.performSelectorInBackground_withObject_(
                         objc.selector(self.quitBg_, signature=b"v@:@"), None)
                     return NS_TERMINATE_LATER
@@ -112,6 +169,46 @@ if objc is not None:
                 pass
             finally:
                 self._hrRecovered = True
+
+        def workspaceDidWake_(self, _notif):
+            self.performSelectorInBackground_withObject_(
+                objc.selector(self.wakeBg_, signature=b"v@:@"), None)
+
+        def wakeBg_(self, _arg):
+            """Wake-from-sleep recovery (background thread). Sleep can kill the detached proxy; if
+            save-credit is ON, RESTART it on the same port so already-open sessions reconnect on their
+            next retry (instead of the poll's policy of tearing routing down — a sleep-induced death is
+            benign, so we heal it back UP, not off). If the restart fails, fall back to stripping the
+            dead routing so new sessions at least run direct. Gated like the poll: wait out launch
+            recovery and never stack with an in-flight health-check."""
+            if not getattr(self, "_hrRecovered", False):
+                return                     # launch recovery (recoverBg_) owns the first reconcile
+            if not self._claimHealthSlot():
+                return
+            try:
+                from acctsw import headroom
+                if self.ctx.load_state().settings().get("headroom"):
+                    if not headroom.global_running():
+                        ok, _ = headroom.global_enable(self.ctx.data_dir)
+                        if ok:
+                            self._notify("Headroom", "restarted the proxy after sleep")
+                        else:
+                            # Restart failed and routing rolled back to clean → the setting would sit
+                            # ON with no proxy/routing behind it (reconcile() returns "clean", not
+                            # healed). Match state to reality by clearing it, like recoverBg_ does, so
+                            # the UI and later health-checks don't keep chasing a dead-but-ON proxy.
+                            with self.ctx.locked():
+                                s = self.ctx.load_state(); s.set_setting("headroom", False); s.save()
+                            healed = headroom.reconcile(self.ctx, blocking=False)[0]
+                            self._notify("Headroom turned off",
+                                         "the proxy didn't survive sleep — "
+                                         + ("restored your setup" if healed else "running direct"))
+                elif headroom.needs_reconcile(self.ctx):
+                    headroom.reconcile(self.ctx, blocking=False)   # strip any orphaned injection
+            except Exception:
+                pass
+            finally:
+                self._releaseHealthSlot()
 
         @objc.python_method
         def _buildPopover(self):
@@ -151,6 +248,7 @@ if objc is not None:
                 objc.selector(self.pollBg_, signature=b"v@:@"), None)
 
         def pollBg_(self, _arg):
+            appalive.mark_alive(self.ctx.data_dir)   # refresh heartbeat so a spurious removal self-heals within one poll
             # Refresh usage + push the dot FIRST, so the (possibly slow: grace sleep + status probe)
             # health-check never delays the usage/dot update.
             result = bridge.handle(self.ctx, {"action": "usage"})
@@ -174,9 +272,8 @@ if objc is not None:
               `global_running` under the op_lock, so a recovery in between is still honored."""
             if not getattr(self, "_hrRecovered", False):
                 return                     # launch recovery (recoverBg_) owns the first reconcile
-            if getattr(self, "_healthInFlight", False):
-                return                     # single-flight: rapid popover-opens can't stack probes/threads
-            self._healthInFlight = True
+            if not self._claimHealthSlot():
+                return                     # single-flight: rapid popover-opens / wake can't stack probes
             try:
                 import time
                 from acctsw import headroom
@@ -208,7 +305,7 @@ if objc is not None:
             except Exception:
                 pass
             finally:
-                self._healthInFlight = False
+                self._releaseHealthSlot()
 
         def applyResult_(self, result):
             self._pushResult(result)
@@ -246,8 +343,8 @@ if objc is not None:
                 from acctsw import headroom
                 if headroom.needs_reconcile(self.ctx):
                     headroom.global_disable(self.ctx.data_dir)   # blocking + op_lock-serialized (unroute + reap)
-                elif headroom.proxy_ready():
-                    headroom.stop_proxy(self.ctx.data_dir)       # reap a graceful-OFF proxy kept alive for open sessions
+                elif headroom.proxy_maybe_running(self.ctx.data_dir):
+                    headroom.stop_proxy(self.ctx.data_dir)       # reap a graceful-OFF proxy (ready OR wedged) by PID
             except Exception:
                 pass
 

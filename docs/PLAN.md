@@ -86,7 +86,15 @@ Subcommands (also the menubar's backend, callable with `--json`):
 - `usage refresh [--tool] [--json]` — fetch live usage (cached, backoff-aware) for the menubar.
 - `switch <tool> <email>` — the swap primitive (below). Used by menubar + auto-switch.
 - `run codex|claude [args…]` — supervised launcher with auto-switch + resume (below).
-- CLI aliases `cx` = `acctsw run codex`, `cl` = `acctsw run claude` (stock binaries never shadowed).
+- CLI aliases `cx` = `acctsw run codex`, `cl` = `acctsw run claude` (stock **binaries** in
+  `~/.local/bin` are never renamed/shadowed — `cx`/`cl` are added alongside, the real `codex`/
+  `claude` are untouched on disk).
+- **Zero-touch shell aliasing (opt-in, reversible):** for the "it just works" path, install can also
+  add shell *aliases* `codex=cx` / `claude=cl` so a plain `codex`/`claude` is supervised
+  (auto-switch + resume). This is a reversible shell alias, not a binary rename, and the app is the
+  master switch: when it's closed, `cx`/`cl` `exec` the stock tool, so aliased `codex`/`claude`
+  behave exactly like stock. The managed rc block is delimited by begin/end markers and removed by
+  `acctsw uninstall`.
 
 ### Swap primitive (`switch`)
 1. **Sync-back first** (longevity-critical — Codex/Claude rotate refresh tokens): copy the
@@ -184,20 +192,24 @@ seats** + **reset** to simulate limits, and **"or peek at the list i've got"** t
 ---
 
 ## Install & uninstall (both guaranteed non-breaking)
-- **`acctsw install`** — idempotent/additive: preflight (binaries, `security`, Python, PATH; never
-  edit shell rc without showing the line); create `~/.account-switcher/{backups}` + empty
-  `state.json`; **snapshot current live creds verbatim** into `backups/` with a sha256 manifest;
-  register the currently-logged-in account as the first switchable account; install `acctsw`/`cx`/
-  `cl` into `~/.local/bin` (**stock `codex`/`claude` never renamed/shadowed**); print summary +
-  uninstall command.
+- **`acctsw install`** — idempotent/additive: preflight (binaries, `security`, Python, PATH); create
+  `~/.account-switcher/{backups}` + empty `state.json`; **snapshot current live creds verbatim** into
+  `backups/` with a sha256 manifest; register the currently-logged-in account as the first switchable
+  account; install `acctsw`/`cx`/`cl` into `~/.local/bin` (**stock `codex`/`claude` binaries never
+  renamed/shadowed**); print summary + uninstall command. By default it does NOT edit the shell rc —
+  it WARNS if `~/.local/bin` isn't on PATH. Shell wiring (PATH + `codex`/`claude` aliases) is opt-in
+  via `acctsw install --path` / `acctsw path`, OR done once automatically on first menubar-app launch
+  (the app is the install) — both write only a marked, reversible block and surface a notification.
 - **`acctsw uninstall [--purge] [--dry-run]`** — sync-back active creds, then **restore**
   `~/.codex/auth.json` and the Claude keychain item from `backups/` (verified vs manifest); remove
-  `acctsw`/`cx`/`cl` + menubar app; offer to remove the PATH line (shown, not silent). Default
-  keeps `~/.account-switcher/` for later reinstall; `--purge` also deletes it and the
-  `acct-switcher` keychain items → system exactly as before.
+  `acctsw`/`cx`/`cl` + menubar app; remove our managed rc block (the begin/end-delimited block we
+  added — only ours). Default keeps `~/.account-switcher/` for later reinstall; `--purge` also
+  deletes it and the `acct-switcher` keychain items → system exactly as before.
 - **Break-safety (both directions):** atomic `rename()` writes, every overwrite preceded by a
-  verified backup, no rc edits without showing a diff, real CLIs never shadowed, `--dry-run` prints
-  all actions without doing them, two accounts never active at once (sequential).
+  verified backup, rc edits confined to one reversible marked block (opt-in or first-launch, with a
+  notification) and removed by uninstall, stock CLI **binaries** never renamed/shadowed (shell
+  aliases are reversible and transparent when the app is closed), `--dry-run` prints all actions
+  without doing them, two accounts never active at once (sequential).
 
 ## Files to create
 - `~/.local/bin/acctsw` — engine (Python 3, stdlib only). `~/.local/bin/{cx,cl}` — 1-line wrappers.

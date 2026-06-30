@@ -35,6 +35,9 @@ def build_parser() -> argparse.ArgumentParser:
     ins.add_argument("--dry-run", action="store_true", help="print actions without doing them")
     ins.add_argument("--no-register", action="store_true",
                      help="don't auto-register the currently logged-in account")
+    ins.add_argument("--path", action="store_true",
+                     help="wire cx/cl into your shell rc (PATH + codex/claude aliases) so it just works")
+    sub.add_parser("path", help="wire cx/cl into your shell rc (PATH + codex/claude aliases)")
     uni = sub.add_parser("uninstall", help="remove the engine and restore original creds")
     uni.add_argument("--purge", action="store_true", help="also delete the store + keychain items")
     uni.add_argument("--dry-run", action="store_true", help="print actions without doing them")
@@ -149,7 +152,8 @@ def _cmd_usage(ctx: Context, ns) -> int:
 
 
 def _cmd_run(ctx: Context, ns) -> int:
-    from .launcher import run as launch
+    from .launcher import run as launch, exec_stock, NoSeats as launcher_mod_NoSeats
+    from . import appalive
 
     def notify(msg: str) -> None:
         print(f"· {msg}", file=sys.stderr)
@@ -157,13 +161,44 @@ def _cmd_run(ctx: Context, ns) -> int:
     args = list(ns.args or [])
     if args and args[0] == "--":  # argparse REMAINDER keeps a leading separator
         args = args[1:]
-    return launch(ctx, ns.tool, args, notify=notify)
+    # The app is the master switch for supervision: when it's CLOSED, behave like the stock tool
+    # (no auto-switch / no seat-hopping) — exec_stock replaces this process and never returns.
+    if not appalive.app_running(ctx.data_dir):
+        # First self-heal Headroom: a hard-killed app never ran its quit teardown, so it can leave
+        # (a) routing injected — stock codex/claude would then hit a now-dead/foreign proxy and crash
+        # with ConnectionRefused — and/or (b) the proxy running with no owner to reap it. heal()
+        # strips any routing AND reaps an orphaned proxy so we exec TRULY stock. Cheap pre-check skips
+        # this entirely when Headroom was never used; blocking=False so a concurrent op never hangs the
+        # launch; app_running=False tells heal the live proxy is an orphan. The save-credit SETTING is
+        # kept (heal doesn't touch it), so it re-applies when the app is reopened.
+        from . import headroom as hr
+        # Gate on the cheap pre-checks: needs_reconcile (setting/backup/injected) OR a live proxy
+        # pidfile. The pidfile case matters because a graceful-OFF deletes the backup and restores
+        # config, leaving needs_reconcile False while the proxy is still alive — without it the
+        # orphan-reap would be unreachable here (the very leak this branch exists to fix).
+        if hr.needs_reconcile(ctx) or hr.proxy_maybe_running(ctx.data_dir):
+            healed, _ = hr.heal(ctx.data_dir, blocking=False, app_running=False)
+            if not healed and hr.routing_injected():
+                # The lock was busy (e.g. the app's own quit teardown mid-flight) AND routing is
+                # still live. We must NOT exec stock into a dying proxy (ConnectionRefused), so wait
+                # out the in-flight op with a blocking retry rather than racing it.
+                healed, _ = hr.heal(ctx.data_dir, blocking=True, app_running=False)
+            if healed:
+                notify(f"the app's closed — cleaned up Headroom; running stock {ns.tool}")
+        return exec_stock(ctx, ns.tool, args)
+    try:
+        return launch(ctx, ns.tool, args, notify=notify)
+    except launcher_mod_NoSeats:
+        # App is open but no seats are registered yet (fresh install). There's nothing to supervise,
+        # so behave like the stock tool instead of erroring out — plain codex/claude must still work.
+        return exec_stock(ctx, ns.tool, args)
 
 
 def _cmd_install(ctx: Context, ns) -> int:
     from . import install as inst
     plan = inst.install(ctx, dry_run=getattr(ns, "dry_run", False),
-                        register=not getattr(ns, "no_register", False))
+                        register=not getattr(ns, "no_register", False),
+                        with_path=getattr(ns, "path", False))
     for a in plan.actions:
         print(f"  {a}")
     if getattr(ns, "dry_run", False):
@@ -186,6 +221,13 @@ def _cmd_uninstall(ctx: Context, ns) -> int:
     return EXIT_OK
 
 
+def _cmd_path(ctx: Context, ns) -> int:
+    from . import install as inst
+    changed, msg = inst.ensure_shell_setup(inst.BIN_DIR)
+    print(f"{'✓' if changed else '·'} {msg}")
+    return EXIT_OK
+
+
 def _not_impl(ctx: Context, ns) -> int:
     print(f"acctsw: '{ns.command}' arrives in a later milestone.", file=sys.stderr)
     return EXIT_NOIMPL
@@ -201,6 +243,7 @@ HANDLERS = {
     "run": _cmd_run,
     "install": _cmd_install,
     "uninstall": _cmd_uninstall,
+    "path": _cmd_path,
 }
 
 

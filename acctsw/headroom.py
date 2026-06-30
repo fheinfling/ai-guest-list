@@ -342,6 +342,22 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _pid_is_proxy(pid: int) -> bool:
+    """Identity guard against PID REUSE: confirm `pid` is actually a Headroom proxy (its command line
+    runs `headroom … proxy`) before we ever treat it as ours or signal it. A bare liveness check is
+    NOT enough — the OS can recycle a dead proxy's PID for an unrelated process, and we must never
+    SIGTERM/SIGKILL an innocent bystander. ps unavailable / no match → False (we'd rather leak an
+    orphan than kill the wrong process)."""
+    if pid <= 0:
+        return False
+    try:
+        out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=2).stdout.lower()
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "headroom" in out and "proxy" in out
+
+
 def _port_busy(port: int = PROXY_PORT) -> bool:
     """True iff something is accepting TCP connections on the loopback port (may not be our proxy)."""
     import socket
@@ -437,6 +453,27 @@ def start_proxy(store: Path | None = None, *, port: int = PROXY_PORT, popen=None
     return False
 
 
+def proxy_maybe_running(store: Path | None = None) -> bool:
+    """Cheap, subprocess- and network-free check: does our proxy pidfile point at a live process?
+    Used by the cx/cl gate to catch an ORPHAN proxy whose routing+backup were already cleaned (a
+    graceful-OFF that deletes the backup leaves needs_reconcile() False, so the pidfile is the only
+    remaining trace). False positives are harmless — heal() re-verifies under the lock."""
+    pidf = _proxy_pidfile(store)
+    try:
+        pid = int(pidf.read_text().strip())
+    except (OSError, ValueError):
+        return False
+    # Liveness AND identity: a recycled PID (dead proxy, PID reused by something else) must read as
+    # "not running" so we neither trigger a spurious reap nor, downstream, signal the wrong process.
+    return pid > 0 and _pid_alive(pid) and _pid_is_proxy(pid)
+
+
+def routing_injected() -> bool:
+    """True if Headroom routing is currently written into the tools' config (public predicate so
+    callers outside this module don't reach into the private _any_injected)."""
+    return _any_injected()
+
+
 def stop_proxy(store: Path | None = None, *, kill=None, sleep=None) -> None:
     """Stop the proxy we started (by PID file) and clear the file. Best-effort; safe if not running."""
     import signal
@@ -448,7 +485,9 @@ def stop_proxy(store: Path | None = None, *, kill=None, sleep=None) -> None:
         pid = int(pidf.read_text().strip())
     except (OSError, ValueError):
         pid = 0
-    if pid > 0 and _pid_alive(pid):
+    # Kill ONLY if the PID is alive AND is really our proxy — never signal a recycled PID that the OS
+    # has handed to an unrelated process (the pidfile can outlive the proxy).
+    if pid > 0 and _pid_alive(pid) and _pid_is_proxy(pid):
         for sig in (signal.SIGTERM, signal.SIGKILL):
             try:
                 _kill(pid, sig)
@@ -743,28 +782,45 @@ def needs_reconcile(ctx) -> bool:
     return has_backup(ctx.data_dir) or _any_injected()
 
 
-def heal(store: Path | None = None, *, blocking: bool = True, push=None) -> tuple[bool, str]:
+def heal(store: Path | None = None, *, blocking: bool = True, push=None,
+         app_running: bool = True) -> tuple[bool, str]:
     """Serialized self-heal that keys off ACTUAL state, not any setting — so it fixes orphans left by
     a failed enable/disable, a crash, or a force-quit, regardless of how the setting reads.
 
-    Returns (healed, msg) where healed=True ONLY when dead routing was found AND successfully removed
-    + restored. healed=False covers: lock busy, proxy healthy, config already clean, OR a restore
+    Returns (healed, msg) where healed=True ONLY when routing/proxy was found AND successfully cleaned
+    up. healed=False covers: lock busy, proxy healthy (app running), config already clean, OR a restore
     that FAILED (config still injected) — so callers never mistake an incomplete restore for success.
+
+    ``app_running`` is the master switch: the proxy's lifecycle belongs to the menubar app, so a
+    proxy that is up while the app is GONE is an ORPHAN (a hard-killed app never ran its quit teardown)
+    and must be reaped — otherwise it lingers and any session still pinned to its port keeps routing
+    through it. cx/cl pass app_running=False (the app is closed when they exec stock); the GUI poll /
+    launcher leave the default True.
 
     Inside op_lock:
       • busy (blocking=False, another op holds it) → (False, "busy"): let that op finish.
-      • proxy running → no-op. Re-checking `proxy_ready` here, under the same lock the toggle
-        holds, closes the enable/health-check TOCTOU: a heal that fires while an enable is still
-        bringing the proxy up blocks on the lock, then sees it ready and leaves it.
+      • proxy running, app alive → no-op. Re-checking `proxy_ready` here, under the same lock the
+        toggle holds, closes the enable/health-check TOCTOU: a heal that fires while an enable is
+        still bringing the proxy up blocks on the lock, then sees it ready and leaves it.
+      • proxy running, app GONE → orphan: strip any routing + restore config + reap the proxy.
       • routing injected but proxy dead → remove routing + restore config + stop the proxy.
       • nothing injected → no-op.
     """
     with op_lock(store, blocking=blocking) as acquired:
         if not acquired:
             return False, "busy"
+        if not app_running and proxy_maybe_running(store):
+            # App gone + a live proxy PROCESS (ready, wedged, OR still starting) → orphan. Reap it by
+            # PID, not by /readyz: a wedged proxy that never answers /readyz would otherwise survive
+            # (proxy_ready() False), yet the pidfile is right there to kill it. Strip routing too.
+            return _remove_and_restore(store)
         if proxy_ready():
-            (push or push_runtime_knobs)()  # best-effort: re-assert knobs on a proxy we may not have started
-            return False, "healthy"
+            if app_running:
+                (push or push_runtime_knobs)()  # best-effort: re-assert knobs on a proxy we may not have started
+                return False, "healthy"
+            # App is gone but the proxy is still up → orphan. Reap it exactly as a graceful quit would
+            # have (strip/restore routing if any was left injected, then stop the proxy).
+            return _remove_and_restore(store)
         if not (_any_injected() or has_backup(store)):
             return False, "clean"
         ok, msg = _remove_and_restore(store)

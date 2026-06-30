@@ -4,6 +4,7 @@ Routing no longer goes through `headroom install apply` (its launchd deploy is b
 docs/headroom-handover.md). We run the proxy ourselves (start_proxy) and hand-write the provider
 routing (_route_all); these tests cover that path plus the snapshot/restore + heal safety nets."""
 import json
+import os
 
 import pytest
 
@@ -235,6 +236,7 @@ def test_stop_proxy_kills_pid_and_clears_file(tmp_path, monkeypatch):
     pidf.write_text("4321")
     killed = []
     monkeypatch.setattr(headroom, "_pid_alive", lambda pid: pid == 4321 and not killed)
+    monkeypatch.setattr(headroom, "_pid_is_proxy", lambda pid: pid == 4321)   # identity confirmed
     headroom.stop_proxy(tmp_path / "store",
                         kill=lambda pid, sig: killed.append((pid, sig)), sleep=lambda *_: None)
     assert killed and killed[0][0] == 4321
@@ -501,6 +503,81 @@ def test_heal_strips_orphaned_injection_when_proxy_dead(tmp_path, monkeypatch):
     assert 'model = "orig"' in cfg.read_text()                # surgical unroute kept the user body
     assert calls["stop"] >= 1                                 # dead proxy torn down
     assert not (tmp_path / "store" / "headroom-global-backup").exists()
+
+
+def test_proxy_maybe_running_reads_pidfile_liveness(tmp_path, monkeypatch):
+    import subprocess
+    store = tmp_path / "store"; store.mkdir()
+    monkeypatch.setattr(headroom, "_pid_is_proxy", lambda pid: True)   # identity satisfied
+    assert headroom.proxy_maybe_running(store) is False          # no pidfile
+    (store / "headroom-proxy.pid").write_text("not-a-pid")
+    assert headroom.proxy_maybe_running(store) is False          # garbage
+    dead = subprocess.Popen(["/bin/sh", "-c", "exit 0"]); dead.wait()
+    (store / "headroom-proxy.pid").write_text(str(dead.pid))
+    assert headroom.proxy_maybe_running(store) is False          # dead pid
+    (store / "headroom-proxy.pid").write_text(str(os.getpid()))
+    assert headroom.proxy_maybe_running(store) is True           # live + identity
+    # PID-reuse guard: live PID but NOT our proxy (recycled) → must read as not running
+    monkeypatch.setattr(headroom, "_pid_is_proxy", lambda pid: False)
+    assert headroom.proxy_maybe_running(store) is False
+
+
+def test_stop_proxy_never_kills_a_recycled_pid(tmp_path, monkeypatch):
+    """A stale pidfile pointing at a live but unrelated process (PID reuse) must NOT be signalled."""
+    store = tmp_path / "store"; store.mkdir()
+    (store / "headroom-proxy.pid").write_text(str(os.getpid()))   # alive, but it's pytest, not a proxy
+    monkeypatch.setattr(headroom, "_pid_is_proxy", lambda pid: False)
+    killed = []
+    headroom.stop_proxy(store, kill=lambda pid, sig: killed.append((pid, sig)), sleep=lambda _s: None)
+    assert killed == []                                          # no signal sent to the bystander
+    assert not (store / "headroom-proxy.pid").exists()           # stale pidfile still cleared
+
+
+def test_heal_reaps_orphan_proxy_when_app_gone(tmp_path, monkeypatch):
+    """Proxy UP but the app is GONE → orphan. heal(app_running=False) must strip the leftover routing
+    AND reap the proxy (a hard-killed app never ran its quit teardown)."""
+    cfg = _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
+    monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
+    calls = _patch_proxy(monkeypatch, ready=True)            # proxy still healthy...
+    headroom.snapshot_global(tmp_path / "store")
+    headroom._route_codex()                                  # ...with routing left injected
+    healed, _ = headroom.heal(tmp_path / "store", app_running=False)
+    assert healed is True
+    assert 'model_provider = "headroom"' not in cfg.read_text()
+    assert 'model = "orig"' in cfg.read_text()
+    assert calls["stop"] >= 1                                # orphan proxy reaped
+
+
+def test_heal_reaps_orphan_proxy_when_app_gone_clean_config(tmp_path, monkeypatch):
+    """Even with config already clean (graceful-OFF left the proxy alive), an app-gone proxy is an
+    orphan and must be stopped."""
+    _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
+    calls = _patch_proxy(monkeypatch, ready=True)
+    healed, _ = headroom.heal(tmp_path / "store", app_running=False)
+    assert healed is True
+    assert calls["stop"] >= 1
+
+
+def test_heal_reaps_wedged_orphan_by_pid_when_app_gone(tmp_path, monkeypatch):
+    """A graceful-OFF proxy that's alive-by-PID but NOT answering /readyz (wedged/starting) must
+    still be reaped when the app is gone — heal keys off the pidfile, not just proxy_ready()."""
+    store = tmp_path / "store"; store.mkdir()
+    _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
+    calls = _patch_proxy(monkeypatch, ready=False)          # /readyz NOT responding (wedged)
+    monkeypatch.setattr(headroom, "_pid_is_proxy", lambda pid: True)  # identity confirmed
+    (store / "headroom-proxy.pid").write_text(str(os.getpid()))  # but the process is alive
+    healed, _ = headroom.heal(store, app_running=False)
+    assert healed is True
+    assert calls["stop"] >= 1                                # reaped by PID despite ready=False
+
+
+def test_heal_keeps_running_proxy_when_app_alive(tmp_path, monkeypatch):
+    """The orphan-reap must NOT fire while the app is alive — a healthy managed proxy stays up."""
+    _codex_cfg(tmp_path, monkeypatch)
+    calls = _patch_proxy(monkeypatch, ready=True)
+    changed, msg = headroom.heal(tmp_path / "store", app_running=True)
+    assert changed is False and msg == "healthy"
+    assert calls["stop"] == 0
 
 
 def test_heal_reports_failure_when_restore_incomplete(tmp_path, monkeypatch):

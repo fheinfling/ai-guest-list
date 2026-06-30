@@ -6,7 +6,8 @@ import pytest
 
 from acctsw import accounts as acct
 from acctsw import launcher as L
-from acctsw.launcher import NoSeats, build_cmd, resume_cmd, detect_limit, handle_limit, run
+from acctsw.launcher import (NoSeats, build_cmd, resume_cmd, detect_limit, detect_auth_dead,
+                             handle_limit, handle_auth_dead, run)
 from acctsw.util import now, iso
 from datetime import timedelta
 from tests.conftest import make_codex_blob
@@ -140,6 +141,72 @@ def test_run_switches_and_resumes_on_limit(ctx):
     assert spawn.calls[1][-2:] == ["resume", "--last"]
     assert ctx.load_state().active("codex") == "b@x.com"
     assert any("hopping to b@x.com" in m for m in msgs)
+
+
+@pytest.mark.parametrize("text", [
+    "your refresh token was revoked. Please log out and sign in again.",
+    "error: refresh token revoked",
+])
+def test_detect_auth_dead_positive(text):
+    assert detect_auth_dead("codex", text)
+
+
+def test_detect_auth_dead_negative_and_not_a_limit():
+    assert not detect_auth_dead("codex", "you've hit your usage limit")
+    assert not detect_limit("codex", "refresh token was revoked")  # auth death isn't a limit
+    # tightened patterns must NOT fire on the model merely writing about auth
+    assert not detect_auth_dead("codex", "to fix this, please sign in again via the portal")
+
+
+def test_handle_limit_honors_auth_failed_exclude(ctx):
+    # after an auth hop, a later limit must NOT re-select the seat that already died this run
+    state = _two_codex(ctx)  # active a, b available
+    dec = handle_limit(ctx, state, "codex", get=fake_get({}), exclude={"b@x.com"})
+    assert dec.action == "give_up"          # b excluded, a just limited → nothing to switch to
+    # sanity: without the exclude it WOULD switch to b
+    state2 = _two_codex(ctx)
+    assert handle_limit(ctx, state2, "codex", get=fake_get({})).action == "switch"
+
+
+def test_detect_event_classifies_in_one_pass():
+    from acctsw.launcher import detect_event
+    assert detect_event("codex", "your refresh token was revoked") == "auth"
+    assert detect_event("codex", "you've hit your usage limit") == "limit"
+    assert detect_event("codex", "all good here") is None
+    # auth wins over a co-occurring limit phrase (different remedy: hop, don't resume same seat)
+    assert detect_event("claude", "usage limit; oauth token expired") == "auth"
+
+
+def test_handle_auth_dead_switches_excluding_active(ctx):
+    state = _two_codex(ctx)  # active a
+    dec = handle_auth_dead(ctx, state, "codex")
+    assert dec.action == "switch" and dec.email == "b@x.com"
+    # no persisted "dead" flag — a usage-poll unauthorized isn't a reliable health signal
+    assert (state.get_seat("codex", "a@x.com").get("usage") or {}).get("error") is None
+
+
+def test_run_switches_to_healthy_seat_on_revoked_token(ctx):
+    _two_codex(ctx)  # active a
+    msgs = []
+    spawn = FakeSpawn([
+        (b"... your refresh token was revoked. Please log out and sign in again.\n", 1),
+        (b"resumed on the healthy seat\n", 0),
+    ])
+    rc = run(ctx, "codex", ["--foo"], spawn=spawn, get=fake_get({}), notify=msgs.append)
+    assert rc == 0
+    assert spawn.calls[1][-2:] == ["resume", "--last"]
+    assert ctx.load_state().active("codex") == "b@x.com"
+    assert any("sign in again" in m for m in msgs)
+
+
+def test_run_gives_up_with_relogin_hint_when_only_seat_revoked(ctx):
+    ctx.cred["codex"].set_live(make_codex_blob("solo@x.com"))
+    acct.add(ctx, ctx.load_state(), "codex", email="solo@x.com")
+    msgs = []
+    spawn = FakeSpawn([(b"refresh token was revoked\n", 1)])
+    rc = run(ctx, "codex", [], spawn=spawn, get=fake_get({}), notify=msgs.append)
+    assert rc == L.EXIT_GAVE_UP
+    assert any("sign in again" in m for m in msgs)
 
 
 def test_run_respects_max_switches(ctx):
