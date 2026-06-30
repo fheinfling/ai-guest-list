@@ -437,6 +437,25 @@ def start_proxy(store: Path | None = None, *, port: int = PROXY_PORT, popen=None
     return False
 
 
+def proxy_maybe_running(store: Path | None = None) -> bool:
+    """Cheap, subprocess- and network-free check: does our proxy pidfile point at a live process?
+    Used by the cx/cl gate to catch an ORPHAN proxy whose routing+backup were already cleaned (a
+    graceful-OFF that deletes the backup leaves needs_reconcile() False, so the pidfile is the only
+    remaining trace). False positives are harmless — heal() re-verifies under the lock."""
+    pidf = _proxy_pidfile(store)
+    try:
+        pid = int(pidf.read_text().strip())
+    except (OSError, ValueError):
+        return False
+    return pid > 0 and _pid_alive(pid)
+
+
+def routing_injected() -> bool:
+    """True if Headroom routing is currently written into the tools' config (public predicate so
+    callers outside this module don't reach into the private _any_injected)."""
+    return _any_injected()
+
+
 def stop_proxy(store: Path | None = None, *, kill=None, sleep=None) -> None:
     """Stop the proxy we started (by PID file) and clear the file. Best-effort; safe if not running."""
     import signal

@@ -52,15 +52,22 @@ def _proc_start(pid: int) -> str | None:
     return r.stdout.strip()  # empty when the PID is not running
 
 
+_START_CACHE: dict[int, str] = {}
+
+
 def mark_alive(data_dir: Path) -> None:
     """Record this process as the running app (called by the menubar app on launch + each poll).
 
     Stores ``PID\\nstart-time`` and writes atomically (temp + os.replace) so a concurrent
     ``app_running`` read during the periodic refresh never sees a truncated/empty file (which would
-    make cx/cl wrongly run stock)."""
+    make cx/cl wrongly run stock). A process's start-time is invariant for its lifetime, so it's
+    computed once and cached — the per-poll refresh never re-spawns ``ps``."""
     pid = os.getpid()
-    start = _proc_start(pid)
-    body = f"{pid}\n{start}" if start else str(pid)  # omit start if ps is unavailable (legacy mode)
+    start = _START_CACHE.get(pid)
+    if start is None:
+        start = _proc_start(pid) or ""   # "" = ps unavailable → legacy (PID-only) mode
+        _START_CACHE[pid] = start
+    body = f"{pid}\n{start}" if start else str(pid)
     f = _pidfile(data_dir)
     f.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     tmp = f.with_name(f"{f.name}.{pid}.tmp")
@@ -84,11 +91,12 @@ def app_running(data_dir: Path) -> bool:
         pid = int(lines[0].strip())
     except (OSError, ValueError, IndexError):
         return False
+    if not _alive(pid):             # cheap (no subprocess): dead/absent PID → app closed. Skips the
+        return False                # `ps` spawn on the common cx/cl path (app closed → run stock).
     stored_start = lines[1].strip() if len(lines) > 1 else None
-
-    start = _proc_start(pid)
-    if start is None:               # ps unavailable → fall back to bare liveness
-        return _alive(pid)
-    if not start:                   # no process with this PID
+    start = _proc_start(pid)        # PID is live — now pay `ps` to defend against PID reuse.
+    if start is None:               # ps unavailable → bare liveness already confirmed alive
+        return True
+    if not start:                   # raced: process exited between the checks → closed
         return False
     return stored_start is None or start == stored_start  # identity match when we recorded one

@@ -223,6 +223,30 @@ def test_ensure_launchers_never_overwrites_existing_wrapper(tmp_path, monkeypatc
     assert "good wrapper" in (bindir / "cx").read_text()
 
 
+def test_ensure_shell_setup_handles_regex_metachars_in_path(tmp_path):
+    """A bin_dir whose path contains re-replacement metachars (\\g, \\1, backslash) must be written
+    LITERALLY when our block is rewritten in place — not interpreted by re.sub."""
+    rc = tmp_path / ".zshrc"
+    bindir = tmp_path / r"w\g<0>ird\1"          # path with backslash + group-ref-looking sequences
+    inst.ensure_shell_setup(bindir, rc)          # first write (append path)
+    inst.ensure_shell_setup(bindir, rc, aliases=False)  # rewrite-in-place path → exercises sub()
+    assert f'export PATH="{bindir}:$PATH"' in rc.read_text()
+
+
+def test_ensure_launchers_prefers_terminal_python_over_bundle(tmp_path, monkeypatch):
+    """Called from the app (no python passed), wrappers must point at a terminal python3, NOT the
+    py2app bundle interpreter (sys.executable)."""
+    rc = tmp_path / ".zshrc"
+    bindir = tmp_path / "bin"
+    monkeypatch.setattr(inst, "shell_rc_path", lambda: rc)
+    monkeypatch.setattr(inst.sys, "executable", "/Bundle.app/Contents/MacOS/python")
+    monkeypatch.setattr(inst.shutil, "which", lambda name: "/usr/bin/python3" if name == "python3" else None)
+    inst.ensure_launchers(bin_dir=bindir)
+    body = (bindir / "acctsw").read_text()
+    assert "/usr/bin/python3" in body
+    assert "/Bundle.app/Contents/MacOS/python" not in body
+
+
 def test_uninstall_removes_only_our_block(ctx, tmp_path, monkeypatch):
     _seed_live(ctx)
     rc = tmp_path / ".zshrc"

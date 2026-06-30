@@ -67,10 +67,11 @@ _ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 # the SAME seat can't help — the seat needs re-login — so we hop to a DIFFERENT seat. Kept to the
 # tools' SPECIFIC error wording (not loose phrases like "sign in again") because this buffer also
 # carries the model's own generated text; a loose match would kill a healthy session on benign output.
+# Shared base + per-tool extras (one source of truth, so the common patterns can't drift apart).
+_AUTH_DEAD_SHARED = [r"refresh token (?:was |is )?revoked", r"log ?out and sign in again"]
 AUTH_DEAD_PATTERNS = {
-    "codex": [r"refresh token (?:was |is )?revoked", r"log ?out and sign in again"],
-    "claude": [r"refresh token (?:was |is )?revoked", r"log ?out and sign in again",
-               r"oauth token (?:has )?expired"],
+    "codex": _AUTH_DEAD_SHARED,
+    "claude": [*_AUTH_DEAD_SHARED, r"oauth token (?:has )?expired"],
 }
 
 # Compile once at import — detect_* runs once per PTY output chunk (a hot interactive path).
@@ -91,6 +92,18 @@ def detect_auth_dead(tool: str, text: str) -> bool:
     """True if recent output says the seat's credentials are dead (revoked / signed out)."""
     clean = _ANSI.sub("", text)
     return any(rx.search(clean) for rx in _AUTH_RE[tool])
+
+
+def detect_event(tool: str, text: str) -> str | None:
+    """Classify a PTY output chunk in ONE ANSI strip (the hot path runs this per chunk): returns
+    "auth" (creds dead), "limit" (usage limit), or None. Auth is checked first — it's not a usage
+    limit and needs a DIFFERENT seat, not a resume on the same one."""
+    clean = _ANSI.sub("", text)
+    if any(rx.search(clean) for rx in _AUTH_RE[tool]):
+        return "auth"
+    if any(rx.search(clean) for rx in _LIMIT_RE[tool]):
+        return "limit"
+    return None
 
 
 class NoSeats(AcctswError):
@@ -393,12 +406,9 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             def on_output(chunk: bytes) -> bool:
                 buf.extend(chunk)
                 del buf[:-4096]  # keep a rolling tail
-                text = buf.decode("utf-8", "replace")
-                if detect_auth_dead(tool, text):   # check auth-death first; it's not a usage limit
-                    hit["reason"] = "auth"
-                    return True
-                if detect_limit(tool, text):
-                    hit["reason"] = "limit"
+                reason = detect_event(tool, buf.decode("utf-8", "replace"))  # one ANSI strip per chunk
+                if reason is not None:
+                    hit["reason"] = reason
                     return True
                 return False
 

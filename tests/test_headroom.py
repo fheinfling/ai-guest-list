@@ -4,6 +4,7 @@ Routing no longer goes through `headroom install apply` (its launchd deploy is b
 docs/headroom-handover.md). We run the proxy ourselves (start_proxy) and hand-write the provider
 routing (_route_all); these tests cover that path plus the snapshot/restore + heal safety nets."""
 import json
+import os
 
 import pytest
 
@@ -501,6 +502,19 @@ def test_heal_strips_orphaned_injection_when_proxy_dead(tmp_path, monkeypatch):
     assert 'model = "orig"' in cfg.read_text()                # surgical unroute kept the user body
     assert calls["stop"] >= 1                                 # dead proxy torn down
     assert not (tmp_path / "store" / "headroom-global-backup").exists()
+
+
+def test_proxy_maybe_running_reads_pidfile_liveness(tmp_path, monkeypatch):
+    import subprocess
+    store = tmp_path / "store"; store.mkdir()
+    assert headroom.proxy_maybe_running(store) is False          # no pidfile
+    (store / "headroom-proxy.pid").write_text("not-a-pid")
+    assert headroom.proxy_maybe_running(store) is False          # garbage
+    dead = subprocess.Popen(["/bin/sh", "-c", "exit 0"]); dead.wait()
+    (store / "headroom-proxy.pid").write_text(str(dead.pid))
+    assert headroom.proxy_maybe_running(store) is False          # dead pid
+    (store / "headroom-proxy.pid").write_text(str(os.getpid()))
+    assert headroom.proxy_maybe_running(store) is True           # live pid
 
 
 def test_heal_reaps_orphan_proxy_when_app_gone(tmp_path, monkeypatch):

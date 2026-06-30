@@ -168,6 +168,15 @@ def test_handle_limit_honors_auth_failed_exclude(ctx):
     assert handle_limit(ctx, state2, "codex", get=fake_get({})).action == "switch"
 
 
+def test_detect_event_classifies_in_one_pass():
+    from acctsw.launcher import detect_event
+    assert detect_event("codex", "your refresh token was revoked") == "auth"
+    assert detect_event("codex", "you've hit your usage limit") == "limit"
+    assert detect_event("codex", "all good here") is None
+    # auth wins over a co-occurring limit phrase (different remedy: hop, don't resume same seat)
+    assert detect_event("claude", "usage limit; oauth token expired") == "auth"
+
+
 def test_handle_auth_dead_switches_excluding_active(ctx):
     state = _two_codex(ctx)  # active a
     dec = handle_auth_dead(ctx, state, "codex")

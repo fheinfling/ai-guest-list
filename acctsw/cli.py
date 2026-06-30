@@ -172,8 +172,17 @@ def _cmd_run(ctx: Context, ns) -> int:
         # launch; app_running=False tells heal the live proxy is an orphan. The save-credit SETTING is
         # kept (heal doesn't touch it), so it re-applies when the app is reopened.
         from . import headroom as hr
-        if hr.needs_reconcile(ctx):
+        # Gate on the cheap pre-checks: needs_reconcile (setting/backup/injected) OR a live proxy
+        # pidfile. The pidfile case matters because a graceful-OFF deletes the backup and restores
+        # config, leaving needs_reconcile False while the proxy is still alive — without it the
+        # orphan-reap would be unreachable here (the very leak this branch exists to fix).
+        if hr.needs_reconcile(ctx) or hr.proxy_maybe_running(ctx.data_dir):
             healed, _ = hr.heal(ctx.data_dir, blocking=False, app_running=False)
+            if not healed and hr.routing_injected():
+                # The lock was busy (e.g. the app's own quit teardown mid-flight) AND routing is
+                # still live. We must NOT exec stock into a dying proxy (ConnectionRefused), so wait
+                # out the in-flight op with a blocking retry rather than racing it.
+                healed, _ = hr.heal(ctx.data_dir, blocking=True, app_running=False)
             if healed:
                 notify(f"the app's closed — cleaned up Headroom; running stock {ns.tool}")
         return exec_stock(ctx, ns.tool, args)

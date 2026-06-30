@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import stat
 import sys
 from dataclasses import dataclass, field
@@ -75,7 +76,9 @@ def ensure_shell_setup(bin_dir: Path | None = None, rc_path: Path | None = None,
     block = shell_block(bin_dir, aliases=aliases)
     existing = rc_path.read_text() if rc_path.exists() else ""
     if BLOCK_BEGIN in existing:
-        new = _BLOCK_RE.sub(block, existing, count=1)
+        # Replace via a function, not a string: a literal home path can contain re replacement
+        # metachars (\g, \1, a backslash), which sub() would otherwise interpret and corrupt.
+        new = _BLOCK_RE.sub(lambda _m: block, existing, count=1)
     else:
         prefix = "" if (not existing or existing.endswith("\n")) else "\n"
         new = existing + prefix + "\n" + block
@@ -219,7 +222,10 @@ def ensure_launchers(*, bin_dir: Path | None = None, python: str | None = None,
     on every app launch so a fresh install "just works" and a deleted rc block self-heals. Returns
     (changed, messages)."""
     bin_dir = bin_dir or BIN_DIR
-    python = python or sys.executable
+    # Resolve a TERMINAL-invokable interpreter. When called from the menubar app (no python passed),
+    # sys.executable is the py2app BUNDLE interpreter, which the wrappers can't usefully exec from a
+    # shell — prefer a real `python3` on PATH. `acctsw install` passes the user's python explicitly.
+    python = python or shutil.which("python3") or sys.executable
     pkg_root = pkg_root or Path(__file__).resolve().parent.parent
     changed, msgs = False, []
     for name in BIN_NAMES:
