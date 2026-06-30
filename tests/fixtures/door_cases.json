@@ -1,0 +1,18 @@
+[
+  {"name": "open-active", "expected": "open",
+   "state": {"tools": {"codex": {"seats": [{"status": "active"}]}, "claude": {"seats": []}}}},
+  {"name": "open-ready", "expected": "open",
+   "state": {"tools": {"codex": {"seats": [{"status": "ready"}]}, "claude": {"seats": []}}}},
+  {"name": "open-empty-fresh-install", "expected": "open", "state": {"tools": {}}},
+  {"name": "open-mixed-one-ready", "expected": "open",
+   "state": {"tools": {"codex": {"seats": [{"status": "resting"}]},
+                       "claude": {"seats": [{"status": "ready"}]}}}},
+  {"name": "shut-all-resting", "expected": "shut",
+   "state": {"tools": {"codex": {"seats": [{"status": "resting"}]},
+                       "claude": {"seats": [{"status": "queued"}]}}}},
+  {"name": "shut-all-needs-login", "expected": "shut",
+   "state": {"tools": {"codex": {"seats": [{"status": "needs-login"}]}, "claude": {"seats": []}}}},
+  {"name": "shut-resting-and-needs-login", "expected": "shut",
+   "state": {"tools": {"codex": {"seats": [{"status": "resting"}]},
+                       "claude": {"seats": [{"status": "needs-login"}]}}}}
+]

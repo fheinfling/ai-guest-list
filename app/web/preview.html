@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>ai guest list — preview</title>
+  <link rel="stylesheet" href="styles.css">
+  <style>body{background:#cdd5e2;padding:30px;display:flex;justify-content:center}</style>
+</head>
+<body>
+  <div id="root"></div>
+  <script src="bundle.js"></script>
+  <script>
+    const iso = (m) => new Date(Date.now() + m*60000).toISOString();
+    window.AGL.result({ state: {
+      settings: { theme: "light", auto_switch: true, headroom: true, strategy: "soonest_back" },
+      headroom_available: true, headroom_savings: 68, recently_switched: false,
+      moved_note: "auto-moved Codex · Work → Personal — Work's resting 💛",
+      counts: { resting: 1, ready: 3 }, dot: "amber",
+      tools: {
+        codex: { active: "personal@studio.dev", plan_label: "CHATGPT BUSINESS", seats: [
+          { email:"work@studio.dev", name:"Work", plan:"Business", status:"resting", active:false,
+            limited:true, limited_until:iso(101), usage5h:100, usageWeek:80, credit:0 },
+          { email:"personal@studio.dev", name:"Personal", plan:"Business", status:"active", active:true,
+            limited:false, usage5h:38, usageWeek:22, credit:62, last_on_floor:iso(-120) },
+        ]},
+        claude: { active:"studio@studio.dev", plan_label:"CLAUDE CODE", seats: [
+          { email:"studio@studio.dev", name:"Studio", plan:"Max", status:"active", active:true,
+            limited:false, usage5h:20, usageWeek:12 },
+          { email:"personal@me.dev", name:"Personal", plan:"Pro", status:"ready", active:false,
+            limited:false, usage5h:5, usageWeek:3 },
+        ]},
+      },
+    }});
+  </script>
+</body>
+</html>

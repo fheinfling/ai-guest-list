@@ -1,0 +1,33 @@
+name: ci
+
+# Test pipeline: runs the Python suite + web-UI render tests on every push to main and every PR.
+# Free for public repos. macOS runner matches the target platform (the engine shells out to macOS
+# `security`/`ps`/`lsof` and the app uses pyobjc).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          pip install -e ".[app,dev]"
+
+      - name: Run tests
+        run: |
+          . .venv/bin/activate
+          python -m pytest -q
+          node --test app/web/*.test.mjs
