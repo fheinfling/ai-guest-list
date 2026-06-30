@@ -10,6 +10,7 @@ import shutil
 import subprocess
 from typing import Any
 
+from . import __version__, build_number
 from . import accounts as acct
 from . import usage as usage_mod
 from .context import Context
@@ -63,6 +64,7 @@ def snapshot_state(ctx: Context) -> dict[str, Any]:
     data["recently_switched"] = bool(last and (now() - last).total_seconds() < SWITCH_FRESH_SECONDS)
     data["dot"] = dot_for(data)  # single source of truth for the dot (JS + native both read this)
     data["door"] = door_for(data)  # shut/open door icon — same state feeds native glyph + web header
+    data["app"] = {"version": __version__, "build": build_number()}  # shown in the settings sheet
     return data
 
 

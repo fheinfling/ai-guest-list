@@ -206,6 +206,8 @@ export function buildSettings(state) {
   const theme = s.theme === "dark" ? "dark" : "light";
   const strat = s.strategy === "most_headroom" ? "most_headroom" : "soonest_back";
   const seg = (act, val, txt) => `<button class="seg ${act === val ? "on" : ""}" data-action="${act === "light" || act === "dark" ? "set_theme" : "set_strategy"}" data-value="${val}">${txt}</button>`;
+  const app = state?.app;
+  const ver = app ? `v${app.version}${app.build && app.build !== "dev" ? ` · build ${app.build}` : ""}` : "";
   return `<div class="backdrop" data-action="picker-close"><div class="sheet settings">
     <h3>settings</h3>
     <div class="set-row"><span>when one runs out</span><span class="segs">
@@ -224,6 +226,7 @@ export function buildSettings(state) {
       <span class="lg"><span class="dot dot--resting"></span>a seat resting</span>
       <span class="lg"><span class="dot dot--needs-login"></span>needs a hello</span></div>
     <button class="link" data-action="picker-close">done</button>
+    <div class="ver">ai guest list ${ver}</div>
   </div></div>`;
 }
 

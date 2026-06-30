@@ -18,6 +18,27 @@ def test_status_returns_state_with_headroom_flag(ctx):
     assert r["state"]["tools"]["codex"]["active"] == "a@x.com"
 
 
+def test_state_carries_app_version_and_build(ctx):
+    _add(ctx, "a@x.com")
+    import acctsw
+    app = bridge.handle(ctx, {"action": "ready"})["state"]["app"]
+    assert app["version"] == acctsw.__version__
+    assert app["build"] == "dev"           # source checkout → not a packaged build
+
+
+def test_build_number_reads_bundle_info_plist(tmp_path, monkeypatch):
+    """From inside a packaged *.app, build_number() reads CFBundleVersion from Info.plist."""
+    import plistlib
+    import acctsw
+    appdir = tmp_path / "AI Guest List.app"
+    fake_module_file = appdir / "Contents" / "Resources" / "lib" / "acctsw" / "__init__.py"
+    fake_module_file.parent.mkdir(parents=True)
+    (appdir / "Contents" / "Info.plist").write_bytes(plistlib.dumps({"CFBundleVersion": "142"}))
+    monkeypatch.setattr(acctsw, "_BUILD_CACHE", None)
+    monkeypatch.setattr(acctsw, "__file__", str(fake_module_file))
+    assert acctsw.build_number() == "142"
+
+
 def test_toggle_setting_persists(ctx):
     r = bridge.handle(ctx, {"action": "toggle", "key": "auto_switch", "value": False})
     assert r["ok"] and r["state"]["settings"]["auto_switch"] is False

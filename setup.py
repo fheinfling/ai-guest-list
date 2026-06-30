@@ -12,11 +12,24 @@ The engine itself is stdlib-only; only the menubar shell needs pyobjc. Web asset
 in Contents/Resources under py2app), and WKWebView can load index.html via file://.
 """
 import os
+import re
+import subprocess
 from glob import glob
+from pathlib import Path
 
 from setuptools import setup
 
 APP = ["app/menubar.py"]
+
+# Single source of truth for the marketing version (acctsw/__init__.py); the build number is the
+# git commit count — monotonic and automatic, so every tagged build gets a fresh CFBundleVersion.
+VERSION = re.search(r'__version__\s*=\s*"([^"]+)"',
+                    Path("acctsw/__init__.py").read_text()).group(1)
+try:
+    BUILD = subprocess.check_output(["git", "rev-list", "--count", "HEAD"],
+                                    text=True, stderr=subprocess.DEVNULL).strip() or "0"
+except Exception:
+    BUILD = "0"
 
 _web = [f for f in glob("app/web/*") if os.path.isfile(f)]
 DATA_FILES = [
@@ -31,8 +44,8 @@ OPTIONS = {
         "CFBundleName": "AI Guest List",
         "CFBundleDisplayName": "AI Guest List",
         "CFBundleIdentifier": "com.fheinfling.aiguestlist",
-        "CFBundleShortVersionString": "0.1.0",
-        "CFBundleVersion": "0.1.0",
+        "CFBundleShortVersionString": VERSION,
+        "CFBundleVersion": BUILD,
         "LSUIElement": True,            # status-bar only: no dock icon, no window
         "LSMinimumSystemVersion": "12.0",
     },

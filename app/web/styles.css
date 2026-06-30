@@ -187,6 +187,7 @@ html, body { background:transparent; width:100%; overflow-x:hidden; }
 .legend .lg-t { color:var(--t1); font-weight:700; margin-bottom:2px; }
 .legend .lg { display:flex; align-items:center; gap:6px; }
 .settings .link { display:block; margin:6px auto 0; }
+.ver { margin-top:8px; text-align:center; font-size:10px; color:var(--t2); opacity:.7; }
 
 .celebrate { animation:pop .5s ease; }
 @keyframes pop { 0%{transform:scale(.99)} 50%{transform:scale(1.01)} 100%{transform:scale(1)} }
