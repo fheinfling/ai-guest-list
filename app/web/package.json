@@ -1,0 +1,10 @@
+{
+  "name": "ai-guest-list-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Web UI (WKWebView popover) for ai guest list",
+  "scripts": {
+    "test": "node --test"
+  }
+}

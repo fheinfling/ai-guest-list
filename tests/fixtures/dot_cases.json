@@ -1,0 +1,15 @@
+[
+  {"name": "green-active", "expected": "green",
+   "state": {"tools": {"codex": {"seats": [{"status": "active"}]}, "claude": {"seats": []}}}},
+  {"name": "empty", "expected": "green", "state": {"tools": {}}},
+  {"name": "amber-resting", "expected": "amber",
+   "state": {"tools": {"codex": {"seats": [{"status": "resting"}]}, "claude": {"seats": []}}}},
+  {"name": "amber-queued", "expected": "amber",
+   "state": {"tools": {"codex": {"seats": [{"status": "queued"}]}, "claude": {"seats": []}}}},
+  {"name": "hello-needs-login", "expected": "hello",
+   "state": {"tools": {"codex": {"seats": [{"status": "needs-login"}]}, "claude": {"seats": []}}}},
+  {"name": "switched", "expected": "switched",
+   "state": {"recently_switched": true, "tools": {"codex": {"seats": [{"status": "active"}]}, "claude": {"seats": []}}}},
+  {"name": "hello-beats-resting", "expected": "hello",
+   "state": {"tools": {"codex": {"seats": [{"status": "resting"}]}, "claude": {"seats": [{"status": "needs-login"}]}}}}
+]

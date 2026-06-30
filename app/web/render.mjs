@@ -1,0 +1,262 @@
+// Pure render logic for the "ai guest list" popover (spec-driven). No DOM/bridge side effects →
+// unit-testable under node. Type rule (spec §0/§3): humanist SANS for UI; MONO only for the
+// wordmark, emails, %, countdowns, plan codes and section meta. Status = flat colored dots, never
+// emoji; the only emoji is 💛.
+
+export const TOOL_META = {
+  codex: { label: "Codex", plan: "CHATGPT BUSINESS", accent: "var(--codex)" },   // teal
+  claude: { label: "Claude", plan: "CLAUDE CODE", accent: "var(--claude)" },     // coral
+};
+
+// menu-bar aggregate dot (spec §9): rose=needs a hello · gold=just switched · amber=a seat
+// resting · green=everyone fresh.
+const DOT_COPY = {
+  hello: { label: "needs a hello" }, switched: { label: "just switched you" },
+  amber: { label: "a seat's resting" }, green: { label: "everyone's fresh" },
+};
+
+export function dotState(state) {
+  const key = state?.dot || dotKey(state);
+  return { key, ...DOT_COPY[key] };
+}
+
+export function dotKey(state) {
+  const seats = ["codex", "claude"].flatMap((t) => state?.tools?.[t]?.seats || []);
+  if (seats.some((s) => (s.status || "") === "needs-login")) return "hello";
+  if (state?.recently_switched) return "switched";
+  if (seats.some((s) => ["resting", "queued"].includes(s.status))) return "amber";
+  return "green";
+}
+
+// Door open/shut — mirror of acctsw.web_dot.door_for (golden fixture keeps them in lockstep).
+export function doorKey(state) {
+  if (state?.door === "open" || state?.door === "shut") return state.door;
+  const seats = ["codex", "claude"].flatMap((t) => state?.tools?.[t]?.seats || []);
+  const free = seats.some((s) => ["ready", "active"].includes(s.status));
+  return free || seats.length === 0 ? "open" : "shut";
+}
+
+// The header door mark (same glyph the menu bar swaps), matching the handoff icon-states prototype:
+// open = warm room with a spinning disco ball + twinkles and the door swung ajar; shut = a closed
+// cream door with a gold knob. Animated purely in CSS; aria-label carries the meaning.
+export function doorMark(state) {
+  const key = doorKey(state);
+  const label = key === "open" ? "a model's free — come on in" : "every seat's resting";
+  const inner = key === "open"
+    ? `<span class="door-room"><span class="door-string"></span><span class="door-ball"></span>` +
+      `<span class="tw tw1"></span><span class="tw tw2"></span>` +
+      `<span class="tw tw3"></span><span class="tw tw4"></span></span>` +
+      `<span class="door-leaf"></span>`
+    : `<span class="door-room"></span><span class="door-panel"></span><span class="door-knob"></span>`;
+  return `<span class="avatar door door--${key}" role="img" aria-label="${label}">${inner}</span>`;
+}
+
+export function needsHello(seat) {
+  return (seat.status || "") === "needs-login" || (seat.usage || {}).error === "unauthorized";
+}
+
+export function pct(seat, win) {
+  const v = win === "5h" ? seat?.usage5h : seat?.usageWeek;
+  const raw = v != null ? v : (seat?.usage?.windows?.[win]?.used_pct);
+  return typeof raw === "number" ? Math.max(0, Math.min(100, raw)) : null;
+}
+
+export function creditLeft(seat) {
+  const used = ["5h", "weekly"].map((w) => pct(seat, w)).filter((v) => v !== null);
+  return used.length ? Math.round(100 - Math.max(...used)) : null;
+}
+
+export function fmtCountdown(iso, now = Date.now()) {
+  if (!iso) return "";
+  const ms = new Date(iso).getTime() - now;
+  if (isNaN(ms) || ms <= 0) return "now";
+  const mins = Math.round(ms / 60000);
+  if (mins < 60) return `${mins}m`;
+  const hrs = Math.floor(mins / 60);
+  return `${hrs}h${mins % 60 ? ` ${mins % 60}m` : ""}`;
+}
+
+function fmtClock(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  let h = d.getHours(); const m = String(d.getMinutes()).padStart(2, "0");
+  const ap = h >= 12 ? "PM" : "AM"; h = h % 12 || 12;
+  return `${h}:${m} ${ap}`;
+}
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+// --- seat card --------------------------------------------------------------------------------
+
+function statusBit(tool, seat) {
+  switch (seat.status) {
+    case "active": return `<span class="pill floor">on the floor</span>`;
+    case "queued": return `<span class="pill queued">up next 💛</span>`;
+    case "resting":
+      return `<span class="mono rest-count">back in ${fmtCountdown(seat.limited_until)}</span>`;
+    case "needs-login":
+      return `<button class="btn rose" data-action="add" data-tool="${tool}">log in</button>`;
+    default:
+      return `<button class="btn switch" data-action="switch" data-tool="${tool}" data-email="${esc(seat.email)}">switch</button>`;
+  }
+}
+
+function bar(seat, win, label) {
+  const v = pct(seat, win);
+  const known = v !== null;
+  return `<div class="usage"><span class="mono u-k">${label}</span>
+    <span class="track"><span class="fill" style="width:${known ? v : 0}%"></span></span>
+    <span class="mono u-v">${known ? `${Math.round(v)}%` : "—"}</span></div>`;
+}
+
+function seatCard(tool, seat) {
+  const plan = seat.plan ? `<span class="mono chip">${esc(seat.plan)}</span>` : "";
+  const reassure = seat.status === "resting"
+    ? `<div class="reassure mono">taking a breather — back ${fmtClock(seat.limited_until)} 💛</div>` : "";
+  const credit = creditLeft(seat);
+  const expanded = `<div class="expand">
+    ${bar(seat, "weekly", "7d")}
+    ${credit !== null ? `<div class="x-row"><span>credit left</span><span class="mono">${credit}%</span></div>` : ""}
+    ${seat.last_on_floor ? `<div class="x-row"><span>last on the floor</span><span class="mono">${esc(fmtClock(seat.last_on_floor))}</span></div>` : ""}
+    <button class="logout" data-action="remove" data-tool="${tool}" data-email="${esc(seat.email)}">log out ↗</button>
+  </div>`;
+  return `<div class="seat seat--${seat.status}" data-card data-tool="${tool}" data-email="${esc(seat.email)}">
+    <div class="seat-row">
+      <span class="dot dot--${seat.status}"></span>
+      <span class="seat-name">${esc(seat.name)}</span>${plan}
+      <span class="grow"></span>${statusBit(tool, seat)}
+    </div>
+    <div class="seat-email mono">${esc(seat.email)}</div>
+    ${bar(seat, "5h", "5h")}
+    ${reassure}
+    ${expanded}
+  </div>`;
+}
+
+function toolGroup(tool, t) {
+  const meta = TOOL_META[tool];
+  const seats = t?.seats || [];
+  const n = seats.length;
+  return `<section class="group" style="--accent:${meta.accent}">
+    <div class="g-head">
+      <span class="dot dot--accent"></span>
+      <span class="g-name">${meta.label}</span><span class="g-count">· ${n} seat${n === 1 ? "" : "s"}</span>
+      <span class="grow"></span><span class="mono g-meta">${esc(t?.plan_label || meta.plan)}</span>
+    </div>
+    ${seats.map((s) => seatCard(tool, s)).join("") || `<div class="empty">no seats yet</div>`}
+    <button class="add-row" data-action="add" data-tool="${tool}">＋ add a seat</button>
+  </section>`;
+}
+
+// funnel icon (three stacked bars narrowing) for Headroom — inline SVG, currentColor.
+const FUNNEL = `<svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><g fill="currentColor">
+  <rect x="2" y="3" width="12" height="2" rx="1"/><rect x="4" y="7" width="8" height="2" rx="1"/>
+  <rect x="6" y="11" width="4" height="2" rx="1"/></g></svg>`;
+const REFRESH = `<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="none"
+  stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+  d="M12.5 4.5a5 5 0 1 0 1.2 3.3"/><path fill="currentColor" d="M13.5 2.2l.6 2.8-2.8.2z"/></svg>`;
+
+function controlBar(opts) {
+  const { icon, title, chip, sub, key, on, accentClass } = opts;
+  return `<label class="ctl">
+    <span class="ctl-ic ${accentClass}">${icon}</span>
+    <span class="ctl-tx"><span class="ctl-t">${title}${chip ? ` <span class="mono ctl-chip">${chip}</span>` : ""}</span>
+      <span class="ctl-s">${sub}</span></span>
+    <input type="checkbox" data-action="toggle" data-key="${key}" ${on ? "checked" : ""}><span class="sw"></span>
+  </label>`;
+}
+
+// --- overlays (add-a-seat, settings) ----------------------------------------------------------
+
+export function buildPicker(plan) {
+  const methods = (plan?.methods || []).map((m) =>
+    m.command
+      ? `<button class="pk-m" data-action="login" data-tool="${esc(plan.tool)}" data-command="${esc(m.command)}">${esc(m.label)}</button>`
+      : `<button class="pk-m" data-action="paste-open" data-tool="${esc(plan.tool)}">${esc(m.label)}</button>`
+  ).join("");
+  return `<div class="backdrop" data-action="picker-close"><div class="sheet">
+    <h3>${esc(plan?.title || "who's joining the list?")}</h3><p class="sub">how should i sign you in?</p>
+    ${methods}<button class="link" data-action="picker-close">cancel</button></div></div>`;
+}
+
+export function buildSaveSeat(tool) {
+  return `<div class="backdrop"><div class="sheet"><h3>signed in?</h3>
+    <p class="sub">i'll keep your ${esc(tool)} seat warm</p>
+    <button class="pk-m" data-action="snapshot" data-tool="${esc(tool)}">save my seat 💛</button>
+    <button class="link" data-action="picker-close">not yet</button></div></div>`;
+}
+
+export function buildPaste(tool) {
+  const hint = tool === "claude" ? "paste a setup-token (sk-ant-oat…)" : "paste auth.json";
+  return `<div class="backdrop"><div class="sheet"><h3>${hint}</h3><p class="sub">no browser dance</p>
+    <textarea id="paste-blob" class="paste mono" placeholder="${tool === "claude" ? "sk-ant-oat…" : "{ ... }"}"></textarea>
+    <button class="pk-m" data-action="paste-save" data-tool="${esc(tool)}">save my seat 💛</button>
+    <button class="link" data-action="picker-close">cancel</button></div></div>`;
+}
+
+function setToggle(key, label, on) {
+  return `<label class="set-row"><span>${label}</span>
+    <input type="checkbox" data-action="toggle" data-key="${key}" ${on ? "checked" : ""}><span class="sw"></span></label>`;
+}
+
+export function buildSettings(state) {
+  const s = state?.settings || {};
+  const theme = s.theme === "dark" ? "dark" : "light";
+  const strat = s.strategy === "most_headroom" ? "most_headroom" : "soonest_back";
+  const seg = (act, val, txt) => `<button class="seg ${act === val ? "on" : ""}" data-action="${act === "light" || act === "dark" ? "set_theme" : "set_strategy"}" data-value="${val}">${txt}</button>`;
+  const app = state?.app;
+  const ver = app ? `v${app.version}${app.build && app.build !== "dev" ? ` · build ${app.build}` : ""}` : "";
+  return `<div class="backdrop" data-action="picker-close"><div class="sheet settings">
+    <h3>settings</h3>
+    <div class="set-row"><span>when one runs out</span><span class="segs">
+      <button class="seg ${strat === "soonest_back" ? "on" : ""}" data-action="set_strategy" data-value="soonest_back">soonest back</button>
+      <button class="seg ${strat === "most_headroom" ? "on" : ""}" data-action="set_strategy" data-value="most_headroom">most headroom</button></span></div>
+    ${setToggle("same_tool_only", "keep me on the same tool", s.same_tool_only)}
+    ${setToggle("notify", "notify when it switches", s.notify)}
+    ${setToggle("restart_app", "restart Codex after a swap", s.restart_app)}
+    ${setToggle("headroom", "Headroom by default", s.headroom)}
+    <div class="set-row"><span>theme</span><span class="segs">
+      <button class="seg ${theme === "light" ? "on" : ""}" data-action="set_theme" data-value="light">light</button>
+      <button class="seg ${theme === "dark" ? "on" : ""}" data-action="set_theme" data-value="dark">dark</button></span></div>
+    <button class="link" data-action="picker-close">done</button>
+    <div class="ver">ai guest list ${ver}</div>
+  </div></div>`;
+}
+
+// --- popover ----------------------------------------------------------------------------------
+
+export function buildHTML(state) {
+  const s = state?.settings || {};
+  const theme = s.theme === "dark" ? "dark" : "light";
+  const hr = state?.headroom_available;
+  const c = state?.counts || { resting: 0, ready: 0 };
+  const moved = state?.moved_note ? `<div class="event mono">↪ ${esc(state.moved_note)}</div>` : "";
+  const hrSub = hr
+    ? (state?.headroom_savings != null
+        ? `wrapping Codex &amp; Claude · ~${state.headroom_savings}% fewer tokens 💛`
+        : "wrapping Codex &amp; Claude 💛")
+    : "install Headroom to enable";
+  return `<div class="app theme-${theme}">
+    <header class="top">
+      ${doorMark(state)}
+      <span class="brand-tx"><span class="brand mono">ai guest list</span>
+        <span class="substatus">${c.resting} resting · ${c.ready} ready 💛</span></span>
+      <span class="top-actions">
+        <button class="ibtn" data-action="settings" title="settings">⋯</button>
+        <button class="ibtn" data-action="add" data-tool="codex" title="add a seat">＋</button>
+      </span>
+    </header>
+    ${controlBar({ icon: REFRESH, title: "auto-switch", sub: "next ready seat · soonest-reset wins",
+                   key: "auto_switch", on: s.auto_switch, accentClass: "ic-auto" })}
+    ${controlBar({ icon: FUNNEL, title: "Headroom", chip: "COMPRESSES CONTEXT", sub: hrSub,
+                   key: "headroom", on: s.headroom && hr, accentClass: "ic-hr" })}
+    ${hr ? "" : `<button class="hr-install" data-action="headroom_install">install Headroom →</button>`}
+    ${moved}
+    ${toolGroup("codex", state?.tools?.codex)}
+    ${toolGroup("claude", state?.tools?.claude)}
+    <footer class="foot"><span>made with <span class="heart">💛</span></span>
+      <button class="link" data-action="quit">quit</button></footer>
+  </div>`;
+}

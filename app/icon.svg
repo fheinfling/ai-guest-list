@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffe6ad"/>
+      <stop offset="55%" stop-color="#f7c668"/>
+      <stop offset="100%" stop-color="#e7a23f"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="40%" r="62%">
+      <stop offset="0%" stop-color="#fff6df" stop-opacity=".95"/>
+      <stop offset="100%" stop-color="#fff6df" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="ball" cx="38%" cy="30%" r="78%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="40%" stop-color="#bfe9df"/>
+      <stop offset="100%" stop-color="#2f8a78"/>
+    </radialGradient>
+    <linearGradient id="leaf" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#f5eedd"/>
+      <stop offset="100%" stop-color="#d8c8a8"/>
+    </linearGradient>
+    <clipPath id="ballClip"><circle cx="512" cy="470" r="172"/></clipPath>
+    <clipPath id="tileClip"><rect x="92" y="92" width="840" height="840" rx="200"/></clipPath>
+  </defs>
+
+  <!-- squircle tile (macOS-style) -->
+  <rect x="92" y="92" width="840" height="840" rx="200" fill="url(#tile)"/>
+  <g clip-path="url(#tileClip)">
+    <rect x="92" y="92" width="840" height="840" fill="url(#glow)"/>
+
+    <!-- door swung open on the left -->
+    <g transform="rotate(-7 250 520)">
+      <rect x="150" y="150" width="120" height="740" rx="26" fill="url(#leaf)"/>
+      <circle cx="244" cy="540" r="13" fill="#cf9b2e"/>
+    </g>
+
+    <!-- disco ball: string, glow, body, facets, highlight -->
+    <line x1="512" y1="120" x2="512" y2="300" stroke="#b5905a" stroke-width="9"/>
+    <circle cx="512" cy="470" r="200" fill="#fff2cf" opacity=".5"/>
+    <circle cx="512" cy="470" r="172" fill="url(#ball)"/>
+    <g clip-path="url(#ballClip)" stroke="#2c7e6d" stroke-width="7" opacity=".5" fill="none">
+      <line x1="392" y1="470" x2="632" y2="470"/>
+      <path d="M360 388 q152 70 304 0"/>
+      <path d="M360 552 q152 -70 304 0"/>
+      <line x1="452" y1="306" x2="452" y2="634"/>
+      <line x1="512" y1="298" x2="512" y2="642"/>
+      <line x1="572" y1="306" x2="572" y2="634"/>
+    </g>
+    <ellipse cx="455" cy="408" rx="46" ry="30" fill="#ffffff" opacity=".92"/>
+
+    <!-- twinkles -->
+    <circle cx="300" cy="300" r="17" fill="#46c2a8"/>
+    <circle cx="745" cy="300" r="14" fill="#e0795a"/>
+    <circle cx="735" cy="690" r="18" fill="#f3c969"/>
+    <circle cx="690" cy="780" r="12" fill="#7c6cf0"/>
+    <circle cx="360" cy="760" r="13" fill="#e0795a"/>
+  </g>
+</svg>

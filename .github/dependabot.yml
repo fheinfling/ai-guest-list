@@ -1,0 +1,16 @@
+version: 2
+updates:
+  # Keep the GitHub Actions we pin (checkout, setup-python, codeql, gh-release) current.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+  # App/build/dev extras in pyproject.toml (pyobjc, py2app, pytest); the engine itself is stdlib-only.
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: deps
