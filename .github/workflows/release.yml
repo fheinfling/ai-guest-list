@@ -58,7 +58,7 @@ jobs:
           ditto -c -k --keepParent "dist/AI Guest List.app" "AI-Guest-List-${GITHUB_REF_NAME}.zip"
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: ${{ github.ref_name }}
           generate_release_notes: true
