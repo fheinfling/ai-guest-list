@@ -789,6 +789,11 @@ def heal(store: Path | None = None, *, blocking: bool = True, push=None,
     with op_lock(store, blocking=blocking) as acquired:
         if not acquired:
             return False, "busy"
+        if not app_running and proxy_maybe_running(store):
+            # App gone + a live proxy PROCESS (ready, wedged, OR still starting) → orphan. Reap it by
+            # PID, not by /readyz: a wedged proxy that never answers /readyz would otherwise survive
+            # (proxy_ready() False), yet the pidfile is right there to kill it. Strip routing too.
+            return _remove_and_restore(store)
         if proxy_ready():
             if app_running:
                 (push or push_runtime_knobs)()  # best-effort: re-assert knobs on a proxy we may not have started

@@ -343,8 +343,8 @@ if objc is not None:
                 from acctsw import headroom
                 if headroom.needs_reconcile(self.ctx):
                     headroom.global_disable(self.ctx.data_dir)   # blocking + op_lock-serialized (unroute + reap)
-                elif headroom.proxy_ready():
-                    headroom.stop_proxy(self.ctx.data_dir)       # reap a graceful-OFF proxy kept alive for open sessions
+                elif headroom.proxy_maybe_running(self.ctx.data_dir):
+                    headroom.stop_proxy(self.ctx.data_dir)       # reap a graceful-OFF proxy (ready OR wedged) by PID
             except Exception:
                 pass
 

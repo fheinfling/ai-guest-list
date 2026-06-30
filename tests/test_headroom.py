@@ -542,6 +542,18 @@ def test_heal_reaps_orphan_proxy_when_app_gone_clean_config(tmp_path, monkeypatc
     assert calls["stop"] >= 1
 
 
+def test_heal_reaps_wedged_orphan_by_pid_when_app_gone(tmp_path, monkeypatch):
+    """A graceful-OFF proxy that's alive-by-PID but NOT answering /readyz (wedged/starting) must
+    still be reaped when the app is gone — heal keys off the pidfile, not just proxy_ready()."""
+    store = tmp_path / "store"; store.mkdir()
+    _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
+    calls = _patch_proxy(monkeypatch, ready=False)          # /readyz NOT responding (wedged)
+    (store / "headroom-proxy.pid").write_text(str(os.getpid()))  # but the process is alive
+    healed, _ = headroom.heal(store, app_running=False)
+    assert healed is True
+    assert calls["stop"] >= 1                                # reaped by PID despite ready=False
+
+
 def test_heal_keeps_running_proxy_when_app_alive(tmp_path, monkeypatch):
     """The orphan-reap must NOT fire while the app is alive — a healthy managed proxy stays up."""
     _codex_cfg(tmp_path, monkeypatch)
