@@ -1,0 +1,30 @@
+name: codeql
+
+# Static security analysis (GitHub code scanning). Free for public repos. Python is where the
+# credential/keychain/proxy logic lives, so that's what we scan. Runs on push/PR + weekly.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "23 5 * * 1"   # Mondays 05:23 UTC — catch newly-published CodeQL rules
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest        # CodeQL Python analysis is platform-agnostic; ubuntu is fast + free
+    permissions:
+      security-events: write       # upload results to the Security tab
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [python, actions]   # actions = scan the workflow files (permissions, pinning)
+    steps:
+      - uses: actions/checkout@v7
+      - uses: github/codeql-action/init@v4
+        with:
+          language: ${{ matrix.language }}
+          queries: security-extended
+      - uses: github/codeql-action/analyze@v4

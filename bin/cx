@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Supervised Codex launcher — auto-switches seats on usage limits and resumes your work.
+# Installed to ~/.local/bin by `acctsw install`. The stock `codex` is never shadowed.
+exec acctsw run codex "$@"
