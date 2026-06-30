@@ -126,7 +126,12 @@ if objc is not None:
             appalive.mark_dead(self.ctx.data_dir)   # app is going away → terminal codex/claude revert to stock
             try:
                 from acctsw import headroom
-                if not self._teardownDone and headroom.needs_reconcile(self.ctx):
+                # Run the teardown when there's routing/backup to undo OR a proxy still alive. The
+                # proxy_maybe_running check matters for the graceful-OFF state (routing+backup already
+                # gone, needs_reconcile False) — without it _headroomTeardown's reap branch is
+                # unreachable and the proxy outlives the app until a later cx/cl cleans it up.
+                if not self._teardownDone and (headroom.needs_reconcile(self.ctx)
+                                               or headroom.proxy_maybe_running(self.ctx.data_dir)):
                     self.performSelectorInBackground_withObject_(
                         objc.selector(self.quitBg_, signature=b"v@:@"), None)
                     return NS_TERMINATE_LATER
@@ -187,9 +192,17 @@ if objc is not None:
                         ok, _ = headroom.global_enable(self.ctx.data_dir)
                         if ok:
                             self._notify("Headroom", "restarted the proxy after sleep")
-                        elif headroom.reconcile(self.ctx, blocking=False)[0]:
+                        else:
+                            # Restart failed and routing rolled back to clean → the setting would sit
+                            # ON with no proxy/routing behind it (reconcile() returns "clean", not
+                            # healed). Match state to reality by clearing it, like recoverBg_ does, so
+                            # the UI and later health-checks don't keep chasing a dead-but-ON proxy.
+                            with self.ctx.locked():
+                                s = self.ctx.load_state(); s.set_setting("headroom", False); s.save()
+                            healed = headroom.reconcile(self.ctx, blocking=False)[0]
                             self._notify("Headroom turned off",
-                                         "the proxy didn't survive sleep — restored your setup")
+                                         "the proxy didn't survive sleep — "
+                                         + ("restored your setup" if healed else "running direct"))
                 elif headroom.needs_reconcile(self.ctx):
                     headroom.reconcile(self.ctx, blocking=False)   # strip any orphaned injection
             except Exception:
