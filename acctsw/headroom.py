@@ -342,6 +342,22 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _pid_is_proxy(pid: int) -> bool:
+    """Identity guard against PID REUSE: confirm `pid` is actually a Headroom proxy (its command line
+    runs `headroom … proxy`) before we ever treat it as ours or signal it. A bare liveness check is
+    NOT enough — the OS can recycle a dead proxy's PID for an unrelated process, and we must never
+    SIGTERM/SIGKILL an innocent bystander. ps unavailable / no match → False (we'd rather leak an
+    orphan than kill the wrong process)."""
+    if pid <= 0:
+        return False
+    try:
+        out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=2).stdout.lower()
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "headroom" in out and "proxy" in out
+
+
 def _port_busy(port: int = PROXY_PORT) -> bool:
     """True iff something is accepting TCP connections on the loopback port (may not be our proxy)."""
     import socket
@@ -447,7 +463,9 @@ def proxy_maybe_running(store: Path | None = None) -> bool:
         pid = int(pidf.read_text().strip())
     except (OSError, ValueError):
         return False
-    return pid > 0 and _pid_alive(pid)
+    # Liveness AND identity: a recycled PID (dead proxy, PID reused by something else) must read as
+    # "not running" so we neither trigger a spurious reap nor, downstream, signal the wrong process.
+    return pid > 0 and _pid_alive(pid) and _pid_is_proxy(pid)
 
 
 def routing_injected() -> bool:
@@ -467,7 +485,9 @@ def stop_proxy(store: Path | None = None, *, kill=None, sleep=None) -> None:
         pid = int(pidf.read_text().strip())
     except (OSError, ValueError):
         pid = 0
-    if pid > 0 and _pid_alive(pid):
+    # Kill ONLY if the PID is alive AND is really our proxy — never signal a recycled PID that the OS
+    # has handed to an unrelated process (the pidfile can outlive the proxy).
+    if pid > 0 and _pid_alive(pid) and _pid_is_proxy(pid):
         for sig in (signal.SIGTERM, signal.SIGKILL):
             try:
                 _kill(pid, sig)

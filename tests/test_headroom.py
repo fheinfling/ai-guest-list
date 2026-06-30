@@ -236,6 +236,7 @@ def test_stop_proxy_kills_pid_and_clears_file(tmp_path, monkeypatch):
     pidf.write_text("4321")
     killed = []
     monkeypatch.setattr(headroom, "_pid_alive", lambda pid: pid == 4321 and not killed)
+    monkeypatch.setattr(headroom, "_pid_is_proxy", lambda pid: pid == 4321)   # identity confirmed
     headroom.stop_proxy(tmp_path / "store",
                         kill=lambda pid, sig: killed.append((pid, sig)), sleep=lambda *_: None)
     assert killed and killed[0][0] == 4321
@@ -507,6 +508,7 @@ def test_heal_strips_orphaned_injection_when_proxy_dead(tmp_path, monkeypatch):
 def test_proxy_maybe_running_reads_pidfile_liveness(tmp_path, monkeypatch):
     import subprocess
     store = tmp_path / "store"; store.mkdir()
+    monkeypatch.setattr(headroom, "_pid_is_proxy", lambda pid: True)   # identity satisfied
     assert headroom.proxy_maybe_running(store) is False          # no pidfile
     (store / "headroom-proxy.pid").write_text("not-a-pid")
     assert headroom.proxy_maybe_running(store) is False          # garbage
@@ -514,7 +516,21 @@ def test_proxy_maybe_running_reads_pidfile_liveness(tmp_path, monkeypatch):
     (store / "headroom-proxy.pid").write_text(str(dead.pid))
     assert headroom.proxy_maybe_running(store) is False          # dead pid
     (store / "headroom-proxy.pid").write_text(str(os.getpid()))
-    assert headroom.proxy_maybe_running(store) is True           # live pid
+    assert headroom.proxy_maybe_running(store) is True           # live + identity
+    # PID-reuse guard: live PID but NOT our proxy (recycled) → must read as not running
+    monkeypatch.setattr(headroom, "_pid_is_proxy", lambda pid: False)
+    assert headroom.proxy_maybe_running(store) is False
+
+
+def test_stop_proxy_never_kills_a_recycled_pid(tmp_path, monkeypatch):
+    """A stale pidfile pointing at a live but unrelated process (PID reuse) must NOT be signalled."""
+    store = tmp_path / "store"; store.mkdir()
+    (store / "headroom-proxy.pid").write_text(str(os.getpid()))   # alive, but it's pytest, not a proxy
+    monkeypatch.setattr(headroom, "_pid_is_proxy", lambda pid: False)
+    killed = []
+    headroom.stop_proxy(store, kill=lambda pid, sig: killed.append((pid, sig)), sleep=lambda _s: None)
+    assert killed == []                                          # no signal sent to the bystander
+    assert not (store / "headroom-proxy.pid").exists()           # stale pidfile still cleared
 
 
 def test_heal_reaps_orphan_proxy_when_app_gone(tmp_path, monkeypatch):
@@ -548,6 +564,7 @@ def test_heal_reaps_wedged_orphan_by_pid_when_app_gone(tmp_path, monkeypatch):
     store = tmp_path / "store"; store.mkdir()
     _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
     calls = _patch_proxy(monkeypatch, ready=False)          # /readyz NOT responding (wedged)
+    monkeypatch.setattr(headroom, "_pid_is_proxy", lambda pid: True)  # identity confirmed
     (store / "headroom-proxy.pid").write_text(str(os.getpid()))  # but the process is alive
     healed, _ = headroom.heal(store, app_running=False)
     assert healed is True
