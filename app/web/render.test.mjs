@@ -116,7 +116,7 @@ test("flat status dots, not emoji", () => {
 test("header substatus + plan chip + section meta", () => {
   const html = buildHTML(state({ counts: { resting: 1, ready: 3 }, tools: {
     codex: { plan_label: "CHATGPT BUSINESS", seats: [seat({ plan: "Business" })] }, claude: { seats: [] } } }));
-  assert.match(html, /1 resting · 3 ready 💛/);
+  assert.match(html, /1 resting · 3 ready/);
   assert.match(html, /class="mono chip">BUSINESS|class="mono chip">Business/);
   assert.match(html, /class="mono g-meta">CHATGPT BUSINESS/);
   assert.match(html, /made with <span class="heart">💛/);

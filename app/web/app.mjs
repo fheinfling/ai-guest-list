@@ -48,15 +48,18 @@ function closeOverlay() { overlay.innerHTML = ""; }
 // which screen occupies the popover: "main" or the settings sub-view (spec §9.1 — a pushed
 // sub-view on the same surface, never a modal).
 let screen = "main";
+let renderedScreen = null;  // what the last render() actually drew — gates scroll preservation
 
 function render() {
-  // A background state push (the usage poll) re-renders whatever screen is up; carry the settings
-  // body's scroll position across the innerHTML swap so a poll doesn't snap it back to the top.
-  const prevBody = root.querySelector(".set-body");
-  const scrollTop = prevBody ? prevBody.scrollTop : 0;
+  // A background state push (the usage poll) re-renders whatever screen is up; carry the current
+  // screen's body scroll position across the innerHTML swap so a poll doesn't snap it to the top.
+  // Only when the screen is unchanged — navigating must start the new screen at the top.
+  const prevBody = root.querySelector(".main-body, .set-body");
+  const scrollTop = screen === renderedScreen && prevBody ? prevBody.scrollTop : 0;
   root.innerHTML = screen === "settings" ? buildSettings(state) : buildHTML(state);
+  renderedScreen = screen;
   if (scrollTop) {
-    const nextBody = root.querySelector(".set-body");
+    const nextBody = root.querySelector(".main-body, .set-body");
     if (nextBody) nextBody.scrollTop = scrollTop;
   }
   // mirror the theme onto <body> so overlays (siblings of #root) get the same CSS vars

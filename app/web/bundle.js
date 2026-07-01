@@ -117,7 +117,7 @@ function bar(seat, win, label) {
 function seatCard(tool, seat) {
   const plan = seat.plan ? `<span class="mono chip">${esc(seat.plan)}</span>` : "";
   const reassure = seat.status === "resting"
-    ? `<div class="reassure mono">taking a breather — back ${fmtClock(seat.limited_until)} 💛</div>` : "";
+    ? `<div class="reassure mono">taking a breather — back ${fmtClock(seat.limited_until)}</div>` : "";
   const credit = creditLeft(seat);
   const expanded = `<div class="expand">
     ${bar(seat, "weekly", "7d")}
@@ -322,30 +322,32 @@ function buildHTML(state) {
     : state?.headroom_proxy_down
       // toggled on but the proxy isn't actually running (e.g. a restart failed) — say so rather than
       // claim it's wrapping; recovery restarts it, so this clears itself.
-      ? "save-credit paused — reconnecting… 💛"
+      ? "save-credit paused — reconnecting…"
       : (state?.headroom_savings != null
-          ? `wrapping Codex &amp; Claude · ~${state.headroom_savings}% fewer tokens (${state?.headroom_savings_measured ? "measured" : "est."})${hrLifetime(state?.headroom_stats)} 💛`
-          : "wrapping Codex &amp; Claude 💛");
+          ? `wrapping Codex &amp; Claude · ~${state.headroom_savings}% fewer tokens (${state?.headroom_savings_measured ? "measured" : "est."})${hrLifetime(state?.headroom_stats)}`
+          : "wrapping Codex &amp; Claude");
   return `<div class="app theme-${theme}">
     <header class="top">
       ${doorMark(state)}
       <span class="brand-tx"><span class="brand"><span class="ai">ai</span> guest list</span>
-        <span class="substatus">${c.resting} resting · ${c.ready} ready 💛</span></span>
+        <span class="substatus">${c.resting} resting · ${c.ready} ready</span></span>
       <span class="top-actions">
         <button class="ibtn" data-action="settings" title="settings">⋯</button>
         <button class="ibtn" data-action="add" data-tool="codex" title="add a seat">＋</button>
       </span>
     </header>
-    ${controlBar({ icon: REFRESH, title: "auto-switch", sub: "next ready seat · soonest-reset wins",
-                   key: "auto_switch", on: s.auto_switch, accentClass: "ic-auto" })}
-    ${controlBar({ icon: FUNNEL, title: "Headroom", chip: "COMPRESSES CONTEXT", sub: hrSub,
-                   key: "headroom", on: s.headroom && hr, accentClass: "ic-hr" })}
-    ${hr ? "" : `<button class="hr-install" data-action="headroom_install">install Headroom →</button>`}
-    ${moved}
-    ${toolGroup("codex", state?.tools?.codex)}
-    ${toolGroup("claude", state?.tools?.claude)}
-    <footer class="foot"><span>made with <span class="heart">💛</span></span>
-      <button class="link" data-action="quit">quit</button></footer>
+    <div class="main-body">
+      ${controlBar({ icon: REFRESH, title: "auto-switch", sub: "next ready seat · soonest-reset wins",
+                     key: "auto_switch", on: s.auto_switch, accentClass: "ic-auto" })}
+      ${controlBar({ icon: FUNNEL, title: "Headroom", chip: "COMPRESSES CONTEXT", sub: hrSub,
+                     key: "headroom", on: s.headroom && hr, accentClass: "ic-hr" })}
+      ${hr ? "" : `<button class="hr-install" data-action="headroom_install">install Headroom →</button>`}
+      ${moved}
+      ${toolGroup("codex", state?.tools?.codex)}
+      ${toolGroup("claude", state?.tools?.claude)}
+      <footer class="foot"><span>made with <span class="heart">💛</span></span>
+        <button class="link" data-action="quit">quit</button></footer>
+    </div>
   </div>`;
 }
 
@@ -398,15 +400,18 @@ function closeOverlay() { overlay.innerHTML = ""; }
 // which screen occupies the popover: "main" or the settings sub-view (spec §9.1 — a pushed
 // sub-view on the same surface, never a modal).
 let screen = "main";
+let renderedScreen = null;  // what the last render() actually drew — gates scroll preservation
 
 function render() {
-  // A background state push (the usage poll) re-renders whatever screen is up; carry the settings
-  // body's scroll position across the innerHTML swap so a poll doesn't snap it back to the top.
-  const prevBody = root.querySelector(".set-body");
-  const scrollTop = prevBody ? prevBody.scrollTop : 0;
+  // A background state push (the usage poll) re-renders whatever screen is up; carry the current
+  // screen's body scroll position across the innerHTML swap so a poll doesn't snap it to the top.
+  // Only when the screen is unchanged — navigating must start the new screen at the top.
+  const prevBody = root.querySelector(".main-body, .set-body");
+  const scrollTop = screen === renderedScreen && prevBody ? prevBody.scrollTop : 0;
   root.innerHTML = screen === "settings" ? buildSettings(state) : buildHTML(state);
+  renderedScreen = screen;
   if (scrollTop) {
-    const nextBody = root.querySelector(".set-body");
+    const nextBody = root.querySelector(".main-body, .set-body");
     if (nextBody) nextBody.scrollTop = scrollTop;
   }
   // mirror the theme onto <body> so overlays (siblings of #root) get the same CSS vars
