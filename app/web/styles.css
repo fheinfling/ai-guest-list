@@ -6,6 +6,8 @@
   src: url("fonts/spacemono-400.woff2") format("woff2"); }
 @font-face { font-family: "Space Mono"; font-weight: 700; font-display: swap;
   src: url("fonts/spacemono-700.woff2") format("woff2"); }
+@font-face { font-family: "Outfit"; font-weight: 700; font-display: swap;
+  src: url("fonts/outfit-700.woff2") format("woff2"); }
 
 :root {
   --codex: #46c2a8;   /* teal  (constant across themes) */
@@ -72,7 +74,9 @@ html, body { background:transparent; width:100%; overflow-x:hidden; }
 @keyframes twinkle { 0%,100% { opacity:.2; transform:scale(.6); } 50% { opacity:1; transform:scale(1); } }
 @media (prefers-reduced-motion: reduce) { .door-ball::before, .tw { animation:none; } }
 .brand-tx { display:flex; flex-direction:column; flex:1; min-width:0; }
-.brand { font-size:14px; font-weight:700; letter-spacing:-.2px; }
+/* wordmark: Outfit (option 05 — geometric, friendly), lowercase, gold "ai" in our accent */
+.brand { font-family:"Outfit", var(--sans); font-size:15px; font-weight:700; letter-spacing:-.01em; }
+.brand .ai { color:var(--gold); }
 .substatus { color:var(--t2); font-size:11px; }
 .top-actions { display:flex; gap:6px; }
 .ibtn { width:28px; height:28px; border-radius:9px; border:1px solid var(--line);
@@ -90,13 +94,13 @@ html, body { background:transparent; width:100%; overflow-x:hidden; }
 .ctl-chip { font-size:8.5px; letter-spacing:.5px; color:var(--t3); border:1px solid var(--line);
   border-radius:4px; padding:1px 4px; }
 .ctl-s { color:var(--t2); font-size:11px; }
-.ctl input, .set-row input, .seat input { display:none; }
+.ctl input, .set-toggle-row input, .seat input { display:none; }
 .sw { width:38px; height:22px; border-radius:999px; background:var(--track); position:relative;
   flex:none; transition:background .18s; }
 .sw::after { content:""; position:absolute; top:2px; left:2px; width:18px; height:18px; border-radius:50%;
   background:#fff; box-shadow:0 1px 3px rgba(0,0,0,.3); transition:transform .18s; }
-.ctl input:checked ~ .sw, .set-row input:checked ~ .sw { background:var(--good); }
-.ctl input:checked ~ .sw::after, .set-row input:checked ~ .sw::after { transform:translateX(16px); }
+.ctl input:checked ~ .sw, .set-toggle-row input:checked ~ .sw { background:var(--good); }
+.ctl input:checked ~ .sw::after, .set-toggle-row input:checked ~ .sw::after { transform:translateX(16px); }
 .hr-install { display:block; margin:-2px 0 8px 53px; background:none; border:none; color:var(--good);
   font:inherit; font-size:11px; cursor:pointer; }
 
@@ -175,19 +179,30 @@ html, body { background:transparent; width:100%; overflow-x:hidden; }
   background:var(--good); color:#04130d; font:inherit; font-weight:700; cursor:pointer; }
 .paste { width:100%; height:92px; margin-bottom:10px; border-radius:9px; border:1px solid var(--line);
   background:var(--card); color:var(--t1); font-size:11px; padding:8px; }
-.settings { text-align:left; }
-.settings h3 { text-align:center; margin-bottom:10px; }
-.set-row { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:8px 0;
-  border-bottom:1px solid var(--line); font-size:12px; cursor:pointer; }
-.segs { display:inline-flex; gap:4px; }
-.seg { padding:3px 10px; border-radius:999px; border:1px solid var(--line); background:transparent;
-  color:var(--t2); font:inherit; font-size:11px; cursor:pointer; }
-.seg.on { background:var(--good); color:#04130d; border-color:var(--good); font-weight:700; }
-.legend { margin:10px 0; font-size:10.5px; color:var(--t2); display:flex; flex-direction:column; gap:4px; }
-.legend .lg-t { color:var(--t1); font-weight:700; margin-bottom:2px; }
-.legend .lg { display:flex; align-items:center; gap:6px; }
-.settings .link { display:block; margin:6px auto 0; }
-.ver { margin-top:8px; text-align:center; font-size:10px; color:var(--t2); opacity:.7; }
+/* settings sub-view (spec §9.1) — pushed screen inside the popover, not a modal ------------------ */
+.set-app { padding:0; display:flex; flex-direction:column; max-height:620px; }
+.set-head { display:flex; align-items:center; gap:11px; padding:13px 14px; border-bottom:1px solid var(--line); }
+.set-back { width:28px; height:28px; border-radius:8px; background:var(--elevated); border:1px solid var(--line);
+  color:var(--t1); font-size:16px; line-height:1; cursor:pointer; display:flex; align-items:center; justify-content:center; }
+.set-title { flex:1; font-weight:800; font-size:15px; }
+.set-done { font-weight:700; font-size:13px; color:var(--codex); background:transparent; border:none; cursor:pointer; padding:4px; }
+.set-body { flex:1; min-height:0; overflow-y:auto; padding:15px 14px 6px; display:flex; flex-direction:column; gap:18px; }
+.set-sec { display:flex; flex-direction:column; gap:8px; }
+.set-label { font-size:10.5px; font-weight:800; letter-spacing:.06em; text-transform:uppercase; color:var(--t3); padding-left:3px; }
+.set-card { background:var(--card); border:1px solid var(--line); border-radius:14px; overflow:hidden; }
+.set-card > * + * { border-top:1px solid var(--line); }
+.set-toggle-row { display:flex; align-items:center; gap:11px; padding:12px 13px; cursor:pointer; }
+.set-seg-row { display:flex; flex-direction:column; gap:9px; padding:12px 13px; }
+.set-tx { flex:1; display:flex; flex-direction:column; gap:1px; }
+.set-t { font-weight:700; font-size:13px; color:var(--t1); }
+.set-s { font-size:11px; color:var(--t2); line-height:1.35; }
+.set-seg { display:flex; gap:4px; background:var(--elevated); border:1px solid var(--line); border-radius:11px; padding:4px; }
+.set-seg .sopt { flex:1; height:32px; border-radius:8px; border:none; cursor:pointer; font:inherit; font-size:12px;
+  font-weight:700; white-space:nowrap; background:transparent; color:var(--t2); transition:background .15s, color .15s; }
+.set-seg .sopt.on { background:var(--codex); color:#fff; }
+.set-legend { display:flex; flex-direction:column; gap:8px; padding:12px 13px; }
+.set-legend-row { display:flex; align-items:center; gap:8px; }
+.set-ver { text-align:center; font-size:11px; color:var(--t3); padding:4px 0 8px; }
 
 .celebrate { animation:pop .5s ease; }
 @keyframes pop { 0%{transform:scale(.99)} 50%{transform:scale(1.01)} 100%{transform:scale(1)} }

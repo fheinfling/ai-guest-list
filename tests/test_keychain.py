@@ -4,9 +4,11 @@ from acctsw import keychain as kc_mod
 from acctsw.keychain import InMemoryKeychain, SecurityKeychain, _encode, _decode
 
 
-def test_security_keychain_set_passes_secret_via_stdin_not_argv(monkeypatch):
-    """SECURITY: the OAuth blob must go to `security` via stdin, never on argv (where same-user `ps`
-    could read it)."""
+def test_security_keychain_set_passes_secret_inline_not_stdin(monkeypatch):
+    """The OAuth blob must be passed inline via `-w <value>`, NOT over stdin. `security`'s stdin
+    prompt reads with readpassphrase(), which silently truncates the blob to 128 bytes — corrupting
+    every real (larger-than-128-byte) credential. Inline has no length cap. The `ps` exposure it
+    trades for is moot: a same-user process that can read our argv can just read the item directly."""
     captured = {}
 
     class _R:
@@ -20,9 +22,8 @@ def test_security_keychain_set_passes_secret_via_stdin_not_argv(monkeypatch):
     monkeypatch.setattr(kc_mod.subprocess, "run", fake_run)
     SecurityKeychain().set("svc", "acct", "my-oauth-secret")
     enc = _encode("my-oauth-secret")
-    assert all(enc not in a and "my-oauth-secret" not in a for a in captured["argv"])  # not on argv
-    assert captured["input"] == f"{enc}\n{enc}\n"        # via stdin, twice (security confirms)
-    assert captured["argv"][-1] == "-w"                  # -w has NO inline value
+    assert captured["input"] is None                     # nothing fed over stdin
+    assert captured["argv"][-2:] == ["-w", enc]          # -w carries the (encoded) value inline
 
 
 def test_encode_decode_roundtrip_multiline():

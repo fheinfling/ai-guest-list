@@ -199,12 +199,46 @@ function buildPaste(tool) {
     <button class="link" data-action="picker-close">cancel</button></div></div>`;
 }
 
-function setToggle(key, label, on) {
-  return `<label class="set-row"><span>${label}</span>
+// Settings sub-view building blocks (spec §9.1): grouped iOS-style cards, every row a subtitle,
+// segmented controls full-width on their own line. Friendly labels are display-only — data-value
+// carries the real persisted value the bridge validates.
+const STRATEGY_OPTS = [
+  { v: "most_headroom", label: "most headroom" },
+  { v: "soonest_back", label: "soonest back" },
+];
+const SAVINGS_OPTS = [
+  { v: "conservative", label: "easy" },
+  { v: "moderate", label: "balanced" },
+  { v: "aggressive", label: "max" },
+];
+const THEME_OPTS = [{ v: "light", label: "light" }, { v: "dark", label: "dark" }];
+
+function strategyHint(strat) {
+  return strat === "most_headroom"
+    ? "i jump to whoever's got the most room left to breathe"
+    : "if everyone's capped, i hold the seat that wakes up first — shortest wait wins";
+}
+function savingsHint(level) {
+  if (level === "conservative") return "trims the obvious. safest, smallest savings";
+  if (level === "aggressive") return "squeezes hardest. most tokens saved 💛";
+  return "balanced — strong savings, full fidelity";
+}
+
+// A toggle row: title + subtitle on the left, 42×24 switch on the right.
+function toggleRow(key, title, subtitle, on) {
+  return `<label class="set-toggle-row">
+    <span class="set-tx"><span class="set-t">${title}</span><span class="set-s">${subtitle}</span></span>
     <input type="checkbox" data-action="toggle" data-key="${key}" ${on ? "checked" : ""}><span class="sw"></span></label>`;
 }
 
-const SAVINGS_LEVELS = ["conservative", "moderate", "aggressive"];
+// A segmented block: label + optional hint stacked, then the full-width control on its own line.
+function segBlock(label, hint, action, current, options) {
+  const segs = options.map((o) =>
+    `<button class="sopt ${current === o.v ? "on" : ""}" data-action="${action}" data-value="${o.v}">${o.label}</button>`).join("");
+  return `<div class="set-seg-row">
+    <div class="set-tx"><span class="set-t">${label}</span>${hint ? `<span class="set-s">${hint}</span>` : ""}</div>
+    <div class="set-seg">${segs}</div></div>`;
+}
 
 function fmtTokens(n) {
   // Threshold at 999_500, not 1e6: Math.round(999_600 / 1e3) is 1000, which would render "1000k"
@@ -224,36 +258,55 @@ function hrLifetime(stats) {
   return bits.length ? ` · ${bits.join(" · ")}` : "";
 }
 
-function savingsLevelRow(current) {
-  const lvl = SAVINGS_LEVELS.includes(current) ? current : "conservative";
-  const btns = SAVINGS_LEVELS.map((v) =>
-    `<button class="seg ${lvl === v ? "on" : ""}" data-action="set_savings_level" data-value="${v}">${v}</button>`).join("");
-  return `<div class="set-row"><span>savings level</span><span class="segs">${btns}</span></div>`;
-}
-
+// Settings sub-view (spec §9.1) — a full-panel pushed screen, NOT a modal. Renders into #root in
+// place of the popover; back chevron / done / Esc pop back to main. Every change persists live.
 function buildSettings(state) {
   const s = state?.settings || {};
   const theme = s.theme === "dark" ? "dark" : "light";
   const strat = s.strategy === "most_headroom" ? "most_headroom" : "soonest_back";
-  const seg = (act, val, txt) => `<button class="seg ${act === val ? "on" : ""}" data-action="${act === "light" || act === "dark" ? "set_theme" : "set_strategy"}" data-value="${val}">${txt}</button>`;
+  const level = SAVINGS_OPTS.some((o) => o.v === s.savings_level) ? s.savings_level : "conservative";
   const app = state?.app;
   const ver = app ? `v${app.version}${app.build && app.build !== "dev" ? ` · build ${app.build}` : ""}` : "";
-  return `<div class="backdrop" data-action="picker-close"><div class="sheet settings">
-    <h3>settings</h3>
-    <div class="set-row"><span>when one runs out</span><span class="segs">
-      <button class="seg ${strat === "soonest_back" ? "on" : ""}" data-action="set_strategy" data-value="soonest_back">soonest back</button>
-      <button class="seg ${strat === "most_headroom" ? "on" : ""}" data-action="set_strategy" data-value="most_headroom">most headroom</button></span></div>
-    ${setToggle("same_tool_only", "keep me on the same tool", s.same_tool_only)}
-    ${setToggle("notify", "notify when it switches", s.notify)}
-    ${setToggle("restart_app", "restart Codex after a swap", s.restart_app)}
-    ${setToggle("headroom", "Headroom by default", s.headroom)}
-    ${s.headroom ? savingsLevelRow(s.savings_level) : ""}
-    <div class="set-row"><span>theme</span><span class="segs">
-      <button class="seg ${theme === "light" ? "on" : ""}" data-action="set_theme" data-value="light">light</button>
-      <button class="seg ${theme === "dark" ? "on" : ""}" data-action="set_theme" data-value="dark">dark</button></span></div>
-    <button class="link" data-action="picker-close">done</button>
-    <div class="ver">ai guest list ${ver}</div>
-  </div></div>`;
+
+  const autoSwitch = `<section class="set-sec"><span class="set-label">auto-switch</span>
+    <div class="set-card">
+      ${segBlock("when a seat runs out", strategyHint(strat), "set_strategy", strat, STRATEGY_OPTS)}
+      ${toggleRow("same_tool_only", "keep me on the same tool", "a Codex limit hops to your other Codex seat, never to Claude", s.same_tool_only)}
+      ${toggleRow("notify", "tell me when it switches", "a gentle notification with who's on now", s.notify)}
+      ${toggleRow("restart_app", "restart Codex after a swap", "Codex needs a fresh start · Claude picks it up live", s.restart_app)}
+    </div></section>`;
+
+  const headroom = `<section class="set-sec"><span class="set-label">headroom</span>
+    <div class="set-card">
+      ${toggleRow("headroom", "wrap new sessions", "compress context so every limit stretches further", s.headroom)}
+      ${s.headroom ? segBlock("savings level", savingsHint(level), "set_savings_level", level, SAVINGS_OPTS) : ""}
+    </div></section>`;
+
+  const appearance = `<section class="set-sec"><span class="set-label">appearance</span>
+    <div class="set-card">
+      ${segBlock("theme", "", "set_theme", theme, THEME_OPTS)}
+      <div class="set-legend">
+        <span class="set-t">what the icon shows</span>
+        <div class="set-legend-row">${doorMark({ door: "open" })}<span class="set-s">a model's free — come on in</span></div>
+        <div class="set-legend-row">${doorMark({ door: "shut" })}<span class="set-s">every seat's resting</span></div>
+        <div class="set-legend-row"><span class="dot dot--queued"></span><span class="set-s">just switched you</span></div>
+        <div class="set-legend-row"><span class="dot dot--needs-login"></span><span class="set-s">a seat needs a hello</span></div>
+      </div>
+    </div></section>`;
+
+  return `<div class="app set-app theme-${theme}">
+    <header class="set-head">
+      <button class="set-back" data-action="settings-back" title="back">‹</button>
+      <span class="set-title">settings</span>
+      <button class="set-done" data-action="settings-back">done</button>
+    </header>
+    <div class="set-body">
+      ${autoSwitch}
+      ${headroom}
+      ${appearance}
+      <div class="set-ver">ai guest list ${ver}</div>
+    </div>
+  </div>`;
 }
 
 // --- popover ----------------------------------------------------------------------------------
@@ -276,7 +329,7 @@ function buildHTML(state) {
   return `<div class="app theme-${theme}">
     <header class="top">
       ${doorMark(state)}
-      <span class="brand-tx"><span class="brand mono">ai guest list</span>
+      <span class="brand-tx"><span class="brand"><span class="ai">ai</span> guest list</span>
         <span class="substatus">${c.resting} resting · ${c.ready} ready 💛</span></span>
       <span class="top-actions">
         <button class="ibtn" data-action="settings" title="settings">⋯</button>
@@ -319,12 +372,12 @@ function send(action, payload = {}) {
 window.AGL = {
   result(res) {
     res = typeof res === "string" ? JSON.parse(res) : res;
-    const settingsOpen = !!overlay.querySelector(".settings");
-    if (res.state) { state = res.state; render(); }
+    if (res.settings_panel) screen = "settings"; // native entrypoint into the settings sub-view
+    if (res.state) state = res.state;
+    if (res.state || res.settings_panel) render(); // re-renders current screen (settings live-updates)
     if (res.error) flash(res.error);
     if (res.login) { overlay.innerHTML = buildPicker(res.login); }
     if (res.await_snapshot) { overlay.innerHTML = buildSaveSeat(res.tool); }
-    if (res.settings_panel || (settingsOpen && res.state)) { overlay.innerHTML = buildSettings(state); }
     if (res.celebrate) celebrate();
   },
   // legacy single-arg state push (kept for the poll path / older callers)
@@ -342,8 +395,20 @@ function flash(text) {
 }
 function closeOverlay() { overlay.innerHTML = ""; }
 
+// which screen occupies the popover: "main" or the settings sub-view (spec §9.1 — a pushed
+// sub-view on the same surface, never a modal).
+let screen = "main";
+
 function render() {
-  root.innerHTML = buildHTML(state);
+  // A background state push (the usage poll) re-renders whatever screen is up; carry the settings
+  // body's scroll position across the innerHTML swap so a poll doesn't snap it back to the top.
+  const prevBody = root.querySelector(".set-body");
+  const scrollTop = prevBody ? prevBody.scrollTop : 0;
+  root.innerHTML = screen === "settings" ? buildSettings(state) : buildHTML(state);
+  if (scrollTop) {
+    const nextBody = root.querySelector(".set-body");
+    if (nextBody) nextBody.scrollTop = scrollTop;
+  }
   // mirror the theme onto <body> so overlays (siblings of #root) get the same CSS vars
   const theme = (state.settings && state.settings.theme === "dark") ? "dark" : "light";
   document.body.className = "theme-" + theme;
@@ -377,7 +442,8 @@ document.addEventListener("click", (e) => {
       if (el.classList.contains("backdrop") && e.target !== el) break;
       closeOverlay();
       break;
-    case "settings": overlay.innerHTML = buildSettings(state); break;
+    case "settings": screen = "settings"; render(); break;
+    case "settings-back": screen = "main"; render(); break;
     case "set_theme": send("set_theme", { value }); break;
     case "set_strategy": send("set_strategy", { value }); break;
     case "set_savings_level": send("set_savings_level", { value }); break;
@@ -389,6 +455,11 @@ document.addEventListener("click", (e) => {
 document.addEventListener("change", (e) => {
   const inp = e.target.closest('input[data-action="toggle"]');
   if (inp) send("toggle", { key: inp.dataset.key, value: inp.checked });
+});
+
+// Esc pops the settings sub-view back to main (spec §9.1)
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && screen === "settings") { screen = "main"; render(); }
 });
 
 // initial paint + ask the native side for fresh state

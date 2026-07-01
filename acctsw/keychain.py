@@ -65,15 +65,18 @@ class SecurityKeychain:
         return _decode(proc.stdout.rstrip("\n"))
 
     def set(self, service: str, account: str, secret: str) -> None:
-        # SECURITY: feed the secret via STDIN, not argv — passing it as `-w <value>` would expose the
-        # (base64) OAuth blob to any same-user `ps` for the lifetime of the call. With `-w` and no
-        # value, `security` reads the password from stdin and asks for confirmation, so we send it
-        # twice. base64 keeps it single-line so the two reads match (and survives hex-mangling on
-        # read-back). -U updates the item if it already exists.
+        # Pass the (base64) blob inline via `-w <value>`. The tempting alternative — `-w` with no
+        # value, feeding the secret over stdin — is BROKEN for real credentials: `security` reads
+        # that prompt with readpassphrase(), which silently TRUNCATES to 128 bytes (returncode 0,
+        # no error) and, when a child TUI holds the tty in raw mode, can block waiting on /dev/tty.
+        # A base64 OAuth blob is far larger than 128 bytes, so stdin stored a corrupt seat. Inline
+        # has no length cap. The `ps` exposure it was meant to avoid is moot: a same-user process
+        # that could read our argv can just call `security find-generic-password` and read the item
+        # directly. -U updates the item if it already exists.
         blob = _encode(secret)
         proc = subprocess.run(
-            [self._security, "add-generic-password", "-U", "-s", service, "-a", account, "-w"],
-            input=f"{blob}\n{blob}\n", capture_output=True, text=True,
+            [self._security, "add-generic-password", "-U", "-s", service, "-a", account, "-w", blob],
+            capture_output=True, text=True,
         )
         if proc.returncode != 0:
             raise KeychainError(f"keychain set failed for {service}:{account}: {proc.stderr.strip()}")

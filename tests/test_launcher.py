@@ -2,6 +2,8 @@
 
 No real PTY, no network: `spawn` is injected and `get` returns canned usage.
 """
+import os
+
 import pytest
 
 from acctsw import accounts as acct
@@ -20,9 +22,20 @@ from acctsw import paths as P
 @pytest.mark.parametrize("text", [
     "Error: you've hit your usage limit", "rate limit exceeded", "5-hour limit reached",
     "HTTP 429 Too Many Requests", "you are out of credits",
+    # Real banners whose committal wording varies — must still be caught (recall over the exact token)
+    "usage limit exceeded", "you've reached your usage limit",
 ])
 def test_detect_limit_positive(text):
     assert detect_limit("codex", text) or detect_limit("claude", text)
+
+
+@pytest.mark.parametrize("text", [
+    "5-hour limit reached", "5-hour limit · resets 8pm", "weekly limit · resets Monday",
+])
+def test_detect_limit_claude_window_banners(text):
+    """Claude's own window-limit banners are caught even when they omit "reached" (e.g. a status
+    line that only says "resets") — the corroboration guard vetoes any false positive."""
+    assert detect_limit("claude", text)
 
 
 def test_detect_limit_negative():
@@ -32,10 +45,23 @@ def test_detect_limit_negative():
 @pytest.mark.parametrize("benign", [
     "the cache resets at midnight", "please try again in a moment",
     "approaching the recursion limit", "rate limiting middleware installed",
+    # Real false positives that killed healthy sessions (the model narrating ABOUT limits while
+    # developing this repo). None are the tool's own committal banner, so none may match.
+    "the usage limit detector fired on the agent's own text",
+    "all claude seats are resting; soonest unlocks at 17:57",
 ])
 def test_detect_limit_no_false_positive_on_benign(benign):
     assert not detect_limit("codex", benign)
     assert not detect_limit("claude", benign)
+
+
+def test_detect_limit_claude_ignores_codex_credit_narration():
+    """A Claude session narrating about Codex credits ("out of credits") must NOT read as a Claude
+    limit — Claude Code never emits that wording as a banner. This is the exact string that kept
+    killing live Claude sessions."""
+    narration = "the routed Codex workspace is out of credits"
+    assert not detect_limit("claude", narration)
+    assert detect_limit("codex", narration)  # still a real signal for an actual codex session
 
 
 def test_detect_limit_ignores_ansi_codes():
@@ -64,7 +90,9 @@ def _two_codex(ctx):
 
 
 class FakeSpawn:
-    """Returns scripted (output, status) per call; records argv of each launch."""
+    """Returns scripted (output, status) per call; records argv of each launch. ``output`` may be
+    a list of chunks to exercise repeated on_output calls within ONE child session; like the real
+    pty_spawn, the child "dies" (remaining chunks dropped) once on_output asks for a stop."""
 
     def __init__(self, scripts):
         self.scripts = scripts
@@ -73,7 +101,9 @@ class FakeSpawn:
     def __call__(self, argv, on_output):
         out, status = self.scripts[len(self.calls)]
         self.calls.append(list(argv))
-        on_output(out)
+        for chunk in (out if isinstance(out, list) else [out]):
+            if on_output(chunk):
+                break
         return status
 
 
@@ -98,6 +128,120 @@ def test_handle_limit_reactive_fallback_when_usage_says_fine(ctx):
     assert seat["limited_until"] is not None
     assert seat["limit_source"] == "reactive"
     assert dec.action == "switch" and dec.email == "b@x.com"
+
+
+def test_handle_limit_resumes_when_usage_confirms_healthy(ctx):
+    """Corroboration guard: a stdout match on a seat the endpoint says is healthy (both windows
+    well under the cap) is a false positive — resume the same seat, never rest it."""
+    state = _two_codex(ctx)  # active a
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=20.0, secondary=70.0))})
+    dec = handle_limit(ctx, state, "codex", get=get)
+    assert dec.action == "resume" and dec.email == "a@x.com"
+    # the healthy seat must NOT be flagged limited by the false positive
+    assert state.get_seat("codex", "a@x.com").get("limited_until") is None
+    assert state.active("codex") == "a@x.com"
+
+
+def test_run_false_positive_never_kills_the_child(ctx):
+    """Verify-before-kill: a benign-but-matching line on a healthy seat is dismissed while the
+    child KEEPS RUNNING — no kill, no relaunch, no switch, no rest."""
+    _two_codex(ctx)  # active a
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=20.0, secondary=70.0))})
+    spawn = FakeSpawn([
+        ([b"... you've hit your usage limit ...\n",   # false positive: usage says a is fine
+          b"carried on, all good\n"], 0),             # ...and the SAME child runs to completion
+    ])
+    rc = run(ctx, "codex", ["--foo"], spawn=spawn, get=get, notify=lambda m: None)
+    assert rc == 0
+    assert len(spawn.calls) == 1                          # never killed, never relaunched
+    assert ctx.load_state().active("codex") == "a@x.com"  # never switched away
+    assert ctx.load_state().get_seat("codex", "a@x.com").get("limited_until") is None
+
+
+def test_run_disables_scanning_after_repeated_false_positives(ctx, monkeypatch):
+    """Past the false-alarm bound the on-screen text is provably untrustworthy (persistent prose
+    about limits) — the supervisor stops SCANNING, not the session: no more usage probes, the child
+    runs on, and its own exit code comes back (never EXIT_GAVE_UP)."""
+    _two_codex(ctx)  # active a
+    monkeypatch.setattr(L, "PROBE_COOLDOWN_S", 0.0)  # let every chunk re-probe
+    probes = {"n": 0}
+
+    def get(url, headers, timeout):
+        probes["n"] += 1
+        return 200, codex_ok_body(primary=20.0, secondary=70.0)
+
+    msgs = []
+    chunks = [b"... you've hit your usage limit ...\n"] * (L.MAX_FALSE_ALARMS + 4)
+    spawn = FakeSpawn([(chunks, 0)])
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=msgs.append)
+    assert rc == 0
+    assert len(spawn.calls) == 1                       # never killed, never relaunched
+    assert probes["n"] == L.MAX_FALSE_ALARMS + 1       # scanning off past the bound → no more probes
+    assert any("ignoring limit" in m for m in msgs)
+    assert ctx.load_state().active("codex") == "a@x.com"
+
+
+def test_run_false_positive_dismissed_even_when_switch_budget_exhausted(ctx):
+    """A dismissed false positive is not a hop: it must not interact with the switch budget."""
+    _two_codex(ctx)  # active a
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=20.0, secondary=70.0))})
+    spawn = FakeSpawn([(b"... you've hit your usage limit ...\n", 0)])
+    # max_switches=0: no seat hop is permitted, yet the healthy session must survive the prose.
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, max_switches=0, notify=lambda m: None)
+    assert rc == 0
+    assert len(spawn.calls) == 1
+    assert ctx.load_state().active("codex") == "a@x.com"  # never switched away
+
+
+def test_run_false_positive_after_real_switch_keeps_session_alive(ctx):
+    """A genuine limit spends the switch budget; a later false alarm on the new seat is dismissed
+    in place — the session keeps running rather than bailing at the cap."""
+    _two_codex(ctx)  # active a
+    reset = iso(now() + timedelta(hours=3))
+    calls = {"n": 0}
+
+    def get(url, headers, timeout):
+        calls["n"] += 1
+        # first probe (seat a) is genuinely limited (with a real future reset, so a stays resting
+        # and choose hops to b); every later probe says healthy
+        body = (codex_ok_body(primary=100.0, p_reset=reset) if calls["n"] == 1
+                else codex_ok_body(primary=20.0))
+        return 200, body
+
+    spawn = FakeSpawn([
+        (b"... you've hit your usage limit ...\n", 1),   # iter1: genuine limit on a → switch to b
+        ([b"... you've hit your usage limit ...\n",      # iter2: false alarm on b, budget spent —
+          b"resumed, all good\n"], 0),                   # dismissed; the same child finishes cleanly
+    ])
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, max_switches=1, notify=lambda m: None)
+    assert rc == 0
+    assert len(spawn.calls) == 2                          # one real hop, then no more relaunches
+    assert ctx.load_state().active("codex") == "b@x.com"  # switched once, then stayed on healthy b
+    assert spawn.calls[1][-2:] == ["resume", "--last"]    # the hop carried the work along
+
+
+def test_seat_confirmed_healthy_tolerates_malformed_window(ctx):
+    """A corrupt/partial usage blob (a null window) must not crash the healthy-seat guard."""
+    state = _two_codex(ctx)  # active a
+    state.set_usage("codex", "a@x.com", {"ok": True, "error": None, "limit_reached": False,
+                                         "windows": {"primary": None, "secondary": {"used_pct": 20.0}}})
+    state.save()
+    summary = {"codex": {"a@x.com": "ok"}}  # endpoint reported success → guard inspects windows
+    # null window must be skipped, not crash; the valid 20% window still confirms headroom
+    assert L._seat_confirmed_healthy(state, "codex", "a@x.com", summary) is True
+
+
+def test_handle_limit_corroborated_skips_refetch_and_second_guess(ctx):
+    """When the verify-before-kill probe already confirmed the limit, handle_limit must neither
+    refetch usage (the probe did, moments ago) nor dismiss the kill as a false alarm."""
+    state = _two_codex(ctx)  # active a
+
+    def get(url, headers, timeout):
+        raise AssertionError("corroborated handle_limit must not hit the usage endpoint")
+
+    dec = handle_limit(ctx, state, "codex", get=get, corroborated=True)
+    assert dec.action == "switch" and dec.email == "b@x.com"
+    assert state.get_seat("codex", "a@x.com")["limited_until"] is not None  # reactive fallback
 
 
 def test_handle_limit_gives_up_when_all_limited(ctx):
@@ -199,6 +343,18 @@ def test_run_switches_to_healthy_seat_on_revoked_token(ctx):
     assert any("sign in again" in m for m in msgs)
 
 
+def test_run_auth_prose_dismissed_when_token_provably_works(ctx):
+    """Auth-death prose while a usage fetch succeeds with the SAME creds is a false positive —
+    the token just authenticated a request, so don't hop; the child keeps running."""
+    _two_codex(ctx)  # active a
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=20.0, secondary=70.0))})
+    spawn = FakeSpawn([(b"... your refresh token was revoked ...\n", 0)])
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=lambda m: None)
+    assert rc == 0
+    assert len(spawn.calls) == 1                          # never killed, never relaunched
+    assert ctx.load_state().active("codex") == "a@x.com"  # no hop
+
+
 def test_run_gives_up_with_relogin_hint_when_only_seat_revoked(ctx):
     ctx.cred["codex"].set_live(make_codex_blob("solo@x.com"))
     acct.add(ctx, ctx.load_state(), "codex", email="solo@x.com")
@@ -213,7 +369,7 @@ def test_run_respects_max_switches(ctx):
     _two_codex(ctx)
     get = fake_get({P.CODEX_USAGE_URL: (429, "")})
     # every launch hits a limit; with max_switches=1 we get: launch, switch, launch(limit)->stop
-    spawn = FakeSpawn([(b"usage limit\n", 1)] * 5)
+    spawn = FakeSpawn([(b"usage limit reached\n", 1)] * 5)
     rc = run(ctx, "codex", [], spawn=spawn, get=get, max_switches=1, notify=lambda m: None)
     assert len(spawn.calls) == 2  # initial + one resume, then bail
     assert rc == L.EXIT_GAVE_UP
@@ -248,7 +404,7 @@ def test_run_claude_resume_uses_continue(ctx):
     from acctsw.switch import switch
     switch(ctx, ctx.load_state(), "claude", "c1@x.com")
     get = fake_get({P.CLAUDE_USAGE_URL: (429, "")})
-    spawn = FakeSpawn([(b"usage limit\n", 1), (b"resumed\n", 0)])
+    spawn = FakeSpawn([(b"usage limit reached\n", 1), (b"resumed\n", 0)])
     rc = run(ctx, "claude", [], spawn=spawn, get=get, notify=lambda m: None)
     assert rc == 0
     assert spawn.calls[1][-1] == "--continue"
@@ -278,3 +434,34 @@ def test_pty_spawn_stop_path_terminates_without_error():
 def test_pty_spawn_nonzero_exit_propagates():
     rc = L.pty_spawn(["/bin/sh", "-c", "exit 7"], lambda c: False)
     assert rc == 7
+
+
+def test_reset_terminal_disables_mouse_tracking_on_tty():
+    """A killed TUI can't disable its own mouse reporting; teardown must, or the shell that
+    inherits the terminal spews "\\e[<..M" mouse coordinates at the prompt."""
+    import pty as _pty
+    master, slave = _pty.openpty()
+    try:
+        L._reset_terminal(slave)  # slave is a real tty → reset written
+        data = os.read(master, 4096)
+    finally:
+        os.close(master)
+        os.close(slave)
+    assert b"\x1b[?1000l" in data  # X10/normal mouse tracking off
+    assert b"\x1b[?1006l" in data  # SGR mouse mode off
+    assert b"\x1b[?25h" in data    # cursor restored
+
+
+def test_reset_terminal_noop_on_non_tty():
+    r, w = os.pipe()
+    try:
+        L._reset_terminal(w)  # pipe is not a tty → nothing written, no raise
+        os.set_blocking(r, False)
+        try:
+            leaked = os.read(r, 4096)
+        except BlockingIOError:
+            leaked = b""
+        assert leaked == b""
+    finally:
+        os.close(r)
+        os.close(w)

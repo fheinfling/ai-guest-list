@@ -263,8 +263,17 @@ def _wrapper_script(name: str, python: str, pkg_root: Path, bin_dir: Path) -> st
         return (f"#!/bin/sh\n# ai guest list engine\n"
                 f'PYTHONPATH={pr} exec {py} -m acctsw "$@"\n')
     tool = "codex" if name == "cx" else "claude"
+    # No `exec`: we keep this shell resident so its trap fires after the tool exits. A TUI killed
+    # mid-session (supervisor auto-switch) — or, when the app is closed, a stock tool that crashes
+    # or is Ctrl-C'd — can't reset the terminal's private modes itself, leaving the shell in
+    # mouse-reporting mode (the "\e[<35;86;2M" coordinate spew). The trap re-asserts the defaults,
+    # rendered as printf escapes from launcher._TERM_RESET (its single owner) so the shell and
+    # Python reset paths can't drift apart.
+    from .launcher import _TERM_RESET
+    reset = 'printf "' + _TERM_RESET.decode("ascii").replace("\x1b", "\\033") + '"'
     return (f"#!/bin/sh\n# supervised {tool} launcher (stock {tool} is not shadowed)\n"
-            f'exec {acctsw} run {tool} "$@"\n')
+            f"trap {shlex.quote(reset)} EXIT INT TERM HUP\n"
+            f'{acctsw} run {tool} "$@"\n')
 
 
 # --- uninstall --------------------------------------------------------------------------------

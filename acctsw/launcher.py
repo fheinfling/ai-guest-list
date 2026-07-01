@@ -7,8 +7,10 @@ with a scripted fake child (no real PTY, no network).
 Flow:
   1. pick a seat (prefer active; else available; else soonest-unlock + report) and switch to it
   2. spawn the agent under a PTY, teeing output while scanning for the limit signal
-  3. on a mid-session limit: flag the seat (reactive), pick another seat, and relaunch with the
-     tool's RESUME command so the conversation continues; repeat
+  3. on a stdout limit-signal: VERIFY BEFORE KILLING — probe the usage endpoint while the child is
+     still running; a false positive (the model narrating about limits) is dismissed in place and
+     the session lives on. Only a corroborated (or unverifiable) signal stops the child, flags the
+     seat (reactive), picks another seat, and relaunches with the tool's RESUME command; repeat
   4. on normal exit: sync-back the (refreshed) creds and return the child's exit status
 """
 from __future__ import annotations
@@ -44,22 +46,44 @@ Notifier = Callable[[str], None]
 # Default cooldown when a limit is caught but no authoritative reset is known.
 DEFAULT_COOLDOWN = timedelta(hours=5)
 MAX_SWITCHES = 6      # safety bound on auto-relaunches within one `run`
+MAX_FALSE_ALARMS = 3  # dismissed stdout matches per run before stdout scanning is switched OFF
+                      # (supervision continues — only the untrustworthy signal is dropped)
+PROBE_COOLDOWN_S = 30.0  # after a dismissed match, skip re-probing usage for this long: a TUI
+                         # redraws the same prose every frame, and without a cooldown each redraw
+                         # would force-hit the usage endpoint
+# A stdout limit-signal is dismissed as a false positive (model prose, not a real banner) when the
+# usage endpoint says the active seat's busiest window is still below this. Well clear of a real
+# ~100% limit even if the endpoint lags a few percent behind stdout.
+FALSE_ALARM_MAX_PCT = 90.0
 EXIT_GAVE_UP = 75     # EX_TEMPFAIL: distinguishes "we gave up / all limited" from a child failure
 
-# Limit signals in the agents' output. Deliberately SPECIFIC: a false positive kills+restarts the
-# session, so weak/ambiguous phrases (e.g. "try again", "resets at", "approaching … limit") are
-# intentionally excluded. Confirmed/extended against real strings during verification (M8).
+# Limit signals in the agents' output. This buffer ALSO carries the model's own generated prose —
+# which, especially when THIS repo is the thing under development, routinely mentions "usage limit"
+# and "out of credits" in passing. A false positive kills+restarts a healthy session, so every phrase
+# here must be the tool's actual out-of-quota BANNER (committal wording), never a word the model can
+# utter mid-sentence. Bare "usage limit" / "limit reached" / "out of credits" are intentionally NOT
+# here for exactly this reason. A missed real limit is corroborated separately by the usage endpoint
+# (handle_limit), so erring toward specificity here is safe.
+_LIMIT_SHARED = [
+    r"usage limit (?:reached|exceeded)",
+    r"you[''`]?ve (?:hit|reached) your (?:usage )?limit",
+    # A limit paired with a reset time IS a committal banner ("usage limit · resets 8pm",
+    # "your limit will reset at …"), not mid-sentence prose. Requiring "reset(s)" close after the
+    # word "limit" keeps benign mentions out ("approaching the recursion limit", "the cache resets
+    # at midnight" — neither has both), and any false positive is still vetoed by the usage endpoint.
+    r"\blimit\b[^.\n]{0,20}?\bresets?\b",
+    r"rate[ -]?limit(?:ed| reached| exceeded)",
+    r"too many requests",
+]
 LIMIT_PATTERNS = {
-    "codex": [
-        r"usage limit", r"you[''`]?ve hit your (?:usage )?limit", r"limit reached",
-        r"rate[ -]?limit(?:ed| reached| exceeded)", r"out of (?:credits?|usage)",
-        r"too many requests",
-    ],
-    "claude": [
-        r"usage limit", r"5-?hour limit", r"weekly limit", r"limit reached",
-        r"rate[ -]?limit(?:ed| reached| exceeded)", r"out of (?:credits?|usage)",
-        r"too many requests",
-    ],
+    # "out of credits" is real ChatGPT/Codex wording, but it's also exactly what the model narrates
+    # about Codex — so it stays out of the CLAUDE list (a Claude session never emits it as a banner).
+    "codex": [*_LIMIT_SHARED, r"out of (?:credits?|usage)"],
+    # "5-hour limit" / "weekly limit" are Claude's OWN window-limit banners (e.g. a status line
+    # "5-hour limit · resets 8pm" that omits "reached"). They're specific enough to rarely appear in
+    # the model's prose, and the corroboration guard (handle_limit) vetoes any that slip through — so
+    # we keep them loose here to catch the real banner regardless of its exact committal wording.
+    "claude": [*_LIMIT_SHARED, r"5-?hour limit", r"weekly limit"],
 }
 
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
@@ -146,20 +170,42 @@ def resume_cmd(ctx: Context, tool: str) -> list:
 
 @dataclass
 class Decision:
-    action: str          # "switch" | "give_up"
+    action: str          # "switch" | "resume" | "give_up"
     email: str | None
     unlocks_at: str | None = None
 
 
+def _seat_confirmed_healthy(state, tool: str, email: str, summary: dict) -> bool:
+    """True only when a FRESH usage fetch confirmed this seat has clear headroom — so a stdout
+    limit-signal can be safely dismissed as a false positive (the model narrating about limits rather
+    than a real banner). Unknown/errored/absent usage → False: we can't confirm, so we fall back to
+    trusting the stdout signal exactly as before."""
+    if (summary.get(tool) or {}).get(email) != "ok":
+        return False  # cached / unauthorized / rate_limited / network / no_creds → can't tell
+    u = (state.get_seat(tool, email) or {}).get("usage") or {}
+    if u.get("limit_reached"):
+        return False  # authoritative API flag says the seat really is out
+    pcts = [w.get("used_pct") for w in (u.get("windows") or {}).values()
+            if isinstance(w, dict) and w.get("used_pct") is not None]
+    return bool(pcts) and max(pcts) < FALSE_ALARM_MAX_PCT
+
+
 def handle_limit(ctx: Context, state, tool: str, *, get=usage_mod._default_get,
-                 exclude: set | frozenset = frozenset()) -> Decision:
+                 exclude: set | frozenset = frozenset(), corroborated: bool = False) -> Decision:
     """A limit was caught for the active seat. Flag it, then choose the next seat. ``exclude`` carries
-    seats that already failed auth this run, so a limit never re-selects a known-dead-token seat."""
+    seats that already failed auth this run, so a limit never re-selects a known-dead-token seat.
+    ``corroborated``: the verify-before-kill probe force-refreshed usage moments ago and it confirmed
+    the limit — don't refetch (state already carries the fresh snapshot) or second-guess it here."""
     active = state.active(tool)
     # Authoritative reset from the usage endpoint for the seat that just hit the limit (only the
     # active seat — others keep their known state; their stale snapshot tokens would 401 anyway).
-    if active:
-        usage_mod.refresh(ctx, state, tool, only=active, force=True, get=get)
+    if active and not corroborated:
+        summary = usage_mod.refresh(ctx, state, tool, only=active, force=True, get=get)
+        # Corroboration guard: the stdout match can be a false positive (the model discussing limits —
+        # routine when THIS repo is under development). If the endpoint FRESHLY confirms the active
+        # seat still has clear headroom, don't rest a healthy seat — resume the same work instead.
+        if _seat_confirmed_healthy(state, tool, active, summary):
+            return Decision("resume", active)
     seat = state.get_seat(tool, active) if active else None
     # ...else a reactive fallback so we don't immediately re-pick the maxed seat.
     if seat is not None and seat.get("limited_until") is None:
@@ -209,6 +255,30 @@ def _set_winsize(master_fd: int, out_fd: int) -> None:
         pass
 
 
+# Terminal private modes a TUI child (claude/codex) turns on but cannot reset when we KILL it:
+# on a limit/auth hop the child gets SIGTERM→SIGKILL and never runs its own cleanup, so the shell
+# that inherits the terminal is left in mouse-reporting mode and spews coordinates (e.g. the
+# "\e[<35;86;2M" garbage seen at the prompt after a session ends). We disable every mouse-tracking
+# variant (including SGR-pixel 1016, which modern Ink-based TUIs set), focus reporting and
+# bracketed paste, and re-show the cursor. Alt-screen is deliberately left alone so an inline
+# session's visible output stays in the scrollback.
+_TERM_RESET = (
+    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?1016l"  # all mouse-tracking modes off
+    b"\x1b[?1004l"  # focus reporting off
+    b"\x1b[?2004l"  # bracketed paste off
+    b"\x1b[?25h"    # cursor visible
+)
+
+
+def _reset_terminal(out_fd: int) -> None:
+    """Undo the terminal private modes a TUI leaves set. No-op unless out_fd is a real terminal."""
+    try:
+        if os.isatty(out_fd):
+            os.write(out_fd, _TERM_RESET)
+    except OSError:
+        pass
+
+
 def _exitcode(raw_status: int) -> int:
     return (os.waitstatus_to_exitcode(raw_status)
             if hasattr(os, "waitstatus_to_exitcode") else raw_status)
@@ -236,7 +306,20 @@ def pty_spawn(argv: list, on_output: Callable[[bytes], bool]) -> int:
     stop_requested = False
     old_attrs = None
     prev_winch = None
+    prev_term = None
+    prev_hup = None
     watch = [master_fd] + ([stdin_fd] if stdin_fd is not None else [])
+
+    def _restore_terminal() -> None:
+        # Undo mouse-tracking et al. and put the tty back into cooked mode. Idempotent, so it's
+        # safe to call from both the signal handler and the finally block.
+        _reset_terminal(out_fd)
+        if old_attrs is not None:
+            try:
+                termios.tcsetattr(stdin_fd, termios.TCSAFLUSH, old_attrs)
+            except (termios.error, OSError):
+                pass
+
     try:
         if stdin_is_tty:
             old_attrs = termios.tcgetattr(stdin_fd)
@@ -249,6 +332,23 @@ def pty_spawn(argv: list, on_output: Callable[[bytes], bool]) -> int:
             prev_winch = signal.signal(signal.SIGWINCH, _winch)
         except (ValueError, OSError):
             prev_winch = None
+
+        # If the supervisor itself is killed (tab closed → SIGHUP, `kill` → SIGTERM) the finally
+        # below never runs, so the child's terminal modes would leak. Restore the terminal and
+        # kill the child from a handler, then die with the signal's default disposition.
+        def _on_term(sig, _frm):
+            _restore_terminal()
+            try:
+                _terminate(pid)
+            except Exception:
+                pass
+            signal.signal(sig, signal.SIG_DFL)
+            os.kill(os.getpid(), sig)
+        try:
+            prev_term = signal.signal(signal.SIGTERM, _on_term)
+            prev_hup = signal.signal(signal.SIGHUP, _on_term)
+        except (ValueError, OSError):
+            pass
 
         while True:
             try:
@@ -278,13 +378,17 @@ def pty_spawn(argv: list, on_output: Callable[[bytes], bool]) -> int:
                 else:
                     watch.remove(stdin_fd)  # stdin EOF → stop watching (avoid busy-loop)
     finally:
-        if old_attrs is not None:
-            termios.tcsetattr(stdin_fd, termios.TCSAFLUSH, old_attrs)
-        if prev_winch is not None:
-            try:
-                signal.signal(signal.SIGWINCH, prev_winch)
-            except (ValueError, OSError):
-                pass
+        # Re-assert the terminal's default private modes the child TUI may have left set (mouse
+        # tracking especially) — on the kill path the child never got to do this itself.
+        _restore_terminal()
+        for sig, prev in ((signal.SIGWINCH, prev_winch),
+                          (signal.SIGTERM, prev_term),
+                          (signal.SIGHUP, prev_hup)):
+            if prev is not None:
+                try:
+                    signal.signal(sig, prev)
+                except (ValueError, OSError):
+                    pass
         try:
             os.close(master_fd)
         except OSError:
@@ -398,29 +502,82 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         resuming = False
         auth_failed: set = set()   # seats whose token died THIS run — skip them for the rest of it
         buf = bytearray()
+        # Verify-before-kill scanning state. A stdout match is corroborated against the usage
+        # endpoint while the child is STILL RUNNING; a dismissed match costs a brief stall of the
+        # output copy loop, never the session. Past MAX_FALSE_ALARMS dismissals the output is
+        # provably untrustworthy (persistent prose about limits — routine when THIS repo is the
+        # thing under development), so scanning turns OFF while supervision continues.
+        scan = {"on": True, "next_probe": 0.0, "dismissed": 0}
+
+        def _dismissed() -> None:
+            scan["dismissed"] += 1
+            scan["next_probe"] = time.monotonic() + PROBE_COOLDOWN_S
+            if scan["on"] and scan["dismissed"] > MAX_FALSE_ALARMS:
+                scan["on"] = False
+                notify(f"{tool}'s output keeps mentioning limits while usage says the seat is fine "
+                       f"— ignoring limit/auth text for the rest of this session")
+
+        def _probe(reason: str) -> str:
+            """Fresh usage check for the active seat while the child is still running. Returns
+            "dismiss" (provably prose), "confirmed" (endpoint agrees the seat is out), or "unknown"
+            (couldn't tell — the stdout signal is then trusted, exactly as before this guard).
+
+            The state flock is held only for the quick reads/writes on either side of the fetch —
+            NEVER across the network call (locked()'s contract; a slow endpoint must stall neither
+            other lock takers like the menubar poll nor this probe's caller longer than needed)."""
+            try:
+                with ctx.locked():
+                    st = ctx.load_state()
+                    seat = st.active(tool)
+                    blob = usage_mod._seat_blob(ctx, st, tool, seat) if seat else None
+                if not seat or not blob:
+                    return "unknown"
+                ua = (usage_mod.claude_user_agent(getattr(ctx, "claude_bin", None))
+                      if tool == "claude" else None)
+                u = usage_mod._fetch_for(tool, blob, get, ua)  # network — no lock held
+                with ctx.locked():
+                    st = ctx.load_state()
+                    status = usage_mod.store_fetch(st, tool, seat, u)
+                    st.save()
+                    if reason == "auth":
+                        # the creds just authenticated a usage fetch → they aren't dead
+                        return "dismiss" if status == "ok" else "unknown"
+                    if _seat_confirmed_healthy(st, tool, seat, {tool: {seat: status}}):
+                        return "dismiss"
+                    return "confirmed" if status == "ok" else "unknown"
+            except Exception:
+                return "unknown"
+
         while True:
             # Headroom is applied globally (app toggle), not per-session, so we run the tool plain.
             argv = resume_cmd(ctx, tool) if resuming else build_cmd(ctx, tool, args)
-            hit = {"reason": None}  # None | "limit" | "auth"
+            hit = {"reason": None, "corroborated": False}  # reason: None | "limit" | "auth"
             buf.clear()
 
             def on_output(chunk: bytes) -> bool:
                 buf.extend(chunk)
                 del buf[:-4096]  # keep a rolling tail
+                if not scan["on"]:
+                    return False
                 reason = detect_event(tool, buf.decode("utf-8", "replace"))  # one ANSI strip per chunk
-                if reason is not None:
-                    hit["reason"] = reason
-                    return True
-                return False
+                if reason is None:
+                    return False
+                if time.monotonic() < scan["next_probe"]:
+                    buf.clear()  # same prose redrawn within a dismissal's cooldown — skip re-probing
+                    return False
+                verdict = _probe(reason)
+                if verdict == "dismiss":
+                    buf.clear()  # don't re-trip on the text still sitting in the rolling tail
+                    _dismissed()
+                    return False
+                hit["reason"] = reason
+                hit["corroborated"] = verdict == "confirmed"
+                return True
 
             status = spawn(argv, on_output)  # NO lock held during the session
 
             if hit["reason"] is None:
                 return status  # clean exit — child's real exit code
-
-            if switches >= max_switches:
-                notify(f"hit the switch limit ({max_switches}); stopping")
-                return EXIT_GAVE_UP
 
             with ctx.locked():
                 state = ctx.load_state()
@@ -430,18 +587,37 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                         auth_failed.add(active)
                     dec = handle_auth_dead(ctx, state, tool, exclude=auth_failed)
                 else:
-                    dec = handle_limit(ctx, state, tool, get=get, exclude=auth_failed)
-                if dec.action == "switch":
+                    dec = handle_limit(ctx, state, tool, get=get, exclude=auth_failed,
+                                       corroborated=hit["corroborated"])
+                # The switch cap gates only an actual seat hop. Classify FIRST: a false-alarm
+                # "resume" (usage says the active seat is healthy) must not be terminated just
+                # because earlier genuine switches used up the budget — that would kill a healthy
+                # session, the very bug this supervisor is meant to avoid.
+                hop_capped = dec.action == "switch" and switches >= max_switches
+                if dec.action == "switch" and not hop_capped:
                     switch(ctx, state, tool, dec.email, sync=(tool != "codex"))
                     _activate_codex_home(dec.email)
                     state.data["last_switch_at"] = iso(now())
                     state.save()
+            if hop_capped:
+                notify(f"hit the switch limit ({max_switches}); stopping")
+                return EXIT_GAVE_UP
             if dec.action == "switch":
                 reason_msg = ("needs you to sign in again 🔑" if hit["reason"] == "auth"
                               else "needs a rest 💤")
                 notify(f"{active} {reason_msg} — hopping to {dec.email}, "
                        f"your work's coming with you ✨")
                 switches += 1
+                resuming = True
+                continue
+            if dec.action == "resume":
+                # Kill-path false alarm: the probe couldn't tell (endpoint error mid-session) so the
+                # child was stopped on the stdout signal alone — but handle_limit's own fresh fetch
+                # then confirmed the seat healthy. Resume the SAME seat and carry the work on. It
+                # counts toward the SAME false-alarm bound as an in-flight dismissal (one counter,
+                # one message, and the probe cooldown), past which scanning turns off — the text is
+                # provably untrustworthy — while supervision continues.
+                _dismissed()
                 resuming = True
                 continue
             if hit["reason"] == "auth":
