@@ -271,6 +271,27 @@ def test_start_proxy_passes_shaper_env_and_tracks_pid(tmp_path, monkeypatch):
     assert (tmp_path / "store" / "headroom-proxy.pid").read_text() == "4321"
 
 
+def test_start_proxy_pins_cwd_to_the_store(tmp_path, monkeypatch):
+    """The proxy must NEVER inherit the caller's cwd: it's long-lived, and litellm lazily does
+    `sys.path.append(os.getcwd())` during response finalize — a caller directory deleted after enable
+    (e.g. a cleaned-up worktree) makes every streamed response die with FileNotFoundError."""
+    monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
+    monkeypatch.setattr(headroom, "_port_busy", lambda *a, **k: False)
+    seen = {}
+
+    class _Proc:
+        pid = 7777
+
+    def fake_popen(argv, **k):
+        seen["cwd"] = k.get("cwd")
+        return _Proc()
+
+    states = iter([False, True])
+    monkeypatch.setattr(headroom, "proxy_ready", lambda *a, **k: next(states, True))
+    assert headroom.start_proxy(tmp_path / "store", popen=fake_popen, sleep=lambda *_: None)
+    assert seen["cwd"] == str(tmp_path / "store")   # the pidfile's dir — stable for the proxy's lifetime
+
+
 def test_start_proxy_returns_true_immediately_if_already_serving(tmp_path, monkeypatch):
     monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
     monkeypatch.setattr(headroom, "proxy_ready", lambda *a, **k: True)

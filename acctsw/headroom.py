@@ -507,9 +507,15 @@ def start_proxy(store: Path | None = None, *, port: int = PROXY_PORT, popen=None
         logfd = None
     sink = logfd if logfd is not None else subprocess.DEVNULL
     try:
+        # cwd is PINNED to our data dir, never inherited: the proxy is long-lived, and litellm does
+        # `sys.path.append(os.getcwd())` on lazy import during response finalize — if the enabling
+        # shell's directory is later deleted (a cleaned-up worktree), os.getcwd() raises
+        # FileNotFoundError and EVERY streamed response dies mid-flight. Pinning also keeps an
+        # arbitrary caller directory out of the proxy's sys.path.
         proc = _popen([exe, "proxy", "--host", "127.0.0.1", "--port", str(port),
                        "--mode", "token", "--backend", "anthropic", "--no-telemetry"],
-                      env=env, stdout=sink, stderr=sink, start_new_session=True)
+                      env=env, stdout=sink, stderr=sink, start_new_session=True,
+                      cwd=str(pidf.parent))
     except (OSError, ValueError) as e:
         _log_full(store, "start_proxy failed", str(e))
         return False
