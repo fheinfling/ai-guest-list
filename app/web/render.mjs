@@ -114,7 +114,7 @@ function bar(seat, win, label) {
 function seatCard(tool, seat) {
   const plan = seat.plan ? `<span class="mono chip">${esc(seat.plan)}</span>` : "";
   const reassure = seat.status === "resting"
-    ? `<div class="reassure mono">taking a breather — back ${fmtClock(seat.limited_until)} 💛</div>` : "";
+    ? `<div class="reassure mono">taking a breather — back ${fmtClock(seat.limited_until)}</div>` : "";
   const credit = creditLeft(seat);
   const expanded = `<div class="expand">
     ${bar(seat, "weekly", "7d")}
@@ -319,15 +319,15 @@ export function buildHTML(state) {
     : state?.headroom_proxy_down
       // toggled on but the proxy isn't actually running (e.g. a restart failed) — say so rather than
       // claim it's wrapping; recovery restarts it, so this clears itself.
-      ? "save-credit paused — reconnecting… 💛"
+      ? "save-credit paused — reconnecting…"
       : (state?.headroom_savings != null
-          ? `wrapping Codex &amp; Claude · ~${state.headroom_savings}% fewer tokens (${state?.headroom_savings_measured ? "measured" : "est."})${hrLifetime(state?.headroom_stats)} 💛`
-          : "wrapping Codex &amp; Claude 💛");
+          ? `wrapping Codex &amp; Claude · ~${state.headroom_savings}% fewer tokens (${state?.headroom_savings_measured ? "measured" : "est."})${hrLifetime(state?.headroom_stats)}`
+          : "wrapping Codex &amp; Claude");
   return `<div class="app theme-${theme}">
     <header class="top">
       ${doorMark(state)}
       <span class="brand-tx"><span class="brand"><span class="ai">ai</span> guest list</span>
-        <span class="substatus">${c.resting} resting · ${c.ready} ready 💛</span></span>
+        <span class="substatus">${c.resting} resting · ${c.ready} ready</span></span>
       <span class="top-actions">
         <button class="ibtn" data-action="settings" title="settings">⋯</button>
         <button class="ibtn" data-action="add" data-tool="codex" title="add a seat">＋</button>
