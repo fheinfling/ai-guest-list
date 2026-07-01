@@ -40,8 +40,10 @@ leave the **macOS Keychain** and the locations the official tools already read �
 anywhere.
 
 <p align="center">
-  <img src="docs/assets/screenshot.png" width="360" alt="The ai guest list popover: Codex and Claude seats with live 5-hour usage bars, an active 'on the floor' seat and a resting one, auto-switch and Headroom save-credit toggles." />
-  <br><sub><i>The menubar popover — seats, live usage, and the auto-switch + save-credit toggles (sample accounts).</i></sub>
+  <img src="docs/assets/screenshot.png" width="340" alt="The ai guest list popover: Codex and Claude seats with live 5-hour usage bars, an active 'on the floor' seat and a resting one, auto-switch and Headroom save-credit toggles." />
+  &nbsp;
+  <img src="docs/assets/screenshot-settings.png" width="340" alt="The settings view: auto-switch strategy and toggles, Headroom savings level, theme, and the menubar icon legend." />
+  <br><sub><i>The menubar popover and its settings view — seats, live usage, auto-switch + save-credit (sample accounts).</i></sub>
 </p>
 
 ## Why
@@ -66,7 +68,7 @@ anywhere.
   `setup-token`). Credentials live only in the Keychain.
 - **Save credit (Headroom)** — optional context-compression proxy with full lifecycle handling
   (sleep/wake recovery, orphan cleanup) and an identity-checked local port.
-- **Version & build** shown in the settings sheet.
+- **Version & build** shown at the bottom of the settings view.
 
 ## Install
 
