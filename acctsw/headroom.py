@@ -404,6 +404,45 @@ def proxy_ready(port: int = PROXY_PORT, *, urlopen=None, timeout: float = 2.0) -
     return bool(isinstance(data, dict) and data.get("ready"))
 
 
+def inbound_active(port: int = PROXY_PORT, *, urlopen=None, timeout: float = 2.0) -> int | None:
+    """Active inbound HTTP requests per the proxy's own Prometheus gauge, or None if unreadable.
+    NB: the scrape itself counts, so an otherwise-idle proxy reads 1, never 0."""
+    import urllib.error
+    import urllib.request
+    opener = urlopen or urllib.request.urlopen
+    try:
+        with opener(f"http://127.0.0.1:{port}/metrics", timeout=timeout) as resp:
+            body = resp.read().decode()
+        for line in body.splitlines():
+            if line.startswith("headroom_inbound_requests_active "):
+                return int(float(line.split()[1]))
+    except (OSError, urllib.error.URLError, ValueError, IndexError):
+        pass
+    return None
+
+
+def drain_proxy(port: int = PROXY_PORT, *, deadline: float = 20.0, urlopen=None,
+                sleep=None, now=None) -> bool:
+    """Best-effort wait until the proxy has no client requests in flight, so a restart doesn't kill a
+    response mid-stream ("Connection closed mid-response" in the routed session). Idle means the
+    inbound gauge reads <=1 — our own scrape is the 1. Returns True when idle was observed; False when
+    the deadline passed (a very long stream) or the gauge is unreadable — callers proceed either way,
+    the deadline just caps how long a level change can stall."""
+    import time
+    _sleep = sleep or time.sleep
+    _now = now or time.monotonic
+    cutoff = _now() + deadline
+    while True:
+        n = inbound_active(port, urlopen=urlopen)
+        if n is None:
+            return False
+        if n <= 1:
+            return True
+        if _now() >= cutoff:
+            return False
+        _sleep(0.5)
+
+
 def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -581,6 +620,10 @@ def restart_proxy(store: Path | None = None, *, level: str | None = None) -> boo
         if not proxy_maybe_running(store):
             return None
         routed = _any_injected()
+        # Wait (bounded) for in-flight client requests to finish: stopping the proxy mid-stream kills
+        # the response in the routed session ("Connection closed mid-response"). Best-effort — after
+        # the deadline (or if the gauge is unreadable) we cycle anyway, matching the old behavior.
+        drain_proxy()
         stop_proxy(store)
         # start_proxy already does the None→persisted fallback, so pass level straight through — one
         # source of truth for how the level is resolved.

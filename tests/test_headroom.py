@@ -160,6 +160,7 @@ def test_restart_proxy_only_cycles_a_running_proxy(tmp_path, monkeypatch):
     """restart_proxy must NOT resurrect a stopped/reaped proxy (that would strand an orphan), but it
     MUST cycle a running proxy — including a retained graceful-OFF one — to apply a new level."""
     started = []
+    monkeypatch.setattr(headroom, "drain_proxy", lambda *a, **k: True)   # no live proxy to probe
     monkeypatch.setattr(headroom, "stop_proxy", lambda *a, **k: None)
     monkeypatch.setattr(headroom, "start_proxy", lambda *a, **k: started.append(k.get("level")) or True)
 
@@ -178,6 +179,7 @@ def test_restart_proxy_unroutes_when_replacement_fails(tmp_path, monkeypatch):
     original config (go direct) instead. A graceful-OFF proxy (not routed) has nothing to unroute."""
     restored = []
     monkeypatch.setattr(headroom, "proxy_maybe_running", lambda store: True)
+    monkeypatch.setattr(headroom, "drain_proxy", lambda *a, **k: True)
     monkeypatch.setattr(headroom, "stop_proxy", lambda *a, **k: None)
     monkeypatch.setattr(headroom, "start_proxy", lambda *a, **k: False)          # replacement fails
     monkeypatch.setattr(headroom, "_remove_and_restore", lambda store, **k: restored.append(k) or (True, ""))
@@ -218,6 +220,57 @@ def test_savings_env_profiles():
     assert "HEADROOM_COMPRESS_USER_MESSAGES" not in dfl
     assert "HEADROOM_COMPRESS_SYSTEM_MESSAGES" not in dfl
     assert headroom.savings_env("bogus") == headroom.savings_env(headroom.DEFAULT_SAVINGS_LEVEL)
+
+
+def _metrics_urlopen(gauge_values):
+    """Fake urlopen serving /metrics with headroom_inbound_requests_active from the iterator."""
+    import contextlib
+    import io
+    vals = iter(gauge_values)
+
+    def opener(url, timeout=None):
+        body = f"headroom_inbound_requests_active {next(vals)}\n".encode()
+        return contextlib.closing(io.BytesIO(body))
+    return opener
+
+
+def test_drain_proxy_waits_until_in_flight_requests_finish(monkeypatch):
+    """drain_proxy polls the proxy's inbound gauge and returns True once it reads <=1 (the probe
+    itself counts as 1), so restart_proxy never kills a response mid-stream needlessly."""
+    naps = []
+    ok = headroom.drain_proxy(urlopen=_metrics_urlopen([3, 2, 1]),
+                              sleep=naps.append, now=lambda: 0.0)
+    assert ok is True
+    assert len(naps) == 2          # slept only while requests were still in flight
+
+
+def test_drain_proxy_gives_up_at_the_deadline(monkeypatch):
+    """A very long stream must not stall a level change forever — after the deadline drain_proxy
+    reports False and the caller cycles anyway (the pre-drain behavior)."""
+    clock = iter([0.0, 10.0, 30.0])
+    ok = headroom.drain_proxy(deadline=20.0, urlopen=_metrics_urlopen([5, 5, 5]),
+                              sleep=lambda *_: None, now=lambda: next(clock))
+    assert ok is False
+
+
+def test_drain_proxy_does_not_block_on_an_unreadable_gauge():
+    """Gauge unreachable (proxy predates /metrics, or it's down) → give up immediately, never loop."""
+    def opener(url, timeout=None):
+        raise OSError("refused")
+    assert headroom.drain_proxy(urlopen=opener, sleep=lambda *_: (_ for _ in ()).throw(
+        AssertionError("must not sleep when the gauge is unreadable"))) is False
+
+
+def test_restart_proxy_drains_before_stopping(tmp_path, monkeypatch):
+    """The drain must happen BEFORE the old proxy is stopped — that's the whole point."""
+    order = []
+    monkeypatch.setattr(headroom, "proxy_maybe_running", lambda store: True)
+    monkeypatch.setattr(headroom, "_any_injected", lambda: True)
+    monkeypatch.setattr(headroom, "drain_proxy", lambda *a, **k: order.append("drain") or True)
+    monkeypatch.setattr(headroom, "stop_proxy", lambda *a, **k: order.append("stop"))
+    monkeypatch.setattr(headroom, "start_proxy", lambda *a, **k: order.append("start") or True)
+    assert headroom.restart_proxy(tmp_path / "s") is True
+    assert order == ["drain", "stop", "start"]
 
 
 def test_start_proxy_applies_selected_savings_level(tmp_path, monkeypatch):
