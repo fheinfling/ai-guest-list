@@ -50,7 +50,15 @@ function closeOverlay() { overlay.innerHTML = ""; }
 let screen = "main";
 
 function render() {
+  // A background state push (the usage poll) re-renders whatever screen is up; carry the settings
+  // body's scroll position across the innerHTML swap so a poll doesn't snap it back to the top.
+  const prevBody = root.querySelector(".set-body");
+  const scrollTop = prevBody ? prevBody.scrollTop : 0;
   root.innerHTML = screen === "settings" ? buildSettings(state) : buildHTML(state);
+  if (scrollTop) {
+    const nextBody = root.querySelector(".set-body");
+    if (nextBody) nextBody.scrollTop = scrollTop;
+  }
   // mirror the theme onto <body> so overlays (siblings of #root) get the same CSS vars
   const theme = (state.settings && state.settings.theme === "dark") ? "dark" : "light";
   document.body.className = "theme-" + theme;

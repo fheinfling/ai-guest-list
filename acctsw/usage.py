@@ -376,20 +376,30 @@ def refresh(ctx, state, tool: str | None = None, *, only: str | None = None,
             # invalidate codex's own session (reviewer KR-B2). For usage display we report
             # last-known/unauthorized instead. Per-account isolation (each account owning its home)
             # makes codex maintain its own tokens — refresh moves there.
-            d = u.to_dict()
-            if u.ok:
-                d["error_streak"] = 0
-                state.set_usage(t, email, d)
-                _apply_limit(state, t, email, u, at)
-            else:
-                # preserve last-known-good windows; bump the error streak for backoff
-                d["windows"] = prev_usage.get("windows", d["windows"])
-                d["stale"] = True
-                d["error_streak"] = int(prev_usage.get("error_streak", 0) or 0) + 1
-                state.set_usage(t, email, d)
-            summary[t][email] = u.error or "ok"
+            summary[t][email] = store_fetch(state, t, email, u, at=at)
     state.save()
     return summary
+
+
+def store_fetch(state, tool: str, email: str, u: Usage, at=None) -> str:
+    """Persist ONE fetch result onto a seat (windows, limit flags, error backoff) and return its
+    summary status ("ok" or the error kind). Shared by refresh() and the launcher's inline probe,
+    which must fetch WITHOUT the state lock held and only take it for this quick write. The caller
+    saves state."""
+    at = at if at is not None else now()
+    prev_usage = (state.get_seat(tool, email) or {}).get("usage") or {}
+    d = u.to_dict()
+    if u.ok:
+        d["error_streak"] = 0
+        state.set_usage(tool, email, d)
+        _apply_limit(state, tool, email, u, at)
+    else:
+        # preserve last-known-good windows; bump the error streak for backoff
+        d["windows"] = prev_usage.get("windows", d["windows"])
+        d["stale"] = True
+        d["error_streak"] = int(prev_usage.get("error_streak", 0) or 0) + 1
+        state.set_usage(tool, email, d)
+    return u.error or "ok"
 
 
 def _limit_reset(u: Usage) -> str | None:

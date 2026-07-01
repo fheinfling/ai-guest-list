@@ -499,7 +499,6 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                    f"{sel.unlocks_at:%H:%M}; starting anyway")
 
         switches = 0
-        false_alarms = 0           # kill-path limit hits that handle_limit then dismissed as healthy
         resuming = False
         auth_failed: set = set()   # seats whose token died THIS run — skip them for the rest of it
         buf = bytearray()
@@ -521,19 +520,29 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         def _probe(reason: str) -> str:
             """Fresh usage check for the active seat while the child is still running. Returns
             "dismiss" (provably prose), "confirmed" (endpoint agrees the seat is out), or "unknown"
-            (couldn't tell — the stdout signal is then trusted, exactly as before this guard)."""
+            (couldn't tell — the stdout signal is then trusted, exactly as before this guard).
+
+            The state flock is held only for the quick reads/writes on either side of the fetch —
+            NEVER across the network call (locked()'s contract; a slow endpoint must stall neither
+            other lock takers like the menubar poll nor this probe's caller longer than needed)."""
             try:
-                with ctx.locked():  # brief: quick state writes only, per the locked() contract
+                with ctx.locked():
                     st = ctx.load_state()
                     seat = st.active(tool)
-                    if not seat:
-                        return "unknown"
-                    summary = usage_mod.refresh(ctx, st, tool, only=seat, force=True, get=get)
-                    status = (summary.get(tool) or {}).get(seat)
+                    blob = usage_mod._seat_blob(ctx, st, tool, seat) if seat else None
+                if not seat or not blob:
+                    return "unknown"
+                ua = (usage_mod.claude_user_agent(getattr(ctx, "claude_bin", None))
+                      if tool == "claude" else None)
+                u = usage_mod._fetch_for(tool, blob, get, ua)  # network — no lock held
+                with ctx.locked():
+                    st = ctx.load_state()
+                    status = usage_mod.store_fetch(st, tool, seat, u)
+                    st.save()
                     if reason == "auth":
                         # the creds just authenticated a usage fetch → they aren't dead
                         return "dismiss" if status == "ok" else "unknown"
-                    if _seat_confirmed_healthy(st, tool, seat, summary):
+                    if _seat_confirmed_healthy(st, tool, seat, {tool: {seat: status}}):
                         return "dismiss"
                     return "confirmed" if status == "ok" else "unknown"
             except Exception:
@@ -604,14 +613,11 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             if dec.action == "resume":
                 # Kill-path false alarm: the probe couldn't tell (endpoint error mid-session) so the
                 # child was stopped on the stdout signal alone — but handle_limit's own fresh fetch
-                # then confirmed the seat healthy. Resume the SAME seat and carry the work on. Past
-                # the bound, the on-screen text is provably untrustworthy: stop TRUSTING it (turn
-                # scanning off) rather than stop SUPERVISING — never end a healthy session over it.
-                false_alarms += 1
-                if false_alarms > MAX_FALSE_ALARMS:
-                    scan["on"] = False
-                    notify(f"{active} keeps looking limited while usage says it's fine — ignoring "
-                           f"limit/auth text for the rest of this session")
+                # then confirmed the seat healthy. Resume the SAME seat and carry the work on. It
+                # counts toward the SAME false-alarm bound as an in-flight dismissal (one counter,
+                # one message, and the probe cooldown), past which scanning turns off — the text is
+                # provably untrustworthy — while supervision continues.
+                _dismissed()
                 resuming = True
                 continue
             if hit["reason"] == "auth":
