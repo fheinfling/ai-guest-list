@@ -59,7 +59,7 @@ EXIT_GAVE_UP = 75     # EX_TEMPFAIL: distinguishes "we gave up / all limited" fr
 # here for exactly this reason. A missed real limit is corroborated separately by the usage endpoint
 # (handle_limit), so erring toward specificity here is safe.
 _LIMIT_SHARED = [
-    r"usage limit reached",
+    r"usage limit (?:reached|exceeded)",
     r"you[''`]?ve (?:hit|reached) your (?:usage )?limit",
     r"your limit will reset",
     r"rate[ -]?limit(?:ed| reached| exceeded)",
@@ -69,7 +69,11 @@ LIMIT_PATTERNS = {
     # "out of credits" is real ChatGPT/Codex wording, but it's also exactly what the model narrates
     # about Codex — so it stays out of the CLAUDE list (a Claude session never emits it as a banner).
     "codex": [*_LIMIT_SHARED, r"out of (?:credits?|usage)"],
-    "claude": [*_LIMIT_SHARED, r"5-?hour limit reached", r"weekly limit reached"],
+    # "5-hour limit" / "weekly limit" are Claude's OWN window-limit banners (e.g. a status line
+    # "5-hour limit · resets 8pm" that omits "reached"). They're specific enough to rarely appear in
+    # the model's prose, and the corroboration guard (handle_limit) vetoes any that slip through — so
+    # we keep them loose here to catch the real banner regardless of its exact committal wording.
+    "claude": [*_LIMIT_SHARED, r"5-?hour limit", r"weekly limit"],
 }
 
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
@@ -172,7 +176,7 @@ def _seat_confirmed_healthy(state, tool: str, email: str, summary: dict) -> bool
     if u.get("limit_reached"):
         return False  # authoritative API flag says the seat really is out
     pcts = [w.get("used_pct") for w in (u.get("windows") or {}).values()
-            if w.get("used_pct") is not None]
+            if isinstance(w, dict) and w.get("used_pct") is not None]
     return bool(pcts) and max(pcts) < FALSE_ALARM_MAX_PCT
 
 
@@ -483,7 +487,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 if false_alarms > MAX_FALSE_ALARMS:
                     notify(f"{active} kept looking limited but usage says it's fine — stopping "
                            f"supervision so the session doesn't loop")
-                    return status
+                    return EXIT_GAVE_UP
                 resuming = True
                 continue
             if hit["reason"] == "auth":

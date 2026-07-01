@@ -20,9 +20,20 @@ from acctsw import paths as P
 @pytest.mark.parametrize("text", [
     "Error: you've hit your usage limit", "rate limit exceeded", "5-hour limit reached",
     "HTTP 429 Too Many Requests", "you are out of credits",
+    # Real banners whose committal wording varies — must still be caught (recall over the exact token)
+    "usage limit exceeded", "you've reached your usage limit",
 ])
 def test_detect_limit_positive(text):
     assert detect_limit("codex", text) or detect_limit("claude", text)
+
+
+@pytest.mark.parametrize("text", [
+    "5-hour limit reached", "5-hour limit · resets 8pm", "weekly limit · resets Monday",
+])
+def test_detect_limit_claude_window_banners(text):
+    """Claude's own window-limit banners are caught even when they omit "reached" (e.g. a status
+    line that only says "resets") — the corroboration guard vetoes any false positive."""
+    assert detect_limit("claude", text)
 
 
 def test_detect_limit_negative():
@@ -138,6 +149,30 @@ def test_run_resumes_same_seat_on_false_positive(ctx):
     assert spawn.calls[1][-2:] == ["resume", "--last"]   # resumed, not a fresh build
     assert ctx.load_state().active("codex") == "a@x.com"  # never switched away
     assert ctx.load_state().get_seat("codex", "a@x.com").get("limited_until") is None
+
+
+def test_run_bails_with_gave_up_code_after_repeated_false_positives(ctx):
+    """A seat that keeps looking limited while usage says it's healthy stops supervising after the
+    bound — and reports EXIT_GAVE_UP (the "we gave up" sentinel), not the killed child's status."""
+    _two_codex(ctx)  # active a
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=20.0, secondary=70.0))})
+    # every relaunch trips the detector again on healthy 'a' → resume, until the bound is exceeded
+    spawn = FakeSpawn([(b"... you've hit your usage limit ...\n", 1)] * (L.MAX_FALSE_ALARMS + 2))
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=lambda m: None)
+    assert rc == L.EXIT_GAVE_UP
+    assert len(spawn.calls) == L.MAX_FALSE_ALARMS + 1   # initial + MAX_FALSE_ALARMS resumes, then bail
+    assert ctx.load_state().active("codex") == "a@x.com"  # never switched away
+
+
+def test_seat_confirmed_healthy_tolerates_malformed_window(ctx):
+    """A corrupt/partial usage blob (a null window) must not crash the healthy-seat guard."""
+    state = _two_codex(ctx)  # active a
+    state.set_usage("codex", "a@x.com", {"ok": True, "error": None, "limit_reached": False,
+                                         "windows": {"primary": None, "secondary": {"used_pct": 20.0}}})
+    state.save()
+    summary = {"codex": {"a@x.com": "ok"}}  # endpoint reported success → guard inspects windows
+    # null window must be skipped, not crash; the valid 20% window still confirms headroom
+    assert L._seat_confirmed_healthy(state, "codex", "a@x.com", summary) is True
 
 
 def test_handle_limit_gives_up_when_all_limited(ctx):
