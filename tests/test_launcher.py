@@ -32,10 +32,23 @@ def test_detect_limit_negative():
 @pytest.mark.parametrize("benign", [
     "the cache resets at midnight", "please try again in a moment",
     "approaching the recursion limit", "rate limiting middleware installed",
+    # Real false positives that killed healthy sessions (the model narrating ABOUT limits while
+    # developing this repo). None are the tool's own committal banner, so none may match.
+    "the usage limit detector fired on the agent's own text",
+    "all claude seats are resting; soonest unlocks at 17:57",
 ])
 def test_detect_limit_no_false_positive_on_benign(benign):
     assert not detect_limit("codex", benign)
     assert not detect_limit("claude", benign)
+
+
+def test_detect_limit_claude_ignores_codex_credit_narration():
+    """A Claude session narrating about Codex credits ("out of credits") must NOT read as a Claude
+    limit — Claude Code never emits that wording as a banner. This is the exact string that kept
+    killing live Claude sessions."""
+    narration = "the routed Codex workspace is out of credits"
+    assert not detect_limit("claude", narration)
+    assert detect_limit("codex", narration)  # still a real signal for an actual codex session
 
 
 def test_detect_limit_ignores_ansi_codes():
@@ -98,6 +111,33 @@ def test_handle_limit_reactive_fallback_when_usage_says_fine(ctx):
     assert seat["limited_until"] is not None
     assert seat["limit_source"] == "reactive"
     assert dec.action == "switch" and dec.email == "b@x.com"
+
+
+def test_handle_limit_resumes_when_usage_confirms_healthy(ctx):
+    """Corroboration guard: a stdout match on a seat the endpoint says is healthy (both windows
+    well under the cap) is a false positive — resume the same seat, never rest it."""
+    state = _two_codex(ctx)  # active a
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=20.0, secondary=70.0))})
+    dec = handle_limit(ctx, state, "codex", get=get)
+    assert dec.action == "resume" and dec.email == "a@x.com"
+    # the healthy seat must NOT be flagged limited by the false positive
+    assert state.get_seat("codex", "a@x.com").get("limited_until") is None
+    assert state.active("codex") == "a@x.com"
+
+
+def test_run_resumes_same_seat_on_false_positive(ctx):
+    """A benign-but-matching line on a healthy seat resumes the SAME seat (no switch, no rest)."""
+    _two_codex(ctx)  # active a
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=20.0, secondary=70.0))})
+    spawn = FakeSpawn([
+        (b"... you've hit your usage limit ...\n", 1),  # false positive: usage says a is fine
+        (b"resumed, all good\n", 0),
+    ])
+    rc = run(ctx, "codex", ["--foo"], spawn=spawn, get=get, notify=lambda m: None)
+    assert rc == 0
+    assert spawn.calls[1][-2:] == ["resume", "--last"]   # resumed, not a fresh build
+    assert ctx.load_state().active("codex") == "a@x.com"  # never switched away
+    assert ctx.load_state().get_seat("codex", "a@x.com").get("limited_until") is None
 
 
 def test_handle_limit_gives_up_when_all_limited(ctx):
@@ -213,7 +253,7 @@ def test_run_respects_max_switches(ctx):
     _two_codex(ctx)
     get = fake_get({P.CODEX_USAGE_URL: (429, "")})
     # every launch hits a limit; with max_switches=1 we get: launch, switch, launch(limit)->stop
-    spawn = FakeSpawn([(b"usage limit\n", 1)] * 5)
+    spawn = FakeSpawn([(b"usage limit reached\n", 1)] * 5)
     rc = run(ctx, "codex", [], spawn=spawn, get=get, max_switches=1, notify=lambda m: None)
     assert len(spawn.calls) == 2  # initial + one resume, then bail
     assert rc == L.EXIT_GAVE_UP
@@ -248,7 +288,7 @@ def test_run_claude_resume_uses_continue(ctx):
     from acctsw.switch import switch
     switch(ctx, ctx.load_state(), "claude", "c1@x.com")
     get = fake_get({P.CLAUDE_USAGE_URL: (429, "")})
-    spawn = FakeSpawn([(b"usage limit\n", 1), (b"resumed\n", 0)])
+    spawn = FakeSpawn([(b"usage limit reached\n", 1), (b"resumed\n", 0)])
     rc = run(ctx, "claude", [], spawn=spawn, get=get, notify=lambda m: None)
     assert rc == 0
     assert spawn.calls[1][-1] == "--continue"

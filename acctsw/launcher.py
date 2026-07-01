@@ -44,22 +44,32 @@ Notifier = Callable[[str], None]
 # Default cooldown when a limit is caught but no authoritative reset is known.
 DEFAULT_COOLDOWN = timedelta(hours=5)
 MAX_SWITCHES = 6      # safety bound on auto-relaunches within one `run`
+MAX_FALSE_ALARMS = 3  # stdout said "limit" but usage disagreed this many times → stop supervising
+# A stdout limit-signal is dismissed as a false positive (model prose, not a real banner) when the
+# usage endpoint says the active seat's busiest window is still below this. Well clear of a real
+# ~100% limit even if the endpoint lags a few percent behind stdout.
+FALSE_ALARM_MAX_PCT = 90.0
 EXIT_GAVE_UP = 75     # EX_TEMPFAIL: distinguishes "we gave up / all limited" from a child failure
 
-# Limit signals in the agents' output. Deliberately SPECIFIC: a false positive kills+restarts the
-# session, so weak/ambiguous phrases (e.g. "try again", "resets at", "approaching … limit") are
-# intentionally excluded. Confirmed/extended against real strings during verification (M8).
+# Limit signals in the agents' output. This buffer ALSO carries the model's own generated prose —
+# which, especially when THIS repo is the thing under development, routinely mentions "usage limit"
+# and "out of credits" in passing. A false positive kills+restarts a healthy session, so every phrase
+# here must be the tool's actual out-of-quota BANNER (committal wording), never a word the model can
+# utter mid-sentence. Bare "usage limit" / "limit reached" / "out of credits" are intentionally NOT
+# here for exactly this reason. A missed real limit is corroborated separately by the usage endpoint
+# (handle_limit), so erring toward specificity here is safe.
+_LIMIT_SHARED = [
+    r"usage limit reached",
+    r"you[''`]?ve (?:hit|reached) your (?:usage )?limit",
+    r"your limit will reset",
+    r"rate[ -]?limit(?:ed| reached| exceeded)",
+    r"too many requests",
+]
 LIMIT_PATTERNS = {
-    "codex": [
-        r"usage limit", r"you[''`]?ve hit your (?:usage )?limit", r"limit reached",
-        r"rate[ -]?limit(?:ed| reached| exceeded)", r"out of (?:credits?|usage)",
-        r"too many requests",
-    ],
-    "claude": [
-        r"usage limit", r"5-?hour limit", r"weekly limit", r"limit reached",
-        r"rate[ -]?limit(?:ed| reached| exceeded)", r"out of (?:credits?|usage)",
-        r"too many requests",
-    ],
+    # "out of credits" is real ChatGPT/Codex wording, but it's also exactly what the model narrates
+    # about Codex — so it stays out of the CLAUDE list (a Claude session never emits it as a banner).
+    "codex": [*_LIMIT_SHARED, r"out of (?:credits?|usage)"],
+    "claude": [*_LIMIT_SHARED, r"5-?hour limit reached", r"weekly limit reached"],
 }
 
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
@@ -146,9 +156,24 @@ def resume_cmd(ctx: Context, tool: str) -> list:
 
 @dataclass
 class Decision:
-    action: str          # "switch" | "give_up"
+    action: str          # "switch" | "resume" | "give_up"
     email: str | None
     unlocks_at: str | None = None
+
+
+def _seat_confirmed_healthy(state, tool: str, email: str, summary: dict) -> bool:
+    """True only when a FRESH usage fetch confirmed this seat has clear headroom — so a stdout
+    limit-signal can be safely dismissed as a false positive (the model narrating about limits rather
+    than a real banner). Unknown/errored/absent usage → False: we can't confirm, so we fall back to
+    trusting the stdout signal exactly as before."""
+    if (summary.get(tool) or {}).get(email) != "ok":
+        return False  # cached / unauthorized / rate_limited / network / no_creds → can't tell
+    u = (state.get_seat(tool, email) or {}).get("usage") or {}
+    if u.get("limit_reached"):
+        return False  # authoritative API flag says the seat really is out
+    pcts = [w.get("used_pct") for w in (u.get("windows") or {}).values()
+            if w.get("used_pct") is not None]
+    return bool(pcts) and max(pcts) < FALSE_ALARM_MAX_PCT
 
 
 def handle_limit(ctx: Context, state, tool: str, *, get=usage_mod._default_get,
@@ -158,8 +183,14 @@ def handle_limit(ctx: Context, state, tool: str, *, get=usage_mod._default_get,
     active = state.active(tool)
     # Authoritative reset from the usage endpoint for the seat that just hit the limit (only the
     # active seat — others keep their known state; their stale snapshot tokens would 401 anyway).
+    summary: dict = {}
     if active:
-        usage_mod.refresh(ctx, state, tool, only=active, force=True, get=get)
+        summary = usage_mod.refresh(ctx, state, tool, only=active, force=True, get=get)
+    # Corroboration guard: the stdout match can be a false positive (the model discussing limits —
+    # routine when THIS repo is under development). If the endpoint FRESHLY confirms the active seat
+    # still has clear headroom, don't rest a healthy seat — resume the same work instead.
+    if active and _seat_confirmed_healthy(state, tool, active, summary):
+        return Decision("resume", active)
     seat = state.get_seat(tool, active) if active else None
     # ...else a reactive fallback so we don't immediately re-pick the maxed seat.
     if seat is not None and seat.get("limited_until") is None:
@@ -395,6 +426,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                    f"{sel.unlocks_at:%H:%M}; starting anyway")
 
         switches = 0
+        false_alarms = 0           # stdout said "limit" but usage disagreed — bounded to avoid a loop
         resuming = False
         auth_failed: set = set()   # seats whose token died THIS run — skip them for the rest of it
         buf = bytearray()
@@ -442,6 +474,16 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 notify(f"{active} {reason_msg} — hopping to {dec.email}, "
                        f"your work's coming with you ✨")
                 switches += 1
+                resuming = True
+                continue
+            if dec.action == "resume":
+                # False alarm: usage confirms the active seat is healthy, so the stdout match was the
+                # model's own prose, not a real limit. Resume the SAME seat and carry the work on.
+                false_alarms += 1
+                if false_alarms > MAX_FALSE_ALARMS:
+                    notify(f"{active} kept looking limited but usage says it's fine — stopping "
+                           f"supervision so the session doesn't loop")
+                    return status
                 resuming = True
                 continue
             if hit["reason"] == "auth":
