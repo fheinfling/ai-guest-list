@@ -22,12 +22,12 @@ function send(action, payload = {}) {
 window.AGL = {
   result(res) {
     res = typeof res === "string" ? JSON.parse(res) : res;
-    const settingsOpen = !!overlay.querySelector(".settings");
-    if (res.state) { state = res.state; render(); }
+    if (res.settings_panel) screen = "settings"; // native entrypoint into the settings sub-view
+    if (res.state) state = res.state;
+    if (res.state || res.settings_panel) render(); // re-renders current screen (settings live-updates)
     if (res.error) flash(res.error);
     if (res.login) { overlay.innerHTML = buildPicker(res.login); }
     if (res.await_snapshot) { overlay.innerHTML = buildSaveSeat(res.tool); }
-    if (res.settings_panel || (settingsOpen && res.state)) { overlay.innerHTML = buildSettings(state); }
     if (res.celebrate) celebrate();
   },
   // legacy single-arg state push (kept for the poll path / older callers)
@@ -45,8 +45,12 @@ function flash(text) {
 }
 function closeOverlay() { overlay.innerHTML = ""; }
 
+// which screen occupies the popover: "main" or the settings sub-view (spec §9.1 — a pushed
+// sub-view on the same surface, never a modal).
+let screen = "main";
+
 function render() {
-  root.innerHTML = buildHTML(state);
+  root.innerHTML = screen === "settings" ? buildSettings(state) : buildHTML(state);
   // mirror the theme onto <body> so overlays (siblings of #root) get the same CSS vars
   const theme = (state.settings && state.settings.theme === "dark") ? "dark" : "light";
   document.body.className = "theme-" + theme;
@@ -80,7 +84,8 @@ document.addEventListener("click", (e) => {
       if (el.classList.contains("backdrop") && e.target !== el) break;
       closeOverlay();
       break;
-    case "settings": overlay.innerHTML = buildSettings(state); break;
+    case "settings": screen = "settings"; render(); break;
+    case "settings-back": screen = "main"; render(); break;
     case "set_theme": send("set_theme", { value }); break;
     case "set_strategy": send("set_strategy", { value }); break;
     case "set_savings_level": send("set_savings_level", { value }); break;
@@ -92,6 +97,11 @@ document.addEventListener("click", (e) => {
 document.addEventListener("change", (e) => {
   const inp = e.target.closest('input[data-action="toggle"]');
   if (inp) send("toggle", { key: inp.dataset.key, value: inp.checked });
+});
+
+// Esc pops the settings sub-view back to main (spec §9.1)
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && screen === "settings") { screen = "main"; render(); }
 });
 
 // initial paint + ask the native side for fresh state

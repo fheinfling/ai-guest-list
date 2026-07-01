@@ -1,0 +1,470 @@
+<!doctype html><meta charset=utf8><style>/* "ai guest list" — spec §2/§3. Default = light. Sans (Hanken Grotesk) for UI; mono (Space Mono)
+   only for wordmark, numbers, emails, plan codes, section meta. Status = flat colored dots. */
+@font-face { font-family: "Hanken Grotesk"; font-weight: 400 800; font-display: swap;
+  src: url("/Users/franz.heinfling/Documents/GitHub/ai-guest-list/app/web/fonts/hankengrotesk.woff2") format("woff2"); }
+@font-face { font-family: "Space Mono"; font-weight: 400; font-display: swap;
+  src: url("/Users/franz.heinfling/Documents/GitHub/ai-guest-list/app/web/fonts/spacemono-400.woff2") format("woff2"); }
+@font-face { font-family: "Space Mono"; font-weight: 700; font-display: swap;
+  src: url("/Users/franz.heinfling/Documents/GitHub/ai-guest-list/app/web/fonts/spacemono-700.woff2") format("woff2"); }
+@font-face { font-family: "Outfit"; font-weight: 700; font-display: swap;
+  src: url("/Users/franz.heinfling/Documents/GitHub/ai-guest-list/app/web/fonts/outfit-700.woff2") format("woff2"); }
+
+:root {
+  --codex: #46c2a8;   /* teal  (constant across themes) */
+  --claude: #e0795a;  /* coral (constant across themes) */
+  --sans: "Hanken Grotesk", -apple-system, system-ui, sans-serif;
+  --mono: "Space Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+.theme-light {
+  --good:#3a9d6e; --amber:#c2853a; --gold:#cf9b2e; --rose:#cf5f7c;
+  --bg:#eef1f6; --popover:#ffffff; --card:#f6f8fc; --elevated:#eceff5;
+  --line:rgba(12,18,30,.10); --t1:#161b24; --t2:#5a6473; --t3:#909aa9; --track:#e6ebf3;
+}
+.theme-dark {
+  --good:#57b98a; --amber:#e0a458; --gold:#f3c969; --rose:#e2778f;
+  --bg:#0c0f15; --popover:#161a21; --card:#1b212c; --elevated:#232b38;
+  --line:rgba(255,255,255,.09); --t1:#eef1f6; --t2:#98a2b2; --t3:#626c7c; --track:#232b38;
+}
+
+* { margin:0; padding:0; box-sizing:border-box; }
+html, body { background:transparent; width:100%; overflow-x:hidden; }
+.app { font-family:var(--sans); background:var(--popover); color:var(--t1);
+  width:100%; padding:14px; border-radius:16px; font-size:13px; line-height:1.35;
+  -webkit-font-smoothing:antialiased; }
+.mono { font-family:var(--mono); }
+.grow { flex:1; }
+
+/* header */
+.top { display:flex; align-items:center; gap:10px; margin-bottom:12px; }
+/* header door mark (icon handoff, app-4): open onto the disco when a model's free, shut when all
+   resting. Faithful 36px port of the prototype's icon-states door. */
+.avatar.door { width:36px; height:36px; border-radius:11px; flex:none; position:relative;
+  overflow:hidden; background:linear-gradient(160deg,#3aa890,#2c8773);
+  box-shadow:0 4px 12px rgba(44,135,115,.35); }
+.door-room { position:absolute; left:50%; bottom:0; transform:translateX(-50%);
+  width:27px; height:31px; border-radius:13.5px 13.5px 0 0; overflow:hidden; }
+/* shut: cream door panel + inner outline + gold knob */
+.door--shut .door-room { background:linear-gradient(180deg,#efe7d8,#e2d8c4); }
+.door-panel { position:absolute; bottom:4px; left:50%; transform:translateX(-50%);
+  width:16px; height:20px; border-radius:8px 8px 0 0; border:1.5px solid #d6cab2; }
+.door-knob { position:absolute; bottom:14px; left:calc(50% + 6px); width:3px; height:3px;
+  border-radius:50%; background:#bf8f37; }
+/* open: warm room glow, hanging disco ball with spinning facets + twinkles, door swung ajar */
+.door--open .door-room { background:radial-gradient(120% 90% at 50% 32%,#fff3d6,#f1bf66); }
+.door-string { position:absolute; top:0; left:50%; transform:translateX(-50%);
+  width:1.5px; height:5px; background:#b9c0cb; }
+.door-ball { position:absolute; top:5px; left:50%; transform:translateX(-50%); width:13px; height:13px;
+  border-radius:50%; overflow:hidden;
+  background:radial-gradient(circle at 38% 30%,#e6ecf3,#909aa8 68%,#5d6675); }
+.door-ball::before { content:""; position:absolute; top:-4px; left:-6px; width:26px; height:20px;
+  background-image:repeating-linear-gradient(90deg,rgba(255,255,255,.4) 0 2px,rgba(40,50,65,.28) 2px 4px),
+    repeating-linear-gradient(0deg,rgba(0,0,0,.16) 0 2px,transparent 2px 4px);
+  animation:disco-spin 1.6s linear infinite; }
+.door-ball::after { content:""; position:absolute; top:2px; left:3px; width:4px; height:3px;
+  border-radius:50%; background:rgba(255,255,255,.75); }
+.tw { position:absolute; border-radius:50%; animation:twinkle 1.1s ease-in-out infinite; }
+.tw1 { top:9px; left:4px; width:2.5px; height:2.5px; background:#46c2a8; }
+.tw2 { top:6px; left:21px; width:2px; height:2px; background:#e0795a; animation-duration:1.4s; animation-delay:.2s; }
+.tw3 { top:21px; left:19px; width:2.5px; height:2.5px; background:#f3c969; animation-duration:1s; animation-delay:.5s; }
+.tw4 { top:23px; left:6px; width:2px; height:2px; background:#7c6cf0; animation-duration:1.2s; animation-delay:.35s; }
+.door-leaf { position:absolute; bottom:2px; left:calc(50% - 15px); width:5px; height:29px;
+  border-radius:2px; background:#efe7d8; transform:rotate(-8deg); transform-origin:bottom right;
+  box-shadow:1px 0 4px rgba(0,0,0,.25); }
+@keyframes disco-spin { to { transform:translateX(-12px); } }
+@keyframes twinkle { 0%,100% { opacity:.2; transform:scale(.6); } 50% { opacity:1; transform:scale(1); } }
+@media (prefers-reduced-motion: reduce) { .door-ball::before, .tw { animation:none; } }
+.brand-tx { display:flex; flex-direction:column; flex:1; min-width:0; }
+/* wordmark: Outfit (option 05 — geometric, friendly), lowercase, gold "ai" in our accent */
+.brand { font-family:"Outfit", var(--sans); font-size:15px; font-weight:700; letter-spacing:-.01em; }
+.brand .ai { color:var(--gold); }
+.substatus { color:var(--t2); font-size:11px; }
+.top-actions { display:flex; gap:6px; }
+.ibtn { width:28px; height:28px; border-radius:9px; border:1px solid var(--line);
+  background:var(--card); color:var(--t2); cursor:pointer; font-size:14px; line-height:1; }
+.ibtn:hover { color:var(--t1); }
+
+/* control bars (auto-switch / headroom) */
+.ctl { display:flex; align-items:center; gap:11px; background:var(--card);
+  border:1px solid var(--line); border-radius:13px; padding:10px 12px; margin-bottom:8px; cursor:pointer; }
+.ctl-ic { width:30px; height:30px; border-radius:9px; flex:none; display:flex; align-items:center;
+  justify-content:center; background:var(--elevated); color:var(--t2); }
+.ctl-ic.ic-hr { color:var(--good); }
+.ctl-tx { display:flex; flex-direction:column; flex:1; min-width:0; }
+.ctl-t { font-size:13px; font-weight:700; display:flex; align-items:center; gap:6px; }
+.ctl-chip { font-size:8.5px; letter-spacing:.5px; color:var(--t3); border:1px solid var(--line);
+  border-radius:4px; padding:1px 4px; }
+.ctl-s { color:var(--t2); font-size:11px; }
+.ctl input, .set-toggle-row input, .seat input { display:none; }
+.sw { width:38px; height:22px; border-radius:999px; background:var(--track); position:relative;
+  flex:none; transition:background .18s; }
+.sw::after { content:""; position:absolute; top:2px; left:2px; width:18px; height:18px; border-radius:50%;
+  background:#fff; box-shadow:0 1px 3px rgba(0,0,0,.3); transition:transform .18s; }
+.ctl input:checked ~ .sw, .set-toggle-row input:checked ~ .sw { background:var(--good); }
+.ctl input:checked ~ .sw::after, .set-toggle-row input:checked ~ .sw::after { transform:translateX(16px); }
+.hr-install { display:block; margin:-2px 0 8px 53px; background:none; border:none; color:var(--good);
+  font:inherit; font-size:11px; cursor:pointer; }
+
+.event { color:var(--t2); font-size:10.5px; margin:2px 2px 10px; }
+
+/* provider group */
+.group { margin-bottom:12px; }
+.g-head { display:flex; align-items:center; gap:7px; margin:10px 2px 7px; }
+.g-name { font-size:12.5px; font-weight:800; }
+.g-count { color:var(--t2); font-size:11px; }
+.g-meta { color:var(--t3); font-size:9.5px; letter-spacing:.5px; text-transform:uppercase; }
+
+/* flat status dots */
+.dot { width:8px; height:8px; border-radius:50%; flex:none; background:var(--t3); }
+.dot--accent, .dot--active { background:var(--accent); }
+.dot--ready { background:var(--good); }
+.dot--resting { background:var(--amber); }
+.dot--queued { background:var(--gold); }
+.dot--needs-login { background:var(--rose); }
+
+/* seat card */
+.seat { background:var(--popover); border:1px solid var(--line); border-radius:12px;
+  padding:10px 12px; margin-bottom:7px; cursor:pointer; }
+.seat--active { background:color-mix(in srgb, var(--accent) 8%, var(--popover));
+  border-left:3px solid var(--accent); padding-left:9px; }
+.seat--queued { border-left:3px solid var(--gold); padding-left:9px; }
+.seat-row { display:flex; align-items:center; gap:7px; }
+.seat-name { font-size:14px; font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  max-width:46%; }
+.chip { flex:none; font-size:9.5px; letter-spacing:.5px; text-transform:uppercase; color:var(--t2);
+  border:1px solid var(--line); border-radius:5px; padding:1px 5px; }
+.pill { flex:none; font-size:11px; font-weight:700; padding:2px 10px; border-radius:999px; }
+.pill.floor { color:#fff; background:var(--accent); }
+.pill.queued { color:#3a2c00; background:var(--gold); }
+.btn { flex:none; font:inherit; font-size:11px; font-weight:700; padding:2px 11px; border-radius:999px;
+  background:transparent; cursor:pointer; }
+.btn.switch { border:1px solid var(--accent); color:var(--accent); }
+.btn.rose { border:1px solid var(--rose); color:var(--rose); }
+.rest-count { flex:none; font-size:10.5px; font-weight:700; color:var(--amber); }
+.seat-email { color:var(--t3); font-size:10.5px; margin:3px 0 7px; overflow:hidden;
+  text-overflow:ellipsis; white-space:nowrap; }
+
+.usage { display:flex; align-items:center; gap:8px; font-size:10.5px; }
+.u-k { color:var(--t2); flex:none; width:18px; }
+.track { flex:1; height:6px; border-radius:4px; background:var(--track); overflow:hidden; }
+.fill { display:block; height:100%; background:var(--accent); border-radius:4px; }
+.seat--resting .fill, .seat--queued .fill { background:var(--amber); }
+.u-v { color:var(--t1); font-weight:700; min-width:36px; text-align:right; }
+
+.reassure { color:var(--amber); font-size:10.5px; margin-top:6px; }
+
+.expand { display:none; margin-top:9px; padding-top:9px; border-top:1px solid var(--line); }
+.seat.expanded .expand { display:block; }
+.seat.expanded .expand .usage { margin-bottom:7px; }
+.x-row { display:flex; justify-content:space-between; font-size:11px; color:var(--t2); padding:3px 0; }
+.logout { margin-top:6px; background:none; border:none; color:var(--rose); font:inherit; font-size:11px; cursor:pointer; }
+
+.add-row { width:100%; margin-top:4px; padding:8px; border:1px dashed var(--line); background:transparent;
+  color:var(--t2); border-radius:10px; cursor:pointer; font:inherit; font-size:12px; }
+.add-row:hover { color:var(--t1); border-color:var(--accent); }
+.empty { color:var(--t2); font-size:12px; padding:6px 2px; }
+
+.foot { display:flex; justify-content:space-between; align-items:center; margin-top:6px;
+  color:var(--t2); font-size:11px; }
+.link { background:none; border:none; color:var(--t2); cursor:pointer; font:inherit; }
+.link:hover { color:var(--t1); }
+
+/* overlays */
+#overlay:empty { display:none; }
+.backdrop { position:fixed; inset:0; background:rgba(12,18,30,.45); display:flex; align-items:center;
+  justify-content:center; padding:18px; }
+.sheet { background:var(--popover); color:var(--t1); border:1px solid var(--line); border-radius:14px;
+  padding:16px; width:100%; max-width:300px; text-align:center; font-family:var(--sans); }
+.sheet h3 { font-size:14px; } .sheet .sub { color:var(--t2); font-size:11px; margin-bottom:12px; }
+.pk-m { display:block; width:100%; margin:6px 0; padding:10px; border:none; border-radius:9px;
+  background:var(--good); color:#04130d; font:inherit; font-weight:700; cursor:pointer; }
+.paste { width:100%; height:92px; margin-bottom:10px; border-radius:9px; border:1px solid var(--line);
+  background:var(--card); color:var(--t1); font-size:11px; padding:8px; }
+/* settings sub-view (spec §9.1) — pushed screen inside the popover, not a modal ------------------ */
+.set-app { padding:0; display:flex; flex-direction:column; max-height:620px; }
+.set-head { display:flex; align-items:center; gap:11px; padding:13px 14px; border-bottom:1px solid var(--line); }
+.set-back { width:28px; height:28px; border-radius:8px; background:var(--elevated); border:1px solid var(--line);
+  color:var(--t1); font-size:16px; line-height:1; cursor:pointer; display:flex; align-items:center; justify-content:center; }
+.set-title { flex:1; font-weight:800; font-size:15px; }
+.set-done { font-weight:700; font-size:13px; color:var(--codex); background:transparent; border:none; cursor:pointer; padding:4px; }
+.set-body { flex:1; min-height:0; overflow-y:auto; padding:15px 14px 6px; display:flex; flex-direction:column; gap:18px; }
+.set-sec { display:flex; flex-direction:column; gap:8px; }
+.set-label { font-size:10.5px; font-weight:800; letter-spacing:.06em; text-transform:uppercase; color:var(--t3); padding-left:3px; }
+.set-card { background:var(--card); border:1px solid var(--line); border-radius:14px; overflow:hidden; }
+.set-card > * + * { border-top:1px solid var(--line); }
+.set-toggle-row { display:flex; align-items:center; gap:11px; padding:12px 13px; cursor:pointer; }
+.set-seg-row { display:flex; flex-direction:column; gap:9px; padding:12px 13px; }
+.set-tx { flex:1; display:flex; flex-direction:column; gap:1px; }
+.set-t { font-weight:700; font-size:13px; color:var(--t1); }
+.set-s { font-size:11px; color:var(--t2); line-height:1.35; }
+.set-seg { display:flex; gap:4px; background:var(--elevated); border:1px solid var(--line); border-radius:11px; padding:4px; }
+.set-seg .sopt { flex:1; height:32px; border-radius:8px; border:none; cursor:pointer; font:inherit; font-size:12px;
+  font-weight:700; white-space:nowrap; background:transparent; color:var(--t2); transition:background .15s, color .15s; }
+.set-seg .sopt.on { background:var(--codex); color:#fff; }
+.set-legend { display:flex; flex-direction:column; gap:8px; padding:12px 13px; }
+.set-legend-row { display:flex; align-items:center; gap:8px; }
+.set-ver { text-align:center; font-size:11px; color:var(--t3); padding:4px 0 8px; }
+
+.celebrate { animation:pop .5s ease; }
+@keyframes pop { 0%{transform:scale(.99)} 50%{transform:scale(1.01)} 100%{transform:scale(1)} }
+
+body{background:#c7d4ea;display:flex;gap:24px;padding:24px;flex-wrap:wrap;font-family:system-ui}
+.frame{width:376px;border-radius:16px;overflow:hidden;box-shadow:0 20px 50px rgba(0,0,0,.3)}</style>
+<div class=frame><div class="app theme-light">
+    <header class="top">
+      <span class="avatar door door--open" role="img" aria-label="a model's free — come on in"><span class="door-room"><span class="door-string"></span><span class="door-ball"></span><span class="tw tw1"></span><span class="tw tw2"></span><span class="tw tw3"></span><span class="tw tw4"></span></span><span class="door-leaf"></span></span>
+      <span class="brand-tx"><span class="brand"><span class="ai">ai</span> guest list</span>
+        <span class="substatus">0 resting · 0 ready 💛</span></span>
+      <span class="top-actions">
+        <button class="ibtn" data-action="settings" title="settings">⋯</button>
+        <button class="ibtn" data-action="add" data-tool="codex" title="add a seat">＋</button>
+      </span>
+    </header>
+    <label class="ctl">
+    <span class="ctl-ic ic-auto"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="none"
+  stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+  d="M12.5 4.5a5 5 0 1 0 1.2 3.3"/><path fill="currentColor" d="M13.5 2.2l.6 2.8-2.8.2z"/></svg></span>
+    <span class="ctl-tx"><span class="ctl-t">auto-switch</span>
+      <span class="ctl-s">next ready seat · soonest-reset wins</span></span>
+    <input type="checkbox" data-action="toggle" data-key="auto_switch" ><span class="sw"></span>
+  </label>
+    <label class="ctl">
+    <span class="ctl-ic ic-hr"><svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><g fill="currentColor">
+  <rect x="2" y="3" width="12" height="2" rx="1"/><rect x="4" y="7" width="8" height="2" rx="1"/>
+  <rect x="6" y="11" width="4" height="2" rx="1"/></g></svg></span>
+    <span class="ctl-tx"><span class="ctl-t">Headroom <span class="mono ctl-chip">COMPRESSES CONTEXT</span></span>
+      <span class="ctl-s">wrapping Codex &amp; Claude · ~68% fewer tokens (est.) 💛</span></span>
+    <input type="checkbox" data-action="toggle" data-key="headroom" checked><span class="sw"></span>
+  </label>
+    
+    
+    <section class="group" style="--accent:var(--codex)">
+    <div class="g-head">
+      <span class="dot dot--accent"></span>
+      <span class="g-name">Codex</span><span class="g-count">· 2 seats</span>
+      <span class="grow"></span><span class="mono g-meta">CHATGPT BUSINESS</span>
+    </div>
+    <div class="seat seat--active" data-card data-tool="codex" data-email="work@x.com">
+    <div class="seat-row">
+      <span class="dot dot--active"></span>
+      <span class="seat-name"></span><span class="mono chip">Business</span>
+      <span class="grow"></span><span class="pill floor">on the floor</span>
+    </div>
+    <div class="seat-email mono">work@x.com</div>
+    <div class="usage"><span class="mono u-k">5h</span>
+    <span class="track"><span class="fill" style="width:62%"></span></span>
+    <span class="mono u-v">62%</span></div>
+    
+    <div class="expand">
+    <div class="usage"><span class="mono u-k">7d</span>
+    <span class="track"><span class="fill" style="width:40%"></span></span>
+    <span class="mono u-v">40%</span></div>
+    <div class="x-row"><span>credit left</span><span class="mono">38%</span></div>
+    
+    <button class="logout" data-action="remove" data-tool="codex" data-email="work@x.com">log out ↗</button>
+  </div>
+  </div><div class="seat seat--resting" data-card data-tool="codex" data-email="side@x.com">
+    <div class="seat-row">
+      <span class="dot dot--resting"></span>
+      <span class="seat-name"></span><span class="mono chip">Pro</span>
+      <span class="grow"></span><span class="mono rest-count">back in </span>
+    </div>
+    <div class="seat-email mono">side@x.com</div>
+    <div class="usage"><span class="mono u-k">5h</span>
+    <span class="track"><span class="fill" style="width:100%"></span></span>
+    <span class="mono u-v">100%</span></div>
+    <div class="reassure mono">taking a breather — back  💛</div>
+    <div class="expand">
+    <div class="usage"><span class="mono u-k">7d</span>
+    <span class="track"><span class="fill" style="width:40%"></span></span>
+    <span class="mono u-v">40%</span></div>
+    <div class="x-row"><span>credit left</span><span class="mono">0%</span></div>
+    
+    <button class="logout" data-action="remove" data-tool="codex" data-email="side@x.com">log out ↗</button>
+  </div>
+  </div>
+    <button class="add-row" data-action="add" data-tool="codex">＋ add a seat</button>
+  </section>
+    <section class="group" style="--accent:var(--claude)">
+    <div class="g-head">
+      <span class="dot dot--accent"></span>
+      <span class="g-name">Claude</span><span class="g-count">· 1 seat</span>
+      <span class="grow"></span><span class="mono g-meta">CLAUDE MAX</span>
+    </div>
+    <div class="seat seat--ready" data-card data-tool="claude" data-email="franz@x.com">
+    <div class="seat-row">
+      <span class="dot dot--ready"></span>
+      <span class="seat-name"></span><span class="mono chip">Max</span>
+      <span class="grow"></span><button class="btn switch" data-action="switch" data-tool="claude" data-email="franz@x.com">switch</button>
+    </div>
+    <div class="seat-email mono">franz@x.com</div>
+    <div class="usage"><span class="mono u-k">5h</span>
+    <span class="track"><span class="fill" style="width:18%"></span></span>
+    <span class="mono u-v">18%</span></div>
+    
+    <div class="expand">
+    <div class="usage"><span class="mono u-k">7d</span>
+    <span class="track"><span class="fill" style="width:40%"></span></span>
+    <span class="mono u-v">40%</span></div>
+    <div class="x-row"><span>credit left</span><span class="mono">60%</span></div>
+    
+    <button class="logout" data-action="remove" data-tool="claude" data-email="franz@x.com">log out ↗</button>
+  </div>
+  </div>
+    <button class="add-row" data-action="add" data-tool="claude">＋ add a seat</button>
+  </section>
+    <footer class="foot"><span>made with <span class="heart">💛</span></span>
+      <button class="link" data-action="quit">quit</button></footer>
+  </div></div>
+<div class=frame><div class="app theme-dark">
+    <header class="top">
+      <span class="avatar door door--open" role="img" aria-label="a model's free — come on in"><span class="door-room"><span class="door-string"></span><span class="door-ball"></span><span class="tw tw1"></span><span class="tw tw2"></span><span class="tw tw3"></span><span class="tw tw4"></span></span><span class="door-leaf"></span></span>
+      <span class="brand-tx"><span class="brand"><span class="ai">ai</span> guest list</span>
+        <span class="substatus">0 resting · 0 ready 💛</span></span>
+      <span class="top-actions">
+        <button class="ibtn" data-action="settings" title="settings">⋯</button>
+        <button class="ibtn" data-action="add" data-tool="codex" title="add a seat">＋</button>
+      </span>
+    </header>
+    <label class="ctl">
+    <span class="ctl-ic ic-auto"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="none"
+  stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+  d="M12.5 4.5a5 5 0 1 0 1.2 3.3"/><path fill="currentColor" d="M13.5 2.2l.6 2.8-2.8.2z"/></svg></span>
+    <span class="ctl-tx"><span class="ctl-t">auto-switch</span>
+      <span class="ctl-s">next ready seat · soonest-reset wins</span></span>
+    <input type="checkbox" data-action="toggle" data-key="auto_switch" ><span class="sw"></span>
+  </label>
+    <label class="ctl">
+    <span class="ctl-ic ic-hr"><svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><g fill="currentColor">
+  <rect x="2" y="3" width="12" height="2" rx="1"/><rect x="4" y="7" width="8" height="2" rx="1"/>
+  <rect x="6" y="11" width="4" height="2" rx="1"/></g></svg></span>
+    <span class="ctl-tx"><span class="ctl-t">Headroom <span class="mono ctl-chip">COMPRESSES CONTEXT</span></span>
+      <span class="ctl-s">wrapping Codex &amp; Claude · ~68% fewer tokens (est.) 💛</span></span>
+    <input type="checkbox" data-action="toggle" data-key="headroom" checked><span class="sw"></span>
+  </label>
+    
+    
+    <section class="group" style="--accent:var(--codex)">
+    <div class="g-head">
+      <span class="dot dot--accent"></span>
+      <span class="g-name">Codex</span><span class="g-count">· 2 seats</span>
+      <span class="grow"></span><span class="mono g-meta">CHATGPT BUSINESS</span>
+    </div>
+    <div class="seat seat--active" data-card data-tool="codex" data-email="work@x.com">
+    <div class="seat-row">
+      <span class="dot dot--active"></span>
+      <span class="seat-name"></span><span class="mono chip">Business</span>
+      <span class="grow"></span><span class="pill floor">on the floor</span>
+    </div>
+    <div class="seat-email mono">work@x.com</div>
+    <div class="usage"><span class="mono u-k">5h</span>
+    <span class="track"><span class="fill" style="width:62%"></span></span>
+    <span class="mono u-v">62%</span></div>
+    
+    <div class="expand">
+    <div class="usage"><span class="mono u-k">7d</span>
+    <span class="track"><span class="fill" style="width:40%"></span></span>
+    <span class="mono u-v">40%</span></div>
+    <div class="x-row"><span>credit left</span><span class="mono">38%</span></div>
+    
+    <button class="logout" data-action="remove" data-tool="codex" data-email="work@x.com">log out ↗</button>
+  </div>
+  </div><div class="seat seat--resting" data-card data-tool="codex" data-email="side@x.com">
+    <div class="seat-row">
+      <span class="dot dot--resting"></span>
+      <span class="seat-name"></span><span class="mono chip">Pro</span>
+      <span class="grow"></span><span class="mono rest-count">back in </span>
+    </div>
+    <div class="seat-email mono">side@x.com</div>
+    <div class="usage"><span class="mono u-k">5h</span>
+    <span class="track"><span class="fill" style="width:100%"></span></span>
+    <span class="mono u-v">100%</span></div>
+    <div class="reassure mono">taking a breather — back  💛</div>
+    <div class="expand">
+    <div class="usage"><span class="mono u-k">7d</span>
+    <span class="track"><span class="fill" style="width:40%"></span></span>
+    <span class="mono u-v">40%</span></div>
+    <div class="x-row"><span>credit left</span><span class="mono">0%</span></div>
+    
+    <button class="logout" data-action="remove" data-tool="codex" data-email="side@x.com">log out ↗</button>
+  </div>
+  </div>
+    <button class="add-row" data-action="add" data-tool="codex">＋ add a seat</button>
+  </section>
+    <section class="group" style="--accent:var(--claude)">
+    <div class="g-head">
+      <span class="dot dot--accent"></span>
+      <span class="g-name">Claude</span><span class="g-count">· 1 seat</span>
+      <span class="grow"></span><span class="mono g-meta">CLAUDE MAX</span>
+    </div>
+    <div class="seat seat--ready" data-card data-tool="claude" data-email="franz@x.com">
+    <div class="seat-row">
+      <span class="dot dot--ready"></span>
+      <span class="seat-name"></span><span class="mono chip">Max</span>
+      <span class="grow"></span><button class="btn switch" data-action="switch" data-tool="claude" data-email="franz@x.com">switch</button>
+    </div>
+    <div class="seat-email mono">franz@x.com</div>
+    <div class="usage"><span class="mono u-k">5h</span>
+    <span class="track"><span class="fill" style="width:18%"></span></span>
+    <span class="mono u-v">18%</span></div>
+    
+    <div class="expand">
+    <div class="usage"><span class="mono u-k">7d</span>
+    <span class="track"><span class="fill" style="width:40%"></span></span>
+    <span class="mono u-v">40%</span></div>
+    <div class="x-row"><span>credit left</span><span class="mono">60%</span></div>
+    
+    <button class="logout" data-action="remove" data-tool="claude" data-email="franz@x.com">log out ↗</button>
+  </div>
+  </div>
+    <button class="add-row" data-action="add" data-tool="claude">＋ add a seat</button>
+  </section>
+    <footer class="foot"><span>made with <span class="heart">💛</span></span>
+      <button class="link" data-action="quit">quit</button></footer>
+  </div></div>
+<div class=frame><div class="app set-app theme-light">
+    <header class="set-head">
+      <button class="set-back" data-action="settings-back" title="back">‹</button>
+      <span class="set-title">settings</span>
+      <button class="set-done" data-action="settings-back">done</button>
+    </header>
+    <div class="set-body">
+      <section class="set-sec"><span class="set-label">auto-switch</span>
+    <div class="set-card">
+      <div class="set-seg-row">
+    <div class="set-tx"><span class="set-t">when a seat runs out</span><span class="set-s">i jump to whoever's got the most room left to breathe</span></div>
+    <div class="set-seg"><button class="sopt on" data-action="set_strategy" data-value="most_headroom">most headroom</button><button class="sopt " data-action="set_strategy" data-value="soonest_back">soonest back</button></div></div>
+      <label class="set-toggle-row">
+    <span class="set-tx"><span class="set-t">keep me on the same tool</span><span class="set-s">a Codex limit hops to your other Codex seat, never to Claude</span></span>
+    <input type="checkbox" data-action="toggle" data-key="same_tool_only" checked><span class="sw"></span></label>
+      <label class="set-toggle-row">
+    <span class="set-tx"><span class="set-t">tell me when it switches</span><span class="set-s">a gentle notification with who's on now</span></span>
+    <input type="checkbox" data-action="toggle" data-key="notify" checked><span class="sw"></span></label>
+      <label class="set-toggle-row">
+    <span class="set-tx"><span class="set-t">restart Codex after a swap</span><span class="set-s">Codex needs a fresh start · Claude picks it up live</span></span>
+    <input type="checkbox" data-action="toggle" data-key="restart_app" ><span class="sw"></span></label>
+    </div></section>
+      <section class="set-sec"><span class="set-label">headroom</span>
+    <div class="set-card">
+      <label class="set-toggle-row">
+    <span class="set-tx"><span class="set-t">wrap new sessions</span><span class="set-s">compress context so every limit stretches further</span></span>
+    <input type="checkbox" data-action="toggle" data-key="headroom" checked><span class="sw"></span></label>
+      <div class="set-seg-row">
+    <div class="set-tx"><span class="set-t">savings level</span><span class="set-s">balanced — strong savings, full fidelity</span></div>
+    <div class="set-seg"><button class="sopt " data-action="set_savings_level" data-value="conservative">easy</button><button class="sopt on" data-action="set_savings_level" data-value="moderate">balanced</button><button class="sopt " data-action="set_savings_level" data-value="aggressive">max</button></div></div>
+    </div></section>
+      <section class="set-sec"><span class="set-label">appearance</span>
+    <div class="set-card">
+      <div class="set-seg-row">
+    <div class="set-tx"><span class="set-t">theme</span></div>
+    <div class="set-seg"><button class="sopt on" data-action="set_theme" data-value="light">light</button><button class="sopt " data-action="set_theme" data-value="dark">dark</button></div></div>
+      <div class="set-legend">
+        <span class="set-t">what the icon shows</span>
+        <div class="set-legend-row"><span class="avatar door door--open" role="img" aria-label="a model's free — come on in"><span class="door-room"><span class="door-string"></span><span class="door-ball"></span><span class="tw tw1"></span><span class="tw tw2"></span><span class="tw tw3"></span><span class="tw tw4"></span></span><span class="door-leaf"></span></span><span class="set-s">a model's free — come on in</span></div>
+        <div class="set-legend-row"><span class="avatar door door--shut" role="img" aria-label="every seat's resting"><span class="door-room"></span><span class="door-panel"></span><span class="door-knob"></span></span><span class="set-s">every seat's resting</span></div>
+        <div class="set-legend-row"><span class="dot dot--queued"></span><span class="set-s">just switched you</span></div>
+        <div class="set-legend-row"><span class="dot dot--needs-login"></span><span class="set-s">a seat needs a hello</span></div>
+      </div>
+    </div></section>
+      <div class="set-ver">ai guest list v0.1.0 · build 1</div>
+    </div>
+  </div></div>

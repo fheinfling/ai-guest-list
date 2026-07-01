@@ -69,11 +69,12 @@ test("fmtCountdown", () => {
   assert.equal(fmtCountdown("2026-06-28T14:30:00Z", now), "2h 30m");
 });
 
-test("type discipline: wordmark + email are mono, seat name is NOT", () => {
+test("type discipline: Outfit wordmark w/ gold 'ai', email mono, seat name NOT mono", () => {
   const s = state({ tools: { codex: { plan_label: "CHATGPT BUSINESS",
     seats: [seat({ status: "ready" })] }, claude: { seats: [] } } });
   const html = buildHTML(s);
-  assert.match(html, /class="brand mono"/);                 // wordmark mono
+  assert.match(html, /class="brand"><span class="ai">ai<\/span> guest list/);  // Outfit wordmark, accented "ai"
+  assert.doesNotMatch(html, /class="brand mono"/);          // wordmark is no longer mono
   assert.match(html, /class="seat-email mono"[^>]*>work@x\.com/);  // email mono
   assert.match(html, /class="seat-name">Work</);            // name is sans (no mono class)
 });
@@ -147,12 +148,31 @@ test("overlays wire their actions", () => {
   assert.match(set, /data-action="set_theme"[^>]*data-value="dark"/);
 });
 
-test("settings sheet renders the savings-level selector when headroom is on", () => {
+test("settings is a pushed sub-view, not a modal (spec §9.1)", () => {
+  const set = buildSettings({ settings: { theme: "light", strategy: "soonest_back", headroom: false } });
+  // no dimming modal backdrop/sheet — it renders in place as the popover surface
+  assert.doesNotMatch(set, /class="backdrop"/);
+  assert.doesNotMatch(set, /class="sheet/);
+  assert.match(set, /class="app set-app theme-light"/);
+  // back chevron + done both pop to main
+  assert.match(set, /data-action="settings-back"[^>]*title="back"/);
+  assert.match(set, /data-action="settings-back"[^>]*>done</);
+  // grouped section labels
+  for (const label of ["auto-switch", "headroom", "appearance"]) assert.ok(set.includes(`>${label}<`));
+  // every control row carries a one-line subtitle
+  assert.match(set, /class="set-s"/);
+  // quiet version footer, and the prototype-only demo group is dropped
+  assert.match(set, /class="set-ver"/);
+  assert.doesNotMatch(set, /cap both Codex seats|try the demo/i);
+});
+
+test("settings renders the savings-level selector only when headroom is on", () => {
   const on = buildSettings({ settings: { theme: "light", strategy: "soonest_back", headroom: true, savings_level: "moderate" } });
-  assert.match(on, /data-action="set_savings_level"[^>]*data-value="conservative"/);
-  assert.match(on, /data-action="set_savings_level"[^>]*data-value="aggressive"/);
+  // friendly labels are display-only; data-value carries the real persisted level
+  assert.match(on, /data-action="set_savings_level"[^>]*data-value="conservative"[^>]*>easy</);
+  assert.match(on, /data-action="set_savings_level"[^>]*data-value="aggressive"[^>]*>max</);
   // the current level is marked selected
-  assert.match(on, /class="seg on"[^>]*data-value="moderate"/);
+  assert.match(on, /class="sopt on"[^>]*data-value="moderate"/);
   // hidden when Headroom is off (nothing to configure)
   const off = buildSettings({ settings: { theme: "light", strategy: "soonest_back", headroom: false } });
   assert.doesNotMatch(off, /set_savings_level/);
