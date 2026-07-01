@@ -333,15 +333,17 @@ export function buildHTML(state) {
         <button class="ibtn" data-action="add" data-tool="codex" title="add a seat">＋</button>
       </span>
     </header>
-    ${controlBar({ icon: REFRESH, title: "auto-switch", sub: "next ready seat · soonest-reset wins",
-                   key: "auto_switch", on: s.auto_switch, accentClass: "ic-auto" })}
-    ${controlBar({ icon: FUNNEL, title: "Headroom", chip: "COMPRESSES CONTEXT", sub: hrSub,
-                   key: "headroom", on: s.headroom && hr, accentClass: "ic-hr" })}
-    ${hr ? "" : `<button class="hr-install" data-action="headroom_install">install Headroom →</button>`}
-    ${moved}
-    ${toolGroup("codex", state?.tools?.codex)}
-    ${toolGroup("claude", state?.tools?.claude)}
-    <footer class="foot"><span>made with <span class="heart">💛</span></span>
-      <button class="link" data-action="quit">quit</button></footer>
+    <div class="main-body">
+      ${controlBar({ icon: REFRESH, title: "auto-switch", sub: "next ready seat · soonest-reset wins",
+                     key: "auto_switch", on: s.auto_switch, accentClass: "ic-auto" })}
+      ${controlBar({ icon: FUNNEL, title: "Headroom", chip: "COMPRESSES CONTEXT", sub: hrSub,
+                     key: "headroom", on: s.headroom && hr, accentClass: "ic-hr" })}
+      ${hr ? "" : `<button class="hr-install" data-action="headroom_install">install Headroom →</button>`}
+      ${moved}
+      ${toolGroup("codex", state?.tools?.codex)}
+      ${toolGroup("claude", state?.tools?.claude)}
+      <footer class="foot"><span>made with <span class="heart">💛</span></span>
+        <button class="link" data-action="quit">quit</button></footer>
+    </div>
   </div>`;
 }

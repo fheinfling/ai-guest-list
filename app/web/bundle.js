@@ -336,16 +336,18 @@ function buildHTML(state) {
         <button class="ibtn" data-action="add" data-tool="codex" title="add a seat">＋</button>
       </span>
     </header>
-    ${controlBar({ icon: REFRESH, title: "auto-switch", sub: "next ready seat · soonest-reset wins",
-                   key: "auto_switch", on: s.auto_switch, accentClass: "ic-auto" })}
-    ${controlBar({ icon: FUNNEL, title: "Headroom", chip: "COMPRESSES CONTEXT", sub: hrSub,
-                   key: "headroom", on: s.headroom && hr, accentClass: "ic-hr" })}
-    ${hr ? "" : `<button class="hr-install" data-action="headroom_install">install Headroom →</button>`}
-    ${moved}
-    ${toolGroup("codex", state?.tools?.codex)}
-    ${toolGroup("claude", state?.tools?.claude)}
-    <footer class="foot"><span>made with <span class="heart">💛</span></span>
-      <button class="link" data-action="quit">quit</button></footer>
+    <div class="main-body">
+      ${controlBar({ icon: REFRESH, title: "auto-switch", sub: "next ready seat · soonest-reset wins",
+                     key: "auto_switch", on: s.auto_switch, accentClass: "ic-auto" })}
+      ${controlBar({ icon: FUNNEL, title: "Headroom", chip: "COMPRESSES CONTEXT", sub: hrSub,
+                     key: "headroom", on: s.headroom && hr, accentClass: "ic-hr" })}
+      ${hr ? "" : `<button class="hr-install" data-action="headroom_install">install Headroom →</button>`}
+      ${moved}
+      ${toolGroup("codex", state?.tools?.codex)}
+      ${toolGroup("claude", state?.tools?.claude)}
+      <footer class="foot"><span>made with <span class="heart">💛</span></span>
+        <button class="link" data-action="quit">quit</button></footer>
+    </div>
   </div>`;
 }
 
@@ -398,15 +400,18 @@ function closeOverlay() { overlay.innerHTML = ""; }
 // which screen occupies the popover: "main" or the settings sub-view (spec §9.1 — a pushed
 // sub-view on the same surface, never a modal).
 let screen = "main";
+let renderedScreen = null;  // what the last render() actually drew — gates scroll preservation
 
 function render() {
-  // A background state push (the usage poll) re-renders whatever screen is up; carry the settings
-  // body's scroll position across the innerHTML swap so a poll doesn't snap it back to the top.
-  const prevBody = root.querySelector(".set-body");
-  const scrollTop = prevBody ? prevBody.scrollTop : 0;
+  // A background state push (the usage poll) re-renders whatever screen is up; carry the current
+  // screen's body scroll position across the innerHTML swap so a poll doesn't snap it to the top.
+  // Only when the screen is unchanged — navigating must start the new screen at the top.
+  const prevBody = root.querySelector(".main-body, .set-body");
+  const scrollTop = screen === renderedScreen && prevBody ? prevBody.scrollTop : 0;
   root.innerHTML = screen === "settings" ? buildSettings(state) : buildHTML(state);
+  renderedScreen = screen;
   if (scrollTop) {
-    const nextBody = root.querySelector(".set-body");
+    const nextBody = root.querySelector(".main-body, .set-body");
     if (nextBody) nextBody.scrollTop = scrollTop;
   }
   // mirror the theme onto <body> so overlays (siblings of #root) get the same CSS vars
