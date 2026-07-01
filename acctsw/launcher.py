@@ -244,6 +244,28 @@ def _set_winsize(master_fd: int, out_fd: int) -> None:
         pass
 
 
+# Terminal private modes a TUI child (claude/codex) turns on but cannot reset when we KILL it:
+# on a limit/auth hop the child gets SIGTERM→SIGKILL and never runs its own cleanup, so the shell
+# that inherits the terminal is left in mouse-reporting mode and spews coordinates (e.g. the
+# "\e[<35;86;2M" garbage seen at the prompt after a session ends). We disable mouse tracking and
+# bracketed paste and re-show the cursor. Alt-screen is deliberately left alone so an inline
+# session's visible output stays in the scrollback.
+_TERM_RESET = (
+    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l"  # all mouse-tracking modes off
+    b"\x1b[?2004l"  # bracketed paste off
+    b"\x1b[?25h"    # cursor visible
+)
+
+
+def _reset_terminal(out_fd: int) -> None:
+    """Undo the terminal private modes a TUI leaves set. No-op unless out_fd is a real terminal."""
+    try:
+        if os.isatty(out_fd):
+            os.write(out_fd, _TERM_RESET)
+    except OSError:
+        pass
+
+
 def _exitcode(raw_status: int) -> int:
     return (os.waitstatus_to_exitcode(raw_status)
             if hasattr(os, "waitstatus_to_exitcode") else raw_status)
@@ -313,6 +335,9 @@ def pty_spawn(argv: list, on_output: Callable[[bytes], bool]) -> int:
                 else:
                     watch.remove(stdin_fd)  # stdin EOF → stop watching (avoid busy-loop)
     finally:
+        # Re-assert the terminal's default private modes the child TUI may have left set (mouse
+        # tracking especially) — on the kill path the child never got to do this itself.
+        _reset_terminal(out_fd)
         if old_attrs is not None:
             termios.tcsetattr(stdin_fd, termios.TCSAFLUSH, old_attrs)
         if prev_winch is not None:
@@ -454,10 +479,6 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             if hit["reason"] is None:
                 return status  # clean exit — child's real exit code
 
-            if switches >= max_switches:
-                notify(f"hit the switch limit ({max_switches}); stopping")
-                return EXIT_GAVE_UP
-
             with ctx.locked():
                 state = ctx.load_state()
                 active = state.active(tool)
@@ -467,11 +488,19 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     dec = handle_auth_dead(ctx, state, tool, exclude=auth_failed)
                 else:
                     dec = handle_limit(ctx, state, tool, get=get, exclude=auth_failed)
-                if dec.action == "switch":
+                # The switch cap gates only an actual seat hop. Classify FIRST: a false-alarm
+                # "resume" (usage says the active seat is healthy) must not be terminated just
+                # because earlier genuine switches used up the budget — that would kill a healthy
+                # session, the very bug this supervisor is meant to avoid.
+                hop_capped = dec.action == "switch" and switches >= max_switches
+                if dec.action == "switch" and not hop_capped:
                     switch(ctx, state, tool, dec.email, sync=(tool != "codex"))
                     _activate_codex_home(dec.email)
                     state.data["last_switch_at"] = iso(now())
                     state.save()
+            if hop_capped:
+                notify(f"hit the switch limit ({max_switches}); stopping")
+                return EXIT_GAVE_UP
             if dec.action == "switch":
                 reason_msg = ("needs you to sign in again 🔑" if hit["reason"] == "auth"
                               else "needs a rest 💤")

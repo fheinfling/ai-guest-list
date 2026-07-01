@@ -2,6 +2,8 @@
 
 No real PTY, no network: `spawn` is injected and `get` returns canned usage.
 """
+import os
+
 import pytest
 
 from acctsw import accounts as acct
@@ -162,6 +164,50 @@ def test_run_bails_with_gave_up_code_after_repeated_false_positives(ctx):
     assert rc == L.EXIT_GAVE_UP
     assert len(spawn.calls) == L.MAX_FALSE_ALARMS + 1   # initial + MAX_FALSE_ALARMS resumes, then bail
     assert ctx.load_state().active("codex") == "a@x.com"  # never switched away
+
+
+def test_run_false_positive_resumes_even_when_switch_budget_exhausted(ctx):
+    """The switch cap must gate only real seat hops. A false alarm on a healthy seat resumes the
+    SAME seat even when the switch budget is spent — otherwise a benign matching line would kill a
+    healthy session, the bug this supervisor exists to avoid."""
+    _two_codex(ctx)  # active a
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=20.0, secondary=70.0))})
+    spawn = FakeSpawn([
+        (b"... you've hit your usage limit ...\n", 1),  # false positive: usage says a is fine
+        (b"resumed, all good\n", 0),
+    ])
+    # max_switches=0: no seat hop is permitted, yet a false-alarm resume is not a hop.
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, max_switches=0, notify=lambda m: None)
+    assert rc == 0
+    assert spawn.calls[1][-2:] == ["resume", "--last"]   # resumed, not bailed with EXIT_GAVE_UP
+    assert ctx.load_state().active("codex") == "a@x.com"  # never switched away
+
+
+def test_run_resumes_healthy_seat_even_after_switch_cap(ctx):
+    """A false alarm arriving AFTER the switch budget is spent must still resume the healthy seat,
+    not bail with EXIT_GAVE_UP — the switch cap gates real hops, not false-positive resumes."""
+    _two_codex(ctx)  # active a
+    reset = iso(now() + timedelta(hours=3))
+    calls = {"n": 0}
+
+    def get(url, headers, timeout):
+        calls["n"] += 1
+        # first refresh (seat a) is genuinely limited (with a real future reset, so a stays resting
+        # and choose hops to b); every later refresh says healthy
+        body = (codex_ok_body(primary=100.0, p_reset=reset) if calls["n"] == 1
+                else codex_ok_body(primary=20.0))
+        return 200, body
+
+    spawn = FakeSpawn([
+        (b"... you've hit your usage limit ...\n", 1),  # iter1: genuine limit on a → switch to b
+        (b"... you've hit your usage limit ...\n", 1),  # iter2: false alarm on b, cap already spent
+        (b"resumed, all good\n", 0),                    # iter3: b resumes cleanly
+    ])
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, max_switches=1, notify=lambda m: None)
+    assert rc == 0
+    assert len(spawn.calls) == 3                          # did NOT bail at the cap on the false alarm
+    assert ctx.load_state().active("codex") == "b@x.com"  # switched once, then stayed on healthy b
+    assert spawn.calls[2][-2:] == ["resume", "--last"]    # last launch was a resume, not a fresh build
 
 
 def test_seat_confirmed_healthy_tolerates_malformed_window(ctx):
@@ -353,3 +399,34 @@ def test_pty_spawn_stop_path_terminates_without_error():
 def test_pty_spawn_nonzero_exit_propagates():
     rc = L.pty_spawn(["/bin/sh", "-c", "exit 7"], lambda c: False)
     assert rc == 7
+
+
+def test_reset_terminal_disables_mouse_tracking_on_tty():
+    """A killed TUI can't disable its own mouse reporting; teardown must, or the shell that
+    inherits the terminal spews "\\e[<..M" mouse coordinates at the prompt."""
+    import pty as _pty
+    master, slave = _pty.openpty()
+    try:
+        L._reset_terminal(slave)  # slave is a real tty → reset written
+        data = os.read(master, 4096)
+    finally:
+        os.close(master)
+        os.close(slave)
+    assert b"\x1b[?1000l" in data  # X10/normal mouse tracking off
+    assert b"\x1b[?1006l" in data  # SGR mouse mode off
+    assert b"\x1b[?25h" in data    # cursor restored
+
+
+def test_reset_terminal_noop_on_non_tty():
+    r, w = os.pipe()
+    try:
+        L._reset_terminal(w)  # pipe is not a tty → nothing written, no raise
+        os.set_blocking(r, False)
+        try:
+            leaked = os.read(r, 4096)
+        except BlockingIOError:
+            leaked = b""
+        assert leaked == b""
+    finally:
+        os.close(r)
+        os.close(w)
