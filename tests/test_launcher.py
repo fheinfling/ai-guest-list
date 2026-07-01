@@ -90,7 +90,9 @@ def _two_codex(ctx):
 
 
 class FakeSpawn:
-    """Returns scripted (output, status) per call; records argv of each launch."""
+    """Returns scripted (output, status) per call; records argv of each launch. ``output`` may be
+    a list of chunks to exercise repeated on_output calls within ONE child session; like the real
+    pty_spawn, the child "dies" (remaining chunks dropped) once on_output asks for a stop."""
 
     def __init__(self, scripts):
         self.scripts = scripts
@@ -99,7 +101,9 @@ class FakeSpawn:
     def __call__(self, argv, on_output):
         out, status = self.scripts[len(self.calls)]
         self.calls.append(list(argv))
-        on_output(out)
+        for chunk in (out if isinstance(out, list) else [out]):
+            if on_output(chunk):
+                break
         return status
 
 
@@ -138,76 +142,82 @@ def test_handle_limit_resumes_when_usage_confirms_healthy(ctx):
     assert state.active("codex") == "a@x.com"
 
 
-def test_run_resumes_same_seat_on_false_positive(ctx):
-    """A benign-but-matching line on a healthy seat resumes the SAME seat (no switch, no rest)."""
+def test_run_false_positive_never_kills_the_child(ctx):
+    """Verify-before-kill: a benign-but-matching line on a healthy seat is dismissed while the
+    child KEEPS RUNNING — no kill, no relaunch, no switch, no rest."""
     _two_codex(ctx)  # active a
     get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=20.0, secondary=70.0))})
     spawn = FakeSpawn([
-        (b"... you've hit your usage limit ...\n", 1),  # false positive: usage says a is fine
-        (b"resumed, all good\n", 0),
+        ([b"... you've hit your usage limit ...\n",   # false positive: usage says a is fine
+          b"carried on, all good\n"], 0),             # ...and the SAME child runs to completion
     ])
     rc = run(ctx, "codex", ["--foo"], spawn=spawn, get=get, notify=lambda m: None)
     assert rc == 0
-    assert spawn.calls[1][-2:] == ["resume", "--last"]   # resumed, not a fresh build
+    assert len(spawn.calls) == 1                          # never killed, never relaunched
     assert ctx.load_state().active("codex") == "a@x.com"  # never switched away
     assert ctx.load_state().get_seat("codex", "a@x.com").get("limited_until") is None
 
 
-def test_run_bails_with_gave_up_code_after_repeated_false_positives(ctx):
-    """A seat that keeps looking limited while usage says it's healthy stops supervising after the
-    bound — and reports EXIT_GAVE_UP (the "we gave up" sentinel), not the killed child's status."""
+def test_run_disables_scanning_after_repeated_false_positives(ctx, monkeypatch):
+    """Past the false-alarm bound the on-screen text is provably untrustworthy (persistent prose
+    about limits) — the supervisor stops SCANNING, not the session: no more usage probes, the child
+    runs on, and its own exit code comes back (never EXIT_GAVE_UP)."""
     _two_codex(ctx)  # active a
-    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=20.0, secondary=70.0))})
-    # every relaunch trips the detector again on healthy 'a' → resume, until the bound is exceeded
-    spawn = FakeSpawn([(b"... you've hit your usage limit ...\n", 1)] * (L.MAX_FALSE_ALARMS + 2))
-    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=lambda m: None)
-    assert rc == L.EXIT_GAVE_UP
-    assert len(spawn.calls) == L.MAX_FALSE_ALARMS + 1   # initial + MAX_FALSE_ALARMS resumes, then bail
-    assert ctx.load_state().active("codex") == "a@x.com"  # never switched away
+    monkeypatch.setattr(L, "PROBE_COOLDOWN_S", 0.0)  # let every chunk re-probe
+    probes = {"n": 0}
+
+    def get(url, headers, timeout):
+        probes["n"] += 1
+        return 200, codex_ok_body(primary=20.0, secondary=70.0)
+
+    msgs = []
+    chunks = [b"... you've hit your usage limit ...\n"] * (L.MAX_FALSE_ALARMS + 4)
+    spawn = FakeSpawn([(chunks, 0)])
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=msgs.append)
+    assert rc == 0
+    assert len(spawn.calls) == 1                       # never killed, never relaunched
+    assert probes["n"] == L.MAX_FALSE_ALARMS + 1       # scanning off past the bound → no more probes
+    assert any("ignoring limit" in m for m in msgs)
+    assert ctx.load_state().active("codex") == "a@x.com"
 
 
-def test_run_false_positive_resumes_even_when_switch_budget_exhausted(ctx):
-    """The switch cap must gate only real seat hops. A false alarm on a healthy seat resumes the
-    SAME seat even when the switch budget is spent — otherwise a benign matching line would kill a
-    healthy session, the bug this supervisor exists to avoid."""
+def test_run_false_positive_dismissed_even_when_switch_budget_exhausted(ctx):
+    """A dismissed false positive is not a hop: it must not interact with the switch budget."""
     _two_codex(ctx)  # active a
     get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=20.0, secondary=70.0))})
-    spawn = FakeSpawn([
-        (b"... you've hit your usage limit ...\n", 1),  # false positive: usage says a is fine
-        (b"resumed, all good\n", 0),
-    ])
-    # max_switches=0: no seat hop is permitted, yet a false-alarm resume is not a hop.
+    spawn = FakeSpawn([(b"... you've hit your usage limit ...\n", 0)])
+    # max_switches=0: no seat hop is permitted, yet the healthy session must survive the prose.
     rc = run(ctx, "codex", [], spawn=spawn, get=get, max_switches=0, notify=lambda m: None)
     assert rc == 0
-    assert spawn.calls[1][-2:] == ["resume", "--last"]   # resumed, not bailed with EXIT_GAVE_UP
+    assert len(spawn.calls) == 1
     assert ctx.load_state().active("codex") == "a@x.com"  # never switched away
 
 
-def test_run_resumes_healthy_seat_even_after_switch_cap(ctx):
-    """A false alarm arriving AFTER the switch budget is spent must still resume the healthy seat,
-    not bail with EXIT_GAVE_UP — the switch cap gates real hops, not false-positive resumes."""
+def test_run_false_positive_after_real_switch_keeps_session_alive(ctx):
+    """A genuine limit spends the switch budget; a later false alarm on the new seat is dismissed
+    in place — the session keeps running rather than bailing at the cap."""
     _two_codex(ctx)  # active a
     reset = iso(now() + timedelta(hours=3))
     calls = {"n": 0}
 
     def get(url, headers, timeout):
         calls["n"] += 1
-        # first refresh (seat a) is genuinely limited (with a real future reset, so a stays resting
-        # and choose hops to b); every later refresh says healthy
+        # first probe (seat a) is genuinely limited (with a real future reset, so a stays resting
+        # and choose hops to b); every later probe says healthy
         body = (codex_ok_body(primary=100.0, p_reset=reset) if calls["n"] == 1
                 else codex_ok_body(primary=20.0))
         return 200, body
 
     spawn = FakeSpawn([
-        (b"... you've hit your usage limit ...\n", 1),  # iter1: genuine limit on a → switch to b
-        (b"... you've hit your usage limit ...\n", 1),  # iter2: false alarm on b, cap already spent
-        (b"resumed, all good\n", 0),                    # iter3: b resumes cleanly
+        (b"... you've hit your usage limit ...\n", 1),   # iter1: genuine limit on a → switch to b
+        ([b"... you've hit your usage limit ...\n",      # iter2: false alarm on b, budget spent —
+          b"resumed, all good\n"], 0),                   # dismissed; the same child finishes cleanly
     ])
     rc = run(ctx, "codex", [], spawn=spawn, get=get, max_switches=1, notify=lambda m: None)
     assert rc == 0
-    assert len(spawn.calls) == 3                          # did NOT bail at the cap on the false alarm
+    assert len(spawn.calls) == 2                          # one real hop, then no more relaunches
     assert ctx.load_state().active("codex") == "b@x.com"  # switched once, then stayed on healthy b
-    assert spawn.calls[2][-2:] == ["resume", "--last"]    # last launch was a resume, not a fresh build
+    assert spawn.calls[1][-2:] == ["resume", "--last"]    # the hop carried the work along
 
 
 def test_seat_confirmed_healthy_tolerates_malformed_window(ctx):
@@ -219,6 +229,19 @@ def test_seat_confirmed_healthy_tolerates_malformed_window(ctx):
     summary = {"codex": {"a@x.com": "ok"}}  # endpoint reported success → guard inspects windows
     # null window must be skipped, not crash; the valid 20% window still confirms headroom
     assert L._seat_confirmed_healthy(state, "codex", "a@x.com", summary) is True
+
+
+def test_handle_limit_corroborated_skips_refetch_and_second_guess(ctx):
+    """When the verify-before-kill probe already confirmed the limit, handle_limit must neither
+    refetch usage (the probe did, moments ago) nor dismiss the kill as a false alarm."""
+    state = _two_codex(ctx)  # active a
+
+    def get(url, headers, timeout):
+        raise AssertionError("corroborated handle_limit must not hit the usage endpoint")
+
+    dec = handle_limit(ctx, state, "codex", get=get, corroborated=True)
+    assert dec.action == "switch" and dec.email == "b@x.com"
+    assert state.get_seat("codex", "a@x.com")["limited_until"] is not None  # reactive fallback
 
 
 def test_handle_limit_gives_up_when_all_limited(ctx):
@@ -318,6 +341,18 @@ def test_run_switches_to_healthy_seat_on_revoked_token(ctx):
     assert spawn.calls[1][-2:] == ["resume", "--last"]
     assert ctx.load_state().active("codex") == "b@x.com"
     assert any("sign in again" in m for m in msgs)
+
+
+def test_run_auth_prose_dismissed_when_token_provably_works(ctx):
+    """Auth-death prose while a usage fetch succeeds with the SAME creds is a false positive —
+    the token just authenticated a request, so don't hop; the child keeps running."""
+    _two_codex(ctx)  # active a
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=20.0, secondary=70.0))})
+    spawn = FakeSpawn([(b"... your refresh token was revoked ...\n", 0)])
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=lambda m: None)
+    assert rc == 0
+    assert len(spawn.calls) == 1                          # never killed, never relaunched
+    assert ctx.load_state().active("codex") == "a@x.com"  # no hop
 
 
 def test_run_gives_up_with_relogin_hint_when_only_seat_revoked(ctx):
