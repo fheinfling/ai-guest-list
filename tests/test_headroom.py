@@ -156,6 +156,93 @@ def test_unroute_claude_leaves_foreign_base_url_alone(tmp_path, monkeypatch):
 
 # --- proxy lifecycle ---------------------------------------------------------------------------
 
+def test_restart_proxy_only_cycles_a_running_proxy(tmp_path, monkeypatch):
+    """restart_proxy must NOT resurrect a stopped/reaped proxy (that would strand an orphan), but it
+    MUST cycle a running proxy — including a retained graceful-OFF one — to apply a new level."""
+    started = []
+    monkeypatch.setattr(headroom, "stop_proxy", lambda *a, **k: None)
+    monkeypatch.setattr(headroom, "start_proxy", lambda *a, **k: started.append(k.get("level")) or True)
+
+    monkeypatch.setattr(headroom, "proxy_maybe_running", lambda store: False)  # no proxy → no-op
+    assert headroom.restart_proxy(tmp_path / "s") is None                      # tri-state: nothing to do
+    assert started == []
+
+    monkeypatch.setattr(headroom, "proxy_maybe_running", lambda store: True)   # running → cycle
+    assert headroom.restart_proxy(tmp_path / "s", level="conservative") is True
+    assert started == ["conservative"]
+
+
+def test_restart_proxy_unroutes_when_replacement_fails(tmp_path, monkeypatch):
+    """Same port → we must stop before starting. If the replacement never comes up, a routed proxy
+    would leave codex/claude pointed at a dead 127.0.0.1:PORT — so restart_proxy must restore the
+    original config (go direct) instead. A graceful-OFF proxy (not routed) has nothing to unroute."""
+    restored = []
+    monkeypatch.setattr(headroom, "proxy_maybe_running", lambda store: True)
+    monkeypatch.setattr(headroom, "stop_proxy", lambda *a, **k: None)
+    monkeypatch.setattr(headroom, "start_proxy", lambda *a, **k: False)          # replacement fails
+    monkeypatch.setattr(headroom, "_remove_and_restore", lambda store, **k: restored.append(k) or (True, ""))
+
+    monkeypatch.setattr(headroom, "_any_injected", lambda: True)                 # was routed
+    assert headroom.restart_proxy(tmp_path / "s") is False
+    assert len(restored) == 1 and restored[0].get("reap_proxy") is True          # unrouted to go direct
+
+    restored.clear()
+    monkeypatch.setattr(headroom, "_any_injected", lambda: False)                # graceful-OFF, not routed
+    assert headroom.restart_proxy(tmp_path / "s") is False
+    assert restored == []                                                        # nothing to unroute
+
+
+def test_savings_env_profiles():
+    """The three UI-selectable levels map to valid Headroom env. Conservative must stay quality-
+    neutral (no user/system-message compression); aggressive is the agent-90 profile."""
+    cons = headroom.savings_env("conservative")
+    assert cons["HEADROOM_ACCURACY_GUARD"] == "strict"
+    assert cons["HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS"] == "3"
+    # RTK_WIRING is strictly validated by the proxy and only accepts enabled/disabled — a value like
+    # "1" crashes the proxy at boot. Guard against that regression.
+    assert cons["HEADROOM_RTK_WIRING"] in ("enabled", "disabled")
+    # quality-neutral: conservative never compresses live user/system content
+    assert "HEADROOM_COMPRESS_USER_MESSAGES" not in cons
+    assert "HEADROOM_COMPRESS_SYSTEM_MESSAGES" not in cons
+
+    mod = headroom.savings_env("moderate")
+    assert mod["HEADROOM_COMPRESS_USER_MESSAGES"] == "1"
+
+    agg = headroom.savings_env("aggressive")
+    assert agg["HEADROOM_SAVINGS_PROFILE"] == "agent-90"
+
+    # unknown level falls back to the default, never raises. The default is the quality-neutral
+    # "conservative" profile — it must NOT compress live user/system content (no silent opt-in).
+    assert headroom.DEFAULT_SAVINGS_LEVEL == "conservative"
+    dfl = headroom.savings_env(headroom.DEFAULT_SAVINGS_LEVEL)
+    assert "HEADROOM_COMPRESS_USER_MESSAGES" not in dfl
+    assert "HEADROOM_COMPRESS_SYSTEM_MESSAGES" not in dfl
+    assert headroom.savings_env("bogus") == headroom.savings_env(headroom.DEFAULT_SAVINGS_LEVEL)
+
+
+def test_start_proxy_applies_selected_savings_level(tmp_path, monkeypatch):
+    """start_proxy must inject the chosen level's compression env alongside the shaper env."""
+    monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
+    monkeypatch.setattr(headroom, "_port_busy", lambda *a, **k: False)
+    seen = {}
+
+    class _Proc:
+        pid = 5555
+
+    def fake_popen(argv, **k):
+        seen["env"] = k.get("env", {})
+        return _Proc()
+
+    states = iter([False, True])
+    monkeypatch.setattr(headroom, "proxy_ready", lambda *a, **k: next(states, True))
+    ok = headroom.start_proxy(tmp_path / "store", popen=fake_popen, sleep=lambda *_: None,
+                              level="conservative")
+    assert ok
+    assert seen["env"]["HEADROOM_ACCURACY_GUARD"] == "strict"
+    assert seen["env"]["HEADROOM_RTK_WIRING"] == "enabled"
+    assert seen["env"]["HEADROOM_OUTPUT_SHAPER"] == "1"     # shaper still applied alongside
+
+
 def test_start_proxy_passes_shaper_env_and_tracks_pid(tmp_path, monkeypatch):
     """start_proxy must launch `headroom proxy` with the shaper/holdout env (we own the child env now,
     no env-less plist) and record the pid so stop_proxy can kill it later."""

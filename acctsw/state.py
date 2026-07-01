@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from . import TOOLS
+from .headroom import DEFAULT_SAVINGS_LEVEL
 from .util import now, iso, write_json
 
 STATE_VERSION = 1
@@ -52,6 +53,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "restart_app": False,     # "restart Codex after a swap"
     "celebrations": True,     # "little celebrations"
     "strategy": "soonest_back",  # "soonest_back" | "most_headroom"
+    # Headroom compression level: "conservative" | "moderate" | "aggressive". Default sourced from
+    # headroom (single source of truth) so state files and the proxy-boot fallback never disagree.
+    "savings_level": DEFAULT_SAVINGS_LEVEL,
     "theme": "light",         # the design default
 }
 

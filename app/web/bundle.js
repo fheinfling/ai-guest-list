@@ -204,6 +204,33 @@ function setToggle(key, label, on) {
     <input type="checkbox" data-action="toggle" data-key="${key}" ${on ? "checked" : ""}><span class="sw"></span></label>`;
 }
 
+const SAVINGS_LEVELS = ["conservative", "moderate", "aggressive"];
+
+function fmtTokens(n) {
+  // Threshold at 999_500, not 1e6: Math.round(999_600 / 1e3) is 1000, which would render "1000k"
+  // instead of rolling over to "1.0M". Anything that rounds to >= 1000k belongs in the M bucket.
+  return n >= 999500 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : `${n}`;
+}
+
+// Lifetime totals from the proxy /stats endpoint, e.g. " · 12.7M tokens · $63 saved".
+function hrLifetime(stats) {
+  if (!stats) return "";
+  const bits = [];
+  // Number.isFinite (not truthy): a legitimately-zero total is still real info and must render, but
+  // anything non-numeric is rejected — /stats is an untrusted loopback response and these values go
+  // into innerHTML, so a stray string must never reach fmtTokens' `${n}` fallback.
+  if (Number.isFinite(stats.tokens_saved)) bits.push(`${fmtTokens(stats.tokens_saved)} tokens`);
+  if (Number.isFinite(stats.usd_saved)) bits.push(`$${Math.round(stats.usd_saved)} saved`);
+  return bits.length ? ` · ${bits.join(" · ")}` : "";
+}
+
+function savingsLevelRow(current) {
+  const lvl = SAVINGS_LEVELS.includes(current) ? current : "conservative";
+  const btns = SAVINGS_LEVELS.map((v) =>
+    `<button class="seg ${lvl === v ? "on" : ""}" data-action="set_savings_level" data-value="${v}">${v}</button>`).join("");
+  return `<div class="set-row"><span>savings level</span><span class="segs">${btns}</span></div>`;
+}
+
 function buildSettings(state) {
   const s = state?.settings || {};
   const theme = s.theme === "dark" ? "dark" : "light";
@@ -220,6 +247,7 @@ function buildSettings(state) {
     ${setToggle("notify", "notify when it switches", s.notify)}
     ${setToggle("restart_app", "restart Codex after a swap", s.restart_app)}
     ${setToggle("headroom", "Headroom by default", s.headroom)}
+    ${s.headroom ? savingsLevelRow(s.savings_level) : ""}
     <div class="set-row"><span>theme</span><span class="segs">
       <button class="seg ${theme === "light" ? "on" : ""}" data-action="set_theme" data-value="light">light</button>
       <button class="seg ${theme === "dark" ? "on" : ""}" data-action="set_theme" data-value="dark">dark</button></span></div>
@@ -236,11 +264,15 @@ function buildHTML(state) {
   const hr = state?.headroom_available;
   const c = state?.counts || { resting: 0, ready: 0 };
   const moved = state?.moved_note ? `<div class="event mono">↪ ${esc(state.moved_note)}</div>` : "";
-  const hrSub = hr
-    ? (state?.headroom_savings != null
-        ? `wrapping Codex &amp; Claude · ~${state.headroom_savings}% fewer tokens 💛`
-        : "wrapping Codex &amp; Claude 💛")
-    : "install Headroom to enable";
+  const hrSub = !hr
+    ? "install Headroom to enable"
+    : state?.headroom_proxy_down
+      // toggled on but the proxy isn't actually running (e.g. a restart failed) — say so rather than
+      // claim it's wrapping; recovery restarts it, so this clears itself.
+      ? "save-credit paused — reconnecting… 💛"
+      : (state?.headroom_savings != null
+          ? `wrapping Codex &amp; Claude · ~${state.headroom_savings}% fewer tokens (${state?.headroom_savings_measured ? "measured" : "est."})${hrLifetime(state?.headroom_stats)} 💛`
+          : "wrapping Codex &amp; Claude 💛");
   return `<div class="app theme-${theme}">
     <header class="top">
       ${doorMark(state)}
@@ -348,6 +380,7 @@ document.addEventListener("click", (e) => {
     case "settings": overlay.innerHTML = buildSettings(state); break;
     case "set_theme": send("set_theme", { value }); break;
     case "set_strategy": send("set_strategy", { value }); break;
+    case "set_savings_level": send("set_savings_level", { value }); break;
     case "quit": send("quit"); break;
   }
 });

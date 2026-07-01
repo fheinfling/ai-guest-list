@@ -142,7 +142,48 @@ test("overlays wire their actions", () => {
     /data-action="login"[^>]*data-command="codex login"/);
   assert.match(buildSaveSeat("claude"), /data-action="snapshot"[^>]*data-tool="claude"/);
   assert.match(buildPaste("claude"), /sk-ant-oat/);
-  const set = buildSettings({ settings: { theme: "light", strategy: "soonest_back", notify: true } });
+  const set = buildSettings({ settings: { theme: "light", strategy: "soonest_back", notify: true, headroom: true } });
   assert.match(set, /data-action="set_strategy"[^>]*data-value="most_headroom"/);
   assert.match(set, /data-action="set_theme"[^>]*data-value="dark"/);
+});
+
+test("settings sheet renders the savings-level selector when headroom is on", () => {
+  const on = buildSettings({ settings: { theme: "light", strategy: "soonest_back", headroom: true, savings_level: "moderate" } });
+  assert.match(on, /data-action="set_savings_level"[^>]*data-value="conservative"/);
+  assert.match(on, /data-action="set_savings_level"[^>]*data-value="aggressive"/);
+  // the current level is marked selected
+  assert.match(on, /class="seg on"[^>]*data-value="moderate"/);
+  // hidden when Headroom is off (nothing to configure)
+  const off = buildSettings({ settings: { theme: "light", strategy: "soonest_back", headroom: false } });
+  assert.doesNotMatch(off, /set_savings_level/);
+});
+
+test("buildHTML labels measured vs estimated savings and shows lifetime totals", () => {
+  const meas = buildHTML(state({ headroom_available: true, headroom_savings: 28,
+    headroom_savings_measured: true, headroom_stats: { tokens_saved: 12748404, usd_saved: 63.74 } }));
+  assert.match(meas, /28% fewer tokens \(measured\)/);
+  assert.match(meas, /12\.7M tokens · \$64 saved/);  // lifetime totals surfaced (63.74 → $64)
+  const est = buildHTML(state({ headroom_available: true, headroom_savings: 35,
+    headroom_savings_measured: false }));
+  assert.match(est, /35% fewer tokens \(est\.\)/);
+  // a legitimately-zero total still renders (must not be dropped as falsy)
+  const zero = buildHTML(state({ headroom_available: true, headroom_savings: 12,
+    headroom_savings_measured: true, headroom_stats: { tokens_saved: 4200, usd_saved: 0 } }));
+  assert.match(zero, /4k tokens · \$0 saved/);
+  // non-numeric stats (untrusted /stats response) must not reach innerHTML
+  const evil = buildHTML(state({ headroom_available: true, headroom_savings: 12,
+    headroom_savings_measured: true, headroom_stats: { tokens_saved: "<img src=x onerror=alert(1)>", usd_saved: "x" } }));
+  assert.doesNotMatch(evil, /<img src=x/);
+  // just-under-1M rolls over to "1.0M", not "1000k" (Math.round(999600/1e3) === 1000)
+  const rollover = buildHTML(state({ headroom_available: true, headroom_savings: 12,
+    headroom_savings_measured: true, headroom_stats: { tokens_saved: 999600, usd_saved: 5 } }));
+  assert.match(rollover, /1\.0M tokens/);
+  assert.doesNotMatch(rollover, /1000k/);
+});
+
+test("buildHTML shows a paused substatus when headroom is on but the proxy is down", () => {
+  const down = buildHTML(state({ headroom_available: true, headroom_proxy_down: true,
+    headroom_savings: 40, headroom_savings_measured: true }));
+  assert.match(down, /save-credit paused/);
+  assert.doesNotMatch(down, /fewer tokens/);  // don't claim it's wrapping while the proxy is dead
 });

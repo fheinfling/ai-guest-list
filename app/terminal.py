@@ -18,9 +18,17 @@ def open_in_terminal(command: str) -> None:
     """Open Terminal.app and run ``command`` (best-effort; macOS only)."""
     if not command:
         return
-    script = f'tell application "Terminal" to do script {json_escape(command)}\n' \
+    # Scrub PYTHONPATH/PYTHONHOME etc: py2app's launcher exports them pointing at the frozen app's 3.11
+    # stdlib zip, and Terminal (→ its shells → system python3) would inherit them and break with "can't
+    # find module 'encodings'". env=harden_env() only cleans the osascript process — but when Terminal
+    # is ALREADY running (the common case), `do script` runs in Terminal.app's own environment, not
+    # osascript's, so the new login shell would still inherit the frozen vars. Prepend an `unset` to the
+    # command the shell actually executes so the fix holds whether or not Terminal was already open.
+    from acctsw.headroom import _PY_ENV_STRIP, harden_env
+    scrubbed = f"unset {' '.join(_PY_ENV_STRIP)}; {command}"
+    script = f'tell application "Terminal" to do script {json_escape(scrubbed)}\n' \
              'tell application "Terminal" to activate'
-    subprocess.run(["osascript", "-e", script], capture_output=True)
+    subprocess.run(["osascript", "-e", script], capture_output=True, env=harden_env())
 
 
 def json_escape(s: str) -> str:
