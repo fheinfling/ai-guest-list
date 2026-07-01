@@ -36,7 +36,7 @@ jobs:
           node --test app/web/*.test.mjs
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}   # add this secret once at codecov.io
           files: coverage.xml
