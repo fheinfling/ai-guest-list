@@ -49,6 +49,76 @@ HARDENING_ENV = {
 # env-less launchd plist to work around anymore.
 SHAPER_ENV = {"HEADROOM_OUTPUT_SHAPER": "1"}
 
+# User-selectable input-side compression profiles (the "savings level" in the UI). These shrink
+# STALE context (old file-reads, large cold tool outputs) to cut INPUT tokens — orthogonal to the
+# output shaper (SHAPER_ENV) which trims the model's replies. All levels keep the shaper + holdout.
+#   conservative — quality-neutral: only stale reads/tool outputs, strict accuracy guard, protect
+#                  recent turns. Never compresses live user/system content.
+#   moderate     — also KOMPRESS older user/system messages (small chance of dropping wanted ctx).
+#   aggressive   — Headroom's shipped agent-90 profile (~90% context reduction; can degrade answers
+#                  on long sessions).
+# NB: HEADROOM_RTK_WIRING is strictly validated by the proxy (only "enabled"/"disabled") — a wrong
+# value (e.g. "1") crashes it at boot. Keep the literal exactly "enabled".
+SAVINGS_PROFILES: dict[str, dict[str, str]] = {
+    "conservative": {
+        "HEADROOM_OPTIMIZE": "1",
+        "HEADROOM_ACCURACY_GUARD": "strict",
+        "HEADROOM_PROTECT_RECENT": "3",
+        "HEADROOM_PROTECT_ANALYSIS_CONTEXT": "1",
+        "HEADROOM_MIN_TOKENS": "200",
+        "HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS": "3",
+        "HEADROOM_COMPRESSION_STABLE_AFTER_TURN": "2",
+        "HEADROOM_RTK_WIRING": "enabled",
+    },
+    "moderate": {
+        "HEADROOM_OPTIMIZE": "1",
+        "HEADROOM_ACCURACY_GUARD": "strict",
+        "HEADROOM_PROTECT_RECENT": "2",
+        "HEADROOM_PROTECT_ANALYSIS_CONTEXT": "1",
+        "HEADROOM_MIN_TOKENS": "160",
+        "HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS": "2",
+        "HEADROOM_COMPRESSION_STABLE_AFTER_TURN": "2",
+        "HEADROOM_RTK_WIRING": "enabled",
+        "HEADROOM_COMPRESS_USER_MESSAGES": "1",
+        "HEADROOM_COMPRESS_SYSTEM_MESSAGES": "1",
+        "HEADROOM_FORCE_KOMPRESS": "1",
+    },
+    "aggressive": {
+        "HEADROOM_OPTIMIZE": "1",
+        "HEADROOM_ACCURACY_GUARD": "strict",
+        "HEADROOM_PROTECT_RECENT": "2",
+        "HEADROOM_MIN_TOKENS": "120",
+        "HEADROOM_RTK_WIRING": "enabled",
+        "HEADROOM_COMPRESS_USER_MESSAGES": "1",
+        "HEADROOM_COMPRESS_SYSTEM_MESSAGES": "1",
+        "HEADROOM_FORCE_KOMPRESS": "1",
+        "HEADROOM_SAVINGS_PROFILE": "agent-90",
+        "HEADROOM_SAVINGS_TARGET": "0.90",
+        "HEADROOM_TARGET_RATIO": "0.10",
+        "HEADROOM_MAX_ITEMS": "8",
+    },
+}
+# Default to the quality-neutral profile: it NEVER compresses live user/system content, preserving
+# the old "don't touch input context" guarantee for users who never explicitly pick a level. Opting
+# into "moderate"/"aggressive" (which KOMPRESS user/system messages) must be a deliberate choice.
+DEFAULT_SAVINGS_LEVEL = "conservative"
+
+
+def savings_env(level: str | None) -> dict[str, str]:
+    """Env for the given savings level; unknown/None → the safe default. Never raises."""
+    return dict(SAVINGS_PROFILES.get(level or "", SAVINGS_PROFILES[DEFAULT_SAVINGS_LEVEL]))
+
+
+def _persisted_savings_level(store: Path | None) -> str:
+    """Read the user's chosen savings level from state (best-effort; default on any problem). Lets
+    recovery callers (launch/wake/heal) that only have a store path pick up the current level."""
+    try:
+        from .state import State
+        lvl = State.load((store or P.DATA_DIR) / "state.json").settings().get("savings_level")
+        return lvl if lvl in SAVINGS_PROFILES else DEFAULT_SAVINGS_LEVEL
+    except Exception:
+        return DEFAULT_SAVINGS_LEVEL
+
 PROXY_PORT = 8787                  # Headroom's default; we start `headroom proxy --port 8787`
 # Hold out a fraction of conversations UNSHAPED so `headroom output-savings` can report a real
 # *measured* A/B number (unbiased shaped-vs-unshaped), not just the synthetic-control "estimate".
@@ -398,7 +468,7 @@ def _adopt_proxy_pid(store: Path | None, port: int = PROXY_PORT) -> None:
 
 
 def start_proxy(store: Path | None = None, *, port: int = PROXY_PORT, popen=None, sleep=None,
-                ready_timeout: float = 30.0, clock=None) -> bool:
+                ready_timeout: float = 30.0, clock=None, level: str | None = None) -> bool:
     """Start the proxy detached + PID-tracked and block until /readyz is healthy (bounded by
     ready_timeout, ~30s). Idempotent: if a proxy already serves the port, adopt its PID (so we can
     still stop it) and return True. Fails fast if the port is held by a non-Headroom process. Returns
@@ -427,6 +497,7 @@ def start_proxy(store: Path | None = None, *, port: int = PROXY_PORT, popen=None
     _sleep = sleep or time.sleep
     env = harden_env()
     env.update(SHAPER_ENV)
+    env.update(savings_env(level if level is not None else _persisted_savings_level(store)))
     env["HEADROOM_OUTPUT_HOLDOUT"] = OUTPUT_HOLDOUT
     pidf = _proxy_pidfile(store)
     pidf.parent.mkdir(parents=True, exist_ok=True)
@@ -480,6 +551,44 @@ def routing_injected() -> bool:
     """True if Headroom routing is currently written into the tools' config (public predicate so
     callers outside this module don't reach into the private _any_injected)."""
     return _any_injected()
+
+
+def restart_proxy(store: Path | None = None, *, level: str | None = None) -> bool | None:
+    """Restart the proxy so a changed env (e.g. a new savings level) is re-read at boot — routing in
+    the tools' config already points at 127.0.0.1:PORT, so we only cycle the process, not the routing.
+    Serialized by op_lock. Tri-state return so the caller can react truthfully:
+      • None  — no proxy was running, nothing to do (the next start_proxy reads the persisted level);
+      • True  — restarted cleanly;
+      • False — the replacement failed to come up. Same port means we must stop the old proxy first, so
+                to avoid leaving routed clients pointed at a dead 127.0.0.1:PORT we unroute (restore the
+                original config) → codex/claude fall back to DIRECT. The caller should reflect that
+                Headroom is no longer active rather than claim it's reconnecting forever."""
+    with op_lock(store):
+        # Only cycle a proxy that's ACTUALLY RUNNING (checked under op_lock, the same lock
+        # global_disable holds). Rationale both directions:
+        #  • never resurrect a stopped/reaped proxy — if a concurrent toggle-OFF reaped it,
+        #    proxy_maybe_running is False here and we no-op (no orphan);
+        #  • DO re-apply the new env to a live routed proxy AND to a retained graceful-OFF proxy
+        #    (routing torn down but proxy kept for open sessions) — otherwise start_proxy would later
+        #    ADOPT that stale-env proxy on re-enable and the selected level would never take effect.
+        # When no proxy runs, the next start_proxy reads the persisted level, so a no-op is correct.
+        if not proxy_maybe_running(store):
+            return None
+        routed = _any_injected()
+        stop_proxy(store)
+        # start_proxy already does the None→persisted fallback, so pass level straight through — one
+        # source of truth for how the level is resolved.
+        if start_proxy(store, level=level):
+            return True
+        # Replacement failed (bad env / startup timeout) and the old proxy is already gone. If we were
+        # routed, restore the original config so requests go direct instead of hitting a dead port —
+        # mirrors global_enable's "never leave clients on a dead port" invariant. (A retained
+        # graceful-OFF proxy wasn't routed, so there's nothing to unroute — clients already go direct.)
+        _log_full(store, "restart_proxy failed", f"proxy did not come back for level={level}; "
+                  + ("unrouting to avoid a dead port" if routed else "was not routed, nothing to unroute"))
+        if routed:
+            _remove_and_restore(store, reap_proxy=True)
+        return False
 
 
 def stop_proxy(store: Path | None = None, *, kill=None, sleep=None) -> None:

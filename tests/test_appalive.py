@@ -83,24 +83,28 @@ def test_legacy_pidfile_without_start_falls_back_to_liveness(ctx):
 def test_exec_stock_execs_the_stock_binary(ctx, monkeypatch):
     captured = {}
 
-    def fake_execvp(file, argv):
+    def fake_execvpe(file, argv, env):
         captured["file"] = file
         captured["argv"] = list(argv)
+        captured["env"] = dict(env)
         # return (don't replace the process) so the test continues
 
-    monkeypatch.setattr(launcher.os, "execvp", fake_execvp)
+    monkeypatch.setenv("PYTHONPATH", "/frozen/app/lib/python311.zip")
+    monkeypatch.setattr(launcher.os, "execvpe", fake_execvpe)
     monkeypatch.setattr(ctx, "codex_bin", "/usr/bin/codex")
     rc = launcher.exec_stock(ctx, "codex", ["exec", "hi"])
     assert captured["file"] == "/usr/bin/codex"
     assert captured["argv"] == ["/usr/bin/codex", "exec", "hi"]
-    assert rc == 127  # only reached because the fake execvp returned
+    # the frozen-app interpreter vars must be stripped from the child's env (the whole point of the fix)
+    assert "PYTHONPATH" not in captured["env"]
+    assert rc == 127  # only reached because the fake execvpe returned
 
 
 def test_exec_stock_returns_127_when_binary_missing(ctx, monkeypatch):
-    def boom(file, argv):
+    def boom(file, argv, env):
         raise OSError("no such file")
 
-    monkeypatch.setattr(launcher.os, "execvp", boom)
+    monkeypatch.setattr(launcher.os, "execvpe", boom)
     assert launcher.exec_stock(ctx, "codex", []) == 127
 
 

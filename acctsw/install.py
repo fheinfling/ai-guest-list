@@ -257,8 +257,11 @@ def _wrapper_script(name: str, python: str, pkg_root: Path, bin_dir: Path) -> st
     # out of the generated /bin/sh script (defense-in-depth; these paths aren't attacker-controlled).
     py, pr, acctsw = shlex.quote(str(python)), shlex.quote(str(pkg_root)), shlex.quote(str(bin_dir / "acctsw"))
     if name == "acctsw":
+        # Set PYTHONPATH to ONLY pkg_root — do NOT append "$PYTHONPATH". If this wrapper runs from a
+        # shell that inherited py2app's leaked PYTHONPATH (the frozen 3.11 stdlib zip), appending it
+        # would shadow the system interpreter's stdlib and crash `python -m acctsw`.
         return (f"#!/bin/sh\n# ai guest list engine\n"
-                f'PYTHONPATH={pr}:"$PYTHONPATH" exec {py} -m acctsw "$@"\n')
+                f'PYTHONPATH={pr} exec {py} -m acctsw "$@"\n')
     tool = "codex" if name == "cx" else "claude"
     return (f"#!/bin/sh\n# supervised {tool} launcher (stock {tool} is not shadowed)\n"
             f'exec {acctsw} run {tool} "$@"\n')

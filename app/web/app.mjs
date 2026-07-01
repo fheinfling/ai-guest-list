@@ -83,6 +83,7 @@ document.addEventListener("click", (e) => {
     case "settings": overlay.innerHTML = buildSettings(state); break;
     case "set_theme": send("set_theme", { value }); break;
     case "set_strategy": send("set_strategy", { value }); break;
+    case "set_savings_level": send("set_savings_level", { value }); break;
     case "quit": send("quit"); break;
   }
 });

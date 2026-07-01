@@ -31,6 +31,7 @@ from typing import Callable
 from . import usage as usage_mod
 from .context import Context
 from .errors import AcctswError
+from .headroom import harden_env
 from .selection import choose
 from .switch import switch, sync_back
 from .util import iso, now
@@ -127,7 +128,7 @@ def exec_stock(ctx: Context, tool: str, args: list) -> int:
     """
     argv = build_cmd(ctx, tool, args)
     try:
-        os.execvp(argv[0], argv)
+        os.execvpe(argv[0], argv, harden_env())
     except OSError:
         return 127
     return 127
@@ -229,7 +230,7 @@ def pty_spawn(argv: list, on_output: Callable[[bytes], bool]) -> int:
 
     pid, master_fd = pty.fork()
     if pid == 0:
-        os.execvp(argv[0], argv)
+        os.execvpe(argv[0], argv, harden_env())
         os._exit(127)
 
     stop_requested = False

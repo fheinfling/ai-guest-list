@@ -11,6 +11,17 @@ def test_empty_state_defaults(tmp_path):
     assert s.settings() == DEFAULT_SETTINGS
 
 
+def test_savings_level_default_and_forward_compatible(tmp_path):
+    # new setting ships the quality-neutral "conservative" default (no silent input-context compression)
+    assert DEFAULT_SETTINGS["savings_level"] == "conservative"
+    assert State.load(tmp_path / "state.json").settings()["savings_level"] == "conservative"
+    # ...and an OLD state file (no savings_level key) auto-adopts the default on load.
+    import json
+    p = tmp_path / "old.json"
+    p.write_text(json.dumps({"version": 1, "tools": {}, "settings": {"theme": "dark"}}))
+    assert State.load(p).settings()["savings_level"] == "conservative"
+
+
 def test_upsert_and_active(tmp_path):
     s = State.load(tmp_path / "state.json")
     seat = s.upsert_seat("codex", "a@x.com", name="work")
