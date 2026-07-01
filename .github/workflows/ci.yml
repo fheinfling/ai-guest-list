@@ -36,7 +36,7 @@ jobs:
           node --test app/web/*.test.mjs
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v7
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7 (pinned SHA; Dependabot keeps it current)
         with:
           token: ${{ secrets.CODECOV_TOKEN }}   # add this secret once at codecov.io
           files: coverage.xml
