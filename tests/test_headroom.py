@@ -1034,3 +1034,66 @@ def test_bridge_headroom_install(ctx):
     r = bridge.handle(ctx, {"action": "headroom_install"})
     assert r["ok"] is True and r["installed"] is True
     assert r["state"]["headroom_available"] is True
+
+
+def test_record_event_stamps_reason_and_time(tmp_path):
+    from acctsw.state import State
+    s = State.load(tmp_path / "state.json")
+    headroom.record_event(s, "the proxy stopped and wouldn't restart")
+    ev = s.data["headroom_event"]
+    assert ev["reason"] == "the proxy stopped and wouldn't restart"
+    assert ev["at"]  # iso timestamp
+
+
+def test_proxy_busy_reads_the_inbound_gauge():
+    """>1 = real client traffic (our probe is the 1); unreadable gauge must NOT count as busy —
+    a wedged proxy would otherwise dodge its reap forever."""
+    assert headroom.proxy_busy(urlopen=_metrics_urlopen([3])) is True
+    assert headroom.proxy_busy(urlopen=_metrics_urlopen([1])) is False
+
+    def opener(url, timeout=None):
+        raise OSError("refused")
+    assert headroom.proxy_busy(urlopen=opener) is False
+
+
+def test_heal_leaves_busy_orphan_proxy_alive(tmp_path, monkeypatch):
+    """App gone + proxy still serving open sessions → strip routing but do NOT reap: agents pinned
+    to the port must finish their work; a later heal reaps it once idle."""
+    seen = {}
+    monkeypatch.setattr(headroom, "proxy_maybe_running", lambda store=None: True)
+    monkeypatch.setattr(headroom, "inbound_active", lambda *a, **k: 4)
+    monkeypatch.setattr(headroom, "_remove_and_restore",
+                        lambda store, reap_proxy=True: seen.update(reap=reap_proxy) or (True, "ok"))
+    ok, _ = headroom.heal(tmp_path / "s", app_running=False)
+    assert ok is True
+    assert seen["reap"] is False
+
+
+def test_heal_reaps_idle_or_wedged_orphan_proxy(tmp_path, monkeypatch):
+    """Idle (gauge <=1) or wedged (gauge unreadable) orphans are reaped exactly as before."""
+    for gauge in (1, None):
+        seen = {}
+        monkeypatch.setattr(headroom, "proxy_maybe_running", lambda store=None: True)
+        monkeypatch.setattr(headroom, "inbound_active", lambda *a, **k: gauge)
+        monkeypatch.setattr(headroom, "_remove_and_restore",
+                            lambda store, reap_proxy=True: seen.update(reap=reap_proxy) or (True, "ok"))
+        ok, _ = headroom.heal(tmp_path / "s", app_running=False)
+        assert ok is True
+        assert seen["reap"] is True
+
+
+def test_breaker_allows_three_then_trips():
+    from app.menubar import breaker_allows
+    times = []
+    assert breaker_allows(times, 0.0) is True
+    assert breaker_allows(times, 100.0) is True
+    assert breaker_allows(times, 200.0) is True
+    assert breaker_allows(times, 300.0) is False     # 4th within the window → breaker trips
+    assert times == [0.0, 100.0, 200.0]              # denied attempt not recorded
+
+
+def test_breaker_window_rolls():
+    from app.menubar import breaker_allows
+    times = [0.0, 100.0, 200.0]
+    assert breaker_allows(times, 1900.0) is True     # 0.0 and 100.0 aged out of the 1800s window
+    assert times == [200.0, 1900.0]

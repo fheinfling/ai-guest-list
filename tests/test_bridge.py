@@ -142,7 +142,8 @@ def test_set_savings_level_kicks_proxy_restart(ctx, monkeypatch):
 def test_savings_level_restart_failure_turns_headroom_off(ctx, monkeypatch):
     """A hard restart failure (False) has already unrouted to avoid a dead port. We first try to roll
     back to the previously-working level (global_enable); only if THAT also fails do we mark the setting
-    off to match reality (the health-check never auto re-enables). A no-op (None) leaves it untouched."""
+    off to match reality (the health-check's own restarts are for a proxy that DIED, not one that
+    won't boot at this level). A no-op (None) leaves it untouched."""
     from acctsw import headroom
     monkeypatch.setattr(bridge, "_run_async", lambda fn: fn())
     st = ctx.load_state(); st.set_setting("headroom", True); st.save()
@@ -276,3 +277,60 @@ def test_is_native_routing():
     assert bridge.is_native("quit") and bridge.is_native("login") and bridge.is_native("settings")
     assert not bridge.is_native("switch") and not bridge.is_native("status")
     assert not bridge.is_native("headroom_install")  # engine-routed (returns command)
+
+
+def test_toggle_headroom_off_keeps_proxy_alive_for_open_sessions(ctx, monkeypatch):
+    """Toggle-OFF is graceful: unroute new sessions but NEVER reap the proxy — open agents pinned to
+    its port must keep working (requirement: 'off' must not disconnect running agents)."""
+    from acctsw import headroom
+    seen = {}
+    monkeypatch.setattr(headroom, "global_disable",
+                        lambda store=None, **k: seen.update(k) or (True, "ok"))
+    st = ctx.load_state(); st.set_setting("headroom", True); st.save()
+    res = bridge.handle(ctx, {"action": "toggle", "key": "headroom", "value": False})
+    assert res["ok"] is True
+    assert seen.get("reap_proxy") is False
+    assert ctx.load_state().settings()["headroom"] is False
+
+
+def test_toggle_headroom_on_clears_auto_off_event(ctx, monkeypatch):
+    """Re-enabling save-credit makes the auto-off banner stale — it must go in the same write."""
+    from acctsw import headroom
+    monkeypatch.setattr(headroom, "global_enable", lambda store=None: (True, "up"))
+    st = ctx.load_state()
+    st.data["headroom_event"] = {"at": "2026-07-02T00:00:00+00:00", "reason": "x"}
+    st.set_setting("headroom", False); st.save()
+    res = bridge.handle(ctx, {"action": "toggle", "key": "headroom", "value": True})
+    assert res["ok"] is True
+    assert ctx.load_state().data.get("headroom_event") is None
+
+
+def test_headroom_event_dismiss_action(ctx):
+    st = ctx.load_state()
+    st.data["headroom_event"] = {"at": "2026-07-02T00:00:00+00:00", "reason": "r"}
+    st.save()
+    res = bridge.handle(ctx, {"action": "headroom_event_dismiss"})
+    assert res["ok"] is True
+    assert ctx.load_state().data.get("headroom_event") is None
+    assert res["state"]["headroom_event"] is None
+
+
+def test_snapshot_exposes_headroom_event(ctx):
+    st = ctx.load_state()
+    st.data["headroom_event"] = {"at": "2026-07-02T00:00:00+00:00", "reason": "the proxy kept crashing"}
+    st.save()
+    assert bridge.snapshot_state(ctx)["headroom_event"]["reason"] == "the proxy kept crashing"
+
+
+def test_savings_level_double_failure_records_auto_off_event(ctx, monkeypatch):
+    """The level-change rollback path runs on a silent background thread — when it flips the setting
+    off it MUST leave the persistent banner, or the user finds out hours later."""
+    from acctsw import headroom
+    monkeypatch.setattr(bridge, "_run_async", lambda fn: fn())
+    monkeypatch.setattr(headroom, "restart_proxy", lambda store=None: False)
+    monkeypatch.setattr(headroom, "global_enable", lambda store=None: (False, "nope"))
+    st = ctx.load_state(); st.set_setting("headroom", True); st.save()
+    bridge.handle(ctx, {"action": "set_savings_level", "value": "aggressive"})
+    s = ctx.load_state()
+    assert s.settings()["headroom"] is False
+    assert "savings level" in s.data["headroom_event"]["reason"]

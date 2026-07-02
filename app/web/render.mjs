@@ -314,6 +314,14 @@ export function buildHTML(state) {
   const hr = state?.headroom_available;
   const c = state?.counts || { resting: 0, ready: 0 };
   const moved = state?.moved_note ? `<div class="event mono">↪ ${esc(state.moved_note)}</div>` : "";
+  // Persistent auto-off banner: save-credit turned ITSELF off (crash loop, failed restart…). Unlike
+  // the transient macOS notification this stays until the user re-enables or dismisses — silently
+  // discovering the toggle off hours later is exactly what it exists to prevent.
+  const hrEvent = state?.headroom_event
+    ? `<div class="event hr-off mono">save-credit turned itself off — ${esc(state.headroom_event.reason)} · ${fmtClock(state.headroom_event.at)}
+        <button class="link" data-action="headroom-retoggle">turn it back on</button>
+        <button class="link" data-action="headroom-event-dismiss">dismiss</button></div>`
+    : "";
   const hrSub = !hr
     ? "install Headroom to enable"
     : state?.headroom_proxy_down
@@ -339,6 +347,7 @@ export function buildHTML(state) {
       ${controlBar({ icon: FUNNEL, title: "Headroom", chip: "COMPRESSES CONTEXT", sub: hrSub,
                      key: "headroom", on: s.headroom && hr, accentClass: "ic-hr" })}
       ${hr ? "" : `<button class="hr-install" data-action="headroom_install">install Headroom →</button>`}
+      ${hrEvent}
       ${moved}
       ${toolGroup("codex", state?.tools?.codex)}
       ${toolGroup("claude", state?.tools?.claude)}

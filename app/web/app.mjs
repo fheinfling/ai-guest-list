@@ -90,6 +90,9 @@ document.addEventListener("click", (e) => {
     }
     case "snapshot": closeOverlay(); send("snapshot", { tool }); break;
     case "headroom_install": send("headroom_install"); break;
+    // auto-off banner: re-enable goes through the same toggle path as the settings switch
+    case "headroom-retoggle": send("toggle", { key: "headroom", value: true }); break;
+    case "headroom-event-dismiss": send("headroom_event_dismiss"); break;
     case "picker-close":
       // close on backdrop click or an explicit cancel/done button; ignore clicks inside the sheet
       if (el.classList.contains("backdrop") && e.target !== el) break;
