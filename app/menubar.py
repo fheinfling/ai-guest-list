@@ -383,21 +383,12 @@ if objc is not None:
             self._teardownDone = True
             try:
                 from acctsw import headroom
-                # Order matters: strip ROUTING first (blocking + op_lock-serialized), so no new
-                # session can start routing through the proxy while we probe it — probing before
-                # unrouting is a check-then-act race that could reap a proxy that just picked up
-                # fresh work. Only then drain and, if idle, reap. A wedged proxy (unreadable gauge)
-                # is never busy, so it still dies here.
-                unrouted = True
-                if headroom.needs_reconcile(self.ctx):
-                    unrouted, _ = headroom.global_disable(self.ctx.data_dir, reap_proxy=False)
-                # Reap ONLY when the unroute actually succeeded: with routing still injected, killing
-                # an idle-right-now proxy would strand routed clients on a dead port — leave it alive
-                # instead; the next launch / cx / cl heal retries the cleanup.
-                if unrouted and headroom.proxy_maybe_running(self.ctx.data_dir):
-                    headroom.drain_proxy()                       # let in-flight responses finish (bounded)
-                    if not headroom.proxy_busy():
-                        headroom.stop_proxy(self.ctx.data_dir)   # by PID (ready OR wedged)
+                # One shutdown sequence for every teardown path (strip routing first, reap only an
+                # idle proxy) — see _graceful_shutdown. drain=True: quit can afford the bounded wait
+                # for in-flight responses; the cheap pre-checks keep the never-used-headroom quit
+                # instant.
+                if headroom.needs_reconcile(self.ctx) or headroom.proxy_maybe_running(self.ctx.data_dir):
+                    headroom.graceful_shutdown(self.ctx.data_dir, drain=True)
             except Exception:
                 pass
 

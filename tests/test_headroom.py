@@ -1078,27 +1078,57 @@ def test_proxy_busy_reads_the_inbound_gauge():
 def test_heal_leaves_busy_orphan_proxy_alive(tmp_path, monkeypatch):
     """App gone + proxy still serving open sessions → strip routing but do NOT reap: agents pinned
     to the port must finish their work; a later heal reaps it once idle."""
-    seen = {}
+    stopped = []
     monkeypatch.setattr(headroom, "proxy_maybe_running", lambda store=None: True)
     monkeypatch.setattr(headroom, "inbound_active", lambda *a, **k: 4)
     monkeypatch.setattr(headroom, "_remove_and_restore",
-                        lambda store, reap_proxy=True: seen.update(reap=reap_proxy) or (True, "ok"))
+                        lambda store, reap_proxy=True: (True, "ok"))
+    monkeypatch.setattr(headroom, "stop_proxy", lambda *a, **k: stopped.append(1))
     ok, _ = headroom.heal(tmp_path / "s", app_running=False)
     assert ok is True
-    assert seen["reap"] is False
+    assert not stopped                                # left alive for open sessions
 
 
 def test_heal_reaps_idle_or_wedged_orphan_proxy(tmp_path, monkeypatch):
     """Idle (gauge <=1) or wedged (gauge unreadable) orphans are reaped exactly as before."""
     for gauge in (1, None):
-        seen = {}
+        stopped = []
         monkeypatch.setattr(headroom, "proxy_maybe_running", lambda store=None: True)
         monkeypatch.setattr(headroom, "inbound_active", lambda *a, **k: gauge)
         monkeypatch.setattr(headroom, "_remove_and_restore",
-                            lambda store, reap_proxy=True: seen.update(reap=reap_proxy) or (True, "ok"))
+                            lambda store, reap_proxy=True: (True, "ok"))
+        monkeypatch.setattr(headroom, "stop_proxy", lambda *a, **k: stopped.append(1))
         ok, _ = headroom.heal(tmp_path / "s", app_running=False)
         assert ok is True
-        assert seen["reap"] is True
+        assert stopped                                # reaped
+
+
+def test_graceful_shutdown_leaves_proxy_alive_when_strip_fails(tmp_path, monkeypatch):
+    """If routing could NOT be stripped, reaping would strand routed clients on a dead port — the
+    proxy must be left alive so a later heal can retry the whole cleanup."""
+    stopped = []
+    monkeypatch.setattr(headroom, "proxy_maybe_running", lambda store=None: True)
+    monkeypatch.setattr(headroom, "inbound_active", lambda *a, **k: 1)   # idle — would reap if ok
+    monkeypatch.setattr(headroom, "_remove_and_restore",
+                        lambda store, reap_proxy=True: (False, "still injected"))
+    monkeypatch.setattr(headroom, "stop_proxy", lambda *a, **k: stopped.append(1))
+    ok, _ = headroom.graceful_shutdown(tmp_path / "s")
+    assert ok is False
+    assert not stopped
+
+
+def test_graceful_shutdown_drains_before_the_idle_probe(tmp_path, monkeypatch):
+    """drain=True (quit path) waits for in-flight responses BEFORE deciding to reap."""
+    order = []
+    monkeypatch.setattr(headroom, "_remove_and_restore",
+                        lambda store, reap_proxy=True: order.append("strip") or (True, "ok"))
+    monkeypatch.setattr(headroom, "proxy_maybe_running", lambda store=None: True)
+    monkeypatch.setattr(headroom, "drain_proxy", lambda *a, **k: order.append("drain") or True)
+    monkeypatch.setattr(headroom, "proxy_busy", lambda *a, **k: order.append("probe") or False)
+    monkeypatch.setattr(headroom, "stop_proxy", lambda *a, **k: order.append("stop"))
+    ok, _ = headroom.graceful_shutdown(tmp_path / "s", drain=True)
+    assert ok is True
+    assert order == ["strip", "drain", "probe", "stop"]
 
 
 def test_breaker_allows_three_then_trips():

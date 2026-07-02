@@ -970,15 +970,36 @@ def proxy_busy(port: int = PROXY_PORT, *, urlopen=None) -> bool:
     return n is not None and n > 1
 
 
-def _reap_orphan(store: Path | None) -> tuple[bool, str]:
-    """Clean up an orphaned proxy (app gone), but never shoot one still serving open sessions: agents
-    are pinned to its port and would die mid-flight. Busy (inbound gauge > 1 — our probe is the 1) →
-    strip routing only (new sessions go direct) and leave the process; a later heal reaps it once
-    idle. Idle, or gauge unreadable (wedged proxy — must die), → strip routing AND reap."""
-    if proxy_busy():
-        _log_full(store, "orphan proxy busy", "requests in flight — left alive for open sessions")
-        return _remove_and_restore(store, reap_proxy=False)
-    return _remove_and_restore(store)
+def _graceful_shutdown(store: Path | None, *, drain: bool = False) -> tuple[bool, str]:
+    """THE proxy-shutdown sequence — every teardown path (quit, orphan heal) funnels through here so
+    the ordering can't drift between call sites. Caller holds op_lock.
+
+    1. Strip routing FIRST (new sessions go direct; probing before unrouting is a check-then-act
+       race — a session could pick up fresh work between the probe and the reap). This also clears
+       a dead proxy's stale pidfile (reap_proxy=False only ever retains a LIVE proxy).
+    2. If the strip failed (config still injected), leave the proxy ALIVE: reaping now would strand
+       routed clients on a dead port. The next launch / cx / cl heal retries the cleanup.
+    3. Otherwise optionally drain (bounded; quit can afford the wait, a cx/cl launch cannot), then
+       reap only an IDLE proxy — one still serving open sessions is left for them and reaped by a
+       later heal; a wedged proxy (unreadable gauge) is never busy, so it still dies."""
+    ok, msg = _remove_and_restore(store, reap_proxy=False)
+    if ok and proxy_maybe_running(store):
+        if drain:
+            drain_proxy()
+        if proxy_busy():
+            _log_full(store, "proxy busy", "requests in flight — left alive for open sessions")
+        else:
+            stop_proxy(store)
+    return ok, msg
+
+
+def graceful_shutdown(store: Path | None = None, *, blocking: bool = True,
+                      drain: bool = False) -> tuple[bool, str]:
+    """Public, op_lock-serialized wrapper around _graceful_shutdown (see there for the sequence)."""
+    with op_lock(store, blocking=blocking) as acquired:
+        if not acquired:
+            return False, "headroom busy (another operation in progress)"
+        return _graceful_shutdown(store, drain=drain)
 
 
 def heal(store: Path | None = None, *, blocking: bool = True, push=None,
@@ -1013,15 +1034,15 @@ def heal(store: Path | None = None, *, blocking: bool = True, push=None,
             # App gone + a live proxy PROCESS (ready, wedged, OR still starting) → orphan. Reap it by
             # PID, not by /readyz: a wedged proxy that never answers /readyz would otherwise survive
             # (proxy_ready() False), yet the pidfile is right there to kill it. Strip routing too —
-            # but a busy orphan is left alive for its open sessions (see _reap_orphan).
-            return _reap_orphan(store)
+            # but a busy orphan is left alive for its open sessions (see _graceful_shutdown).
+            return _graceful_shutdown(store)
         if proxy_ready():
             if app_running:
                 (push or push_runtime_knobs)()  # best-effort: re-assert knobs on a proxy we may not have started
                 return False, "healthy"
             # App is gone but the proxy is still up → orphan. Strip/restore routing if any was left
-            # injected; reap the proxy only once idle (see _reap_orphan).
-            return _reap_orphan(store)
+            # injected; reap the proxy only once idle (see _graceful_shutdown).
+            return _graceful_shutdown(store)
         if not (_any_injected() or has_backup(store)):
             return False, "clean"
         ok, msg = _remove_and_restore(store)
