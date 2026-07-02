@@ -383,14 +383,21 @@ if objc is not None:
             self._teardownDone = True
             try:
                 from acctsw import headroom
+                # Order matters: strip ROUTING first (blocking + op_lock-serialized), so no new
+                # session can start routing through the proxy while we probe it — probing before
+                # unrouting is a check-then-act race that could reap a proxy that just picked up
+                # fresh work. Only then drain and, if idle, reap. A wedged proxy (unreadable gauge)
+                # is never busy, so it still dies here.
+                unrouted = True
                 if headroom.needs_reconcile(self.ctx):
+                    unrouted, _ = headroom.global_disable(self.ctx.data_dir, reap_proxy=False)
+                # Reap ONLY when the unroute actually succeeded: with routing still injected, killing
+                # an idle-right-now proxy would strand routed clients on a dead port — leave it alive
+                # instead; the next launch / cx / cl heal retries the cleanup.
+                if unrouted and headroom.proxy_maybe_running(self.ctx.data_dir):
                     headroom.drain_proxy()                       # let in-flight responses finish (bounded)
-                    headroom.global_disable(self.ctx.data_dir,   # blocking + op_lock-serialized (unroute;
-                                            reap_proxy=not headroom.proxy_busy())  # reap only if idle)
-                elif headroom.proxy_maybe_running(self.ctx.data_dir):
-                    headroom.drain_proxy()
                     if not headroom.proxy_busy():
-                        headroom.stop_proxy(self.ctx.data_dir)   # reap a graceful-OFF proxy (ready OR wedged) by PID
+                        headroom.stop_proxy(self.ctx.data_dir)   # by PID (ready OR wedged)
             except Exception:
                 pass
 

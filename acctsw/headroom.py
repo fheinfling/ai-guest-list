@@ -836,7 +836,10 @@ def _remove_and_restore(store: Path | None, *, reap_proxy: bool = True) -> tuple
             return False, "Headroom routing still present and no backup to restore (see ~/.account-switcher/headroom.log)"
         return True, "headroom routing removed"
     finally:
-        if reap_proxy:
+        # reap_proxy=False only ever RETAINS a live proxy (for open sessions). A dead one still gets
+        # stop_proxy so its stale pidfile is cleared — a lingering pidfile widens the PID-recycling
+        # exposure of the _pid_is_proxy heuristic for nothing.
+        if reap_proxy or not proxy_maybe_running(store):
             stop_proxy(store)
 
 
@@ -972,9 +975,8 @@ def _reap_orphan(store: Path | None) -> tuple[bool, str]:
     are pinned to its port and would die mid-flight. Busy (inbound gauge > 1 — our probe is the 1) →
     strip routing only (new sessions go direct) and leave the process; a later heal reaps it once
     idle. Idle, or gauge unreadable (wedged proxy — must die), → strip routing AND reap."""
-    n = inbound_active()
-    if n is not None and n > 1:
-        _log_full(store, "orphan proxy busy", f"{n - 1} request(s) in flight — left alive for open sessions")
+    if proxy_busy():
+        _log_full(store, "orphan proxy busy", "requests in flight — left alive for open sessions")
         return _remove_and_restore(store, reap_proxy=False)
     return _remove_and_restore(store)
 

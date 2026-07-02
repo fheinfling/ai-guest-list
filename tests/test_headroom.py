@@ -75,6 +75,9 @@ def _patch_proxy(monkeypatch, *, ready=True, start=True):
     that counts start/stop calls."""
     calls = {"start": 0, "stop": 0}
     monkeypatch.setattr(headroom, "proxy_ready", lambda *a, **k: ready)
+    # Hermetic: heal's orphan reap probes the inbound gauge (busy check) — never let tests hit a
+    # REAL proxy that happens to be serving on this machine. None = unreadable = idle → reap.
+    monkeypatch.setattr(headroom, "inbound_active", lambda *a, **k: None)
 
     def _start(store=None, **k):
         calls["start"] += 1
@@ -587,11 +590,12 @@ def test_enable_disable_restores_user_claude_env(tmp_path, monkeypatch):
 
 
 def test_global_disable_graceful_keeps_proxy_alive(tmp_path, monkeypatch):
-    """reap_proxy=False (graceful toggle-OFF): unroute the configs but DON'T stop the proxy, so a
+    """reap_proxy=False (graceful toggle-OFF): unroute the configs but DON'T stop a LIVE proxy, so a
     session that pinned the port at launch keeps working while new sessions go direct."""
     cfg = _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
     monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
     calls = _patch_proxy(monkeypatch)
+    monkeypatch.setattr(headroom, "proxy_maybe_running", lambda store=None: True)  # a live proxy exists
     headroom.snapshot_global(tmp_path / "store")
     headroom._route_codex()
     ok, _ = headroom.global_disable(tmp_path / "store", reap_proxy=False)
@@ -599,6 +603,21 @@ def test_global_disable_graceful_keeps_proxy_alive(tmp_path, monkeypatch):
     assert 'model_provider = "headroom"' not in cfg.read_text()   # new sessions go direct
     assert 'model = "orig"' in cfg.read_text()                    # user body restored
     assert calls["stop"] == 0                                     # proxy LEFT alive for open sessions
+
+
+def test_global_disable_graceful_still_clears_a_dead_proxys_pidfile(tmp_path, monkeypatch):
+    """'Retain' only ever keeps a LIVE proxy: when the process is already dead, the graceful path
+    must still run stop_proxy so the stale pidfile is cleared (a lingering pidfile widens the
+    PID-recycling exposure of the _pid_is_proxy heuristic)."""
+    _codex_cfg(tmp_path, monkeypatch, 'model = "orig"\n')
+    monkeypatch.setattr(headroom, "headroom_path", lambda: "/fake/headroom")
+    calls = _patch_proxy(monkeypatch)
+    monkeypatch.setattr(headroom, "proxy_maybe_running", lambda store=None: False)  # proxy is dead
+    headroom.snapshot_global(tmp_path / "store")
+    headroom._route_codex()
+    ok, _ = headroom.global_disable(tmp_path / "store", reap_proxy=False)
+    assert ok
+    assert calls["stop"] == 1                                     # stale pidfile cleared
 
 
 def test_disable_no_backup_uses_surgical_strip(tmp_path, monkeypatch):

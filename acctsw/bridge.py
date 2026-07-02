@@ -54,8 +54,8 @@ def _restart_proxy_quietly(headroom, ctx, prev_level=None) -> None:
 
     A merely-different tier must not silently kill save-credit, so on failure we first try to ROLL BACK
     to the previously-working level and bring routing back up at it (global_enable). Only if that also
-    fails do we mark the headroom setting OFF to match reality — the poll health-check only cleans up
-    (it never re-enables), so leaving it on would show "reconnecting" forever. The user can re-toggle."""
+    fails do we mark the headroom setting OFF to match reality — the health check's auto-restarts would
+    just retry the same failing enable and burn through its breaker. The user can re-toggle."""
     try:
         if headroom.restart_proxy(ctx.data_dir) is not False:
             return
@@ -80,6 +80,10 @@ def _restart_proxy_quietly(headroom, ctx, prev_level=None) -> None:
                     # learns save-credit gave up.
                     headroom.record_event(s, "the proxy wouldn't restart at the new savings level")
                     s.save()
+            # The failed enable's own rollback can itself partially fail (e.g. one config file
+            # unwritable), which would leave routing injected at a dead port. reconcile() verifies
+            # and strips any leftover — mirroring _hrAutoOff in the menubar.
+            headroom.reconcile(ctx, blocking=False)
     except Exception:
         pass
 
