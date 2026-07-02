@@ -75,6 +75,9 @@ def _patch_proxy(monkeypatch, *, ready=True, start=True):
     that counts start/stop calls."""
     calls = {"start": 0, "stop": 0}
     monkeypatch.setattr(headroom, "proxy_ready", lambda *a, **k: ready)
+    # Hermetic: heal's orphan reap probes the inbound gauge (busy check) — never let tests hit a
+    # REAL proxy that happens to be serving on this machine. None = unreadable = idle → reap.
+    monkeypatch.setattr(headroom, "inbound_active", lambda *a, **k: None)
 
     def _start(store=None, **k):
         calls["start"] += 1

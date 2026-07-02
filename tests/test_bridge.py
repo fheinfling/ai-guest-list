@@ -329,8 +329,11 @@ def test_savings_level_double_failure_records_auto_off_event(ctx, monkeypatch):
     monkeypatch.setattr(bridge, "_run_async", lambda fn: fn())
     monkeypatch.setattr(headroom, "restart_proxy", lambda store=None: False)
     monkeypatch.setattr(headroom, "global_enable", lambda store=None: (False, "nope"))
+    reconciled = []
+    monkeypatch.setattr(headroom, "reconcile", lambda c, blocking=True: reconciled.append(c) or (False, ""))
     st = ctx.load_state(); st.set_setting("headroom", True); st.save()
     bridge.handle(ctx, {"action": "set_savings_level", "value": "aggressive"})
     s = ctx.load_state()
     assert s.settings()["headroom"] is False
     assert "savings level" in s.data["headroom_event"]["reason"]
+    assert reconciled  # a partially-failed rollback must not leave routing injected unverified

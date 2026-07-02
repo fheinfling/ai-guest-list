@@ -972,9 +972,8 @@ def _reap_orphan(store: Path | None) -> tuple[bool, str]:
     are pinned to its port and would die mid-flight. Busy (inbound gauge > 1 — our probe is the 1) →
     strip routing only (new sessions go direct) and leave the process; a later heal reaps it once
     idle. Idle, or gauge unreadable (wedged proxy — must die), → strip routing AND reap."""
-    n = inbound_active()
-    if n is not None and n > 1:
-        _log_full(store, "orphan proxy busy", f"{n - 1} request(s) in flight — left alive for open sessions")
+    if proxy_busy():
+        _log_full(store, "orphan proxy busy", "requests in flight — left alive for open sessions")
         return _remove_and_restore(store, reap_proxy=False)
     return _remove_and_restore(store)
 
