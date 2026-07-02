@@ -708,8 +708,9 @@ def op_lock(store: Path | None = None, *, blocking: bool = True):
     + restore), so a background toggle, usage poll, launch recovery, and quit teardown can't race.
 
     Yields True if the lock was acquired, False if ``blocking=False`` and another op holds it. The
-    blocking callers (enable/disable/heal) ignore the value (it's always True for them); only quit
-    teardown uses blocking=False so it can never freeze the UI waiting on a slow background op."""
+    blocking callers (enable/disable/heal, quit teardown — quit runs on a background thread, so
+    waiting out an in-flight op is safe) ignore the value; non-blocking callers (the poll health
+    check, cx/cl's first heal attempt) skip their work instead of stacking up behind a slow op."""
     import fcntl
     # The lock file lives BESIDE the backup dir, never inside it — restore_global/_rm_backup rmtree
     # the backup dir, which would otherwise swap the lock's inode mid-hold and break serialization.
@@ -913,14 +914,15 @@ def seed_baseline(store: Path | None = None, *, run=subprocess.run) -> tuple[boo
 
 def global_disable(store: Path | None = None, *, blocking: bool = True,
                    reap_proxy: bool = True) -> tuple[bool, str]:
-    """Undo routing (and, by default, stop the proxy). Serialized by op_lock. With blocking=False (quit
-    teardown), returns (False, 'busy') immediately rather than waiting on a concurrent op — the next
-    launch / cx / cl heal() is a reliable backstop, so quit never freezes on lock acquisition.
+    """Undo routing (and, by default, stop the proxy). Serialized by op_lock. With blocking=False,
+    returns (False, 'busy') immediately rather than waiting on a concurrent op — the next
+    launch / cx / cl heal() is a reliable backstop.
 
     reap_proxy=False = graceful toggle-OFF: unroute (new codex/claude go direct) but LEAVE the proxy
     running, so an already-open session that pinned 127.0.0.1:PORT at launch keeps working instead of
-    hitting ConnectionRefused. A retained proxy is later reaped once idle (quit teardown drains
-    first; heal's orphan reap skips a busy one) or re-adopted by the next enable."""
+    hitting ConnectionRefused. A retained proxy is later reaped once idle by graceful_shutdown
+    (quit) or heal's orphan cleanup, or re-adopted by the next enable. Callers wanting the busy-aware
+    strip-drain-reap sequence itself should use graceful_shutdown, not this."""
     with op_lock(store, blocking=blocking) as acquired:
         if not acquired:
             return False, "headroom busy (another operation in progress)"
@@ -981,9 +983,16 @@ def _graceful_shutdown(store: Path | None, *, drain: bool = False) -> tuple[bool
        routed clients on a dead port. The next launch / cx / cl heal retries the cleanup.
     3. Otherwise optionally drain (bounded; quit can afford the wait, a cx/cl launch cannot), then
        reap only an IDLE proxy — one still serving open sessions is left for them and reaped by a
-       later heal; a wedged proxy (unreadable gauge) is never busy, so it still dies."""
+       later heal. The not-busy branch calls stop_proxy UNCONDITIONALLY: it reaps a live-idle proxy,
+       kills a wedged one (unreadable gauge is never busy), and merely clears the pidfile of a dead
+       one — probing liveness first would just reopen the died-between-probes pidfile leak.
+
+    The drain runs under the caller's op_lock. That's deliberate, not an oversight: routing is
+    already stripped by then, so the only op that could contend — a cx/cl launch's blocking heal
+    retry — gates on routing_injected() and sails through; everything else is app-internal and the
+    app is quitting."""
     ok, msg = _remove_and_restore(store, reap_proxy=False)
-    if ok and proxy_maybe_running(store):
+    if ok:
         if drain:
             drain_proxy()
         if proxy_busy():

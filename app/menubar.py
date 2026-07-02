@@ -371,8 +371,8 @@ if objc is not None:
         @objc.python_method
         def _headroomTeardown(self):
             """On quit (driven by applicationShouldTerminate_ on a background thread): remove global
-            routing + restore config via global_disable, which is SERIALIZED through op_lock (waits
-            out any in-flight enable/heal) and does an exact restore. The `headroom` SETTING is kept
+            routing + restore config via graceful_shutdown, which is SERIALIZED through op_lock
+            (waits out any in-flight enable/heal) and does an exact restore. The `headroom` SETTING is kept
             so it re-applies next launch. The PROXY is only reaped once idle: open agents pin its
             port at launch, so quitting the app must not kill their in-flight work. We drain
             (bounded 20s), then leave a still-busy proxy alive — routing is stripped regardless, the

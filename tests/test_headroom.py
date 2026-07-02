@@ -1078,15 +1078,16 @@ def test_proxy_busy_reads_the_inbound_gauge():
 def test_heal_leaves_busy_orphan_proxy_alive(tmp_path, monkeypatch):
     """App gone + proxy still serving open sessions → strip routing but do NOT reap: agents pinned
     to the port must finish their work; a later heal reaps it once idle."""
-    stopped = []
+    stopped, seen = [], {}
     monkeypatch.setattr(headroom, "proxy_maybe_running", lambda store=None: True)
     monkeypatch.setattr(headroom, "inbound_active", lambda *a, **k: 4)
     monkeypatch.setattr(headroom, "_remove_and_restore",
-                        lambda store, reap_proxy=True: (True, "ok"))
+                        lambda store, reap_proxy=True: seen.update(reap=reap_proxy) or (True, "ok"))
     monkeypatch.setattr(headroom, "stop_proxy", lambda *a, **k: stopped.append(1))
     ok, _ = headroom.heal(tmp_path / "s", app_running=False)
     assert ok is True
     assert not stopped                                # left alive for open sessions
+    assert seen["reap"] is False                      # the strip itself must never reap either
 
 
 def test_heal_reaps_idle_or_wedged_orphan_proxy(tmp_path, monkeypatch):
@@ -1114,6 +1115,17 @@ def test_graceful_shutdown_leaves_proxy_alive_when_strip_fails(tmp_path, monkeyp
     monkeypatch.setattr(headroom, "stop_proxy", lambda *a, **k: stopped.append(1))
     ok, _ = headroom.graceful_shutdown(tmp_path / "s")
     assert ok is False
+    assert not stopped
+
+
+def test_graceful_shutdown_nonblocking_returns_busy_under_contention(tmp_path, monkeypatch):
+    """blocking=False must bail immediately when another op holds the lock — callers on latency-
+    sensitive paths rely on this instead of stacking up behind a slow enable/heal."""
+    stopped = []
+    monkeypatch.setattr(headroom, "stop_proxy", lambda *a, **k: stopped.append(1))
+    with headroom.op_lock(tmp_path / "s"):
+        ok, msg = headroom.graceful_shutdown(tmp_path / "s", blocking=False)
+    assert ok is False and "busy" in msg
     assert not stopped
 
 
