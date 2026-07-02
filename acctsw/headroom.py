@@ -836,7 +836,10 @@ def _remove_and_restore(store: Path | None, *, reap_proxy: bool = True) -> tuple
             return False, "Headroom routing still present and no backup to restore (see ~/.account-switcher/headroom.log)"
         return True, "headroom routing removed"
     finally:
-        if reap_proxy:
+        # reap_proxy=False only ever RETAINS a live proxy (for open sessions). A dead one still gets
+        # stop_proxy so its stale pidfile is cleared — a lingering pidfile widens the PID-recycling
+        # exposure of the _pid_is_proxy heuristic for nothing.
+        if reap_proxy or not proxy_maybe_running(store):
             stop_proxy(store)
 
 
