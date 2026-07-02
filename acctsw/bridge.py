@@ -76,6 +76,9 @@ def _restart_proxy_quietly(headroom, ctx, prev_level=None) -> None:
                 s = ctx.load_state()
                 if s.settings().get("headroom"):
                     s.set_setting("headroom", False)
+                    # Silent background thread — the persistent banner is the only way the user
+                    # learns save-credit gave up.
+                    headroom.record_event(s, "the proxy wouldn't restart at the new savings level")
                     s.save()
     except Exception:
         pass
@@ -217,6 +220,9 @@ def snapshot_state(ctx: Context) -> dict[str, Any]:
     data["headroom_proxy_down"] = bool(
         state.settings().get("headroom") and not headroom.proxy_maybe_running(ctx.data_dir))
     data["moved_note"] = state.data.get("moved_note")
+    # Last auto-off ({at, reason}): the popover shows a persistent banner until the user re-enables
+    # save-credit or dismisses it — a transient notification alone is missable.
+    data["headroom_event"] = state.data.get("headroom_event")
     last = parse_iso(state.data.get("last_switch_at"))
     data["recently_switched"] = bool(last and (now() - last).total_seconds() < SWITCH_FRESH_SECONDS)
     data["dot"] = dot_for(data)  # single source of truth for the dot (JS + native both read this)
@@ -271,7 +277,10 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
                 except Exception as e:                 # never let the toggle hang with no result
                     ok, msg, effective = False, f"{type(e).__name__}: {e}", (not val)
                 with ctx.locked():
-                    s = ctx.load_state(); s.set_setting("headroom", effective); s.save()
+                    s = ctx.load_state(); s.set_setting("headroom", effective)
+                    if effective:                      # back on → the auto-off banner is stale
+                        s.data.pop("headroom_event", None)
+                    s.save()
                 if not ok:
                     err = f"couldn't enable Headroom: {msg}" if val else msg
                     return {"ok": False, "error": err, "state": snapshot_state(ctx)}
@@ -279,6 +288,13 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
             with ctx.locked():
                 state = ctx.load_state()
                 state.set_setting(key, val)
+                state.save()
+            return {"ok": True, "state": snapshot_state(ctx)}
+
+        if action == "headroom_event_dismiss":
+            with ctx.locked():
+                state = ctx.load_state()
+                state.data.pop("headroom_event", None)
                 state.save()
             return {"ok": True, "state": snapshot_state(ctx)}
 

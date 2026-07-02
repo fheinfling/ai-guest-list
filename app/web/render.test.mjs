@@ -207,3 +207,17 @@ test("buildHTML shows a paused substatus when headroom is on but the proxy is do
   assert.match(down, /save-credit paused/);
   assert.doesNotMatch(down, /fewer tokens/);  // don't claim it's wrapping while the proxy is dead
 });
+
+test("buildHTML renders the persistent auto-off banner with actions", () => {
+  const html = buildHTML(state({ headroom_available: true,
+    headroom_event: { at: "2026-07-02T00:14:00+00:00", reason: "the proxy kept crashing (3 restarts in 30 min)" } }));
+  assert.match(html, /save-credit turned itself off — the proxy kept crashing/);
+  assert.match(html, /data-action="headroom-retoggle"[^>]*>turn it back on/);
+  assert.match(html, /data-action="headroom-event-dismiss"[^>]*>dismiss/);
+  // reason text is untrusted state → must be escaped
+  const evil = buildHTML(state({ headroom_available: true,
+    headroom_event: { at: "2026-07-02T00:14:00+00:00", reason: "<img src=x onerror=alert(1)>" } }));
+  assert.doesNotMatch(evil, /<img src=x/);
+  // no event → no banner
+  assert.doesNotMatch(buildHTML(state({ headroom_available: true })), /turned itself off/);
+});

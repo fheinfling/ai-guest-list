@@ -36,6 +36,22 @@ DOOR_SYMBOL = {"open": "door.left.hand.open", "shut": "door.left.hand.closed"}
 DOOR_EMOJI = {"open": "🪩", "shut": "🚪"}
 NS_TERMINATE_NOW = 1      # NSApplicationTerminateReply.terminateNow
 NS_TERMINATE_LATER = 2    # NSApplicationTerminateReply.terminateLater (we reply when teardown done)
+HR_MAX_RESTARTS = 3       # proxy auto-restarts allowed per rolling window before the breaker trips
+HR_RESTART_WINDOW = 1800.0  # seconds
+
+
+def breaker_allows(times: list, now: float, *, max_n: int = HR_MAX_RESTARTS,
+                   window: float = HR_RESTART_WINDOW) -> bool:
+    """Crash-loop breaker for proxy auto-restarts: prune entries older than `window` from `times`
+    (mutated in place), then allow — and record — one more attempt unless `max_n` already happened
+    inside the window. Pure (caller supplies the clock) so the policy is trivially testable; the
+    delegate owns the in-memory `times` list, so an app relaunch resets the breaker — fine, launch
+    recovery makes its own single attempt."""
+    times[:] = [t for t in times if now - t < window]
+    if len(times) >= max_n:
+        return False
+    times.append(now)
+    return True
 
 
 if objc is not None:
@@ -51,7 +67,26 @@ if objc is not None:
             self.webview = None
             self._healthInFlight = False
             self._healthLock = threading.Lock()   # makes the single-flight check-then-set atomic
+            self._hrRestartTimes = []             # breaker_allows window (auto-restart timestamps)
             return self
+
+        @objc.python_method
+        def _hrAutoOff(self, reason):
+            """LAST resort, after restarts failed or the breaker tripped: flip save-credit OFF to
+            match reality, persist the auto-off event (the popover's banner — a transient
+            notification alone is missable), strip the dead routing, and notify. Every automatic
+            disable funnels through here so the user always learns what happened and why."""
+            from acctsw import headroom
+            try:
+                with self.ctx.locked():
+                    s = self.ctx.load_state()
+                    s.set_setting("headroom", False)
+                    headroom.record_event(s, reason)
+                    s.save()
+                headroom.reconcile(self.ctx, blocking=False)
+            except Exception:
+                pass
+            self._notify("save-credit turned itself off", reason)
 
         @objc.python_method
         def _claimHealthSlot(self):
@@ -161,8 +196,7 @@ if objc is not None:
                     if not headroom.global_running():
                         ok, _ = headroom.global_enable(self.ctx.data_dir)
                         if not ok:
-                            with self.ctx.locked():
-                                s = self.ctx.load_state(); s.set_setting("headroom", False); s.save()
+                            self._hrAutoOff("couldn't start the proxy at launch")
                 else:
                     headroom.heal(self.ctx.data_dir)   # clean an orphaned injection, if any
             except Exception:
@@ -194,15 +228,9 @@ if objc is not None:
                             self._notify("Headroom", "restarted the proxy after sleep")
                         else:
                             # Restart failed and routing rolled back to clean → the setting would sit
-                            # ON with no proxy/routing behind it (reconcile() returns "clean", not
-                            # healed). Match state to reality by clearing it, like recoverBg_ does, so
-                            # the UI and later health-checks don't keep chasing a dead-but-ON proxy.
-                            with self.ctx.locked():
-                                s = self.ctx.load_state(); s.set_setting("headroom", False); s.save()
-                            healed = headroom.reconcile(self.ctx, blocking=False)[0]
-                            self._notify("Headroom turned off",
-                                         "the proxy didn't survive sleep — "
-                                         + ("restored your setup" if healed else "running direct"))
+                            # ON with no proxy/routing behind it. Match state to reality (setting off,
+                            # persistent banner, notify) like every other auto-off.
+                            self._hrAutoOff("the proxy didn't survive sleep and wouldn't restart")
                 elif headroom.needs_reconcile(self.ctx):
                     headroom.reconcile(self.ctx, blocking=False)   # strip any orphaned injection
             except Exception:
@@ -267,9 +295,11 @@ if objc is not None:
             • Setting ON + proxy healthy: re-verify the rtk binary, so a swapped (tampered) rtk is
               caught between toggles, not only at enable time.
             • Setting ON + proxy reads down: DEBOUNCE with a short in-poll grace re-check (not a
-              multi-poll streak — that left up to a 180s dead-proxy window). One transient blip is
-              tolerated; a genuinely dead proxy is healed within seconds. reconcile()/heal() re-check
-              `global_running` under the op_lock, so a recovery in between is still honored."""
+              multi-poll streak — that left up to a 180s dead-proxy window), then RESTART the proxy
+              (breaker-bounded) — the setting is user intent, so we heal up, not off. Auto-off is the
+              last resort (enable failed / crash loop) and always leaves a persistent banner.
+              global_enable runs under op_lock, so a concurrent manual toggle stays serialized; the
+              setting is re-read after the grace sleep so a user's OFF is never overridden."""
             if not getattr(self, "_hrRecovered", False):
                 return                     # launch recovery (recoverBg_) owns the first reconcile
             if not self._claimHealthSlot():
@@ -285,23 +315,33 @@ if objc is not None:
                     ok_rtk, _ = headroom.verify_rtk(self.ctx.data_dir)
                     if not ok_rtk:        # supply-chain tamper while routing was live → tear it down
                         if headroom.global_disable(self.ctx.data_dir)[0]:
-                            with self.ctx.locked():
-                                s = self.ctx.load_state(); s.set_setting("headroom", False); s.save()
-                            self._notify("Headroom turned off", "its helper binary changed unexpectedly")
+                            self._hrAutoOff("its helper binary changed unexpectedly")
                         else:             # couldn't tear down → warn; routing may still use a bad rtk
                             self._notify("Headroom may be unsafe",
                                          "its helper binary changed and I couldn't turn routing off — "
                                          "quit the app or run save-credit off")
                     return
                 # proxy reads down — grace re-check to ride out a transient blip (proxy restart,
-                # wake-from-sleep) before the destructive teardown, then heal fast. (8s is a balance
-                # between a too-eager teardown and a too-long dead-proxy window; tune at M8.)
+                # wake-from-sleep). (8s is a balance between a too-eager reaction and a too-long
+                # dead-proxy window; tune at M8.) Then heal UP, not off: the setting is the user's
+                # INTENT, so a dead proxy gets restarted (same port — open sessions recover on their
+                # own retries), exactly like the wake handler and launch recovery do. The breaker
+                # stops a crash-looping proxy from restarting forever; only then flip the toggle off,
+                # leaving a persistent banner so the user actually learns about it.
                 time.sleep(8)
                 if headroom.global_running():
                     return
-                healed, _ = headroom.reconcile(self.ctx, blocking=False)
-                if healed:
-                    self._notify("Headroom turned off", "the proxy stopped — restored your setup")
+                if not self.ctx.load_state().settings().get("headroom"):
+                    return          # user toggled OFF during the grace sleep — honor their intent
+                if breaker_allows(self._hrRestartTimes, time.monotonic()):
+                    ok, _ = headroom.global_enable(self.ctx.data_dir)
+                    if ok:
+                        self._notify("save-credit", "the proxy stopped — restarted it")
+                        return
+                    reason = "the proxy stopped and wouldn't restart"
+                else:
+                    reason = "the proxy kept crashing (3 restarts in 30 min)"
+                self._hrAutoOff(reason)
             except Exception:
                 pass
             finally:
@@ -333,18 +373,24 @@ if objc is not None:
             """On quit (driven by applicationShouldTerminate_ on a background thread): remove global
             routing + restore config via global_disable, which is SERIALIZED through op_lock (waits
             out any in-flight enable/heal) and does an exact restore. The `headroom` SETTING is kept
-            so it re-applies next launch. The proxy's lifecycle is the APP's, so quit also reaps a
-            graceful-OFF proxy that was left running for open sessions (needs_reconcile is false then,
-            since routing is already direct). Guarded against a double run."""
+            so it re-applies next launch. The PROXY is only reaped once idle: open agents pin its
+            port at launch, so quitting the app must not kill their in-flight work. We drain
+            (bounded 20s), then leave a still-busy proxy alive — routing is stripped regardless, the
+            next enable re-adopts it, and the next cx/cl heal reaps it once idle. A wedged proxy
+            (unreadable gauge) never counts as busy. Guarded against a double run."""
             if getattr(self, "_teardownDone", False):
                 return
             self._teardownDone = True
             try:
                 from acctsw import headroom
                 if headroom.needs_reconcile(self.ctx):
-                    headroom.global_disable(self.ctx.data_dir)   # blocking + op_lock-serialized (unroute + reap)
+                    headroom.drain_proxy()                       # let in-flight responses finish (bounded)
+                    headroom.global_disable(self.ctx.data_dir,   # blocking + op_lock-serialized (unroute;
+                                            reap_proxy=not headroom.proxy_busy())  # reap only if idle)
                 elif headroom.proxy_maybe_running(self.ctx.data_dir):
-                    headroom.stop_proxy(self.ctx.data_dir)       # reap a graceful-OFF proxy (ready OR wedged) by PID
+                    headroom.drain_proxy()
+                    if not headroom.proxy_busy():
+                        headroom.stop_proxy(self.ctx.data_dir)   # reap a graceful-OFF proxy (ready OR wedged) by PID
             except Exception:
                 pass
 

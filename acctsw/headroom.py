@@ -379,8 +379,10 @@ def _unroute_all(port: int = PROXY_PORT) -> None:
 # --- proxy: run `headroom proxy` ourselves as a detached, PID-tracked subprocess -------------------
 # Replaces `headroom install apply`'s broken launchd service. We own the child's environment, so the
 # output-shaper knobs go in at startup. start_new_session detaches it from the app's process group;
-# we track it by PID file and tear it down on toggle-off/quit/health-fail (stop_proxy) so plain
-# codex/claude never point at a dead proxy.
+# we track it by PID file. Teardown rule: ROUTING is always cleaned eagerly (plain codex/claude must
+# never point at a dead proxy), but the PROCESS is only stopped once idle — sessions pin the port at
+# launch and a busy proxy shot mid-flight kills their responses. A surviving proxy is re-adopted by
+# the next enable (start_proxy's adopt path) or reaped by a later heal once idle.
 
 def _proxy_pidfile(store: Path | None) -> Path:
     return (store or P.DATA_DIR) / "headroom-proxy.pid"
@@ -914,8 +916,8 @@ def global_disable(store: Path | None = None, *, blocking: bool = True,
 
     reap_proxy=False = graceful toggle-OFF: unroute (new codex/claude go direct) but LEAVE the proxy
     running, so an already-open session that pinned 127.0.0.1:PORT at launch keeps working instead of
-    hitting ConnectionRefused. The proxy is reaped on quit/health-fail (reap_proxy=True) — its real
-    lifecycle is the app's, not the toggle's."""
+    hitting ConnectionRefused. A retained proxy is later reaped once idle (quit teardown drains
+    first; heal's orphan reap skips a busy one) or re-adopted by the next enable."""
     with op_lock(store, blocking=blocking) as acquired:
         if not acquired:
             return False, "headroom busy (another operation in progress)"
@@ -948,6 +950,35 @@ def needs_reconcile(ctx) -> bool:
     return has_backup(ctx.data_dir) or _any_injected()
 
 
+def record_event(state, reason: str) -> None:
+    """Stamp the save-credit auto-off event onto a LOADED State (caller holds ctx.locked() and saves;
+    the flock is not reentrant, so this must not lock itself): {at, reason} under
+    state.data['headroom_event']. The popover renders it as a PERSISTENT banner — a transient
+    notification alone is missable, and the toggle silently reading OFF is how a user finds out hours
+    later that sessions broke. Cleared when the user re-enables save-credit or dismisses the banner."""
+    from .util import iso, now
+    state.data["headroom_event"] = {"at": iso(now()), "reason": reason}
+
+
+def proxy_busy(port: int = PROXY_PORT, *, urlopen=None) -> bool:
+    """True iff the proxy is serving real client requests right now (inbound gauge above our own
+    probe). Unreadable gauge → False: a wedged proxy must not pass as busy and dodge its reap."""
+    n = inbound_active(port, urlopen=urlopen)
+    return n is not None and n > 1
+
+
+def _reap_orphan(store: Path | None) -> tuple[bool, str]:
+    """Clean up an orphaned proxy (app gone), but never shoot one still serving open sessions: agents
+    are pinned to its port and would die mid-flight. Busy (inbound gauge > 1 — our probe is the 1) →
+    strip routing only (new sessions go direct) and leave the process; a later heal reaps it once
+    idle. Idle, or gauge unreadable (wedged proxy — must die), → strip routing AND reap."""
+    n = inbound_active()
+    if n is not None and n > 1:
+        _log_full(store, "orphan proxy busy", f"{n - 1} request(s) in flight — left alive for open sessions")
+        return _remove_and_restore(store, reap_proxy=False)
+    return _remove_and_restore(store)
+
+
 def heal(store: Path | None = None, *, blocking: bool = True, push=None,
          app_running: bool = True) -> tuple[bool, str]:
     """Serialized self-heal that keys off ACTUAL state, not any setting — so it fixes orphans left by
@@ -958,10 +989,11 @@ def heal(store: Path | None = None, *, blocking: bool = True, push=None,
     that FAILED (config still injected) — so callers never mistake an incomplete restore for success.
 
     ``app_running`` is the master switch: the proxy's lifecycle belongs to the menubar app, so a
-    proxy that is up while the app is GONE is an ORPHAN (a hard-killed app never ran its quit teardown)
-    and must be reaped — otherwise it lingers and any session still pinned to its port keeps routing
-    through it. cx/cl pass app_running=False (the app is closed when they exec stock); the GUI poll /
-    launcher leave the default True.
+    proxy that is up while the app is GONE is an ORPHAN (a hard-killed app never ran its quit teardown).
+    Routing is always stripped eagerly; the PROCESS is only reaped once idle — an orphan still serving
+    requests is kept alive for the open sessions pinned to its port and reaped by a later heal (or
+    re-adopted by the next enable via start_proxy). cx/cl pass app_running=False (the app is closed
+    when they exec stock); the GUI poll / launcher leave the default True.
 
     Inside op_lock:
       • busy (blocking=False, another op holds it) → (False, "busy"): let that op finish.
@@ -978,15 +1010,16 @@ def heal(store: Path | None = None, *, blocking: bool = True, push=None,
         if not app_running and proxy_maybe_running(store):
             # App gone + a live proxy PROCESS (ready, wedged, OR still starting) → orphan. Reap it by
             # PID, not by /readyz: a wedged proxy that never answers /readyz would otherwise survive
-            # (proxy_ready() False), yet the pidfile is right there to kill it. Strip routing too.
-            return _remove_and_restore(store)
+            # (proxy_ready() False), yet the pidfile is right there to kill it. Strip routing too —
+            # but a busy orphan is left alive for its open sessions (see _reap_orphan).
+            return _reap_orphan(store)
         if proxy_ready():
             if app_running:
                 (push or push_runtime_knobs)()  # best-effort: re-assert knobs on a proxy we may not have started
                 return False, "healthy"
-            # App is gone but the proxy is still up → orphan. Reap it exactly as a graceful quit would
-            # have (strip/restore routing if any was left injected, then stop the proxy).
-            return _remove_and_restore(store)
+            # App is gone but the proxy is still up → orphan. Strip/restore routing if any was left
+            # injected; reap the proxy only once idle (see _reap_orphan).
+            return _reap_orphan(store)
         if not (_any_injected() or has_backup(store)):
             return False, "clean"
         ok, msg = _remove_and_restore(store)
