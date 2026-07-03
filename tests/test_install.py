@@ -211,15 +211,16 @@ def test_ensure_launchers_writes_wrappers_and_wires_rc(tmp_path, monkeypatch):
     assert not changed2
 
 
-def test_ensure_launchers_never_overwrites_existing_wrapper(tmp_path, monkeypatch):
+def test_ensure_launchers_preserves_non_poisoned_wrapper(tmp_path, monkeypatch):
     rc = tmp_path / ".zshrc"
     bindir = tmp_path / "bin"
     bindir.mkdir()
     monkeypatch.setattr(inst, "shell_rc_path", lambda: rc)
     (bindir / "cx").write_text("#!/bin/sh\n# good wrapper from `acctsw install`\n")
     inst.ensure_launchers(bin_dir=bindir)
-    # an existing wrapper (e.g. written by the system-python install) must NOT be rewritten to a
-    # bundle-interpreter path that can't run from a terminal
+    # an existing wrapper that isn't the known-broken pattern (no frozen `python311.zip` on
+    # PYTHONPATH) must be preserved — healing is scoped to the crash symptom, so a good hand-written
+    # or `acctsw install` wrapper is never clobbered by the app bootstrap
     assert "good wrapper" in (bindir / "cx").read_text()
 
 
@@ -244,18 +245,66 @@ def test_ensure_shell_setup_handles_regex_metachars_in_path(tmp_path):
     assert f'export PATH="{bindir}:$PATH"' in rc.read_text()
 
 
-def test_ensure_launchers_prefers_terminal_python_over_bundle(tmp_path, monkeypatch):
-    """Called from the app (no python passed), wrappers must point at a terminal python3, NOT the
-    py2app bundle interpreter (sys.executable)."""
+def test_ensure_launchers_uses_bundle_python_when_frozen(tmp_path, monkeypatch):
+    """Called from the frozen app (no python passed), wrappers must exec the py2app BUNDLE interpreter
+    (sys.executable = …/Contents/MacOS/python) with NO PYTHONPATH — a system python3 + the frozen 3.11
+    stdlib zip is what crashed `claude auth login` with "can't find module 'encodings'"."""
     rc = tmp_path / ".zshrc"
     bindir = tmp_path / "bin"
     monkeypatch.setattr(inst, "shell_rc_path", lambda: rc)
     monkeypatch.setattr(inst.sys, "executable", "/Bundle.app/Contents/MacOS/python")
-    monkeypatch.setattr(inst.shutil, "which", lambda name: "/usr/bin/python3" if name == "python3" else None)
     inst.ensure_launchers(bin_dir=bindir)
     body = (bindir / "acctsw").read_text()
-    assert "/usr/bin/python3" in body
-    assert "/Bundle.app/Contents/MacOS/python" not in body
+    assert "/Bundle.app/Contents/MacOS/python -m acctsw" in body
+    assert "PYTHONPATH=" not in body           # no PYTHONPATH *assignment* (the crash cause)
+    assert "unset PYTHONHOME PYTHONPATH" in body   # it clears an inherited leak instead
+    assert "python311.zip" not in body and "/usr/bin/python3" not in body
+
+
+def test_ensure_launchers_heals_stale_wrapper(tmp_path, monkeypatch):
+    """A wrapper an older build baked with the broken system-python3 + frozen-zip PYTHONPATH gets
+    rewritten to the bundle-python form on the next (idempotent) bootstrap."""
+    rc = tmp_path / ".zshrc"
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    stale = bindir / "acctsw"
+    stale.write_text('#!/bin/sh\nPYTHONPATH=/App.app/Contents/Resources/lib/python311.zip '
+                     'exec /usr/bin/python3 -m acctsw "$@"\n')
+    monkeypatch.setattr(inst, "shell_rc_path", lambda: rc)
+    monkeypatch.setattr(inst.sys, "executable", "/Bundle.app/Contents/MacOS/python")
+    changed, _ = inst.ensure_launchers(bin_dir=bindir)
+    assert changed
+    body = stale.read_text()
+    assert "python311.zip" not in body and "/usr/bin/python3" not in body
+    assert "/Bundle.app/Contents/MacOS/python -m acctsw" in body
+    # idempotent: the healed wrapper has no poison marker, so a second pass leaves it untouched
+    assert inst.ensure_launchers(bin_dir=bindir)[0] is False
+
+
+def test_ensure_launchers_heals_wrapper_after_python_version_bump(tmp_path, monkeypatch):
+    """Healing matches the poison shape (python3NN.zip), not the pinned 311 — so an old broken wrapper
+    still self-heals if a future bundle ships a newer Python."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "acctsw").write_text('#!/bin/sh\nPYTHONPATH=/App.app/Contents/Resources/lib/python312.zip '
+                                   'exec /usr/bin/python3 -m acctsw "$@"\n')
+    monkeypatch.setattr(inst, "shell_rc_path", lambda: tmp_path / ".zshrc")
+    monkeypatch.setattr(inst.sys, "executable", "/Bundle.app/Contents/MacOS/python")
+    changed, _ = inst.ensure_launchers(bin_dir=bindir, wire_rc=False)
+    assert changed
+    assert "python312.zip" not in (bindir / "acctsw").read_text()
+
+
+def test_ensure_launchers_wire_rc_false_skips_rc(tmp_path, monkeypatch):
+    """wire_rc=False heals wrappers but never touches the shell rc (so re-heal every launch doesn't
+    re-add a block the user removed)."""
+    rc = tmp_path / ".zshrc"
+    bindir = tmp_path / "bin"
+    monkeypatch.setattr(inst, "shell_rc_path", lambda: rc)
+    monkeypatch.setattr(inst.sys, "executable", "/Bundle.app/Contents/MacOS/python")
+    inst.ensure_launchers(bin_dir=bindir, wire_rc=False)
+    assert (bindir / "acctsw").exists()
+    assert not rc.exists()
 
 
 def test_uninstall_removes_only_our_block(ctx, tmp_path, monkeypatch):

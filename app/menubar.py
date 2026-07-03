@@ -136,19 +136,22 @@ if objc is not None:
                 objc.selector(self.bootstrapBg_, signature=b"v@:@"), None)
 
         def bootstrapBg_(self, _arg):
-            # Run ONCE (first launch), not every launch: a sentinel records that we've set up the
-            # shell. This respects a user who later removes our rc block / aliases — we won't fight
-            # them by re-adding it on the next launch.
+            # Two responsibilities, two lifetimes:
+            #  - bin wrappers: validate/heal EVERY launch (idempotent) so a wrapper an older build
+            #    baked with a broken interpreter — e.g. system python3 + the frozen 3.11 zip, which
+            #    crashed `claude auth login` with "can't find module 'encodings'" — gets corrected.
+            #  - shell rc block: wire ONCE (first launch), gated by a sentinel, so we don't fight a
+            #    user who later removes our rc block / aliases by re-adding them.
             try:
                 from acctsw import install
                 sentinel = self.ctx.data_dir / ".cli-bootstrapped"
-                if sentinel.exists():
-                    return
-                changed, _ = install.ensure_launchers()
-                sentinel.write_text("")   # mark done even if unchanged, so we never re-edit the rc
-                if changed:
-                    self._notify("ai guest list is ready",
-                                 "wired up codex/claude — open a new terminal to use them")
+                first_run = not sentinel.exists()
+                changed, _ = install.ensure_launchers(wire_rc=first_run)
+                if first_run:
+                    sentinel.write_text("")   # mark rc wired even if unchanged, so we never re-edit it
+                    if changed:
+                        self._notify("ai guest list is ready",
+                                     "wired up codex/claude — open a new terminal to use them")
             except Exception:
                 pass
 
