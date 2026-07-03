@@ -74,12 +74,10 @@ jobs:
           generate_release_notes: true
           files: AI-Guest-List-${{ github.ref_name }}.zip
           body: |
-            Unsigned build — macOS Gatekeeper blocks the first launch. To run it, either:
-            - install via Homebrew with the quarantine flag skipped:
-              `brew install --cask --no-quarantine fheinfling/tap/ai-guest-list`
-            - clear quarantine after installing/unzipping:
-              `xattr -dr com.apple.quarantine "/Applications/AI Guest List.app"`
-            - or approve it: on macOS 15+ open the app once, then System Settings →
+            Unsigned build — macOS Gatekeeper blocks the first launch. After installing
+            (`brew install --cask fheinfling/tap/ai-guest-list` or this zip), either:
+            - `xattr -dr com.apple.quarantine "/Applications/AI Guest List.app"`, or
+            - approve it: on macOS 15+ open the app once, then System Settings →
               Privacy & Security → "Open Anyway" (right-click → Open no longer works on 15+);
               on macOS 14 and earlier, right-click → Open → Open.
 

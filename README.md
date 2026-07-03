@@ -74,8 +74,10 @@ anywhere.
 
 **Homebrew (easiest):**
 ```sh
-brew install --cask --no-quarantine fheinfling/tap/ai-guest-list
+brew install --cask fheinfling/tap/ai-guest-list
 ```
+If Homebrew refuses the tap as untrusted, run `brew trust --tap fheinfling/tap` first, then retry.
+
 Then launch **AI Guest List** from Spotlight or `/Applications`, click the menubar door, and **add your
 seats**.
 
@@ -83,12 +85,13 @@ seats**.
 1. Grab the latest `.app` from [**Releases**](https://github.com/fheinfling/ai-guest-list/releases/latest).
 2. Unzip, drag **AI Guest List.app** to `/Applications`, and open it.
 
-> **Unsigned-app note.** The app isn't signed/notarized yet — `--no-quarantine` above skips the
-> Gatekeeper warning. If you installed without it (or used the zip) and macOS blocks the app:
-> - **macOS 15 (Sequoia)+**: open the app once, dismiss the dialog, then **System Settings → Privacy &
->   Security** → scroll down → **Open Anyway** (right-click → Open no longer bypasses Gatekeeper on 15+).
-> - **macOS 14 and earlier**: right-click the app in `/Applications` → **Open** → **Open**.
-> - **Either**: `xattr -dr com.apple.quarantine "/Applications/AI Guest List.app"`
+> **Unsigned-app note.** The app isn't signed/notarized yet, so macOS Gatekeeper blocks the first
+> launch. After installing (brew or zip), either:
+> - run `xattr -dr com.apple.quarantine "/Applications/AI Guest List.app"` (easiest), or
+> - approve it: **macOS 15 (Sequoia)+** — open the app once, dismiss the dialog, then **System
+>   Settings → Privacy & Security** → scroll down → **Open Anyway** (right-click → Open no longer
+>   bypasses Gatekeeper on 15+); **macOS 14 and earlier** — right-click the app in `/Applications` →
+>   **Open** → **Open**.
 
 **From source (CLI engine):**
 ```sh
