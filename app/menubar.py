@@ -25,7 +25,7 @@ except ImportError:  # allows importing this module's pure helpers without pyobj
     objc = None
 
 from acctsw import appalive, bridge
-from acctsw.context import Context
+from acctsw.context import Context, hydrate_path
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 USAGE_POLL_SECONDS = 180.0
@@ -487,6 +487,9 @@ def main() -> int:
     if objc is None:
         print("pyobjc not installed; run `pip install '.[app]'`", file=sys.stderr)
         return 1
+    # A GUI launch gives us only launchd's minimal PATH; add the dirs where claude/codex/node live
+    # BEFORE resolving them, or the app can't run the CLIs (identify a login → seat, poll usage).
+    hydrate_path()
     ctx = Context.default()
     ctx.ensure_dirs()
     app = NSApplication.sharedApplication()

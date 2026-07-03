@@ -21,6 +21,33 @@ from .state import State
 from .util import chmod_dir
 
 
+# A GUI app (Finder/launchd-launched) inherits only launchd's minimal PATH (/usr/bin:/bin:…), so the
+# Homebrew/npm/~-local dirs where `claude`, `codex` and their `node` runtime live are missing. Then
+# shutil.which() returns None and the app can't run the CLIs — so a completed `claude auth login`
+# can't be identified into a seat, and usage never polls. Prepend the usual locations so both
+# resolution AND running the tool (which itself needs `node` on PATH) work.
+_COMMON_BIN_DIRS = ("/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin",
+                    str(Path.home() / ".local" / "bin"), str(Path.home() / ".npm-global" / "bin"),
+                    str(Path.home() / "bin"))
+
+
+def hydrate_path() -> None:
+    """Ensure os.environ['PATH'] includes the common bin dirs a GUI-launched app's PATH omits, so the
+    app can find AND run claude/codex (→ node). Idempotent; call once at app startup, before the
+    Context/binaries are resolved. No subprocess — cheap and safe on the main thread."""
+    have = os.environ.get("PATH", "").split(os.pathsep)
+    extra = [d for d in _COMMON_BIN_DIRS if d and d not in have]
+    if extra:
+        os.environ["PATH"] = os.pathsep.join([*have, *extra])
+
+
+def which_tool(name: str) -> str | None:
+    """shutil.which that also searches the common bin dirs a GUI app's PATH omits — belt-and-suspenders
+    in case a Context is built before `hydrate_path` ran."""
+    return shutil.which(name) or shutil.which(
+        name, path=os.pathsep.join([os.environ.get("PATH", ""), *_COMMON_BIN_DIRS]))
+
+
 @dataclass
 class Context:
     data_dir: Path
@@ -59,8 +86,8 @@ class Context:
             keychain=keychain,
             keychain_service=P.KEYCHAIN_SERVICE,
             cred=cred,
-            claude_bin=shutil.which("claude"),
-            codex_bin=shutil.which("codex"),
+            claude_bin=which_tool("claude"),
+            codex_bin=which_tool("codex"),
             homes_root=P.CODEX_HOMES,
             codex_real=P.CODEX_HOME,
         )
