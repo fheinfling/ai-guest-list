@@ -3,6 +3,7 @@ name: release
 # Cut a release by pushing a tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
 # This builds the unsigned .app on a macOS runner and attaches it to a GitHub Release.
 # The tag's X.Y.Z MUST match acctsw/__init__.py __version__ (the job verifies and fails otherwise).
+# A second job then auto-bumps the Homebrew cask in fheinfling/homebrew-tap to this release.
 
 on:
   push:
@@ -14,6 +15,8 @@ permissions:
 jobs:
   build-and-release:
     runs-on: macos-14
+    outputs:
+      sha256: ${{ steps.checksum.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -57,6 +60,13 @@ jobs:
         run: |
           ditto -c -k --keepParent "dist/AI Guest List.app" "AI-Guest-List-${GITHUB_REF_NAME}.zip"
 
+      - name: Compute asset sha256
+        id: checksum
+        run: |
+          set -euo pipefail
+          SHA="$(shasum -a 256 "AI-Guest-List-${GITHUB_REF_NAME}.zip" | awk '{print $1}')"
+          echo "sha256=$SHA" | tee -a "$GITHUB_OUTPUT"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3 (pinned SHA; Dependabot keeps it current)
         with:
@@ -64,6 +74,53 @@ jobs:
           generate_release_notes: true
           files: AI-Guest-List-${{ github.ref_name }}.zip
           body: |
-            Unsigned build — macOS will warn on first open. To run it:
-            **right-click the app → Open → Open**, or
-            `xattr -dr com.apple.quarantine "/Applications/AI Guest List.app"`.
+            Unsigned build — macOS Gatekeeper blocks the first launch. To run it, either:
+            - install via Homebrew with the quarantine flag skipped:
+              `brew install --cask --no-quarantine fheinfling/tap/ai-guest-list`
+            - clear quarantine after installing/unzipping:
+              `xattr -dr com.apple.quarantine "/Applications/AI Guest List.app"`
+            - or approve it: on macOS 15+ open the app once, then System Settings →
+              Privacy & Security → "Open Anyway" (right-click → Open no longer works on 15+);
+              on macOS 14 and earlier, right-click → Open → Open.
+
+  update-tap:
+    # Bump the Homebrew cask in fheinfling/homebrew-tap to point at this release.
+    needs: build-and-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read      # tap pushes use TAP_PUSH_TOKEN, not GITHUB_TOKEN
+    steps:
+      - name: Checkout homebrew-tap
+        uses: actions/checkout@v7
+        with:
+          repository: fheinfling/homebrew-tap
+          token: ${{ secrets.TAP_PUSH_TOKEN }}
+
+      - name: Bump cask version + sha256
+        env:
+          SHA256: ${{ needs.build-and-release.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          VER="${GITHUB_REF_NAME#v}"
+          CASK="Casks/ai-guest-list.rb"
+          [[ "$SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::bad sha256 output from build job: '$SHA256'"; exit 1; }
+          [[ "$VER" =~ ^[0-9A-Za-z.+-]+$ ]]  || { echo "::error::unexpected version format: '$VER'"; exit 1; }
+          sed -i -E "s|^([[:space:]]*version[[:space:]]+\").*(\")$|\1${VER}\2|"    "$CASK"
+          sed -i -E "s|^([[:space:]]*sha256[[:space:]]+\").*(\")$|\1${SHA256}\2|"  "$CASK"
+          # Fail loudly if the sed patterns stopped matching the cask's formatting:
+          grep -Fq "version \"${VER}\""    "$CASK"
+          grep -Fq "sha256 \"${SHA256}\""  "$CASK"
+          git diff -- "$CASK"
+
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo "Cask already up to date for ${GITHUB_REF_NAME} — nothing to push."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/ai-guest-list.rb
+          git commit -m "ai-guest-list ${GITHUB_REF_NAME#v}"
+          git push
