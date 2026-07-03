@@ -2,6 +2,7 @@
 import json
 import os
 import stat
+import sys
 
 from acctsw import install as inst
 from acctsw.install import install, uninstall, _backup_account
@@ -246,18 +247,20 @@ def test_ensure_shell_setup_handles_regex_metachars_in_path(tmp_path):
 
 
 def test_ensure_launchers_uses_bundle_python_when_frozen(tmp_path, monkeypatch):
-    """Called from the frozen app (no python passed), wrappers must exec the py2app BUNDLE interpreter
-    (sys.executable = …/Contents/MacOS/python) with NO PYTHONPATH — a system python3 + the frozen 3.11
-    stdlib zip is what crashed `claude auth login` with "can't find module 'encodings'"."""
+    """Called from the frozen app (no python passed), the acctsw wrapper must exec the py2app BUNDLE
+    interpreter (sys.executable = …/Contents/MacOS/python) with PYTHONHOME pointed at the bundle's
+    Contents/Resources — otherwise the bundle python can't find its own stdlib on a machine lacking a
+    system Python.framework and dies with "can't find module 'encodings'". No PYTHONPATH assignment
+    (the ≤0.2.3 crash cause)."""
     rc = tmp_path / ".zshrc"
     bindir = tmp_path / "bin"
     monkeypatch.setattr(inst, "shell_rc_path", lambda: rc)
     monkeypatch.setattr(inst.sys, "executable", "/Bundle.app/Contents/MacOS/python")
     inst.ensure_launchers(bin_dir=bindir)
     body = (bindir / "acctsw").read_text()
-    assert "/Bundle.app/Contents/MacOS/python -m acctsw" in body
-    assert "PYTHONPATH=" not in body           # no PYTHONPATH *assignment* (the crash cause)
-    assert "unset PYTHONHOME PYTHONPATH" in body   # it clears an inherited leak instead
+    assert "PYTHONHOME=/Bundle.app/Contents/Resources exec /Bundle.app/Contents/MacOS/python -m acctsw" in body
+    assert "PYTHONPATH=" not in body           # no PYTHONPATH *assignment* (the ≤0.2.3 crash cause)
+    assert "unset PYTHONHOME PYTHONPATH" in body   # clears any inherited leak before setting our own
     assert "python311.zip" not in body and "/usr/bin/python3" not in body
 
 
@@ -276,9 +279,55 @@ def test_ensure_launchers_heals_stale_wrapper(tmp_path, monkeypatch):
     assert changed
     body = stale.read_text()
     assert "python311.zip" not in body and "/usr/bin/python3" not in body
-    assert "/Bundle.app/Contents/MacOS/python -m acctsw" in body
-    # idempotent: the healed wrapper has no poison marker, so a second pass leaves it untouched
+    assert "PYTHONHOME=/Bundle.app/Contents/Resources" in body
+    # idempotent: the healed wrapper matches desired, so a second pass leaves it untouched
     assert inst.ensure_launchers(bin_dir=bindir)[0] is False
+
+
+def test_ensure_launchers_heals_bundle_wrapper_missing_pythonhome(tmp_path, monkeypatch):
+    """The 0.2.4 breakage: a bundle-python wrapper with NO PYTHONHOME (it unset the vars but never set
+    one) can't find its own stdlib on a clean machine. The bootstrap must heal it to set PYTHONHOME."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "acctsw").write_text(
+        '#!/bin/sh\n# ai guest list engine\n'
+        'unset PYTHONHOME PYTHONPATH PYTHONEXECUTABLE __PYVENV_LAUNCHER__\n'
+        'exec /Bundle.app/Contents/MacOS/python -m acctsw "$@"\n')
+    monkeypatch.setattr(inst, "shell_rc_path", lambda: tmp_path / ".zshrc")
+    monkeypatch.setattr(inst.sys, "executable", "/Bundle.app/Contents/MacOS/python")
+    changed, _ = inst.ensure_launchers(bin_dir=bindir, wire_rc=False)
+    assert changed
+    assert "PYTHONHOME=/Bundle.app/Contents/Resources" in (bindir / "acctsw").read_text()
+
+
+def test_ensure_launchers_heals_wrapper_with_dead_interpreter(tmp_path, monkeypatch):
+    """A wrapper whose baked interpreter no longer exists (app moved/renamed, or venv deleted) is dead
+    and gets healed to the current interpreter."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "acctsw").write_text(
+        '#!/bin/sh\n# ai guest list engine\n'
+        'PYTHONHOME=/Old/Moved.app/Contents/Resources '
+        'exec /Old/Moved.app/Contents/MacOS/python -m acctsw "$@"\n')
+    monkeypatch.setattr(inst, "shell_rc_path", lambda: tmp_path / ".zshrc")
+    monkeypatch.setattr(inst.sys, "executable", "/Bundle.app/Contents/MacOS/python")
+    changed, _ = inst.ensure_launchers(bin_dir=bindir, wire_rc=False)
+    assert changed
+    assert "/Bundle.app/Contents/MacOS/python -m acctsw" in (bindir / "acctsw").read_text()
+
+
+def test_ensure_launchers_preserves_wrapper_with_live_interpreter(tmp_path, monkeypatch):
+    """A source-install wrapper that execs a real, existing interpreter is NOT stale — the app
+    bootstrap must not clobber it just because it differs from the bundle form."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    good = ('#!/bin/sh\n# ai guest list engine\n'
+            f'PYTHONPATH=/src/checkout exec {sys.executable} -m acctsw "$@"\n')
+    (bindir / "acctsw").write_text(good)
+    monkeypatch.setattr(inst, "shell_rc_path", lambda: tmp_path / ".zshrc")
+    monkeypatch.setattr(inst.sys, "executable", "/Bundle.app/Contents/MacOS/python")
+    inst.ensure_launchers(bin_dir=bindir, wire_rc=False)
+    assert (bindir / "acctsw").read_text() == good    # preserved verbatim
 
 
 def test_ensure_launchers_heals_wrapper_after_python_version_bump(tmp_path, monkeypatch):

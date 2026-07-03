@@ -227,17 +227,48 @@ def install(ctx: Context, *, dry_run: bool = False, register: bool = True,
 # shape (python311.zip today, python3NN.zip after any bump) so healing survives a Python upgrade.
 _POISON_RE = re.compile(r"python3\d+\.zip")
 
+# The interpreter path an `acctsw` wrapper execs: `… exec <py> -m acctsw …` (py may be shell-quoted).
+_EXEC_PY_RE = re.compile(r"""exec\s+(?:'([^']*)'|"([^"]*)"|(\S+))\s+-m\s+acctsw""")
+
 
 def _is_bundle_python(python: str) -> bool:
     """True if ``python`` is the interpreter shipped INSIDE our py2app .app bundle
-    (``…/AI Guest List.app/Contents/MacOS/python``). That interpreter is a self-contained 3.11 that
-    resolves ``acctsw`` from its own frozen stdlib zip — so its wrapper needs NO PYTHONPATH, and must
-    never get one pointing at the frozen zip (that would crash a *different* interpreter with
-    "can't find module 'encodings'"). Match the exact py2app exe layout — anchored on the trailing
+    (``…/AI Guest List.app/Contents/MacOS/python``). That interpreter finds its frozen stdlib only
+    when ``PYTHONHOME`` points at the bundle's ``Contents/Resources`` — so its wrapper sets that (a
+    system ``python3`` is macOS's 3.9, which can't run our 3.11 code, so the bundle python is the only
+    interpreter we can rely on). Match the exact py2app exe layout — anchored on the trailing
     ``.app/Contents/MacOS/python`` — so a python.org framework GUI stub
     (``…/Python.app/Contents/MacOS/Python``, capital P) doesn't false-positive into this branch and
     strip the PYTHONPATH a source checkout needs."""
     return str(python).endswith(".app/Contents/MacOS/python")
+
+
+def _wrapper_exe(body: str) -> str | None:
+    """The interpreter path an existing `acctsw` wrapper execs, or None if it's not one we recognize
+    (e.g. a cx/cl wrapper, or a hand-written file)."""
+    m = _EXEC_PY_RE.search(body)
+    return (m.group(1) or m.group(2) or m.group(3)) if m else None
+
+
+def _wrapper_stale(body: str) -> bool:
+    """True if an existing `acctsw` wrapper is a broken one a past build baked, so the app bootstrap
+    should overwrite it. Scoped to concrete breakage signals so a good source-install / hand-written
+    wrapper (one that execs an interpreter that actually works) is preserved:
+      - a frozen py2app stdlib zip on PYTHONPATH (≤0.2.3 — crashes a foreign python with "encodings"),
+      - the bundle python WITHOUT PYTHONHOME (0.2.4 — the bundle python then can't find its own stdlib
+        on a machine that lacks a system Python.framework), or
+      - an interpreter path that no longer exists (the .app was moved/renamed, or a venv was deleted)."""
+    if _POISON_RE.search(body):
+        return True
+    exe = _wrapper_exe(body)
+    if exe is None:
+        return False
+    if exe.endswith(".app/Contents/MacOS/python") and "PYTHONHOME=" not in body:
+        return True
+    try:
+        return os.path.isabs(exe) and not Path(exe).exists()
+    except OSError:
+        return False
 
 
 def ensure_launchers(*, bin_dir: Path | None = None, python: str | None = None,
@@ -250,9 +281,9 @@ def ensure_launchers(*, bin_dir: Path | None = None, python: str | None = None,
     (changed, messages)."""
     bin_dir = bin_dir or BIN_DIR
     # Interpreter for the wrappers. When called from the menubar app (no python passed), sys.executable
-    # is the py2app BUNDLE interpreter — which IS invokable from a shell (`… -m acctsw` self-resolves)
-    # and is the only 3.11 we can rely on (a cask user's system `python3` is macOS's 3.9, which can't
-    # run our 3.11 code). `acctsw install` passes the user's python explicitly for a source checkout.
+    # is the py2app BUNDLE interpreter — the only 3.11 we can rely on (a cask user's system `python3`
+    # is macOS's 3.9, which can't run our 3.11 code). `_wrapper_script` runs it with PYTHONHOME set to
+    # the bundle so it finds its own stdlib. `acctsw install` passes the user's python for a checkout.
     python = python or sys.executable
     pkg_root = pkg_root or Path(__file__).resolve().parent.parent
     changed, msgs = False, []
@@ -261,16 +292,15 @@ def ensure_launchers(*, bin_dir: Path | None = None, python: str | None = None,
         desired = _wrapper_script(name, python, pkg_root, bin_dir)
         verb = "installed"
         if target.exists():
-            # Preserve an existing wrapper UNLESS it carries the exact poison a broken build baked in:
-            # a frozen py2app stdlib zip on PYTHONPATH (which crashes the interpreter with "can't find
-            # module 'encodings'"). Scoping the heal to that symptom means we never clobber a good
-            # hand-written or `acctsw install` wrapper that merely differs. `errors="ignore"` +
-            # catching OSError keeps a foreign/unreadable file at our name from aborting the bootstrap.
+            # Leave a correct or good-but-different wrapper alone; only overwrite one `_wrapper_stale`
+            # recognizes as broken (see it for the signals), so we never clobber a working
+            # hand-written / `acctsw install` wrapper. `errors="ignore"` + catching OSError keeps a
+            # foreign/unreadable file at our name from aborting the whole bootstrap.
             try:
                 body = target.read_text(errors="ignore")
             except OSError:
                 continue
-            if not _POISON_RE.search(body):
+            if body == desired or not _wrapper_stale(body):
                 continue
             verb = "healed"
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -291,15 +321,18 @@ def _wrapper_script(name: str, python: str, pkg_root: Path, bin_dir: Path) -> st
     py, pr, acctsw = shlex.quote(str(python)), shlex.quote(str(pkg_root)), shlex.quote(str(bin_dir / "acctsw"))
     if name == "acctsw":
         if _is_bundle_python(python):
-            # The bundled interpreter self-resolves `acctsw` (and its whole stdlib) from the bundle,
-            # with NO PYTHONHOME/PYTHONPATH needed. `unset` the interpreter-redirect vars first so an
-            # inherited leak (a Terminal the app spawned inherits py2app's PYTHONHOME/PYTHONPATH) can't
-            # misdirect it — pointing them at the frozen zip is what crashed a foreign python3 with
-            # "can't find module 'encodings'".
+            # The bundled interpreter is the framework python3.11 copied into the app; on its own it
+            # derives sys.prefix from a compiled-in framework path that need not exist on the user's
+            # machine, so it can't find its stdlib and dies with "can't find module 'encodings'". Point
+            # PYTHONHOME at the bundle's own Resources (which carries lib/python311.zip + lib/python3.11)
+            # so it ALWAYS resolves acctsw and the stdlib from inside the .app, machine-independently.
+            # `unset` the leaked redirect vars first (a Terminal the app spawned inherits py2app's
+            # PYTHONHOME/PYTHONPATH) so only our explicit PYTHONHOME on the exec line takes effect.
             from .headroom import _PY_ENV_STRIP
+            home = shlex.quote(str(Path(python).parent.parent / "Resources"))
             return (f"#!/bin/sh\n# ai guest list engine\n"
                     f"unset {' '.join(_PY_ENV_STRIP)}\n"
-                    f'exec {py} -m acctsw "$@"\n')
+                    f'PYTHONHOME={home} exec {py} -m acctsw "$@"\n')
         # Source checkout: set PYTHONPATH to ONLY pkg_root — do NOT append "$PYTHONPATH". If this wrapper
         # runs from a shell that inherited py2app's leaked PYTHONPATH (the frozen 3.11 stdlib zip),
         # appending it would shadow the interpreter's stdlib and crash `python -m acctsw`.
