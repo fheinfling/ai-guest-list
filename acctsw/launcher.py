@@ -443,10 +443,23 @@ def _noop(_msg: str) -> None:
     pass
 
 
+# Sub-commands that establish/replace credentials rather than run an agent session: codex login,
+# claude auth login / auth status / setup-token, logout. They must NOT be supervised — there is no
+# seat to pick, switch, or auto-switch, and the interactive OAuth flow needs the tool to fully own the
+# real TTY. Under our PTY the sign-in never completes: the browser redirects to
+# http://localhost:PORT/callback but the callback server (running in the supervised child) is torn
+# down / never handed the request, so the seat is never actually added. Run these as the stock tool.
+_PASSTHROUGH_CMDS = frozenset({"login", "logout", "auth", "setup-token"})
+
+
 def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         notify: Notifier = _noop, get=usage_mod._default_get,
         max_switches: int = MAX_SWITCHES) -> int:
     """Launch ``tool`` with the best seat, auto-switching + resuming on limits. Returns exit code."""
+    if args and args[0] in _PASSTHROUGH_CMDS:
+        # Credential flow (e.g. `claude auth login`): run stock, unsupervised, so the OAuth
+        # localhost-callback + interactive prompts work exactly as they do for a plain invocation.
+        return exec_stock(ctx, tool, args)
     state = ctx.load_state()
     if not state.accounts(tool):
         raise NoSeats(f"no {tool} seats yet — add one first")

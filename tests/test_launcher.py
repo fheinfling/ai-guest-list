@@ -260,6 +260,26 @@ def test_run_no_seats_raises(ctx):
         run(ctx, "codex", [], spawn=FakeSpawn([]))
 
 
+def test_run_passes_credential_flows_through_to_stock_unsupervised(ctx, monkeypatch):
+    """Login / auth / setup-token / logout must run as the STOCK tool, never under the supervisor —
+    so the OAuth localhost-callback completes — and must work even with no seats yet (first sign-in)."""
+    calls = []
+    monkeypatch.setattr(L, "exec_stock", lambda c, tool, args: calls.append((tool, args)) or 0)
+
+    def _no_spawn(*a, **k):
+        raise AssertionError("credential flow was supervised via spawn — it must run stock")
+
+    for tool, args in [("claude", ["auth", "login"]), ("claude", ["setup-token"]),
+                       ("codex", ["login"]), ("claude", ["logout"])]:
+        calls.clear()
+        assert run(ctx, tool, args, spawn=_no_spawn) == 0   # no seats needed; spawn untouched
+        assert calls == [(tool, args)]
+
+    # a normal (non-credential) invocation is still supervised — passthrough must not swallow it
+    with pytest.raises(NoSeats):
+        run(ctx, "codex", ["--foo"], spawn=_no_spawn)
+
+
 def test_run_clean_exit_no_switch(ctx):
     state = _two_codex(ctx)
     spawn = FakeSpawn([(b"all good, done\n", 0)])
