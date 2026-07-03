@@ -136,19 +136,22 @@ if objc is not None:
                 objc.selector(self.bootstrapBg_, signature=b"v@:@"), None)
 
         def bootstrapBg_(self, _arg):
-            # Run ONCE (first launch), not every launch: a sentinel records that we've set up the
-            # shell. This respects a user who later removes our rc block / aliases — we won't fight
-            # them by re-adding it on the next launch.
+            # Two responsibilities, two lifetimes:
+            #  - bin wrappers: validate/heal EVERY launch (idempotent) so a wrapper an older build
+            #    baked with a broken interpreter — e.g. system python3 + the frozen 3.11 zip, which
+            #    crashed `claude auth login` with "can't find module 'encodings'" — gets corrected.
+            #  - shell rc block: wire ONCE (first launch), gated by a sentinel, so we don't fight a
+            #    user who later removes our rc block / aliases by re-adding them.
             try:
                 from acctsw import install
                 sentinel = self.ctx.data_dir / ".cli-bootstrapped"
-                if sentinel.exists():
-                    return
-                changed, _ = install.ensure_launchers()
-                sentinel.write_text("")   # mark done even if unchanged, so we never re-edit the rc
-                if changed:
-                    self._notify("ai guest list is ready",
-                                 "wired up codex/claude — open a new terminal to use them")
+                first_run = not sentinel.exists()
+                changed, _ = install.ensure_launchers(wire_rc=first_run)
+                if first_run:
+                    sentinel.write_text("")   # mark rc wired even if unchanged, so we never re-edit it
+                    if changed:
+                        self._notify("ai guest list is ready",
+                                     "wired up codex/claude — open a new terminal to use them")
             except Exception:
                 pass
 
@@ -371,8 +374,8 @@ if objc is not None:
         @objc.python_method
         def _headroomTeardown(self):
             """On quit (driven by applicationShouldTerminate_ on a background thread): remove global
-            routing + restore config via global_disable, which is SERIALIZED through op_lock (waits
-            out any in-flight enable/heal) and does an exact restore. The `headroom` SETTING is kept
+            routing + restore config via graceful_shutdown, which is SERIALIZED through op_lock
+            (waits out any in-flight enable/heal) and does an exact restore. The `headroom` SETTING is kept
             so it re-applies next launch. The PROXY is only reaped once idle: open agents pin its
             port at launch, so quitting the app must not kill their in-flight work. We drain
             (bounded 20s), then leave a still-busy proxy alive — routing is stripped regardless, the
@@ -383,21 +386,12 @@ if objc is not None:
             self._teardownDone = True
             try:
                 from acctsw import headroom
-                # Order matters: strip ROUTING first (blocking + op_lock-serialized), so no new
-                # session can start routing through the proxy while we probe it — probing before
-                # unrouting is a check-then-act race that could reap a proxy that just picked up
-                # fresh work. Only then drain and, if idle, reap. A wedged proxy (unreadable gauge)
-                # is never busy, so it still dies here.
-                unrouted = True
-                if headroom.needs_reconcile(self.ctx):
-                    unrouted, _ = headroom.global_disable(self.ctx.data_dir, reap_proxy=False)
-                # Reap ONLY when the unroute actually succeeded: with routing still injected, killing
-                # an idle-right-now proxy would strand routed clients on a dead port — leave it alive
-                # instead; the next launch / cx / cl heal retries the cleanup.
-                if unrouted and headroom.proxy_maybe_running(self.ctx.data_dir):
-                    headroom.drain_proxy()                       # let in-flight responses finish (bounded)
-                    if not headroom.proxy_busy():
-                        headroom.stop_proxy(self.ctx.data_dir)   # by PID (ready OR wedged)
+                # One shutdown sequence for every teardown path (strip routing first, reap only an
+                # idle proxy) — see _graceful_shutdown. drain=True: quit can afford the bounded wait
+                # for in-flight responses; the cheap pre-checks keep the never-used-headroom quit
+                # instant.
+                if headroom.needs_reconcile(self.ctx) or headroom.proxy_maybe_running(self.ctx.data_dir):
+                    headroom.graceful_shutdown(self.ctx.data_dir, drain=True)
             except Exception:
                 pass
 

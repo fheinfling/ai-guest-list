@@ -222,34 +222,67 @@ def install(ctx: Context, *, dry_run: bool = False, register: bool = True,
     return plan
 
 
+# The frozen py2app stdlib zip a broken build baked onto a foreign interpreter's PYTHONPATH — the
+# poison that crashed the wrapper with "can't find module 'encodings'". Match the version-agnostic
+# shape (python311.zip today, python3NN.zip after any bump) so healing survives a Python upgrade.
+_POISON_RE = re.compile(r"python3\d+\.zip")
+
+
+def _is_bundle_python(python: str) -> bool:
+    """True if ``python`` is the interpreter shipped INSIDE our py2app .app bundle
+    (``…/AI Guest List.app/Contents/MacOS/python``). That interpreter is a self-contained 3.11 that
+    resolves ``acctsw`` from its own frozen stdlib zip — so its wrapper needs NO PYTHONPATH, and must
+    never get one pointing at the frozen zip (that would crash a *different* interpreter with
+    "can't find module 'encodings'"). Match the exact py2app exe layout — anchored on the trailing
+    ``.app/Contents/MacOS/python`` — so a python.org framework GUI stub
+    (``…/Python.app/Contents/MacOS/Python``, capital P) doesn't false-positive into this branch and
+    strip the PYTHONPATH a source checkout needs."""
+    return str(python).endswith(".app/Contents/MacOS/python")
+
+
 def ensure_launchers(*, bin_dir: Path | None = None, python: str | None = None,
-                     pkg_root: Path | None = None, aliases: bool = True) -> tuple[bool, list[str]]:
+                     pkg_root: Path | None = None, aliases: bool = True,
+                     wire_rc: bool = True) -> tuple[bool, list[str]]:
     """Make cx/cl usable end-to-end with zero manual steps: (re)write the bin wrappers if missing or
-    stale, and wire the shell rc (PATH + codex/claude aliases). Idempotent and cheap — safe to call
-    on every app launch so a fresh install "just works" and a deleted rc block self-heals. Returns
+    stale, and (when ``wire_rc``) wire the shell rc (PATH + codex/claude aliases). Idempotent and
+    cheap — safe to call on every app launch so a fresh install "just works", a deleted rc block
+    self-heals, and a wrapper baked with a broken interpreter gets corrected. Returns
     (changed, messages)."""
     bin_dir = bin_dir or BIN_DIR
-    # Resolve a TERMINAL-invokable interpreter. When called from the menubar app (no python passed),
-    # sys.executable is the py2app BUNDLE interpreter, which the wrappers can't usefully exec from a
-    # shell — prefer a real `python3` on PATH. `acctsw install` passes the user's python explicitly.
-    python = python or shutil.which("python3") or sys.executable
+    # Interpreter for the wrappers. When called from the menubar app (no python passed), sys.executable
+    # is the py2app BUNDLE interpreter — which IS invokable from a shell (`… -m acctsw` self-resolves)
+    # and is the only 3.11 we can rely on (a cask user's system `python3` is macOS's 3.9, which can't
+    # run our 3.11 code). `acctsw install` passes the user's python explicitly for a source checkout.
+    python = python or sys.executable
     pkg_root = pkg_root or Path(__file__).resolve().parent.parent
     changed, msgs = False, []
     for name in BIN_NAMES:
         target = bin_dir / name
-        # Only CREATE missing wrappers — never overwrite an existing one. `acctsw install` (run under
-        # the user's system python) is the authoritative writer; the app bootstrap must not rewrite a
-        # working wrapper to point at the bundle interpreter, which isn't invokable from a terminal.
+        desired = _wrapper_script(name, python, pkg_root, bin_dir)
+        verb = "installed"
         if target.exists():
-            continue
+            # Preserve an existing wrapper UNLESS it carries the exact poison a broken build baked in:
+            # a frozen py2app stdlib zip on PYTHONPATH (which crashes the interpreter with "can't find
+            # module 'encodings'"). Scoping the heal to that symptom means we never clobber a good
+            # hand-written or `acctsw install` wrapper that merely differs. `errors="ignore"` +
+            # catching OSError keeps a foreign/unreadable file at our name from aborting the bootstrap.
+            try:
+                body = target.read_text(errors="ignore")
+            except OSError:
+                continue
+            if not _POISON_RE.search(body):
+                continue
+            verb = "healed"
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(_wrapper_script(name, python, pkg_root, bin_dir))
+        target.write_text(desired)
         target.chmod(0o755)
         changed = True
-        msgs.append(f"installed {target}")
-    did, msg = ensure_shell_setup(bin_dir, aliases=aliases)
-    msgs.append(msg)
-    return (changed or did), msgs
+        msgs.append(f"{verb} {target}")
+    if wire_rc:
+        did, msg = ensure_shell_setup(bin_dir, aliases=aliases)
+        msgs.append(msg)
+        changed = changed or did
+    return changed, msgs
 
 
 def _wrapper_script(name: str, python: str, pkg_root: Path, bin_dir: Path) -> str:
@@ -257,9 +290,19 @@ def _wrapper_script(name: str, python: str, pkg_root: Path, bin_dir: Path) -> st
     # out of the generated /bin/sh script (defense-in-depth; these paths aren't attacker-controlled).
     py, pr, acctsw = shlex.quote(str(python)), shlex.quote(str(pkg_root)), shlex.quote(str(bin_dir / "acctsw"))
     if name == "acctsw":
-        # Set PYTHONPATH to ONLY pkg_root — do NOT append "$PYTHONPATH". If this wrapper runs from a
-        # shell that inherited py2app's leaked PYTHONPATH (the frozen 3.11 stdlib zip), appending it
-        # would shadow the system interpreter's stdlib and crash `python -m acctsw`.
+        if _is_bundle_python(python):
+            # The bundled interpreter self-resolves `acctsw` (and its whole stdlib) from the bundle,
+            # with NO PYTHONHOME/PYTHONPATH needed. `unset` the interpreter-redirect vars first so an
+            # inherited leak (a Terminal the app spawned inherits py2app's PYTHONHOME/PYTHONPATH) can't
+            # misdirect it — pointing them at the frozen zip is what crashed a foreign python3 with
+            # "can't find module 'encodings'".
+            from .headroom import _PY_ENV_STRIP
+            return (f"#!/bin/sh\n# ai guest list engine\n"
+                    f"unset {' '.join(_PY_ENV_STRIP)}\n"
+                    f'exec {py} -m acctsw "$@"\n')
+        # Source checkout: set PYTHONPATH to ONLY pkg_root — do NOT append "$PYTHONPATH". If this wrapper
+        # runs from a shell that inherited py2app's leaked PYTHONPATH (the frozen 3.11 stdlib zip),
+        # appending it would shadow the interpreter's stdlib and crash `python -m acctsw`.
         return (f"#!/bin/sh\n# ai guest list engine\n"
                 f'PYTHONPATH={pr} exec {py} -m acctsw "$@"\n')
     tool = "codex" if name == "cx" else "claude"
@@ -359,7 +402,6 @@ def uninstall(ctx: Context, *, purge: bool = False, dry_run: bool = False,
                     lambda t=tool: ctx.keychain.delete(ctx.keychain_service, _backup_account(t)))
 
         def _rmtree():
-            import shutil
             shutil.rmtree(ctx.data_dir, ignore_errors=True)
         plan.do(f"delete store {ctx.data_dir}", _rmtree)
 
