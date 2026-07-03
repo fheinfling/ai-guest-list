@@ -103,7 +103,8 @@ jobs:
           set -euo pipefail
           VER="${GITHUB_REF_NAME#v}"
           CASK="Casks/ai-guest-list.rb"
-          [ -n "$SHA256" ] || { echo "::error::empty sha256 output from build job"; exit 1; }
+          [[ "$SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::bad sha256 output from build job: '$SHA256'"; exit 1; }
+          [[ "$VER" =~ ^[0-9A-Za-z.+-]+$ ]]  || { echo "::error::unexpected version format: '$VER'"; exit 1; }
           sed -i -E "s|^([[:space:]]*version[[:space:]]+\").*(\")$|\1${VER}\2|"    "$CASK"
           sed -i -E "s|^([[:space:]]*sha256[[:space:]]+\").*(\")$|\1${SHA256}\2|"  "$CASK"
           # Fail loudly if the sed patterns stopped matching the cask's formatting:
