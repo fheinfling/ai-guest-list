@@ -24,13 +24,24 @@ Releases are built and published by GitHub Actions when you push a tag — see
    ```
 3. The `release` workflow runs on a macOS runner: verifies the tag matches `__version__`, runs the
    test suite + web tests (a hard gate), builds the `.app` via py2app, zips it with `ditto`, and
-   creates a GitHub Release with auto-generated notes and the zip attached.
+   creates a GitHub Release with auto-generated notes and the zip attached. A second job
+   (`update-tap`) then bumps `Casks/ai-guest-list.rb` in `fheinfling/homebrew-tap` to the new version
+   + zip sha256 and pushes it — the tap is **not** maintained by hand.
 
 ## Notes
 
 - **Unsigned.** No Apple Developer certificate is configured, so the `.app` is unsigned/un-notarized.
-  Users open it via right-click → Open, or
+  Installing via `brew install --cask --no-quarantine fheinfling/tap/ai-guest-list` skips the
+  Gatekeeper warning. If a user installs without it (or uses the zip) and macOS blocks the app: on
+  **macOS 15 (Sequoia)+** open the app once, then **System Settings → Privacy & Security → Open
+  Anyway** (right-click → Open no longer bypasses Gatekeeper on 15+); on **macOS 14 and earlier**
+  right-click → Open → Open; or, on any version,
   `xattr -dr com.apple.quarantine "/Applications/AI Guest List.app"`. Wire signing/notarization into
   the workflow once a Developer ID is available.
+- **Homebrew tap.** The `update-tap` job authenticates with a fine-grained PAT stored as the
+  `TAP_PUSH_TOKEN` Actions secret (scoped to `fheinfling/homebrew-tap`, **Contents: Read and write**).
+  If the token expires the job fails with a 403 — rotate it by generating a new PAT and running
+  `gh secret set TAP_PUSH_TOKEN --repo fheinfling/ai-guest-list`. The job no-ops when the cask is
+  already current, so re-running a release is safe.
 - **Re-running a release:** delete the tag and GitHub Release, then re-tag
   (`git tag -d vX.Y.Z && git push origin :vX.Y.Z`).

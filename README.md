@@ -74,15 +74,21 @@ anywhere.
 
 **Homebrew (easiest):**
 ```sh
-brew install --cask fheinfling/tap/ai-guest-list
+brew install --cask --no-quarantine fheinfling/tap/ai-guest-list
 ```
 Then launch **AI Guest List** from Spotlight or `/Applications`, click the menubar door, and **add your
-seats**. (It's **unsigned** for now, so on first open: **right-click → Open → Open**, or
-`xattr -dr com.apple.quarantine "/Applications/AI Guest List.app"`.)
+seats**.
 
 **Or download the app directly:**
 1. Grab the latest `.app` from [**Releases**](https://github.com/fheinfling/ai-guest-list/releases/latest).
-2. Unzip, drag **AI Guest List.app** to `/Applications`, and open it (same unsigned note as above).
+2. Unzip, drag **AI Guest List.app** to `/Applications`, and open it.
+
+> **Unsigned-app note.** The app isn't signed/notarized yet — `--no-quarantine` above skips the
+> Gatekeeper warning. If you installed without it (or used the zip) and macOS blocks the app:
+> - **macOS 15 (Sequoia)+**: open the app once, dismiss the dialog, then **System Settings → Privacy &
+>   Security** → scroll down → **Open Anyway** (right-click → Open no longer bypasses Gatekeeper on 15+).
+> - **macOS 14 and earlier**: right-click the app in `/Applications` → **Open** → **Open**.
+> - **Either**: `xattr -dr com.apple.quarantine "/Applications/AI Guest List.app"`
 
 **From source (CLI engine):**
 ```sh
