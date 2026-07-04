@@ -392,6 +392,26 @@ def _proxy_logfile(store: Path | None) -> Path:
     return (store or P.DATA_DIR) / "headroom-proxy.log"
 
 
+def last_proxy_error(store: Path | None = None, *, lines: int = 5, max_chars: int = 400,
+                     tail_bytes: int = 8192) -> str:
+    """Return the last few non-empty lines of the proxy's log — its captured stdout/stderr — so a
+    crash-loop can SHOW why the proxy keeps dying instead of a bare "restarted it". Empty string if
+    the log is missing/unreadable/blank. Bounded: the log is append-only and never rotated, so we read
+    only the final ``tail_bytes`` (seek to end) rather than the whole file, then cap the joined result
+    — a huge log never blows up memory, a notification, or the persisted banner."""
+    p = _proxy_logfile(store)
+    try:
+        with p.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - tail_bytes))
+            raw = f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+    tail = [ln.strip() for ln in raw.splitlines() if ln.strip()][-lines:]
+    out = " · ".join(tail)
+    return out[-max_chars:] if len(out) > max_chars else out
+
+
 def proxy_ready(port: int = PROXY_PORT, *, urlopen=None, timeout: float = 2.0) -> bool:
     """True iff the proxy answers GET /readyz with ready:true. Cross-process (plain HTTP), so a cx/cl
     launcher in another process can check the GUI-started proxy."""
