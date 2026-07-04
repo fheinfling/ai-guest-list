@@ -31,7 +31,7 @@ from pathlib import Path
 
 from . import paths as P
 
-PINNED_VERSION = "0.27.0"                       # pin: audited build (see docs/SECURITY-headroom.md)
+PINNED_VERSION = "0.29.0"                       # pin: reviewed build (see docs/SECURITY-headroom.md)
 PACKAGE = f"headroom-ai[proxy]=={PINNED_VERSION}"
 
 # Hardening env applied to every wrapped session: telemetry off, no third-party tracing/analytics,
@@ -1153,5 +1153,3 @@ def ensure_installed() -> bool:
         _log_full(None, "ensure_installed failed", str(e))
         return False
     return available()
-
-

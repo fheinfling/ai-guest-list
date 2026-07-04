@@ -87,6 +87,8 @@ acctsw uninstall --purge       # also deletes the store + all our keychain items
     GUI poll does while it's open, and a closed app means the proxy is down → routing is healed
     away). NB: the new path never runs `headroom wrap`, so `rtk` may never be downloaded at all and
     `verify_rtk` is a no-op ("not present yet") — fine, but confirm savings don't depend on rtk.
+  - **Headroom version drift**: `acctsw.headroom.PINNED_VERSION` is intentionally pinned to the
+    currently reviewed upstream version (`0.29.0`). Re-check upstream proxy CLI flags before bumping.
   - **Savings seeding / shaper env**: enabling save-credit (a) starts the proxy with
     `HEADROOM_OUTPUT_SHAPER=1` + `HEADROOM_OUTPUT_HOLDOUT` directly in the child's env (we own it now,
     so no plist workaround) and (b) seeds the baseline once via `headroom learn --verbosity --apply

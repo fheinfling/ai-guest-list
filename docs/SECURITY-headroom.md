@@ -3,20 +3,20 @@
 Headroom (`headroom-ai`, Apache-2.0) is an **optional** integration: when "save credit" is on, the
 supervised launcher routes the agent through Headroom's **local** proxy, which compresses context to
 cut tokens. Because it sits in the agent's data path (it sees prompts and forwards your OAuth bearer
-token) and edits `~/.codex` config, we audited it. **Pinned & audited version: `0.27.0`.**
+token) and edits `~/.codex` config, we reviewed it. **Pinned & reviewed version: `0.29.0`.**
 
 ## Method
-Static review of the installed package + a live network capture of `headroom proxy` under our
-hardened env (`acctsw.headroom.HARDENING_ENV`). Not covered: the compiled `_core.abi3.so` (native,
-unauditable from source) and a full packet capture of in-flight provider traffic.
+Static review of upstream `0.29.0` source/docs + a live network-capture recipe for `headroom proxy`
+under our hardened env (`acctsw.headroom.HARDENING_ENV`). Not covered: the compiled `_core.abi3.so`
+(native, unauditable from source) and a full packet capture of in-flight provider traffic.
 
 ## Findings
 
 **Verdict: safe for opt-in, local use. No credential leakage or covert egress found.**
 
-- **Telemetry is OFF by default** (flag help: *"anonymous usage telemetry — off by default"*). Even
-  when enabled, the reporter's contract is: *"Never sends message content, API keys, prompts, tool
-  results, or user data — only aggregate counts."*
+- **Telemetry is forced OFF by us** on every subprocess (`--no-telemetry` +
+  `HEADROOM_TELEMETRY=off`). Upstream exposes both the flag and env opt-out; we never rely on the
+  package default.
 - **All cloud features are opt-in, gated behind unset keys:** Langfuse tracing (`LANGFUSE_PUBLIC_KEY`/
   `_SECRET_KEY`), the `api.headroomlabs.ai` callback (`HEADROOM_API_KEY`), Qdrant memory
   (`HEADROOM_QDRANT_API_KEY`). None are set → default is **local-only**.
@@ -24,9 +24,8 @@ unauditable from source) and a full packet capture of in-flight provider traffic
 - **Your bearer token only goes to the official provider.** Forwarding map (from the proxy's own
   startup banner): `/v1/messages → api.anthropic.com`, `/v1/chat/completions` & `/v1/responses →
   api.openai.com`, Gemini → `googleapis.com`. No path sends tokens to a third party.
-- **Live capture (hardened env):** startup banner showed `License: OSS (no license key)` and
-  `Telemetry: DISABLED`; the proxy made **zero non-local connections at idle**. (A `codex-aar →
-  Cloudflare` connection observed was the user's Codex desktop app, not Headroom.)
+- **Live-capture check is documented below:** under the hardened env, expected idle behavior is zero
+  non-local Headroom connections; routed calls should go only to official provider endpoints.
 
 ## Caveats (known, not leakage)
 1. **Local MITM by design** — when on, the proxy sees prompts and holds the bearer token in memory to
@@ -41,9 +40,9 @@ unauditable from source) and a full packet capture of in-flight provider traffic
    macOS launchd deploy is broken); instead we run the proxy ourselves as a detached, PID-tracked
    subprocess and hand-write that minimal routing
    (`acctsw/headroom.py` `_route_all`). Our integration is **global & app-managed**: enabling
-   snapshots the ORIGINAL files (bytes + mode + symlink target); disabling does a surgical unroute
-   (strips only our marker block, preserving any edits you made while it was on) and falls back to an
-   exact byte-for-byte restore from the snapshot only if a marker survives. A serialized `heal()`
+   snapshots the ORIGINAL files (bytes + mode + symlink target); disabling restores that exact
+   backup when it exists, and falls back to a surgical unroute only for orphan/desync cleanup with no
+   backup. A serialized `heal()`
    (keyed off actual on-disk injection state, not a flag) strips any dangling routing and stops the
    proxy on the next app launch or `cx`/`cl` run. So after a crash/force-quit, the dangling routing is
    healed the next time the app starts or you run `cx`/`cl`; a plain `codex`/`claude` run in that gap
@@ -51,7 +50,7 @@ unauditable from source) and a full packet capture of in-flight provider traffic
    Normal quit removes routing on exit, so the gap only opens on an abnormal kill.
 
 ## Hardening we apply (`acctsw/headroom.py`)
-- **Version pinned** to the audited `0.27.0` (`PINNED_VERSION`).
+- **Version pinned** to the reviewed `0.29.0` (`PINNED_VERSION`).
 - **Env on every Headroom subprocess** (`HARDENING_ENV`): `HEADROOM_TELEMETRY=off`,
   `LITELLM_TELEMETRY=False`, `DO_NOT_TRACK=1`.
 - **No cloud keys are ever set** by us (Langfuse/Qdrant/Headroom-API stay off).

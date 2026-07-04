@@ -102,6 +102,8 @@ def test_route_codex_idempotent_preserves_body_and_orders_keys(tmp_path, monkeyp
     body = cfg.read_text()
     assert body.count('[model_providers.headroom]') == 1          # no dup table
     assert body.count('model_provider = "headroom"') == 1        # no dup key
+    assert f'openai_base_url = "http://127.0.0.1:{headroom.PROXY_PORT}/v1"' in body
+    assert "supports_websockets = true" in body                  # Codex /v1/responses WS support
     assert 'model = "gpt-5.5"' in body and 'foo = 1' in body     # user body preserved
     assert body.index('model_provider') < body.index('[profiles.x]')
     assert body.index('model_provider') < body.index('[model_providers.headroom]')
@@ -319,7 +321,10 @@ def test_start_proxy_passes_shaper_env_and_tracks_pid(tmp_path, monkeypatch):
     monkeypatch.setattr(headroom, "proxy_ready", lambda *a, **k: next(states, True))
     ok = headroom.start_proxy(tmp_path / "store", popen=fake_popen, sleep=lambda *_: None)
     assert ok
-    assert seen["argv"][1] == "proxy" and "--port" in seen["argv"]
+    assert seen["argv"] == [
+        "/fake/headroom", "proxy", "--host", "127.0.0.1", "--port", str(headroom.PROXY_PORT),
+        "--mode", "token", "--backend", "anthropic", "--no-telemetry",
+    ]
     assert seen["new_session"] is True
     assert seen["env"]["HEADROOM_OUTPUT_SHAPER"] == "1"
     assert float(seen["env"]["HEADROOM_OUTPUT_HOLDOUT"]) > 0
@@ -994,8 +999,16 @@ def test_harden_env_sets_telemetry_off():
     assert e["DO_NOT_TRACK"] == "1"
 
 
-def test_package_pinned_to_audited_version():
+def test_package_pinned_to_reviewed_version():
+    assert headroom.PINNED_VERSION == "0.29.0"
     assert headroom.PACKAGE.endswith("==" + headroom.PINNED_VERSION)
+
+
+def test_security_doc_pin_matches_runtime():
+    from pathlib import Path
+    doc = Path("docs/SECURITY-headroom.md").read_text()
+    assert f"version: `{headroom.PINNED_VERSION}`" in doc
+    assert f"reviewed `{headroom.PINNED_VERSION}`" in doc
 
 
 def test_verify_rtk_tofu(tmp_path, monkeypatch):
