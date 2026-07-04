@@ -19,7 +19,7 @@ def _add_codex(ctx, email):
 
 def test_add_stamps_account_fingerprint(ctx):
     _, seat = _add_codex(ctx, "a@x.com")
-    assert seat["account_id"] == "acc"   # from the codex token's account_id
+    assert seat["account_id"] == "acct:a@x.com"   # from the codex token's account_id
 
 
 def test_shared_account_seats_are_flagged_and_warned(ctx):

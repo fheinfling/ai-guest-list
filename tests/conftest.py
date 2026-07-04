@@ -10,14 +10,14 @@ import pytest
 from acctsw.context import Context
 
 
-def make_codex_blob(email: str, account_id: str = "acc") -> str:
+def make_codex_blob(email: str, account_id: str | None = None) -> str:
     """A minimal auth.json whose id_token JWT carries the given email. ``account_id`` is the
-    underlying ChatGPT account (two seats sharing it are the same account); default keeps the legacy
-    fixture value, pass distinct ids to model genuinely separate accounts."""
+    underlying ChatGPT account (two seats sharing it are the same account); it DEFAULTS to a distinct
+    per-email id so separate seats model separate accounts — pass the SAME id to model a duplicate."""
     payload = base64.urlsafe_b64encode(json.dumps({"email": email}).encode()).decode().rstrip("=")
     id_token = f"header.{payload}.sig"
-    return json.dumps({"auth_mode": "ChatGPT", "tokens": {"id_token": id_token,
-                       "access_token": "a", "refresh_token": "r", "account_id": account_id}})
+    return json.dumps({"auth_mode": "ChatGPT", "tokens": {"id_token": id_token, "access_token": "a",
+                       "refresh_token": "r", "account_id": account_id or f"acct:{email}"}})
 
 
 def make_claude_blob(sub: str = "max") -> str:

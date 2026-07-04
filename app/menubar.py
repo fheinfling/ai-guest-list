@@ -392,10 +392,12 @@ if objc is not None:
 
         @objc.python_method
         def _notifyAccountWarnings(self, result):
-            """Surface a shared-account warning ONCE per session (the popover shows it persistently;
-            a toast makes sure the user notices that two seats are secretly the same account and give
-            no real headroom). Keyed on the message so a new/changed warning re-notifies."""
-            for w in (result.get("warnings") or []):
+            """Toast each shared-account warning ONCE per session — the user needs to know two seats
+            are secretly the same account (no real headroom). Keyed on the exact message so a new or
+            changed warning re-notifies. The warning also rides `status --json`; the toast is the
+            in-app surface today (a persistent popover banner is a follow-up). Warnings live under the
+            nested state payload (bridge returns {ok, state}), same level as the dot."""
+            for w in ((result.get("state") or {}).get("warnings") or []):
                 if w not in self._acctWarned:
                     self._acctWarned.add(w)
                     self._notify("heads up — seats share one account", w)

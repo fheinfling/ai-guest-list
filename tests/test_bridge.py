@@ -18,6 +18,18 @@ def test_status_returns_state_with_headroom_flag(ctx):
     assert r["state"]["tools"]["codex"]["active"] == "a@x.com"
 
 
+def test_shared_account_warning_rides_the_nested_state(ctx):
+    """The shared-account warning must land at result['state']['warnings'] — the level the menubar
+    reads. Two codex seats on ONE ChatGPT account (same account_id) → exactly one warning there."""
+    ctx.cred["codex"].set_live(make_codex_blob("a@x.com", account_id="dup"))
+    acct.add(ctx, ctx.load_state(), "codex", email="a@x.com")
+    ctx.cred["codex"].set_live(make_codex_blob("a+codex@x.com", account_id="dup"))
+    acct.add(ctx, ctx.load_state(), "codex", email="a+codex@x.com")
+    r = bridge.handle(ctx, {"action": "usage"})
+    assert "warnings" not in r                      # NOT at the top level (the bug we fixed)
+    assert len(r["state"]["warnings"]) == 1 and "same account" in r["state"]["warnings"][0]
+
+
 def test_state_carries_app_version_and_build(ctx):
     _add(ctx, "a@x.com")
     import acctsw

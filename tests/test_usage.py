@@ -76,7 +76,7 @@ def test_parse_missing_windows_are_empty():
 # --- token extraction -------------------------------------------------------------------------
 
 def test_codex_token_account():
-    tok, acc = U.codex_token_account(make_codex_blob("a@x.com"))
+    tok, acc = U.codex_token_account(make_codex_blob("a@x.com", account_id="acc"))
     assert tok == "a" and acc == "acc"
 
 

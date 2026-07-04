@@ -144,7 +144,7 @@ def _seat_view(seat: dict, *, active: bool, at: datetime) -> dict[str, Any]:
         "added_at": seat.get("added_at"),
         "last_on_floor": seat.get("last_on_floor"),
         # underlying provider-account id; two seats sharing it are one account (filled by _mark_shared)
-        "account_id": seat.get("account_id") or usage.get("account_id"),
+        "account_id": seat.get("account_id"),
         "shared_account": False,
         "shared_account_with": [],
     }
