@@ -2,6 +2,7 @@
 
 No real PTY, no network: `spawn` is injected and `get` returns canned usage.
 """
+import json
 import os
 
 import pytest
@@ -526,6 +527,35 @@ def test_run_no_switch_on_plain_nonzero_exit(ctx):
     assert rc == 2
     assert len(spawn.calls) == 1
     assert ctx.load_state().active("codex") == "a@x.com"
+
+
+@pytest.mark.parametrize("code", [130, 143, -2])   # SIGINT (Ctrl-C), SIGTERM, signal death (negative)
+def test_run_abort_exit_skips_safety_net(ctx, code):
+    """A user abort (Ctrl-C/kill) must NOT trigger a usage fetch or a hop — the exit-time safety net
+    is only for genuine (positive, non-abort) failure codes, so aborting never delays teardown on a
+    network round-trip."""
+    _two_codex(ctx)  # active a
+    def boom_get(*a, **k):
+        raise AssertionError("safety net fetched usage on an abort exit")
+    spawn = FakeSpawn([(b"^C\n", code)])
+    rc = run(ctx, "codex", [], spawn=spawn, get=boom_get, notify=lambda m: None)
+    assert rc == code
+    assert len(spawn.calls) == 1                          # no resume
+    assert ctx.load_state().active("codex") == "a@x.com"  # no hop
+
+
+def test_handle_exhausted_confirms_out_on_limit_reached_without_reset(ctx):
+    """A seat out by the authoritative limit_reached flag but carrying NO reset timestamp still counts
+    as out: rest it reactively (so choose() won't re-pick it) and hop to the healthy seat."""
+    state = _two_codex(ctx)  # active a
+    body = json.dumps({"rate_limit": {"limit_reached": True,
+                       "primary_window": {"used_percent": 50},
+                       "secondary_window": {"used_percent": 50}}})   # maxed flag, no window≥100, no reset
+    get = fake_get({P.CODEX_USAGE_URL: (200, body)})
+    dec = L.handle_exhausted(ctx, state, "codex", get=get)
+    assert dec.action == "switch" and dec.email == "b@x.com"
+    seat = state.get_seat("codex", "a@x.com")
+    assert seat["limited_until"] is not None and seat["limit_source"] == "reactive"
 
 
 def test_run_codex_home_preserved_on_exception(ctx):
