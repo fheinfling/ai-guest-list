@@ -10,7 +10,7 @@ import pytest
 from acctsw import accounts as acct
 from acctsw import launcher as L
 from acctsw.launcher import (NoSeats, build_cmd, resume_cmd, detect_limit, detect_auth_dead,
-                             handle_limit, handle_auth_dead, run)
+                             detect_hard_limit, handle_limit, handle_auth_dead, run)
 from acctsw.util import now, iso
 from datetime import timedelta
 from tests.conftest import make_codex_blob
@@ -84,6 +84,21 @@ def test_detect_limit_ignores_ansi_codes():
     assert detect_limit("codex", colored)
 
 
+def test_detect_hard_limit_matches_codex_workspace_credits_banner():
+    banner = "■ Your workspace is out of credits. Add credits to continue."
+    assert detect_hard_limit("codex", banner)
+    assert not detect_hard_limit("claude", banner)
+    assert not detect_hard_limit("codex", "the routed Codex workspace is out of credits")
+    assert not detect_hard_limit(
+        "codex",
+        "the routed Codex workspace is out of credits. Add credits to continue",
+    )
+    assert not detect_hard_limit(
+        "codex",
+        "Codex printed: Your workspace is out of credits. Add credits to continue.",
+    )
+
+
 def test_build_and_resume_cmd(ctx):
     assert build_cmd(ctx, "codex", ["exec", "hi"])[-2:] == ["exec", "hi"]
     assert resume_cmd(ctx, "codex")[-2:] == ["resume", "--last"]
@@ -101,6 +116,18 @@ def _two_codex(ctx):
     from acctsw.switch import switch
     state = ctx.load_state()
     switch(ctx, state, "codex", "a@x.com")
+    return ctx.load_state()
+
+
+def _two_realistic_codex_aliases(ctx):
+    emails = ("primary@example.test", "primary+codex@example.test")
+    for em in emails:
+        ctx.cred["codex"].set_live(make_codex_blob(em, account_id=f"acct:{em}"))
+        state = ctx.load_state()
+        acct.add(ctx, state, "codex", email=em)
+    from acctsw.switch import switch
+    state = ctx.load_state()
+    switch(ctx, state, "codex", emails[0])
     return ctx.load_state()
 
 
@@ -357,6 +384,44 @@ def test_run_switches_and_resumes_on_limit(ctx):
     assert spawn.calls[1][-2:] == ["resume", "--last"]
     assert ctx.load_state().active("codex") == "b@x.com"
     assert any("hopping to b@x.com" in m for m in msgs)
+
+
+def test_run_switches_on_codex_workspace_out_of_credits_without_usage_confirmation(ctx):
+    """The hard Codex billing banner is already positive evidence. Do not require the usage API to
+    corroborate it, because workspace credits can fail outside the normal usage-window response."""
+    _two_realistic_codex_aliases(ctx)
+
+    def no_usage_fetch(*_a, **_k):
+        raise AssertionError("hard workspace-credit banner must not require usage API corroboration")
+
+    msgs = []
+    spawn = FakeSpawn([
+        (b"\xe2\x96\xa0 Your workspace is out of credits. Add credits to continue.\n", 1),
+        (b"resumed on the fresh alias\n", 0),
+    ])
+    rc = run(ctx, "codex", [], spawn=spawn, get=no_usage_fetch, notify=msgs.append)
+    assert rc == 0
+    assert spawn.calls[1][-2:] == ["resume", "--last"]
+    state = ctx.load_state()
+    assert state.active("codex") == "primary+codex@example.test"
+    assert state.get_seat("codex", "primary@example.test")["limited_until"] is not None
+    assert any("primary+codex@example.test" in m for m in msgs)
+
+
+def test_hard_codex_workspace_credit_banner_bypasses_disabled_generic_scan(ctx, monkeypatch):
+    """Repeated prose can disable generic limit scanning, but the exact Codex billing banner must
+    still be caught so a fresh seat can take over."""
+    _two_codex(ctx)  # active a
+    monkeypatch.setattr(L, "PROBE_COOLDOWN_S", 0.0)
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=20.0, secondary=30.0))})
+    chunks = [b"... you've hit your usage limit ...\n"] * (L.MAX_FALSE_ALARMS + 1)
+    chunks.append(b"Your workspace is out of credits. Add credits to continue.\n")
+    spawn = FakeSpawn([(chunks, 1), (b"resumed\n", 0)])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=lambda m: None)
+    assert rc == 0
+    assert len(spawn.calls) == 2
+    assert ctx.load_state().active("codex") == "b@x.com"
 
 
 def test_run_unverifiable_limit_never_gives_up(ctx):

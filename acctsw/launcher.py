@@ -113,6 +113,22 @@ AUTH_DEAD_PATTERNS = {
 _LIMIT_RE = {t: [re.compile(p, re.IGNORECASE) for p in pats] for t, pats in LIMIT_PATTERNS.items()}
 _AUTH_RE = {t: [re.compile(p, re.IGNORECASE) for p in pats] for t, pats in AUTH_DEAD_PATTERNS.items()}
 
+# Codex can emit this hard billing banner when the ChatGPT workspace has no credits left. It is not
+# always reflected as a normal usage-window reset, so waiting for usage API corroboration can trap the
+# launcher in a same-seat resume loop. Keep this deliberately narrower than generic "out of credits"
+# prose, which is still guarded by the usage probe.
+HARD_LIMIT_PATTERNS = {
+    "codex": [
+        r"(?m)^[^\w\n]{0,8}\s*your\s+workspace\s+is\s+out\s+of\s+credits?\.?"
+        r"\s+add\s+credits\s+to\s+continue\.?\s*$",
+    ],
+    "claude": [],
+}
+_HARD_LIMIT_RE = {
+    t: [re.compile(p, re.IGNORECASE) for p in pats]
+    for t, pats in HARD_LIMIT_PATTERNS.items()
+}
+
 
 # Classification on ALREADY-ANSI-stripped text — the single source of truth for the limit veto and
 # the pattern scans, so detect_limit/detect_auth_dead (the public probes) and detect_event (the hot
@@ -138,6 +154,12 @@ def detect_limit(tool: str, text: str) -> bool:
 def detect_auth_dead(tool: str, text: str) -> bool:
     """True if recent output says the seat's credentials are dead (revoked / signed out)."""
     return _is_auth_dead(tool, _ANSI.sub("", text))
+
+
+def detect_hard_limit(tool: str, text: str) -> bool:
+    """True for a trusted tool-side limit banner that does not need usage API corroboration."""
+    clean = _ANSI.sub("", text)
+    return any(rx.search(clean) for rx in _HARD_LIMIT_RE[tool])
 
 
 def detect_event(tool: str, text: str) -> str | None:
@@ -594,9 +616,9 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         buf = bytearray()
         # Verify-before-kill scanning state. A stdout match is corroborated against the usage
         # endpoint while the child is STILL RUNNING; a dismissed match costs a brief stall of the
-        # output copy loop, never the session. Past MAX_FALSE_ALARMS dismissals the output is
-        # provably untrustworthy (persistent prose about limits — routine when THIS repo is the
-        # thing under development), so scanning turns OFF while supervision continues.
+        # output copy loop, never the session. Past MAX_FALSE_ALARMS dismissals the generic output
+        # scan turns OFF while supervision continues. Trusted hard-limit banners still bypass that
+        # off switch, because they are tool-side stop messages rather than model prose.
         scan = {"on": True, "next_probe": 0.0, "dismissed": 0}
 
         def _dismissed() -> None:
@@ -647,9 +669,14 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             def on_output(chunk: bytes) -> bool:
                 buf.extend(chunk)
                 del buf[:-4096]  # keep a rolling tail
+                text = buf.decode("utf-8", "replace")
+                if detect_hard_limit(tool, text):
+                    hit["reason"] = "limit"
+                    hit["corroborated"] = True
+                    return True
                 if not scan["on"]:
                     return False
-                reason = detect_event(tool, buf.decode("utf-8", "replace"))  # one ANSI strip per chunk
+                reason = detect_event(tool, text)  # one ANSI strip per chunk
                 if reason is None:
                     return False
                 if time.monotonic() < scan["next_probe"]:
