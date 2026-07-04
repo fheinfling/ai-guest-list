@@ -469,8 +469,63 @@ def test_run_respects_max_switches(ctx):
 
 def test_run_propagates_nonzero_clean_exit(ctx):
     _two_codex(ctx)
-    spawn = FakeSpawn([(b"build failed\n", 3)])  # no limit text → clean (failed) exit
-    assert run(ctx, "codex", [], spawn=spawn, get=fake_get({})) == 3
+    # no limit text AND usage says the active seat is healthy → a plain failure, surfaced untouched
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=20.0, secondary=30.0))})
+    spawn = FakeSpawn([(b"build failed\n", 3)])
+    assert run(ctx, "codex", [], spawn=spawn, get=get) == 3
+
+
+def test_handle_exhausted_switches_when_active_confirmed_out(ctx):
+    """A fresh usage fetch confirms the active seat is genuinely maxed → hop to a healthy seat."""
+    state = _two_codex(ctx)  # active a
+    reset = iso(now() + timedelta(hours=3))
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=100.0, p_reset=reset))})
+    dec = L.handle_exhausted(ctx, state, "codex", get=get)
+    assert dec.action == "switch" and dec.email == "b@x.com"
+
+
+def test_handle_exhausted_gives_up_when_active_healthy(ctx):
+    """No positive evidence the active seat is out → give_up, so the caller surfaces the exit code."""
+    state = _two_codex(ctx)  # active a
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=20.0, secondary=30.0))})
+    dec = L.handle_exhausted(ctx, state, "codex", get=get)
+    assert dec.action == "give_up"
+
+
+def test_handle_exhausted_gives_up_when_endpoint_unreachable(ctx):
+    """A transient error is not positive evidence — never manufacture a hop on an unconfirmed limit."""
+    state = _two_codex(ctx)  # active a
+    dec = L.handle_exhausted(ctx, state, "codex", get=fake_get({P.CODEX_USAGE_URL: (0, "")}))
+    assert dec.action == "give_up"
+
+
+def test_run_switches_on_silent_limit_exit(ctx):
+    """Exit-time safety net: codex hits a real limit but exits with only a plain error (no banner we
+    can match). A fresh usage check confirms the active seat is out → hop to a healthy seat + resume."""
+    _two_codex(ctx)  # active a
+    reset = iso(now() + timedelta(hours=3))
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=100.0, p_reset=reset))})  # a maxed
+    spawn = FakeSpawn([
+        (b"stream error: disconnected\n", 1),   # non-zero exit, NO matchable limit banner
+        (b"resumed on b, all good\n", 0),        # resumed on the healthy seat
+    ])
+    rc = run(ctx, "codex", ["--foo"], spawn=spawn, get=get, notify=lambda m: None)
+    assert rc == 0
+    assert len(spawn.calls) == 2
+    assert spawn.calls[1][-2:] == ["resume", "--last"]          # carried the work over
+    assert ctx.load_state().active("codex") == "b@x.com"        # hopped to the healthy seat
+
+
+def test_run_no_switch_on_plain_nonzero_exit(ctx):
+    """A non-zero exit that is NOT a limit (usage says the seat is healthy) is surfaced untouched —
+    the safety net must not turn an ordinary failure into a spurious seat hop."""
+    _two_codex(ctx)  # active a
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=20.0, secondary=30.0))})
+    spawn = FakeSpawn([(b"build failed: syntax error\n", 2)])
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=lambda m: None)
+    assert rc == 2
+    assert len(spawn.calls) == 1
+    assert ctx.load_state().active("codex") == "a@x.com"
 
 
 def test_run_codex_home_preserved_on_exception(ctx):
