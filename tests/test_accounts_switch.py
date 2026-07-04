@@ -17,6 +17,39 @@ def _add_codex(ctx, email):
     return state, seat
 
 
+def test_add_stamps_account_fingerprint(ctx):
+    _, seat = _add_codex(ctx, "a@x.com")
+    assert seat["account_id"] == "acc"   # from the codex token's account_id
+
+
+def test_shared_account_seats_are_flagged_and_warned(ctx):
+    """Two codex seats backed by the SAME ChatGPT account (e.g. a Gmail '+alias' login) share one
+    quota — they must be flagged and a warning surfaced, since switching between them can't help."""
+    ctx.cred["codex"].set_live(make_codex_blob("a@x.com", account_id="same"))
+    acct.add(ctx, ctx.load_state(), "codex", email="a@x.com")
+    ctx.cred["codex"].set_live(make_codex_blob("a+codex@x.com", account_id="same"))
+    acct.add(ctx, ctx.load_state(), "codex", email="a+codex@x.com")
+    state = ctx.load_state()
+    seats = acct.list_seats(state, "codex")
+    assert all(s["shared_account"] for s in seats)
+    a = next(s for s in seats if s["email"] == "a@x.com")
+    assert a["shared_account_with"] == ["a+codex@x.com"]
+    warnings = acct.status(ctx, state)["warnings"]
+    assert len(warnings) == 1 and "same account" in warnings[0]
+    assert "a@x.com" in warnings[0] and "a+codex@x.com" in warnings[0]
+
+
+def test_distinct_account_seats_are_not_flagged(ctx):
+    """Genuinely separate accounts (distinct account_id) give real headroom → no flag, no warning."""
+    ctx.cred["codex"].set_live(make_codex_blob("a@x.com", account_id="acct-a"))
+    acct.add(ctx, ctx.load_state(), "codex", email="a@x.com")
+    ctx.cred["codex"].set_live(make_codex_blob("b@x.com", account_id="acct-b"))
+    acct.add(ctx, ctx.load_state(), "codex", email="b@x.com")
+    state = ctx.load_state()
+    assert not any(s["shared_account"] for s in acct.list_seats(state, "codex"))
+    assert acct.status(ctx, state)["warnings"] == []
+
+
 def test_add_clears_stale_auth_error(ctx):
     """Re-capturing a seat (after re-login) must reset its usage error/backoff so the app
     auto-recovers instead of staying stuck on 'log in' behind the error backoff."""

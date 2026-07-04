@@ -80,9 +80,31 @@ def test_codex_token_account():
     assert tok == "a" and acc == "acc"
 
 
+def test_account_fingerprint():
+    assert U.account_fingerprint("codex", make_codex_blob("a@x.com", account_id="X9")) == "X9"
+    # two seats, same underlying account → same fingerprint (this is the duplicate-account signal)
+    assert U.account_fingerprint("codex", make_codex_blob("a@x.com", account_id="Z")) == \
+           U.account_fingerprint("codex", make_codex_blob("a+alias@x.com", account_id="Z"))
+    assert U.account_fingerprint("claude", make_claude_blob()) is None   # no claude fingerprint today
+    assert U.account_fingerprint("codex", "not json") is None
+
+
 def test_claude_token():
     assert U.claude_token(make_claude_blob()) == "x"
     assert U.claude_token("not json") is None
+
+
+def test_refresh_backfills_account_id(ctx):
+    """A usage poll self-heals the account fingerprint for a seat that predates the feature."""
+    ctx.cred["codex"].set_live(make_codex_blob("a@x.com", account_id="ACCT7"))
+    acct.add(ctx, ctx.load_state(), "codex", email="a@x.com")
+    state = ctx.load_state()
+    state.get_seat("codex", "a@x.com").pop("account_id", None)   # simulate a pre-feature seat
+    state.save()
+    state = ctx.load_state()
+    U.refresh(ctx, state, "codex", force=True,
+              get=fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body())}))
+    assert ctx.load_state().get_seat("codex", "a@x.com")["account_id"] == "ACCT7"
 
 
 # --- error classification ---------------------------------------------------------------------

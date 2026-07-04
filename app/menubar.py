@@ -82,6 +82,7 @@ if objc is not None:
             self._hrRestartTimes = []             # breaker_allows window (auto-restart timestamps)
             self._hrFailStreak = 0                # consecutive proxy-down restarts this episode (0 = healthy)
             self._hrLastRestartAt = 0.0           # monotonic ts of the last auto-restart (backoff spacing)
+            self._acctWarned = set()              # shared-account warnings already toasted this session
             return self
 
         @objc.python_method
@@ -387,6 +388,17 @@ if objc is not None:
         def applyResult_(self, result):
             self._pushResult(result)
             self._updateDot(result.get("state"))
+            self._notifyAccountWarnings(result)
+
+        @objc.python_method
+        def _notifyAccountWarnings(self, result):
+            """Surface a shared-account warning ONCE per session (the popover shows it persistently;
+            a toast makes sure the user notices that two seats are secretly the same account and give
+            no real headroom). Keyed on the message so a new/changed warning re-notifies."""
+            for w in (result.get("warnings") or []):
+                if w not in self._acctWarned:
+                    self._acctWarned.add(w)
+                    self._notify("heads up — seats share one account", w)
 
         def bgToggle_(self, msg):
             result = bridge.handle(self.ctx, dict(msg))   # global enable/disable runs here, off-main
