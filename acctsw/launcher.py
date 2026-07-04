@@ -56,6 +56,10 @@ PROBE_COOLDOWN_S = 30.0  # after a dismissed match, skip re-probing usage for th
 # ~100% limit even if the endpoint lags a few percent behind stdout.
 FALSE_ALARM_MAX_PCT = 90.0
 EXIT_GAVE_UP = 75     # EX_TEMPFAIL: distinguishes "we gave up / all limited" from a child failure
+# A usage-limit exit is an ordinary POSITIVE failure code; a user abort is not. Signal deaths come
+# back NEGATIVE (os.waitstatus_to_exitcode), and a tool that catches the signal exits 128+N — so the
+# exit-time safety net skips both rather than pay a usage fetch (and delay teardown) on a Ctrl-C/kill.
+_ABORT_EXITS = frozenset({129, 130, 131, 143})   # SIGHUP, SIGINT (Ctrl-C), SIGQUIT, SIGTERM
 
 # Limit signals in the agents' output. This buffer ALSO carries the model's own generated prose —
 # which, especially when THIS repo is the thing under development, routinely mentions "usage limit"
@@ -207,6 +211,17 @@ def _seat_confirmed_healthy(state, tool: str, email: str, summary: dict) -> bool
     return bool(pcts) and max(pcts) < FALSE_ALARM_MAX_PCT
 
 
+def _hop_or_give_up(state, tool: str, *, exclude, active) -> Decision:
+    """Shared decision tail for the limit/auth/exhausted handlers: hop to a free OTHER seat, else
+    give_up carrying the soonest unlock time. (``exclude`` may already contain ``active``; the
+    ``!= active`` guard is a belt-and-braces so we never 'switch' to the seat we're leaving.)"""
+    sel = choose(state, tool, exclude=exclude)
+    if sel.email and sel.available and sel.email != active:
+        return Decision("switch", sel.email)
+    return Decision("give_up", sel.email,
+                    sel.unlocks_at.isoformat() if sel.unlocks_at else None)
+
+
 def handle_limit(ctx: Context, state, tool: str, *, get=usage_mod._default_get,
                  exclude: set | frozenset = frozenset(), corroborated: bool = False) -> Decision:
     """A limit was caught for the active seat. Flag it, then choose the next seat. ``exclude`` carries
@@ -246,12 +261,7 @@ def handle_limit(ctx: Context, state, tool: str, *, get=usage_mod._default_get,
     if seat is not None and seat.get("limited_until") is None:
         state.set_limited_until(tool, active, iso(now() + DEFAULT_COOLDOWN), source="reactive")
     state.save()
-
-    sel = choose(state, tool, exclude=exclude)
-    if sel.email and sel.available and sel.email != active:
-        return Decision("switch", sel.email)
-    return Decision("give_up", sel.email,
-                    sel.unlocks_at.isoformat() if sel.unlocks_at else None)
+    return _hop_or_give_up(state, tool, exclude=exclude, active=active)
 
 
 def handle_auth_dead(ctx: Context, state, tool: str, *, exclude: set | frozenset = frozenset()) -> Decision:
@@ -264,11 +274,7 @@ def handle_auth_dead(ctx: Context, state, tool: str, *, exclude: set | frozenset
     """
     active = state.active(tool)
     skip = set(exclude) | ({active} if active else set())
-    sel = choose(state, tool, exclude=skip)
-    if sel.email and sel.available:
-        return Decision("switch", sel.email)
-    return Decision("give_up", sel.email,
-                    sel.unlocks_at.isoformat() if sel.unlocks_at else None)
+    return _hop_or_give_up(state, tool, exclude=skip, active=active)
 
 
 def handle_exhausted(ctx: Context, state, tool: str, *, get=usage_mod._default_get,
@@ -276,22 +282,27 @@ def handle_exhausted(ctx: Context, state, tool: str, *, get=usage_mod._default_g
     """Post-exit safety net: the child exited on its own WITHOUT a stdout limit banner we could catch
     mid-session (codex often just errors/exits on a real limit, and this repo's own limit-prose can
     have turned scanning off earlier in the run). FORCE-refresh the active seat; only if the endpoint
-    now confirms it is genuinely out (a future ``limited_until``, stamped from ``usage`` — positive
-    evidence, never a transient error) AND another seat is free do we hop. No confirmation → give_up,
-    so an ordinary non-zero exit (build failure, crash) is surfaced untouched, never turned into a
-    spurious switch."""
+    now POSITIVELY confirms it is out AND another seat is free do we hop. No confirmation → give_up,
+    so an ordinary non-zero exit (build failure, crash) is surfaced untouched, never a spurious
+    switch."""
     active = state.active(tool)
     if not active or state.get_seat(tool, active) is None:
         return Decision("give_up", active)
-    usage_mod.refresh(ctx, state, tool, only=active, force=True, get=get)
+    summary = usage_mod.refresh(ctx, state, tool, only=active, force=True, get=get)
     until = parse_iso((state.get_seat(tool, active) or {}).get("limited_until"))
-    if until is None or until <= now():
-        return Decision("give_up", active)  # not confirmed out → don't manufacture a hop
-    sel = choose(state, tool, exclude=exclude)
-    if sel.email and sel.available and sel.email != active:
-        return Decision("switch", sel.email)
-    return Decision("give_up", sel.email,
-                    sel.unlocks_at.isoformat() if sel.unlocks_at else None)
+    out = until is not None and until > now()
+    # A seat can be authoritatively out (limit_reached / a window at 100%) yet carry NO reset
+    # timestamp, so usage stamps no ``limited_until``. Treat that "ok but not healthy" reading — the
+    # same positive evidence handle_limit rests on — as out, and reactively rest it so choose() won't
+    # re-pick it. Anything other than a clean "ok" fetch stays inconclusive → give_up.
+    if not out and (summary.get(tool) or {}).get(active) == "ok" \
+            and not _seat_confirmed_healthy(state, tool, active, summary):
+        state.set_limited_until(tool, active, iso(now() + DEFAULT_COOLDOWN), source="reactive")
+        state.save()
+        out = True
+    if not out:
+        return Decision("give_up", active)
+    return _hop_or_give_up(state, tool, exclude=exclude, active=active)
 
 
 # --- real PTY supervisor ----------------------------------------------------------------------
@@ -554,6 +565,14 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             codexhome.ensure_home(email, codex_home=ctx._codex_real, root=ctx._homes_root)
             os.environ["CODEX_HOME"] = str(ctx.codex_home(email))
 
+    def _commit_switch(state, email):
+        """Persist a seat hop: switch creds, repoint codex's home, stamp the switch time. Caller holds
+        ctx.locked() and owns the surrounding notify/budget bookkeeping."""
+        switch(ctx, state, tool, email, sync=(tool != "codex"))
+        _activate_codex_home(email)
+        state.data["last_switch_at"] = iso(now())
+        state.save()
+
     try:
         # Initial selection + switch, under the state lock (brief; never held across a spawn).
         with ctx.locked():
@@ -653,17 +672,15 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 # resort: confirm via the usage endpoint; if the active seat is genuinely out and a
                 # healthy seat is free (and the switch budget allows), hop + resume so the work
                 # continues instead of dying on a maxed seat. A clean (0) exit is a real completion —
-                # never second-guess it. See handle_exhausted (positive-evidence only).
-                if status != 0 and switches < max_switches:
+                # never second-guess it, and a user abort (Ctrl-C/kill) is not a limit — only a
+                # POSITIVE, non-abort failure code is worth a usage check. See handle_exhausted.
+                if status > 0 and status not in _ABORT_EXITS and switches < max_switches:
                     with ctx.locked():
                         state = ctx.load_state()
                         active = state.active(tool)
                         dec = handle_exhausted(ctx, state, tool, get=get, exclude=auth_failed)
                         if dec.action == "switch":
-                            switch(ctx, state, tool, dec.email, sync=(tool != "codex"))
-                            _activate_codex_home(dec.email)
-                            state.data["last_switch_at"] = iso(now())
-                            state.save()
+                            _commit_switch(state, dec.email)
                     if dec.action == "switch":
                         notify(f"{active} hit its usage limit — hopping to {dec.email}, "
                                f"resuming your work ✨")
@@ -688,10 +705,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 # session, the very bug this supervisor is meant to avoid.
                 hop_capped = dec.action == "switch" and switches >= max_switches
                 if dec.action == "switch" and not hop_capped:
-                    switch(ctx, state, tool, dec.email, sync=(tool != "codex"))
-                    _activate_codex_home(dec.email)
-                    state.data["last_switch_at"] = iso(now())
-                    state.save()
+                    _commit_switch(state, dec.email)
             if hop_capped:
                 notify(f"hit the switch limit ({max_switches}); stopping")
                 return EXIT_GAVE_UP
