@@ -1158,3 +1158,30 @@ def test_breaker_window_rolls():
     times = [0.0, 100.0, 200.0]
     assert breaker_allows(times, 1900.0) is True     # 0.0 and 100.0 aged out of the 1800s window
     assert times == [200.0, 1900.0]
+
+
+def test_restart_backoff_grows_then_caps():
+    from app.menubar import restart_backoff, HR_BACKOFF_CAP
+    assert restart_backoff(0) == 0.0        # first restart of an episode is immediate
+    assert restart_backoff(1) == 60.0       # then space attempts out: 60s…
+    assert restart_backoff(2) == 120.0      # …doubling each further failure…
+    assert restart_backoff(3) == 240.0
+    assert restart_backoff(50) == HR_BACKOFF_CAP   # …capped so a flapping proxy stops churning
+
+
+def test_last_proxy_error_tails_log(tmp_path):
+    from acctsw import headroom
+    assert headroom.last_proxy_error(tmp_path) == ""   # no log yet → empty, never raises
+    (tmp_path / "headroom-proxy.log").write_text(
+        "starting up\n\n" + "\n".join(f"line{i}" for i in range(10))
+        + "\nModuleNotFoundError: no module named 'encodings'\n")
+    out = headroom.last_proxy_error(tmp_path, lines=3)
+    assert "ModuleNotFoundError" in out    # the actual crash cause is surfaced
+    assert "line0" not in out              # only the last few lines
+    assert " · " in out and "\n" not in out   # blank lines dropped, joined to one line
+
+
+def test_last_proxy_error_caps_length(tmp_path):
+    from acctsw import headroom
+    (tmp_path / "headroom-proxy.log").write_text("x" * 5000 + "\n")
+    assert len(headroom.last_proxy_error(tmp_path, max_chars=400)) == 400

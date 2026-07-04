@@ -88,6 +88,12 @@ LIMIT_PATTERNS = {
 
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
+# A transient SERVER-side throttle (HTTP 429/529 overload) is NOT the account's usage limit — Claude
+# Code says so verbatim: "Server is temporarily limiting requests (not your usage limit) · Rate
+# limited". Switching or resting a seat for a server blip is a false positive (the same class that
+# killed healthy sessions), so an explicit disclaimer vetoes an otherwise-matching limit phrase.
+_NOT_A_LIMIT = re.compile(r"not (?:your|a) usage limit|temporarily limiting requests", re.IGNORECASE)
+
 # Auth-death signals (token revoked / signed out). DISTINCT from a usage limit: switching+resuming on
 # the SAME seat can't help — the seat needs re-login — so we hop to a DIFFERENT seat. Kept to the
 # tools' SPECIFIC error wording (not loose phrases like "sign in again") because this buffer also
@@ -104,19 +110,30 @@ _LIMIT_RE = {t: [re.compile(p, re.IGNORECASE) for p in pats] for t, pats in LIMI
 _AUTH_RE = {t: [re.compile(p, re.IGNORECASE) for p in pats] for t, pats in AUTH_DEAD_PATTERNS.items()}
 
 
+# Classification on ALREADY-ANSI-stripped text — the single source of truth for the limit veto and
+# the pattern scans, so detect_limit/detect_auth_dead (the public probes) and detect_event (the hot
+# per-chunk path) can never drift apart. Callers own the one _ANSI.sub so no strip is done twice.
+def _is_limit(tool: str, clean: str) -> bool:
+    if _NOT_A_LIMIT.search(clean):
+        return False  # server throttle explicitly disclaims the usage limit → not a limit banner
+    return any(rx.search(clean) for rx in _LIMIT_RE[tool])
+
+
+def _is_auth_dead(tool: str, clean: str) -> bool:
+    return any(rx.search(clean) for rx in _AUTH_RE[tool])
+
+
 def detect_limit(tool: str, text: str) -> bool:
     """True if ``text`` (a rolling buffer of recent output) looks like a usage-limit message.
 
     ANSI escape codes are stripped first so a TUI's color codes can't split a phrase.
     """
-    clean = _ANSI.sub("", text)
-    return any(rx.search(clean) for rx in _LIMIT_RE[tool])
+    return _is_limit(tool, _ANSI.sub("", text))
 
 
 def detect_auth_dead(tool: str, text: str) -> bool:
     """True if recent output says the seat's credentials are dead (revoked / signed out)."""
-    clean = _ANSI.sub("", text)
-    return any(rx.search(clean) for rx in _AUTH_RE[tool])
+    return _is_auth_dead(tool, _ANSI.sub("", text))
 
 
 def detect_event(tool: str, text: str) -> str | None:
@@ -124,9 +141,9 @@ def detect_event(tool: str, text: str) -> str | None:
     "auth" (creds dead), "limit" (usage limit), or None. Auth is checked first — it's not a usage
     limit and needs a DIFFERENT seat, not a resume on the same one."""
     clean = _ANSI.sub("", text)
-    if any(rx.search(clean) for rx in _AUTH_RE[tool]):
+    if _is_auth_dead(tool, clean):
         return "auth"
-    if any(rx.search(clean) for rx in _LIMIT_RE[tool]):
+    if _is_limit(tool, clean):
         return "limit"
     return None
 
@@ -205,6 +222,24 @@ def handle_limit(ctx: Context, state, tool: str, *, get=usage_mod._default_get,
         # routine when THIS repo is under development). If the endpoint FRESHLY confirms the active
         # seat still has clear headroom, don't rest a healthy seat — resume the same work instead.
         if _seat_confirmed_healthy(state, tool, active, summary):
+            return Decision("resume", active)
+        # Only rest on POSITIVE evidence that the seat is really out: the endpoint answered "ok" and
+        # its windows show the seat maxed (else _seat_confirmed_healthy would have resumed above).
+        # Anything else is inconclusive and must NOT burn a 5h rest — that false positive, cascaded
+        # across every seat, is exactly what wrongly killed sessions with "all seats resting":
+        #   • network / unauthorized / cached / no_creds → we simply couldn't reach or read the endpoint
+        #     (network down, the Headroom proxy in front of it flapping, a stale snapshot token).
+        #   • rate_limited (429) is the USAGE ENDPOINT throttling us (it "rate-limits hard" — see
+        #     usage._backoff_seconds), NOT the account's quota; a transient server 429 is not an out-
+        #     of-quota banner (Claude Code even says "temporarily limiting requests (not your usage
+        #     limit)").
+        # So on anything but "ok" we keep working on the same seat — bounded by the false-alarm
+        # counter, which turns scanning off after MAX_FALSE_ALARMS so a genuine limit still stops.
+        # (Only when the active seat is still a real, selectable seat; if the active pointer is stale
+        # — the account was removed mid-run — fall through to choose() a valid seat instead of
+        # resuming a phantom, exactly as the pre-guard reactive path did.)
+        status = (summary.get(tool) or {}).get(active)
+        if status != "ok" and state.get_seat(tool, active) is not None:
             return Decision("resume", active)
     seat = state.get_seat(tool, active) if active else None
     # ...else a reactive fallback so we don't immediately re-pick the maxed seat.

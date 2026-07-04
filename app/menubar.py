@@ -38,6 +38,8 @@ NS_TERMINATE_NOW = 1      # NSApplicationTerminateReply.terminateNow
 NS_TERMINATE_LATER = 2    # NSApplicationTerminateReply.terminateLater (we reply when teardown done)
 HR_MAX_RESTARTS = 3       # proxy auto-restarts allowed per rolling window before the breaker trips
 HR_RESTART_WINDOW = 1800.0  # seconds
+HR_BACKOFF_BASE = 60.0    # seconds before the 2nd restart; doubles each further failure…
+HR_BACKOFF_CAP = 900.0    # …capped at 15 min so a flapping proxy stops burning energy every poll
 
 
 def breaker_allows(times: list, now: float, *, max_n: int = HR_MAX_RESTARTS,
@@ -54,6 +56,16 @@ def breaker_allows(times: list, now: float, *, max_n: int = HR_MAX_RESTARTS,
     return True
 
 
+def restart_backoff(streak: int, *, base: float = HR_BACKOFF_BASE, cap: float = HR_BACKOFF_CAP) -> float:
+    """Minimum spacing before the next auto-restart given how many failures have piled up this
+    episode. First restart (streak 0) is immediate; then 60s → 120s → … capped. A healthy re-check
+    resets the streak, so a one-off blip stays fast while a chronic flapper slows to once-per-15-min —
+    cutting the subprocess/energy churn (and toast spam) that a dead-on-this-machine proxy caused."""
+    if streak <= 0:
+        return 0.0
+    return min(base * (2 ** (streak - 1)), cap)
+
+
 if objc is not None:
 
     class AGLDelegate(NSObject):
@@ -68,6 +80,8 @@ if objc is not None:
             self._healthInFlight = False
             self._healthLock = threading.Lock()   # makes the single-flight check-then-set atomic
             self._hrRestartTimes = []             # breaker_allows window (auto-restart timestamps)
+            self._hrFailStreak = 0                # consecutive proxy-down restarts this episode (0 = healthy)
+            self._hrLastRestartAt = 0.0           # monotonic ts of the last auto-restart (backoff spacing)
             return self
 
         @objc.python_method
@@ -77,16 +91,21 @@ if objc is not None:
             notification alone is missable), strip the dead routing, and notify. Every automatic
             disable funnels through here so the user always learns what happened and why."""
             from acctsw import headroom
+            self._hrFailStreak = 0   # episode over — a later re-enable starts fresh
+            # Surface WHY it died: the proxy's captured stdout/stderr, so the banner/toast names the
+            # actual cause (bad interpreter, port in use, …) instead of a mute "turned itself off".
+            tail = headroom.last_proxy_error(self.ctx.data_dir)
+            detail = f"{reason} — last proxy log: {tail}" if tail else reason
             try:
                 with self.ctx.locked():
                     s = self.ctx.load_state()
                     s.set_setting("headroom", False)
-                    headroom.record_event(s, reason)
+                    headroom.record_event(s, detail)
                     s.save()
                 headroom.reconcile(self.ctx, blocking=False)
             except Exception:
                 pass
-            self._notify("save-credit turned itself off", reason)
+            self._notify("save-credit turned itself off", detail)
 
         @objc.python_method
         def _claimHealthSlot(self):
@@ -311,10 +330,12 @@ if objc is not None:
                 import time
                 from acctsw import headroom
                 if not self.ctx.load_state().settings().get("headroom"):
+                    self._hrFailStreak = 0   # routing is off → no live episode; next enable starts fresh
                     if headroom.needs_reconcile(self.ctx):
                         headroom.reconcile(self.ctx, blocking=False)
                     return
                 if headroom.global_running():
+                    self._hrFailStreak = 0   # proxy is up → any prior flap episode is over
                     ok_rtk, _ = headroom.verify_rtk(self.ctx.data_dir)
                     if not ok_rtk:        # supply-chain tamper while routing was live → tear it down
                         if headroom.global_disable(self.ctx.data_dir)[0]:
@@ -333,13 +354,26 @@ if objc is not None:
                 # leaving a persistent banner so the user actually learns about it.
                 time.sleep(8)
                 if headroom.global_running():
+                    self._hrFailStreak = 0   # recovered on its own during the grace window
                     return
                 if not self.ctx.load_state().settings().get("headroom"):
-                    return          # user toggled OFF during the grace sleep — honor their intent
-                if breaker_allows(self._hrRestartTimes, time.monotonic()):
+                    self._hrFailStreak = 0   # user toggled OFF during the grace sleep — honor their
+                    return                   # intent, and let a later re-enable start a fresh episode
+                # Space restarts once the proxy starts flapping: a chronically-dying proxy (bad env on
+                # this machine) otherwise gets relaunched every poll, spamming toasts and burning
+                # energy. Skip quietly until the streak's backoff has elapsed (the healthy re-checks
+                # above reset the streak, so a one-off blip stays fast); this consumes no breaker token.
+                now_mono = time.monotonic()
+                if self._hrFailStreak and now_mono - self._hrLastRestartAt < restart_backoff(self._hrFailStreak):
+                    return
+                if breaker_allows(self._hrRestartTimes, now_mono):
                     ok, _ = headroom.global_enable(self.ctx.data_dir)
                     if ok:
-                        self._notify("save-credit", "the proxy stopped — restarted it")
+                        self._hrLastRestartAt = now_mono   # same clock the breaker recorded this attempt on
+                        first = self._hrFailStreak == 0
+                        self._hrFailStreak += 1
+                        if first:   # one toast per flap EPISODE, not one per restart (was notify-spam)
+                            self._notify("save-credit", "the proxy stopped — restarted it")
                         return
                     reason = "the proxy stopped and wouldn't restart"
                 else:

@@ -55,6 +55,20 @@ def test_detect_limit_no_false_positive_on_benign(benign):
     assert not detect_limit("claude", benign)
 
 
+@pytest.mark.parametrize("text", [
+    # Claude Code's own server-overload error: a transient 429/529, NOT the account's usage limit.
+    "API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited",
+    "Rate limited — this is not your usage limit, please retry",
+])
+def test_detect_limit_ignores_server_throttle(text):
+    """A server-side throttle that explicitly disclaims the usage limit must never read as one —
+    otherwise a transient overload wrongly rests/switches a seat (the false-positive class this guards)."""
+    assert not detect_limit("codex", text)
+    assert not detect_limit("claude", text)
+    from acctsw.launcher import detect_event
+    assert detect_event("claude", text) is None
+
+
 def test_detect_limit_claude_ignores_codex_credit_narration():
     """A Claude session narrating about Codex credits ("out of credits") must NOT read as a Claude
     limit — Claude Code never emits that wording as a banner. This is the exact string that kept
@@ -119,15 +133,51 @@ def test_handle_limit_switches_when_alternative_available(ctx):
     assert state.get_seat("codex", "a@x.com")["limited_until"] is not None
 
 
-def test_handle_limit_reactive_fallback_when_usage_says_fine(ctx):
+def test_handle_limit_reactive_fallback_when_seat_near_max(ctx):
+    """Positive evidence with no authoritative reset: the endpoint answers "ok" and the seat sits in
+    the near-max band (≥ FALSE_ALARM_MAX_PCT but < 100, so usage doesn't stamp a reset) — the reactive
+    fallback flags it so we don't immediately re-pick the maxed seat, then hops away."""
     state = _two_codex(ctx)
-    # usage endpoint errors → no authoritative reset; reactive fallback must still flag the seat
-    get = fake_get({P.CODEX_USAGE_URL: (429, "")})
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=95.0, secondary=20.0))})
     dec = handle_limit(ctx, state, "codex", get=get)
     seat = state.get_seat("codex", "a@x.com")
     assert seat["limited_until"] is not None
     assert seat["limit_source"] == "reactive"
     assert dec.action == "switch" and dec.email == "b@x.com"
+
+
+def test_handle_limit_resumes_when_endpoint_unreachable(ctx):
+    """The false 'all seats resting' kill: a stdout limit signal the usage endpoint can't verify
+    (network down, or the Headroom proxy in front of it flapping) is NOT positive evidence — it must
+    not burn a 5h rest. With no way to confirm, keep working on the same seat, never lock it out."""
+    state = _two_codex(ctx)  # active a
+    get = fake_get({P.CODEX_USAGE_URL: (0, "")})   # connection failure → status "network"
+    dec = handle_limit(ctx, state, "codex", get=get)
+    assert dec.action == "resume" and dec.email == "a@x.com"
+    assert state.get_seat("codex", "a@x.com").get("limited_until") is None
+    assert state.active("codex") == "a@x.com"
+
+
+def test_handle_limit_resumes_when_usage_endpoint_throttled(ctx):
+    """A 429 from the USAGE endpoint is that endpoint throttling us (it rate-limits hard), NOT the
+    account's quota — and a transient server 429 ("temporarily limiting requests, not your usage
+    limit") is not an out-of-quota banner. Inconclusive → resume the same seat, never a 5h rest."""
+    state = _two_codex(ctx)  # active a
+    get = fake_get({P.CODEX_USAGE_URL: (429, "")})
+    dec = handle_limit(ctx, state, "codex", get=get)
+    assert dec.action == "resume" and dec.email == "a@x.com"
+    assert state.get_seat("codex", "a@x.com").get("limited_until") is None
+
+
+def test_handle_limit_switches_off_stale_active_pointer(ctx):
+    """If the active pointer is stale (its account was removed mid-run), an inconclusive probe must
+    NOT resume the phantom seat — it falls through to choose() a real, available seat."""
+    state = _two_codex(ctx)  # a, b real; active a
+    state.set_active("codex", "ghost@x.com")   # stale pointer, not in accounts
+    state.save()
+    get = fake_get({P.CODEX_USAGE_URL: (0, "")})   # unreachable → inconclusive status
+    dec = handle_limit(ctx, state, "codex", get=get)
+    assert dec.action == "switch" and dec.email in ("a@x.com", "b@x.com")
 
 
 def test_handle_limit_resumes_when_usage_confirms_healthy(ctx):
@@ -248,7 +298,8 @@ def test_handle_limit_gives_up_when_all_limited(ctx):
     ctx.cred["codex"].set_live(make_codex_blob("solo@x.com"))
     state = ctx.load_state()
     acct.add(ctx, state, "codex", email="solo@x.com")
-    get = fake_get({P.CODEX_USAGE_URL: (429, "")})
+    reset = iso(now() + timedelta(hours=3))
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=100.0, p_reset=reset))})
     dec = handle_limit(ctx, state, "codex", get=get)
     assert dec.action == "give_up"
 
@@ -307,6 +358,24 @@ def test_run_switches_and_resumes_on_limit(ctx):
     assert any("hopping to b@x.com" in m for m in msgs)
 
 
+def test_run_unverifiable_limit_never_gives_up(ctx):
+    """End-to-end guard against the false 'all seats resting' kill: every usage probe fails to
+    connect (e.g. the Headroom proxy in front of the endpoint is flapping), so a limit line can
+    never be corroborated. The supervisor must keep the session alive on the same seat and return
+    the child's own exit code — never EXIT_GAVE_UP, never a 5h rest."""
+    _two_codex(ctx)  # active a
+    get = fake_get({P.CODEX_USAGE_URL: (0, "")})   # endpoint unreachable on every probe
+    spawn = FakeSpawn([
+        (b"... you've hit your usage limit ...\n", 1),  # kill-path: probe can't confirm → resume
+        (b"resumed, all good\n", 0),                    # same seat, carried on to a clean finish
+    ])
+    rc = run(ctx, "codex", ["--foo"], spawn=spawn, get=get, notify=lambda m: None)
+    assert rc == 0 and rc != L.EXIT_GAVE_UP
+    assert spawn.calls[1][-2:] == ["resume", "--last"]       # resumed the SAME seat's work
+    assert ctx.load_state().active("codex") == "a@x.com"     # never switched away
+    assert ctx.load_state().get_seat("codex", "a@x.com").get("limited_until") is None  # never rested
+
+
 @pytest.mark.parametrize("text", [
     "your refresh token was revoked. Please log out and sign in again.",
     "error: refresh token revoked",
@@ -323,13 +392,15 @@ def test_detect_auth_dead_negative_and_not_a_limit():
 
 
 def test_handle_limit_honors_auth_failed_exclude(ctx):
-    # after an auth hop, a later limit must NOT re-select the seat that already died this run
+    # after an auth hop, a later (real) limit must NOT re-select the seat that already died this run
+    reset = iso(now() + timedelta(hours=3))
+    maxed = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=100.0, p_reset=reset))})  # ok+maxed
     state = _two_codex(ctx)  # active a, b available
-    dec = handle_limit(ctx, state, "codex", get=fake_get({}), exclude={"b@x.com"})
-    assert dec.action == "give_up"          # b excluded, a just limited → nothing to switch to
+    dec = handle_limit(ctx, state, "codex", get=maxed, exclude={"b@x.com"})
+    assert dec.action == "give_up"          # b excluded, a genuinely limited → nothing to switch to
     # sanity: without the exclude it WOULD switch to b
     state2 = _two_codex(ctx)
-    assert handle_limit(ctx, state2, "codex", get=fake_get({})).action == "switch"
+    assert handle_limit(ctx, state2, "codex", get=maxed).action == "switch"
 
 
 def test_detect_event_classifies_in_one_pass():
@@ -387,8 +458,9 @@ def test_run_gives_up_with_relogin_hint_when_only_seat_revoked(ctx):
 
 def test_run_respects_max_switches(ctx):
     _two_codex(ctx)
-    get = fake_get({P.CODEX_USAGE_URL: (429, "")})
-    # every launch hits a limit; with max_switches=1 we get: launch, switch, launch(limit)->stop
+    reset = iso(now() + timedelta(hours=3))
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=100.0, p_reset=reset))})  # genuinely maxed
+    # every launch hits a real limit; with max_switches=1 we get: launch, switch, launch(limit)->stop
     spawn = FakeSpawn([(b"usage limit reached\n", 1)] * 5)
     rc = run(ctx, "codex", [], spawn=spawn, get=get, max_switches=1, notify=lambda m: None)
     assert len(spawn.calls) == 2  # initial + one resume, then bail
