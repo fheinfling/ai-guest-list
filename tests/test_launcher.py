@@ -169,6 +169,17 @@ def test_handle_limit_resumes_when_usage_endpoint_throttled(ctx):
     assert state.get_seat("codex", "a@x.com").get("limited_until") is None
 
 
+def test_handle_limit_switches_off_stale_active_pointer(ctx):
+    """If the active pointer is stale (its account was removed mid-run), an inconclusive probe must
+    NOT resume the phantom seat — it falls through to choose() a real, available seat."""
+    state = _two_codex(ctx)  # a, b real; active a
+    state.set_active("codex", "ghost@x.com")   # stale pointer, not in accounts
+    state.save()
+    get = fake_get({P.CODEX_USAGE_URL: (0, "")})   # unreachable → inconclusive status
+    dec = handle_limit(ctx, state, "codex", get=get)
+    assert dec.action == "switch" and dec.email in ("a@x.com", "b@x.com")
+
+
 def test_handle_limit_resumes_when_usage_confirms_healthy(ctx):
     """Corroboration guard: a stdout match on a seat the endpoint says is healthy (both windows
     well under the cap) is a false positive — resume the same seat, never rest it."""

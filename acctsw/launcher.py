@@ -110,21 +110,30 @@ _LIMIT_RE = {t: [re.compile(p, re.IGNORECASE) for p in pats] for t, pats in LIMI
 _AUTH_RE = {t: [re.compile(p, re.IGNORECASE) for p in pats] for t, pats in AUTH_DEAD_PATTERNS.items()}
 
 
-def detect_limit(tool: str, text: str) -> bool:
-    """True if ``text`` (a rolling buffer of recent output) looks like a usage-limit message.
-
-    ANSI escape codes are stripped first so a TUI's color codes can't split a phrase.
-    """
-    clean = _ANSI.sub("", text)
+# Classification on ALREADY-ANSI-stripped text — the single source of truth for the limit veto and
+# the pattern scans, so detect_limit/detect_auth_dead (the public probes) and detect_event (the hot
+# per-chunk path) can never drift apart. Callers own the one _ANSI.sub so no strip is done twice.
+def _is_limit(tool: str, clean: str) -> bool:
     if _NOT_A_LIMIT.search(clean):
         return False  # server throttle explicitly disclaims the usage limit → not a limit banner
     return any(rx.search(clean) for rx in _LIMIT_RE[tool])
 
 
+def _is_auth_dead(tool: str, clean: str) -> bool:
+    return any(rx.search(clean) for rx in _AUTH_RE[tool])
+
+
+def detect_limit(tool: str, text: str) -> bool:
+    """True if ``text`` (a rolling buffer of recent output) looks like a usage-limit message.
+
+    ANSI escape codes are stripped first so a TUI's color codes can't split a phrase.
+    """
+    return _is_limit(tool, _ANSI.sub("", text))
+
+
 def detect_auth_dead(tool: str, text: str) -> bool:
     """True if recent output says the seat's credentials are dead (revoked / signed out)."""
-    clean = _ANSI.sub("", text)
-    return any(rx.search(clean) for rx in _AUTH_RE[tool])
+    return _is_auth_dead(tool, _ANSI.sub("", text))
 
 
 def detect_event(tool: str, text: str) -> str | None:
@@ -132,9 +141,9 @@ def detect_event(tool: str, text: str) -> str | None:
     "auth" (creds dead), "limit" (usage limit), or None. Auth is checked first — it's not a usage
     limit and needs a DIFFERENT seat, not a resume on the same one."""
     clean = _ANSI.sub("", text)
-    if any(rx.search(clean) for rx in _AUTH_RE[tool]):
+    if _is_auth_dead(tool, clean):
         return "auth"
-    if not _NOT_A_LIMIT.search(clean) and any(rx.search(clean) for rx in _LIMIT_RE[tool]):
+    if _is_limit(tool, clean):
         return "limit"
     return None
 
@@ -226,8 +235,11 @@ def handle_limit(ctx: Context, state, tool: str, *, get=usage_mod._default_get,
         #     limit)").
         # So on anything but "ok" we keep working on the same seat — bounded by the false-alarm
         # counter, which turns scanning off after MAX_FALSE_ALARMS so a genuine limit still stops.
+        # (Only when the active seat is still a real, selectable seat; if the active pointer is stale
+        # — the account was removed mid-run — fall through to choose() a valid seat instead of
+        # resuming a phantom, exactly as the pre-guard reactive path did.)
         status = (summary.get(tool) or {}).get(active)
-        if status != "ok":
+        if status != "ok" and state.get_seat(tool, active) is not None:
             return Decision("resume", active)
     seat = state.get_seat(tool, active) if active else None
     # ...else a reactive fallback so we don't immediately re-pick the maxed seat.
