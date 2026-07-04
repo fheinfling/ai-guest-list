@@ -143,6 +143,28 @@ def codex_token_account(blob: str) -> tuple[str | None, str | None]:
     return tokens.get("access_token"), tokens.get("account_id")
 
 
+def account_fingerprint(tool: str, blob: str | None) -> str | None:
+    """The underlying provider-account id for a credential blob. Two seats that share a fingerprint
+    are the SAME billing account — one quota pool, so they can't cover each other when limited (a
+    Gmail '+alias' codex login still maps to one ChatGPT account). Codex: the ChatGPT account id;
+    Claude: none exposed today → None (claude seats are distinct Anthropic accounts by email)."""
+    if not blob or tool != "codex":
+        return None
+    from .util import jwt_payload
+    try:
+        data = json.loads(blob)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    tokens = data.get("tokens") or {}
+    if tokens.get("account_id"):
+        return tokens["account_id"]
+    for tok in (tokens.get("access_token"), tokens.get("id_token")):
+        auth = (jwt_payload(tok or "") or {}).get("https://api.openai.com/auth") or {}
+        if auth.get("chatgpt_account_id"):
+            return auth["chatgpt_account_id"]
+    return None
+
+
 def claude_token(blob: str) -> str | None:
     try:
         data = json.loads(blob)
@@ -370,6 +392,9 @@ def refresh(ctx, state, tool: str | None = None, *, only: str | None = None,
             if not blob:
                 summary[t][email] = "no_creds"
                 continue
+            fp = account_fingerprint(t, blob)   # cheap local decode; self-heals existing seats
+            if fp and seat.get("account_id") != fp:
+                seat["account_id"] = fp         # persisted by the state.save() below
             u = _fetch_for(t, blob, get, ua)
             # NOTE: we deliberately do NOT auto-refresh/rotate the token here. Codex's refresh
             # tokens are single-use; rotating one that codex itself owns (the active auth.json) can
