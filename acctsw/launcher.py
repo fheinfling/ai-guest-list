@@ -36,7 +36,7 @@ from .errors import AcctswError
 from .headroom import harden_env
 from .selection import choose
 from .switch import switch, sync_back
-from .util import iso, now
+from .util import iso, now, parse_iso
 
 # A spawn function: (argv, on_output) -> exit_status.
 #   on_output(chunk: bytes) -> bool ; returning True asks the supervisor to stop the child.
@@ -266,6 +266,29 @@ def handle_auth_dead(ctx: Context, state, tool: str, *, exclude: set | frozenset
     skip = set(exclude) | ({active} if active else set())
     sel = choose(state, tool, exclude=skip)
     if sel.email and sel.available:
+        return Decision("switch", sel.email)
+    return Decision("give_up", sel.email,
+                    sel.unlocks_at.isoformat() if sel.unlocks_at else None)
+
+
+def handle_exhausted(ctx: Context, state, tool: str, *, get=usage_mod._default_get,
+                     exclude: set | frozenset = frozenset()) -> Decision:
+    """Post-exit safety net: the child exited on its own WITHOUT a stdout limit banner we could catch
+    mid-session (codex often just errors/exits on a real limit, and this repo's own limit-prose can
+    have turned scanning off earlier in the run). FORCE-refresh the active seat; only if the endpoint
+    now confirms it is genuinely out (a future ``limited_until``, stamped from ``usage`` — positive
+    evidence, never a transient error) AND another seat is free do we hop. No confirmation → give_up,
+    so an ordinary non-zero exit (build failure, crash) is surfaced untouched, never turned into a
+    spurious switch."""
+    active = state.active(tool)
+    if not active or state.get_seat(tool, active) is None:
+        return Decision("give_up", active)
+    usage_mod.refresh(ctx, state, tool, only=active, force=True, get=get)
+    until = parse_iso((state.get_seat(tool, active) or {}).get("limited_until"))
+    if until is None or until <= now():
+        return Decision("give_up", active)  # not confirmed out → don't manufacture a hop
+    sel = choose(state, tool, exclude=exclude)
+    if sel.email and sel.available and sel.email != active:
         return Decision("switch", sel.email)
     return Decision("give_up", sel.email,
                     sel.unlocks_at.isoformat() if sel.unlocks_at else None)
@@ -625,7 +648,29 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             status = spawn(argv, on_output)  # NO lock held during the session
 
             if hit["reason"] is None:
-                return status  # clean exit — child's real exit code
+                # No stdout limit banner was caught — but a NON-ZERO exit can be a real limit codex
+                # surfaced as a plain error (or one that slipped past after scanning turned off). Last
+                # resort: confirm via the usage endpoint; if the active seat is genuinely out and a
+                # healthy seat is free (and the switch budget allows), hop + resume so the work
+                # continues instead of dying on a maxed seat. A clean (0) exit is a real completion —
+                # never second-guess it. See handle_exhausted (positive-evidence only).
+                if status != 0 and switches < max_switches:
+                    with ctx.locked():
+                        state = ctx.load_state()
+                        active = state.active(tool)
+                        dec = handle_exhausted(ctx, state, tool, get=get, exclude=auth_failed)
+                        if dec.action == "switch":
+                            switch(ctx, state, tool, dec.email, sync=(tool != "codex"))
+                            _activate_codex_home(dec.email)
+                            state.data["last_switch_at"] = iso(now())
+                            state.save()
+                    if dec.action == "switch":
+                        notify(f"{active} hit its usage limit — hopping to {dec.email}, "
+                               f"resuming your work ✨")
+                        switches += 1
+                        resuming = True
+                        continue
+                return status  # clean exit, or a plain failure — child's real exit code
 
             with ctx.locked():
                 state = ctx.load_state()
