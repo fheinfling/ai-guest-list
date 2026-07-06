@@ -205,12 +205,34 @@ def test_refresh_clears_stale_limit_when_usage_drops(ctx):
 
 
 def test_refresh_does_not_clear_active_reactive_limit(ctx):
-    """A still-future reactive flag must survive a proactive poll showing <100% (anti-flapping)."""
+    """A still-future reactive flag must survive a poll in the lag band (≥FALSE_ALARM_MAX_PCT):
+    the endpoint can trail a real limit by a few percent, so a near-max reading is inconclusive."""
+    state = _seed_two_codex(ctx)
+    state.set_limited_until("codex", "a@x.com", iso(now() + timedelta(hours=2)), source="reactive")
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=95.0, secondary=5.0))})
+    U.refresh(ctx, state, "codex", force=True, get=get)
+    assert state.get_seat("codex", "a@x.com")["limited_until"] is not None
+
+
+def test_refresh_clears_reactive_limit_when_confirmed_healthy(ctx):
+    """A CONFIRMED-healthy fetch (clear headroom, no limit flag) cannot be endpoint lag — it clears
+    a stale reactive flag so a false positive never blocks launches with 'all seats resting'."""
     state = _seed_two_codex(ctx)
     state.set_limited_until("codex", "a@x.com", iso(now() + timedelta(hours=2)), source="reactive")
     get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=5.0, secondary=5.0))})
     U.refresh(ctx, state, "codex", force=True, get=get)
-    assert state.get_seat("codex", "a@x.com")["limited_until"] is not None
+    assert state.get_seat("codex", "a@x.com")["limited_until"] is None
+
+
+def test_refresh_never_clears_hard_limit_early(ctx):
+    """A ``hard`` flag (tool-side billing banner, e.g. codex out of credits) survives even a fully
+    healthy poll: the usage windows can look fine while the workspace has no credits."""
+    state = _seed_two_codex(ctx)
+    state.set_limited_until("codex", "a@x.com", iso(now() + timedelta(hours=2)), source="hard")
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=5.0, secondary=5.0))})
+    U.refresh(ctx, state, "codex", force=True, get=get)
+    seat = state.get_seat("codex", "a@x.com")
+    assert seat["limited_until"] is not None and seat["limit_source"] == "hard"
 
 
 def test_limit_reached_flag_is_authoritative(ctx):
@@ -231,6 +253,64 @@ def test_both_windows_maxed_uses_later_reset():
         "5h": U.Window(used_pct=100.0, resets_at=early),
         "weekly": U.Window(used_pct=100.0, resets_at=late)})
     assert U._limit_reset(u) == late  # max(), not min()
+
+
+def test_maxed_window_without_reset_still_rests_seat(ctx):
+    """A window at 100% with NO reset timestamp (e.g. a workspace out of credits) must still rest
+    the seat — otherwise the display shows 100% while choose() calls it available and the launcher
+    picks a maxed seat. With no reset anywhere, the estimate is now + DEFAULT_COOLDOWN."""
+    from acctsw.selection import choose
+    state = _seed_two_codex(ctx)
+    body = json.dumps({"rate_limit": {
+        "primary_window": {"used_percent": 100},
+        "secondary_window": {"used_percent": 40}}})   # maxed, no reset_at, no limit_reached
+    U.refresh(ctx, state, "codex", only="a@x.com", force=True,
+              get=fake_get({P.CODEX_USAGE_URL: (200, body)}))
+    seat = state.get_seat("codex", "a@x.com")
+    until = parse_iso(seat["limited_until"])
+    assert until is not None and seat["limit_source"] == "usage"
+    assert timedelta(hours=4) < (until - now()) <= U.DEFAULT_COOLDOWN
+    assert choose(state, "codex").email == "b@x.com"   # maxed seat not picked
+
+
+def test_limit_reached_without_any_reset_still_rests_seat(ctx):
+    """The authoritative limit_reached flag with NO reset anywhere must rest the seat too."""
+    state = _seed_two_codex(ctx)
+    body = json.dumps({"rate_limit": {"limit_reached": True,
+        "primary_window": {"used_percent": 50},
+        "secondary_window": {"used_percent": 50}}})
+    U.refresh(ctx, state, "codex", force=True, get=fake_get({P.CODEX_USAGE_URL: (200, body)}))
+    seat = state.get_seat("codex", "a@x.com")
+    assert seat["limited_until"] is not None and seat["limit_source"] == "usage"
+
+
+def test_fallback_rest_estimate_is_stable_across_polls(ctx):
+    """A no-reset limited fetch stamps its DEFAULT_COOLDOWN estimate ONCE: later polls with the
+    same shape must NOT re-anchor (slide) it — a receding stamp makes the launcher's wait target
+    creep forward forever, re-notifying on every poll and never reaching its moment of truth."""
+    state = _seed_two_codex(ctx)
+    body = json.dumps({"rate_limit": {
+        "primary_window": {"used_percent": 100},
+        "secondary_window": {"used_percent": 40}}})   # maxed, no reset_at
+    get = fake_get({P.CODEX_USAGE_URL: (200, body)})
+    U.refresh(ctx, state, "codex", only="a@x.com", force=True, get=get)
+    first = state.get_seat("codex", "a@x.com")["limited_until"]
+    U.refresh(ctx, state, "codex", only="a@x.com", force=True, get=get)
+    assert state.get_seat("codex", "a@x.com")["limited_until"] == first
+
+
+def test_maxed_usage_poll_does_not_downgrade_hard_limit(ctx):
+    """A still-future ``hard`` flag must survive a poll showing a maxed window WITH a short reset:
+    re-stamping it as clearable source=\"usage\" would let the next healthy-looking fetch free a
+    creditless seat — the exact ping-pong the hard source exists to prevent."""
+    state = _seed_two_codex(ctx)
+    hard_until = iso(now() + timedelta(hours=5))
+    state.set_limited_until("codex", "a@x.com", hard_until, source="hard")
+    reset = iso(now() + timedelta(minutes=10))
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=100.0, p_reset=reset))})
+    U.refresh(ctx, state, "codex", only="a@x.com", force=True, get=get)
+    seat = state.get_seat("codex", "a@x.com")
+    assert seat["limit_source"] == "hard" and seat["limited_until"] == hard_until
 
 
 def test_error_preserves_last_known_windows(ctx):

@@ -22,6 +22,7 @@ import subprocess
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any, Callable
 
 from . import paths as P
@@ -321,6 +322,16 @@ def fetch_claude(token: str | None, *, user_agent: str | None = None,
 
 LIMIT_PCT = 100.0  # a window at/above this means the seat is out of credit
 
+# Default cooldown when a limit is known but no authoritative reset is (shared with the launcher,
+# which re-exports it; defined here so usage's own limit-flagging can use it without a cycle).
+DEFAULT_COOLDOWN = timedelta(hours=5)
+
+# A limit-signal is dismissed as a false positive (model prose / a stale reactive flag, not a real
+# limit) when a FRESH fetch says the seat's busiest window is still below this. Well clear of a real
+# ~100% limit even if the endpoint lags a few percent behind reality — a lagging truly-maxed seat
+# still reads >= this, so it is never mistaken for healthy.
+FALSE_ALARM_MAX_PCT = 90.0
+
 
 def _seat_blob(ctx, state, tool: str, email: str) -> str | None:
     """Freshest creds for a seat: live blob if it's active, else the keychain snapshot."""
@@ -427,38 +438,71 @@ def store_fetch(state, tool: str, email: str, u: Usage, at=None) -> str:
     return u.error or "ok"
 
 
+def _is_limited(u: Usage) -> bool:
+    """True when THIS fetch shows the seat out: a window at/above LIMIT_PCT, or the authoritative
+    API flag. A limited seat must ALWAYS end up rested even when the payload carries no reset
+    timestamp (e.g. a codex workspace out of credits) — otherwise the seat reads "available" while
+    the display shows 100% and the launcher picks a maxed seat."""
+    return bool(u.limit_reached) or any(
+        w.used_pct is not None and w.used_pct >= LIMIT_PCT for w in u.windows.values())
+
+
 def _limit_reset(u: Usage) -> str | None:
-    """Return when a maxed-out seat unlocks, or None if it isn't limited.
+    """The payload's own unlock time for a limited seat, or None if it carries no reset data.
 
     When MULTIPLE windows are maxed (e.g. both 5h and weekly), the seat stays blocked until the
     LATER reset, so we take ``max()`` over maxed windows (using ``min()`` would mark the seat
-    available too early and the launcher would switch back to a still-capped seat).
+    available too early and the launcher would switch back to a still-capped seat). With no reset
+    on the maxed window(s), the latest known reset across all windows is the best estimate.
     """
-    maxed = [w.resets_at for w in u.windows.values()
-             if w.used_pct is not None and w.used_pct >= LIMIT_PCT and w.resets_at]
-    if maxed:
-        return max(maxed)
-    # Authoritative API flag with no window over 100 → use the latest known reset as best estimate.
-    if u.limit_reached:
-        allr = [w.resets_at for w in u.windows.values() if w.resets_at]
-        return max(allr) if allr else None
-    return None
+    maxed = [w for w in u.windows.values() if w.used_pct is not None and w.used_pct >= LIMIT_PCT]
+    resets = [w.resets_at for w in maxed if w.resets_at]
+    if resets:
+        return max(resets)
+    allr = [w.resets_at for w in u.windows.values() if w.resets_at]
+    return max(allr) if allr else None
+
+
+def _confirmed_healthy(u: Usage) -> bool:
+    """True only when THIS fresh fetch proves the seat has clear headroom (mirror of the launcher's
+    ``_seat_confirmed_healthy``, for a Usage object in hand rather than persisted state): ok, no
+    authoritative limit flag, and the busiest window well under the false-alarm bar. A lagging
+    endpoint on a truly-maxed seat reads ~95-100% — above the bar — so lag can never look healthy."""
+    if not u.ok or u.limit_reached:
+        return False
+    pcts = [w.used_pct for w in u.windows.values() if w.used_pct is not None]
+    return bool(pcts) and max(pcts) < FALSE_ALARM_MAX_PCT
 
 
 def _apply_limit(state, tool: str, email: str, u: Usage, at) -> None:
-    """Update limited_until from usage, WITHOUT prematurely clearing a reactive flag.
+    """Update limited_until from usage, without prematurely clearing a rest the fetch can't disprove.
 
-    A still-future ``reactive`` flag (set when the launcher caught a real limit mid-session) is
-    authoritative over the usage endpoint, which can lag. We only clear it once it has expired.
+    - A still-future ``hard`` flag (tool-side billing banner, e.g. codex "workspace out of credits")
+      is NEVER cleared, re-stamped, or downgraded early: the usage windows can look perfectly
+      healthy — or maxed with a short reset — while the seat is genuinely unusable, and replacing
+      the flag with a clearable ``usage`` stamp would re-pick the creditless seat in a ping-pong loop.
+    - A limited fetch whose payload carries NO reset data stamps a DEFAULT_COOLDOWN estimate ONCE:
+      an existing still-future stamp is kept STABLE rather than re-anchored to ``at`` on every poll,
+      which would make the launcher's wait target recede forever (and re-notify on each poll).
+    - A still-future ``reactive`` flag (limit caught mid-session) is kept while the endpoint lags a
+      real limit — but a CONFIRMED-healthy fetch (<FALSE_ALARM_MAX_PCT, no limit flag) cannot be
+      lag, so it clears the flag: that stale false positive is what wrongly blocked launches with
+      "all seats resting" when capacity actually existed.
     """
     from .util import parse_iso
-    maxed_reset = _limit_reset(u)
-    if maxed_reset:
-        state.set_limited_until(tool, email, maxed_reset, source="usage")
-        return
     seat = state.get_seat(tool, email)
     src = (seat or {}).get("limit_source")
     until = parse_iso((seat or {}).get("limited_until"))
-    if src == "reactive" and until is not None and until > at:
-        return  # keep the reactive flag until it expires
+    live = until is not None and until > at
+    if src == "hard" and live:
+        return  # billing banner: the seat is already rested; nothing here may weaken that
+    if _is_limited(u):
+        reset = _limit_reset(u)
+        if reset:
+            state.set_limited_until(tool, email, reset, source="usage")
+        elif not live:
+            state.set_limited_until(tool, email, iso(at + DEFAULT_COOLDOWN), source="usage")
+        return
+    if live and src == "reactive" and not _confirmed_healthy(u):
+        return  # inconclusive / near-max reading: keep the rest until it expires
     state.set_limited_until(tool, email, None)

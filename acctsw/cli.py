@@ -261,6 +261,11 @@ def main(argv: list[str] | None = None) -> int:
     except AcctswError as e:
         print(f"acctsw: {e}", file=sys.stderr)
         return EXIT_ERR
+    except KeyboardInterrupt:
+        # E.g. Ctrl-C during the all-seats-resting wait: a clean one-liner, not a traceback.
+        # (run()'s finally has already synced creds back while the interrupt propagated.)
+        print("\nacctsw: interrupted — stopping.", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":

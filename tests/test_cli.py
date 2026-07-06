@@ -110,3 +110,15 @@ def test_keychain_error_is_friendly(isolated, monkeypatch, capsys):
     rc = cli.main(["add", "claude", "--email", "c@x.com"])
     assert rc == cli.EXIT_ERR
     assert "acctsw:" in capsys.readouterr().err
+
+
+def test_ctrl_c_exits_cleanly(isolated, monkeypatch, capsys):
+    """Ctrl-C (e.g. during the all-seats-resting wait) prints one friendly line and exits 130 —
+    never the raw KeyboardInterrupt traceback the wait used to dump."""
+    def interrupted(ctx, ns):
+        raise KeyboardInterrupt
+    monkeypatch.setitem(cli.HANDLERS, "list", interrupted)
+    rc = cli.main(["list"])
+    assert rc == 130
+    err = capsys.readouterr().err
+    assert "interrupted" in err and "Traceback" not in err
