@@ -13,8 +13,8 @@ from acctsw.launcher import (NoSeats, build_cmd, resume_cmd, detect_limit, detec
                              detect_hard_limit, handle_limit, handle_auth_dead, run)
 from acctsw.util import now, iso
 from datetime import timedelta
-from tests.conftest import make_codex_blob
-from tests.test_usage import fake_get, codex_ok_body
+from tests.conftest import make_claude_blob, make_codex_blob
+from tests.test_usage import fake_get, claude_ok_body, codex_ok_body
 from acctsw import paths as P
 
 
@@ -50,6 +50,7 @@ def test_detect_limit_negative():
     # developing this repo). None are the tool's own committal banner, so none may match.
     "the usage limit detector fired on the agent's own text",
     "all claude seats are resting; soonest unlocks at 17:57",
+    "2 MCP servers need authentication · run /mcp",
 ])
 def test_detect_limit_no_false_positive_on_benign(benign):
     assert not detect_limit("codex", benign)
@@ -128,6 +129,17 @@ def _two_realistic_codex_aliases(ctx):
     from acctsw.switch import switch
     state = ctx.load_state()
     switch(ctx, state, "codex", emails[0])
+    return ctx.load_state()
+
+
+def _two_claude(ctx):
+    for em in ("c1@x.com", "c2@x.com"):
+        ctx.cred["claude"].set_live(make_claude_blob())
+        state = ctx.load_state()
+        acct.add(ctx, state, "claude", email=em)
+    from acctsw.switch import switch
+    state = ctx.load_state()
+    switch(ctx, state, "claude", "c1@x.com")
     return ctx.load_state()
 
 
@@ -522,10 +534,11 @@ def test_run_gives_up_with_relogin_hint_when_only_seat_revoked(ctx):
     assert any("sign in again" in m for m in msgs)
 
 
-def test_run_respects_max_switches(ctx):
+def test_run_respects_max_switches(ctx, monkeypatch):
     _two_codex(ctx)
     reset = iso(now() + timedelta(hours=3))
     get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=100.0, p_reset=reset))})  # genuinely maxed
+    monkeypatch.setenv(L.WAIT_ON_ALL_RESTING_ENV, "0")
     # every launch hits a real limit; with max_switches=1 we get: launch, switch, launch(limit)->stop
     spawn = FakeSpawn([(b"usage limit reached\n", 1)] * 5)
     rc = run(ctx, "codex", [], spawn=spawn, get=get, max_switches=1, notify=lambda m: None)
@@ -650,6 +663,66 @@ def test_run_claude_resume_uses_continue(ctx):
     rc = run(ctx, "claude", [], spawn=spawn, get=get, notify=lambda m: None)
     assert rc == 0
     assert spawn.calls[1][-1] == "--continue"
+
+
+def test_run_claude_waits_and_resumes_when_all_seats_resting(ctx):
+    state = _two_claude(ctx)
+    first = iso(now() + timedelta(seconds=30))
+    second = iso(now() + timedelta(seconds=60))
+    state.set_limited_until("claude", "c1@x.com", first, source="usage")
+    state.set_limited_until("claude", "c2@x.com", second, source="usage")
+    state.save()
+    sleeps = []
+    msgs = []
+    spawn = FakeSpawn([(b"resumed\n", 0)])
+
+    rc = run(ctx, "claude", [], spawn=spawn, get=fake_get({}),
+             notify=msgs.append, sleep=sleeps.append)
+
+    assert rc == 0
+    assert len(sleeps) == 1
+    assert sleeps[0] > 0
+    assert spawn.calls[0][-1] == "--continue"
+    assert any("waiting until" in m for m in msgs)
+    assert ctx.load_state().get_seat("claude", "c1@x.com").get("limited_until") is None
+
+
+def test_run_claude_wait_activates_soonest_unlocked_seat(ctx):
+    state = _two_claude(ctx)  # active c1
+    c1_reset = iso(now() + timedelta(seconds=60))
+    c2_reset = iso(now() + timedelta(seconds=30))
+    state.set_limited_until("claude", "c2@x.com", c2_reset, source="usage")
+    state.save()
+    get = fake_get({P.CLAUDE_USAGE_URL: (200, claude_ok_body(five=100.0,
+                                                             five_reset=c1_reset))})
+    sleeps = []
+    spawn = FakeSpawn([(b"usage limit reached\n", 1), (b"resumed\n", 0)])
+
+    rc = run(ctx, "claude", [], spawn=spawn, get=get, notify=lambda m: None,
+             sleep=sleeps.append)
+
+    assert rc == 0
+    assert len(sleeps) == 1
+    assert spawn.calls[1][-1] == "--continue"
+    assert ctx.load_state().active("claude") == "c2@x.com"
+
+
+def test_run_claude_all_resting_opt_out_exits_without_spawn(ctx, monkeypatch):
+    state = _two_claude(ctx)
+    state.set_limited_until("claude", "c1@x.com", iso(now() + timedelta(seconds=30)),
+                            source="usage")
+    state.set_limited_until("claude", "c2@x.com", iso(now() + timedelta(seconds=60)),
+                            source="usage")
+    state.save()
+    monkeypatch.setenv(L.WAIT_ON_ALL_RESTING_ENV, "0")
+    msgs = []
+    spawn = FakeSpawn([])
+
+    rc = run(ctx, "claude", [], spawn=spawn, get=fake_get({}), notify=msgs.append)
+
+    assert rc == L.EXIT_GAVE_UP
+    assert spawn.calls == []
+    assert any("soonest unlocks" in m for m in msgs)
 
 
 # --- real PTY smoke tests (would have caught the B1 reaping bug) -------------------------------

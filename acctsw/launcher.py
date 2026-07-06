@@ -56,6 +56,8 @@ PROBE_COOLDOWN_S = 30.0  # after a dismissed match, skip re-probing usage for th
 # ~100% limit even if the endpoint lags a few percent behind stdout.
 FALSE_ALARM_MAX_PCT = 90.0
 EXIT_GAVE_UP = 75     # EX_TEMPFAIL: distinguishes "we gave up / all limited" from a child failure
+WAIT_ON_ALL_RESTING_ENV = "ACCTSW_WAIT_ON_ALL_RESTING"
+_ENV_FALSE = frozenset({"0", "false", "no", "off"})
 # A usage-limit exit is an ordinary POSITIVE failure code; a user abort is not. Signal deaths come
 # back NEGATIVE (os.waitstatus_to_exitcode), and a tool that catches the signal exits 128+N — so the
 # exit-time safety net skips both rather than pay a usage fetch (and delay teardown) on a Ctrl-C/kill.
@@ -176,6 +178,35 @@ def detect_event(tool: str, text: str) -> str | None:
 
 class NoSeats(AcctswError):
     """No seats configured for a tool."""
+
+
+def _wait_on_all_resting_enabled(environ: dict[str, str] | None = None) -> bool:
+    environ = os.environ if environ is None else environ
+    return environ.get(WAIT_ON_ALL_RESTING_ENV, "1").strip().lower() not in _ENV_FALSE
+
+
+def _wait_for_unlock(ctx: Context, tool: str, dec: Decision, notify: Notifier,
+                     sleep: Callable[[float], None]) -> bool:
+    """Wait until the soonest resting seat should be usable, then let selection retry."""
+    if not _wait_on_all_resting_enabled() or not dec.email or not dec.unlocks_at:
+        return False
+    unlocks_at = parse_iso(dec.unlocks_at)
+    if unlocks_at is None:
+        return False
+    seconds = max(0.0, (unlocks_at - now()).total_seconds())
+    notify(f"all {tool} seats are resting; waiting until {unlocks_at.isoformat()} "
+           f"to resume on {dec.email}")
+    sleep(seconds)
+    # After sleeping until the advertised unlock time, clear that stale local rest marker.
+    # In tests the injected sleep returns immediately; in real use this runs after time passes.
+    with ctx.locked():
+        state = ctx.load_state()
+        seat = state.get_seat(tool, dec.email)
+        current = parse_iso((seat or {}).get("limited_until"))
+        if seat is not None and (current is None or current <= unlocks_at):
+            state.set_limited_until(tool, dec.email, None)
+            state.save()
+    return True
 
 
 # --- commands ---------------------------------------------------------------------------------
@@ -545,7 +576,8 @@ _PASSTHROUGH_CMDS = frozenset({"login", "logout", "auth", "setup-token"})
 
 def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         notify: Notifier = _noop, get=usage_mod._default_get,
-        max_switches: int = MAX_SWITCHES) -> int:
+        max_switches: int = MAX_SWITCHES,
+        sleep: Callable[[float], None] = time.sleep) -> int:
     """Launch ``tool`` with the best seat, auto-switching + resuming on limits. Returns exit code."""
     if args and args[0] in _PASSTHROUGH_CMDS:
         # Credential flow (e.g. `claude auth login`): run stock, unsupervised, so the OAuth
@@ -595,7 +627,17 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         state.data["last_switch_at"] = iso(now())
         state.save()
 
+    def _wait_and_activate(dec: Decision) -> bool:
+        if not _wait_for_unlock(ctx, tool, dec, notify, sleep):
+            return False
+        with ctx.locked():
+            state = ctx.load_state()
+            if dec.email and dec.email != state.active(tool):
+                _commit_switch(state, dec.email)
+        return True
+
     try:
+        initial_resting: Decision | None = None
         # Initial selection + switch, under the state lock (brief; never held across a spawn).
         with ctx.locked():
             state = ctx.load_state()
@@ -607,11 +649,17 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 switch(ctx, state, tool, sel.email, sync=(tool != "codex"))
             _activate_codex_home(state.active(tool))
         if sel.all_limited and sel.unlocks_at:
-            notify(f"all {tool} seats are resting — {sel.email} unlocks at "
-                   f"{sel.unlocks_at:%H:%M}; starting anyway")
+            initial_resting = Decision("give_up", sel.email, sel.unlocks_at.isoformat())
 
         switches = 0
         resuming = False
+        if initial_resting is not None:
+            if _wait_and_activate(initial_resting):
+                resuming = True
+            else:
+                notify(f"all {tool} seats are resting; soonest unlocks at "
+                       f"{initial_resting.unlocks_at}")
+                return EXIT_GAVE_UP
         auth_failed: set = set()   # seats whose token died THIS run — skip them for the rest of it
         buf = bytearray()
         # Verify-before-kill scanning state. A stdout match is corroborated against the usage
@@ -714,6 +762,13 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                         switches += 1
                         resuming = True
                         continue
+                    if dec.action == "give_up" and dec.unlocks_at:
+                        if _wait_and_activate(dec):
+                            resuming = True
+                            continue
+                        notify(f"all {tool} seats are resting"
+                               + (f"; soonest unlocks at {dec.unlocks_at}" if dec.unlocks_at else ""))
+                        return EXIT_GAVE_UP
                 return status  # clean exit, or a plain failure — child's real exit code
 
             with ctx.locked():
@@ -762,6 +817,9 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     notify(f"{active} needs you to sign in again (token revoked) and no other "
                            f"{tool} seat is ready — re-add it via the app or `acctsw add {tool}`")
                 return EXIT_GAVE_UP
+            if _wait_and_activate(dec):
+                resuming = True
+                continue
             notify(f"all {tool} seats are resting"
                    + (f"; soonest unlocks at {dec.unlocks_at}" if dec.unlocks_at else ""))
             return EXIT_GAVE_UP
