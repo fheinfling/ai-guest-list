@@ -195,7 +195,8 @@ const ADD_COPY = {
 const BROWSER_HINT = "i'll pop open the official sign-in — nothing leaves your Mac, i just save the seat.";
 
 // Only a codex "token" paste uses the textarea + direct install; everything else (browser, and
-// claude's setup-token) is an official flow launched in Terminal.
+// claude's setup-token) is an official flow launched in Terminal. Exported so app.mjs shares the
+// single definition instead of re-deriving the predicate.
 function addUsesPaste(add) { return add.method === "token" && add.provider === "codex"; }
 
 function addProviderStep() {
@@ -446,11 +447,11 @@ window.AGL = {
         if (screen === "add" && add && add.step === "done") { screen = "main"; add = null; render(); }
       }, 1600);
     }
-    if (res.error && inAdd && add.pending) {    // our async op failed → clear pending, show the toast
+    if (res.error && res.add_op && inAdd && add.pending) {   // OUR add op failed (not a poll error)
       add.pending = false;
       // codex paste: back to the form (auth.json preserved). Terminal flows (browser sign-in, claude
       // setup-token): stay on connecting so the user can finish and tap "save my seat" again.
-      if (add.method === "token" && add.provider === "codex") add.step = "details";
+      if (addUsesPaste(add)) add.step = "details";
       addChanged = true;
     }
 
@@ -459,7 +460,9 @@ window.AGL = {
     } else if (res.state || res.settings_panel) {
       render();
     }
-    if (res.error) flash(res.error);
+    // Toast a user-action error, but never a background usage-poll blip (it would pop over whatever
+    // screen the user is on, unrelated to anything they did).
+    if (res.error && !res.background) flash(res.error);
     if (res.celebrate) celebrate();
   },
   // legacy single-arg state push (kept for the poll path / older callers)
@@ -533,7 +536,7 @@ document.addEventListener("click", (e) => {
       const name = add.name.trim();
       // Only a codex "token" paste installs an auth.json in-app; everything else (browser sign-in,
       // and claude's setup-token) launches an official flow in Terminal and waits on the user.
-      if (add.method === "token" && add.provider === "codex") {
+      if (addUsesPaste(add)) {
         const blob = add.token.trim();
         if (!blob) break;                      // empty field → no-op, not a spinner + error toast
         add.pending = true; add.step = "connecting"; render();   // paste in flight → saving spinner

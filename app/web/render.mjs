@@ -192,8 +192,9 @@ const ADD_COPY = {
 const BROWSER_HINT = "i'll pop open the official sign-in — nothing leaves your Mac, i just save the seat.";
 
 // Only a codex "token" paste uses the textarea + direct install; everything else (browser, and
-// claude's setup-token) is an official flow launched in Terminal.
-function addUsesPaste(add) { return add.method === "token" && add.provider === "codex"; }
+// claude's setup-token) is an official flow launched in Terminal. Exported so app.mjs shares the
+// single definition instead of re-deriving the predicate.
+export function addUsesPaste(add) { return add.method === "token" && add.provider === "codex"; }
 
 function addProviderStep() {
   const row = (tool) => `<button class="add-prov" data-action="add-provider" data-tool="${tool}"

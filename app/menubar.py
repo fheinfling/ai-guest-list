@@ -150,7 +150,8 @@ if objc is not None:
 
         def pollBg_(self, _arg):
             appalive.mark_alive(self.ctx.data_dir)   # refresh heartbeat so a spurious removal self-heals within one poll
-            result = bridge.handle(self.ctx, {"action": "usage"})
+            result = dict(bridge.handle(self.ctx, {"action": "usage"}))
+            result["background"] = True   # the JS must not toast a transient poll error over the UI
             self.performSelectorOnMainThread_withObject_waitUntilDone_(
                 objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
 
@@ -164,19 +165,20 @@ if objc is not None:
                 result = dict(bridge.handle(self.ctx, dict(msg)))
             except Exception:
                 result = {"ok": False, "error": "something went wrong saving that seat"}
-            result["_notify_added"] = True   # let applyResult_ fire the "seat saved" nudge
+            # Tag it as an add-op reply. The JS uses this to attribute an error to THIS paste/snapshot
+            # (vs. a 180s usage-poll error landing mid-add), and it also gates the "seat saved" nudge.
+            result["add_op"] = True
             self.performSelectorOnMainThread_withObject_waitUntilDone_(
                 objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
 
         def applyResult_(self, result):
-            # A backgrounded add still deserves the "seat added" nudge the main path fires — decide it
-            # here, and strip the marker BEFORE pushing so the internal key never reaches the webview.
-            notify_added = result.pop("_notify_added", False)
             self._pushResult(result)
             self._updateDot(result.get("state"))
             self._notifyAccountWarnings(result)
-            if notify_added and result.get("added") and result.get("ok") \
-                    and self.ctx.load_state().settings().get("notify", True):
+            # A backgrounded add still deserves the "seat added" nudge the main path fires. The notify
+            # flag is already in the result's own snapshot — no need to re-read state from disk.
+            notify_on = ((result.get("state") or {}).get("settings") or {}).get("notify", True)
+            if result.get("add_op") and result.get("added") and result.get("ok") and notify_on:
                 self._notify("seat saved ✨", "your seat's on the floor")
 
         @objc.python_method
