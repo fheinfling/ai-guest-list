@@ -112,7 +112,8 @@ class ClaudeCredLocation:
             base = {}
         if not isinstance(base, dict):
             base = {}
-        oauth = dict(base.get("claudeAiOauth") or {})
+        raw = base.get("claudeAiOauth")
+        oauth = dict(raw) if isinstance(raw, dict) else {}   # corrupt/non-dict item → start clean
         oauth["accessToken"] = token
         oauth.pop("refreshToken", None)
         oauth.pop("refreshTokenExpiresAt", None)

@@ -5,8 +5,10 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   buildHTML, dotState, dotKey, doorKey, doorMark, creditLeft, pct, fmtCountdown, needsHello,
-  buildPicker, buildSaveSeat, buildPaste, buildSettings,
+  buildPicker, buildSaveSeat, buildPaste, buildSettings, buildAddSeat,
 } from "./render.mjs";
+
+const mkAdd = (over = {}) => ({ step: "provider", provider: null, name: "", method: "browser", token: "", ...over });
 
 function seat(over = {}) {
   return { email: "work@x.com", name: "Work", plan: "Business", status: "ready",
@@ -158,6 +160,89 @@ test("settings is a pushed sub-view, not a modal (spec §9.1)", () => {
   // quiet version footer, and the prototype-only demo group is dropped
   assert.match(set, /class="set-ver"/);
   assert.doesNotMatch(set, /cap both Codex seats|try the demo/i);
+});
+
+test("add-a-seat is a pushed sub-view, not a modal (spec §9)", () => {
+  const st = { settings: { theme: "light" } };
+  for (const step of ["provider", "details", "connecting", "done"]) {
+    const h = buildAddSeat(st, mkAdd({ step, provider: "codex" }));
+    assert.doesNotMatch(h, /class="backdrop"/, step);
+    assert.doesNotMatch(h, /class="sheet/, step);
+    assert.doesNotMatch(h, /pk-m/, step);
+    assert.match(h, /class="app set-app add-app theme-light"/, step);
+    assert.match(h, /data-action="add-back"[^>]*title="back"/, step);
+  }
+});
+
+test("add: provider step is one grouped card with both providers", () => {
+  const h = buildAddSeat({ settings: {} }, mkAdd({ step: "provider" }));
+  assert.ok(h.includes("who's joining the list?"));
+  assert.match(h, /data-action="add-provider" data-tool="codex"/);
+  assert.match(h, /data-action="add-provider" data-tool="claude"/);
+  assert.ok(h.includes("ChatGPT sign-in · Business seat"));
+  assert.ok(h.includes("Claude.ai sign-in · Max or Pro seat"));
+  assert.ok(h.includes("nothing leaves your Mac"));
+  assert.match(h, /data-action="add-cancel"/);                 // cancel shows on provider
+});
+
+test("add: cancel only on provider|details, never connecting|done", () => {
+  for (const step of ["provider", "details"])
+    assert.match(buildAddSeat({ settings: {} }, mkAdd({ step, provider: "codex" })), /add-cancel/, step);
+  for (const step of ["connecting", "done"])
+    assert.doesNotMatch(buildAddSeat({ settings: {} }, mkAdd({ step, provider: "codex" })), /add-cancel/, step);
+});
+
+test("add: details (claude, browser) — accent, name, method, CTA", () => {
+  const h = buildAddSeat({ settings: {} }, mkAdd({ step: "details", provider: "claude" }));
+  assert.match(h, /--accent:var\(--claude\)/);
+  assert.ok(h.includes("new Claude seat") && h.includes("rotating OAuth or setup-token"));
+  assert.match(h, /data-action="add-change"/);
+  assert.match(h, /id="add-name"[^>]*placeholder="Work · Personal · Late-night"/);
+  assert.match(h, /data-action="add-method" data-value="browser"/);
+  assert.match(h, /data-action="add-method" data-value="token"/);
+  assert.ok(h.includes("i'll pop open the official sign-in"));
+  assert.ok(h.includes("open sign-in →"));
+  assert.doesNotMatch(h, /id="add-token"/);                    // no textarea in browser method
+});
+
+test("add: details token variant reveals the field + save CTA", () => {
+  const h = buildAddSeat({ settings: {} }, mkAdd({ step: "details", provider: "claude", method: "token" }));
+  assert.match(h, /id="add-token"[^>]*placeholder="[^"]*sk-ant-oat01/);
+  assert.ok(h.includes("lasts a year"));
+  assert.ok(h.includes("save the seat →"));
+  assert.match(h, /class="sopt on" data-action="add-method" data-value="token"/);  // token selected
+});
+
+test("add: codex token copy drops the unsupported 'API key' promise", () => {
+  const h = buildAddSeat({ settings: {} }, mkAdd({ step: "details", provider: "codex", method: "token" }));
+  assert.ok(h.includes("auth.json"));
+  assert.doesNotMatch(h, /API key/i);                          // engine can't accept one → don't promise it
+});
+
+test("add: typed name + token survive a re-render (escaped, controlled)", () => {
+  const h = buildAddSeat({ settings: {} },
+    mkAdd({ step: "details", provider: "codex", method: "token", name: 'Wo"rk', token: "sk-x<y" }));
+  assert.match(h, /value="Wo&quot;rk"/);                       // name reproduced, escaped
+  assert.ok(h.includes("sk-x&lt;y"));                          // token reproduced, escaped
+});
+
+test("add: connecting differs by method; browser carries save-my-seat", () => {
+  const b = buildAddSeat({ settings: {} }, mkAdd({ step: "connecting", provider: "codex", method: "browser" }));
+  assert.match(b, /class="add-spin"/);
+  assert.ok(b.includes("we opened your browser…"));
+  assert.match(b, /data-action="add-save"[^>]*>save my seat 💛</);
+  const t = buildAddSeat({ settings: {} }, mkAdd({ step: "connecting", provider: "claude", method: "token" }));
+  assert.ok(t.includes("saving your seat…"));
+  assert.doesNotMatch(t, /add-save/);                          // token path resolves via the bridge
+});
+
+test("add: done greets the seat, escapes, falls back to 'new seat'", () => {
+  assert.match(buildAddSeat({ settings: {} }, mkAdd({ step: "done", provider: "codex", name: "Work" })),
+    /class="add-welcome">welcome, Work</);
+  assert.match(buildAddSeat({ settings: {} }, mkAdd({ step: "done", provider: "codex", name: "  " })),
+    /welcome, new seat</);
+  assert.ok(buildAddSeat({ settings: {} }, mkAdd({ step: "done", provider: "codex", name: "<b>" }))
+    .includes("welcome, &lt;b&gt;"));
 });
 
 test("buildHTML has no retired Headroom surface", () => {

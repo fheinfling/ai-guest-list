@@ -57,8 +57,9 @@ def test_claude_identity_sends_the_right_request():
     assert seen["headers"]["User-Agent"] == "claude-code/9"
 
 
-@pytest.mark.parametrize("status,body", [(401, ""), (0, ""), (200, "not json"),
-                                         (200, "{}"), (200, json.dumps({"account": {}}))])
+@pytest.mark.parametrize("status,body", [
+    (401, ""), (0, ""), (200, "not json"), (200, "{}"), (200, json.dumps({"account": {}})),
+    (200, "[1]"), (200, json.dumps({"account": "x"}))])   # non-object JSON must not crash
 def test_claude_identity_rejects(status, body):
     assert ct.claude_identity(TOK, get=_get(status, body)) is None
 
@@ -100,3 +101,10 @@ def test_merge_token_drops_stale_subscription_when_plan_unknown():
 def test_merge_token_tolerates_corrupt_existing():
     blob = json.loads(ClaudeCredLocation.merge_token("not json", TOK, "max"))
     assert blob["claudeAiOauth"]["accessToken"] == TOK
+
+
+def test_merge_token_tolerates_non_dict_oauth():
+    # a corrupt item where claudeAiOauth isn't an object must not crash, and a sibling survives
+    item = json.dumps({"mcpOAuth": {"p": 1}, "claudeAiOauth": "corrupt"})
+    blob = json.loads(ClaudeCredLocation.merge_token(item, TOK, "max"))
+    assert blob["claudeAiOauth"]["accessToken"] == TOK and blob["mcpOAuth"] == {"p": 1}

@@ -52,9 +52,9 @@ def claude_identity(token: str, *, user_agent: str | None = None,
         return None
     try:
         account = (json.loads(body) or {}).get("account") or {}
-    except (ValueError, TypeError):
-        return None
-    email = account.get("email")
+        email = account.get("email")
+    except (ValueError, TypeError, AttributeError):
+        return None                 # non-object JSON / account-not-a-dict — same net as usage.py
     if not email:
         return None
     plan = "max" if account.get("has_claude_max") else "pro" if account.get("has_claude_pro") else None

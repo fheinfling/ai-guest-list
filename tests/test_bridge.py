@@ -174,9 +174,10 @@ def test_paste_claude_token_installs_and_registers(ctx, monkeypatch):
     assert r["ok"] and r["added"] == "c@x.com"
     seat = ctx.load_state().accounts("claude")["c@x.com"]
     assert seat["name"] == "Work" and seat["plan"] == "Max"
+    import time
     o = json.loads(ctx.cred["claude"].get_live())["claudeAiOauth"]
     assert o["accessToken"] == TOK and "refreshToken" not in o and "refreshTokenExpiresAt" not in o
-    assert o["subscriptionType"] == "max" and o["expiresAt"] > 0
+    assert o["subscriptionType"] == "max" and o["expiresAt"] > int(time.time() * 1000)  # far-future
 
 
 def test_paste_claude_preserves_mcp_oauth(ctx, monkeypatch):
@@ -206,7 +207,7 @@ def test_paste_claude_rejected_token_leaves_creds_untouched(ctx, monkeypatch):
     r = bridge.handle(ctx, {"action": "paste", "tool": "claude", "blob": TOK})
     assert r["ok"] is False and "nothing was changed" in r["error"]
     assert ctx.cred["claude"].get_live() == _shared_claude_item()   # no write happened at all
-    assert "b@x.com" not in ctx.load_state().accounts("claude")
+    assert ctx.load_state().accounts("claude") == {}                # no seat registered
 
 
 def test_paste_claude_rollback_on_write_failure_restores_original(ctx, monkeypatch):
