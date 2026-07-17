@@ -85,11 +85,11 @@ def test_add_action_is_gone(ctx):
 
 
 def test_login_command():
+    # both tools' only Terminal path is the browser sign-in; method is reserved but unused
     assert bridge.login_command("codex") == "codex login"
-    assert bridge.login_command("codex", "token") == "codex login"        # method ignored for codex
-    assert bridge.login_command("claude") == "claude auth login"          # default = browser
-    assert bridge.login_command("claude", "browser") == "claude auth login"
-    assert bridge.login_command("claude", "token") == "claude setup-token"
+    assert bridge.login_command("codex", "token") == "codex login"
+    assert bridge.login_command("claude") == "claude auth login"
+    assert bridge.login_command("claude", "token") == "claude auth login"
 
 
 def test_snapshot_after_login_adds_seat(ctx):

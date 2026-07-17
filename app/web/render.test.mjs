@@ -194,28 +194,18 @@ test("add: cancel only on provider|details, never connecting|done", () => {
     assert.doesNotMatch(buildAddSeat({ settings: {} }, mkAdd({ step, provider: "codex" })), /add-cancel/, step);
 });
 
-test("add: details (claude, browser) — accent, name, method, CTA", () => {
+test("add: claude is browser-only — no method chooser, no token surface", () => {
+  // `claude setup-token` produces an env-var token, not the Keychain login this app snapshots, so
+  // there is no working no-browser path for Claude — the details step is name + a single sign-in CTA.
   const h = buildAddSeat({ settings: {} }, mkAdd({ step: "details", provider: "claude" }));
   assert.match(h, /--accent:var\(--claude\)/);
-  assert.ok(h.includes("new Claude seat"));
+  assert.ok(h.includes("new Claude seat") && h.includes("Claude.ai sign-in"));
   assert.match(h, /data-action="add-change"/);
   assert.match(h, /id="add-name"[^>]*placeholder="Work · Personal · Late-night"/);
-  assert.match(h, /data-action="add-method" data-value="browser"/);
-  assert.match(h, /data-action="add-method" data-value="token"/);
-  assert.ok(h.includes("open browser") && h.includes("setup-token"));   // claude's token segment label
-  assert.ok(h.includes("i'll pop open the official sign-in"));
-  assert.ok(h.includes("open sign-in →"));
-  assert.doesNotMatch(h, /id="add-token"/);                    // no textarea in browser method
-});
-
-test("add: claude setup-token runs in Terminal, no textarea", () => {
-  // a claude setup-token is an inference credential that can't be pasted/validated in-app; the
-  // token method launches `claude setup-token` in Terminal instead.
-  const h = buildAddSeat({ settings: {} }, mkAdd({ step: "details", provider: "claude", method: "token" }));
-  assert.doesNotMatch(h, /id="add-token"/);                    // NO textarea for claude
-  assert.ok(h.includes("run claude setup-token in Terminal"));
-  assert.ok(h.includes("open Terminal →"));                    // CTA launches the official flow
-  assert.match(h, /class="sopt on" data-action="add-method" data-value="token"/);
+  assert.doesNotMatch(h, /data-action="add-method"/);          // NO segmented control
+  assert.doesNotMatch(h, /how should i sign you in/);          // NO method section
+  assert.doesNotMatch(h, /id="add-token"/);                    // NO textarea
+  assert.ok(h.includes("open sign-in →"));                     // single browser CTA
 });
 
 test("add: codex setup-token method DOES paste an auth.json textarea", () => {
@@ -254,10 +244,10 @@ test("add: connecting — browser waits for the user, no premature spinner", () 
   assert.match(paste, /class="add-spin"/);
   assert.ok(paste.includes("saving your seat…"));
   assert.doesNotMatch(paste, /add-save/);
-  // claude setup-token is a Terminal flow: like browser, it waits with a save button, no premature spinner
-  const claude = buildAddSeat({ settings: {} }, mkAdd({ step: "connecting", provider: "claude", method: "token" }));
+  // claude is browser-only: same waiting connecting step with a save button, no premature spinner
+  const claude = buildAddSeat({ settings: {} }, mkAdd({ step: "connecting", provider: "claude", method: "browser" }));
   assert.doesNotMatch(claude, /class="add-spin"/);
-  assert.ok(claude.includes("we opened Terminal…"));
+  assert.ok(claude.includes("we opened your browser…"));
   assert.match(claude, /data-action="add-save"[^>]*>save my seat 💛</);
 });
 

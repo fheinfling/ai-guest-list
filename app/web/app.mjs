@@ -44,12 +44,17 @@ window.AGL = {
         if (screen === "add" && add === doneFlow && add.step === "done") { screen = "main"; add = null; render(); }
       }, 1600);
     }
-    if (res.error && res.add_op && inAdd && add.pending) {   // OUR add op failed (not a poll error)
-      add.pending = false;
-      // codex paste: back to the form (auth.json preserved). Terminal flows (browser sign-in, claude
-      // setup-token): stay on connecting so the user can finish and tap "save my seat" again.
-      if (addUsesPaste(add)) add.step = "details";
-      addChanged = true;
+    if (res.error && res.add_op && inAdd) {      // OUR add op failed (not an unrelated poll error)
+      if (add.pending) {                         // a save was in flight
+        add.pending = false;
+        // codex paste: back to the form (auth.json preserved). Browser save (tapped before the login
+        // finished): stay on connecting so they can complete sign-in and tap "save my seat" again.
+        if (addUsesPaste(add)) add.step = "details";
+        addChanged = true;
+      } else if (add.step === "connecting") {    // the login LAUNCH failed (Terminal never opened)
+        add.step = "details";                    // back to the form to retry
+        addChanged = true;
+      }
     }
 
     if (screen === "add") {

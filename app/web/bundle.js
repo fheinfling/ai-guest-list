@@ -172,31 +172,29 @@ function controlBar(opts) {
 // Claude) rides a single `--accent` CSS var on the root, so step markup never branches on tool.
 // `add` is the transient flow state owned by app.mjs: {step, provider, name, method, token}.
 
-// The "paste a token" method means different things per provider:
-//   codex  — paste an auth.json blob (a textarea; the engine validates + installs it directly).
-//   claude — a `claude setup-token` is an inference credential that can't be validated/identified
-//            from a paste, so this runs `claude setup-token` in Terminal (like browser sign-in, just
-//            a different command). No textarea; identity comes from Claude's own state afterward.
+// Sign-in methods per provider:
+//   codex  — browser sign-in, OR paste an auth.json blob (a textarea the engine installs directly).
+//   claude — browser sign-in ONLY. A `claude setup-token` is a long-lived token for the
+//            CLAUDE_CODE_OAUTH_TOKEN env var; it does NOT write the Keychain login our snapshot
+//            pipeline reads, so there is no working paste/Terminal no-browser path for Claude today.
 const ADD_COPY = {
   codex: {
     row: "ChatGPT sign-in · Business seat",
     chip: "Codex CLI · ChatGPT sign-in or auth.json",
-    seg: "paste auth.json",
     tokenHint: "paste your auth.json — handy for a headless or shared box.",
     tokenPh: "paste auth.json contents",
   },
   claude: {
     row: "Claude.ai sign-in · Max or Pro seat",
-    chip: "Claude Code · browser or setup-token",
-    seg: "setup-token",
-    tokenHint: "i'll run claude setup-token in Terminal — finish there, then save your seat.",
+    chip: "Claude Code · Claude.ai sign-in",
   },
 };
 const BROWSER_HINT = "i'll pop open the official sign-in — nothing leaves your Mac, i just save the seat.";
 
-// Only a codex "token" paste uses the textarea + direct install; everything else (browser, and
-// claude's setup-token) is an official flow launched in Terminal. Exported so app.mjs shares the
-// single definition instead of re-deriving the predicate.
+// Which providers offer a no-browser method (a method choice at all). Only codex, via auth.json.
+function addHasMethods(provider) { return provider === "codex"; }
+// A codex "token" is the only in-app paste; everything else is an official flow launched in a window.
+// Exported so app.mjs shares the single definition instead of re-deriving the predicate.
 function addUsesPaste(add) { return add.method === "token" && add.provider === "codex"; }
 
 function addProviderStep() {
@@ -215,16 +213,30 @@ function addProviderStep() {
 
 function addDetailsStep(add) {
   const c = ADD_COPY[add.provider];
-  const seg = (v, label) =>
-    `<button class="sopt ${add.method === v ? "on" : ""}" data-action="add-method" data-value="${v}">${label}</button>`;
   const paste = addUsesPaste(add);
-  const hint = add.method === "token" ? c.tokenHint : BROWSER_HINT;
-  const tokenWrap = paste          // textarea only for a codex auth.json paste
-    ? `<div class="add-tokenwrap"><textarea id="add-token" class="add-token mono"
-         placeholder="${esc(c.tokenPh)}">${esc(add.token)}</textarea></div>`
-    : "";
-  // CTA: a codex paste saves in-app; browser and claude's setup-token launch an official flow.
-  const cta = paste ? "save the seat →" : add.method === "token" ? "open Terminal →" : "open sign-in →";
+  const cta = paste ? "save the seat →" : "open sign-in →";
+  // The method chooser shows only for a provider that has a no-browser option (codex). Claude is
+  // browser-only, so it renders name + a single "open sign-in" CTA with no segmented control.
+  let methodSection = "";
+  if (addHasMethods(add.provider)) {
+    const seg = (v, label) =>
+      `<button class="sopt ${add.method === v ? "on" : ""}" data-action="add-method" data-value="${v}">${label}</button>`;
+    const hint = add.method === "token" ? c.tokenHint : BROWSER_HINT;
+    const tokenWrap = paste
+      ? `<div class="add-tokenwrap"><textarea id="add-token" class="add-token mono"
+           placeholder="${esc(c.tokenPh)}">${esc(add.token)}</textarea></div>`
+      : "";
+    methodSection = `<section class="set-sec">
+      <span class="set-label">how should i sign you in?</span>
+      <div class="set-card">
+        <div class="add-method">
+          <div class="set-seg">${seg("browser", "open browser")}${seg("token", "paste auth.json")}</div>
+          <div class="add-hint">${hint}</div>
+        </div>
+        ${tokenWrap}
+      </div>
+    </section>`;
+  }
   return `<div class="add-provcard">
       <span class="add-chip add-chip--sm"><span class="add-chip-dot"></span></span>
       <span class="add-prov-tx"><span class="add-provcard-t">new ${TOOL_META[add.provider].label} seat</span>
@@ -237,16 +249,7 @@ function addDetailsStep(add) {
         <input id="add-name" class="add-input" placeholder="Work · Personal · Late-night" value="${esc(add.name)}">
       </div>
     </section>
-    <section class="set-sec">
-      <span class="set-label">how should i sign you in?</span>
-      <div class="set-card">
-        <div class="add-method">
-          <div class="set-seg">${seg("browser", "open browser")}${seg("token", c.seg)}</div>
-          <div class="add-hint">${hint}</div>
-        </div>
-        ${tokenWrap}
-      </div>
-    </section>
+    ${methodSection}
     <button class="add-cta" data-action="add-cta">${cta}</button>`;
 }
 
@@ -255,14 +258,10 @@ function addConnectingStep(add) {
   // other window and tap "save my seat"; only then (add.pending) is a snapshot in flight. A codex
   // paste is always actively saving. Spinner + "saving…" copy show only when something is really in
   // flight — a lone spinner while we wait on the user would read as "hung".
-  const terminalFlow = !addUsesPaste(add);
+  const terminalFlow = !addUsesPaste(add);        // a browser sign-in (codex or claude) waits on the user
   const saving = !terminalFlow || add.pending;
-  const waitTitle = add.method === "browser" ? "we opened your browser…" : "we opened Terminal…";
-  const waitSub = add.method === "browser"
-    ? "say hi over there and you're on the list 💛"
-    : "finish claude setup-token there, then save your seat 💛";
-  const title = saving ? "saving your seat…" : waitTitle;
-  const sub = saving ? "tucking it away safely 💛" : waitSub;
+  const title = saving ? "saving your seat…" : "we opened your browser…";
+  const sub = saving ? "tucking it away safely 💛" : "say hi over there and you're on the list 💛";
   const spin = saving ? `<div class="add-spin"></div>` : "";
   const cta = terminalFlow
     ? `<button class="add-cta" data-action="add-save"${add.pending ? " disabled" : ""}>save my seat 💛</button>`
@@ -446,12 +445,17 @@ window.AGL = {
         if (screen === "add" && add === doneFlow && add.step === "done") { screen = "main"; add = null; render(); }
       }, 1600);
     }
-    if (res.error && res.add_op && inAdd && add.pending) {   // OUR add op failed (not a poll error)
-      add.pending = false;
-      // codex paste: back to the form (auth.json preserved). Terminal flows (browser sign-in, claude
-      // setup-token): stay on connecting so the user can finish and tap "save my seat" again.
-      if (addUsesPaste(add)) add.step = "details";
-      addChanged = true;
+    if (res.error && res.add_op && inAdd) {      // OUR add op failed (not an unrelated poll error)
+      if (add.pending) {                         // a save was in flight
+        add.pending = false;
+        // codex paste: back to the form (auth.json preserved). Browser save (tapped before the login
+        // finished): stay on connecting so they can complete sign-in and tap "save my seat" again.
+        if (addUsesPaste(add)) add.step = "details";
+        addChanged = true;
+      } else if (add.step === "connecting") {    // the login LAUNCH failed (Terminal never opened)
+        add.step = "details";                    // back to the form to retry
+        addChanged = true;
+      }
     }
 
     if (screen === "add") {

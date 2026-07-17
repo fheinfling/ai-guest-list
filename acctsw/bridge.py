@@ -45,15 +45,12 @@ def snapshot_state(ctx: Context) -> dict[str, Any]:
 
 
 def login_command(tool: str, method: str = "browser") -> str:
-    """The Terminal command for an official sign-in. Kept in the bridge (not the UI) so the engine
-    stays the source of truth for how each tool logs in. The new add-seat sub-view sends
-    ``{tool, method}`` and the native side resolves the command here; ``method`` only affects Claude
-    (browser sign-in vs. the long-lived ``setup-token``)."""
-    if tool == "codex":
-        return "codex login"
-    if method == "token":
-        return "claude setup-token"
-    return "claude auth login"
+    """The Terminal command for an official browser sign-in. Kept in the bridge (not the UI) so the
+    engine stays the source of truth for how each tool logs in. ``method`` is reserved but currently
+    unused: both tools' only Terminal path is the browser sign-in (codex's no-browser option pastes
+    an auth.json in-app; Claude has no working no-browser path — `claude setup-token` produces an
+    env-var token, not the Keychain login this app snapshots)."""
+    return "codex login" if tool == "codex" else "claude auth login"
 
 
 def handle(ctx: Context, message: dict) -> dict[str, Any]:

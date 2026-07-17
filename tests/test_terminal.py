@@ -4,6 +4,8 @@ py2app's native launcher setenv's PYTHONPATH=.../python311.zip into the process 
 child that inherits it (Terminal → its shells → system python3) breaks with "can't find module
 'encodings'". open_in_terminal must scrub the interpreter-redirect vars before spawning osascript.
 """
+import types
+
 from app import terminal
 
 
@@ -15,7 +17,7 @@ def test_open_in_terminal_scrubs_python_env(monkeypatch):
     def fake_run(argv, **kw):
         seen["argv"] = argv
         seen["env"] = kw.get("env")
-        return None
+        return types.SimpleNamespace(returncode=0, stderr="")   # open_in_terminal checks returncode
 
     monkeypatch.setattr(terminal.subprocess, "run", fake_run)
     terminal.open_in_terminal("codex login")

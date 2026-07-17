@@ -48,6 +48,7 @@ if objc is not None:
             self.popover = None
             self.webview = None
             self._acctWarned = set()              # shared-account warnings already toasted this session
+            self._login_baseline = {}             # tool → digest of live creds when a login was launched
             return self
 
         # --- lifecycle ----------------------------------------------------------------------
@@ -155,6 +156,12 @@ if objc is not None:
             self.performSelectorOnMainThread_withObject_waitUntilDone_(
                 objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
 
+        @objc.python_method
+        def _credDigest(self, tool):
+            import hashlib
+            blob = self.ctx.cred[tool].get_live()
+            return hashlib.sha256(blob.encode()).hexdigest() if blob else None
+
         def addBg_(self, msg):
             # `paste`/`snapshot` verify creds against the provider (Claude shells out / hits the
             # network), so run them off the main thread — a synchronous handle() would beachball the
@@ -162,7 +169,20 @@ if objc is not None:
             # Guard: an unexpected raise here would otherwise leave the user stuck on the spinner with
             # nothing pushed back — turn it into a friendly error the connecting step can act on.
             try:
+                tool = msg.get("tool")
+                if msg.get("action") == "snapshot":
+                    base = self._login_baseline.get(tool)
+                    if base is not None and self._credDigest(tool) == base:
+                        # Live creds are unchanged since the login launched → the browser sign-in
+                        # isn't finished. Snapshotting now would just re-add the OUTGOING seat.
+                        result = {"ok": False, "add_op": True, "tool": tool,
+                                  "error": "finish signing in first, then save your seat"}
+                        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                            objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
+                        return
                 result = dict(bridge.handle(self.ctx, dict(msg)))
+                if result.get("ok") and msg.get("action") == "snapshot":
+                    self._login_baseline.pop(tool, None)   # consumed — a real add completed
             except Exception:
                 result = {"ok": False, "error": "something went wrong saving that seat"}
             # Tag it as an add-op reply. The JS uses this to attribute an error to THIS paste/snapshot
@@ -212,10 +232,20 @@ if objc is not None:
                 from app.terminal import prepare_then_login
                 # The sub-view sends {tool, method}; the engine resolves the Terminal command.
                 command = bridge.login_command(msg["tool"], msg.get("method", "browser"))
-                prepare_then_login(self.ctx, msg["tool"], command)
+                try:
+                    prepare_then_login(self.ctx, msg["tool"], command)
+                except Exception:
+                    # Launch failed (sync-back error / Terminal automation blocked). Tell the web flow
+                    # so it doesn't sit on the connecting step waiting for a login that never opened.
+                    self._pushResult({"ok": False, "add_op": True, "tool": msg["tool"],
+                                      "error": "couldn't open the sign-in — try again"})
+                    return
+                # Baseline the outgoing live creds so a "save my seat" tapped BEFORE the login actually
+                # completes (creds unchanged) is rejected instead of silently re-adding the old seat.
+                self._login_baseline[msg["tool"]] = self._credDigest(msg["tool"])
                 # The connecting step is already shown optimistically by the web add-cta handler; the
-                # notification is the only feedback needed. (No result pushed back — the flow waits
-                # for the user to finish in Terminal and tap "save my seat", which sends `snapshot`.)
+                # notification is the only feedback needed. (No result pushed back on success — the
+                # flow waits for the user to finish in Terminal and tap "save my seat" → `snapshot`.)
                 self._notify("finish signing in", "then tap ‘save my seat’ 🎟️")
                 return
             if action in ("paste", "snapshot"):

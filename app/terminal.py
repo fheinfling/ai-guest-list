@@ -15,7 +15,8 @@ from acctsw.switch import sync_back
 
 
 def open_in_terminal(command: str) -> None:
-    """Open Terminal.app and run ``command`` (best-effort; macOS only)."""
+    """Open Terminal.app and run ``command``. Raises if the AppleScript launch fails, so the caller
+    can tell the user the sign-in didn't actually open instead of waiting on a window that never came."""
     if not command:
         return
     # Scrub PYTHONPATH/PYTHONHOME etc: py2app's launcher exports them pointing at the frozen app's 3.11
@@ -28,7 +29,10 @@ def open_in_terminal(command: str) -> None:
     scrubbed = f"unset {' '.join(_PY_ENV_STRIP)}; {command}"
     script = f'tell application "Terminal" to do script {json_escape(scrubbed)}\n' \
              'tell application "Terminal" to activate'
-    subprocess.run(["osascript", "-e", script], capture_output=True, env=harden_env())
+    proc = subprocess.run(["osascript", "-e", script], capture_output=True, text=True,
+                          env=harden_env())
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or "couldn't open Terminal").strip())
 
 
 def json_escape(s: str) -> str:
@@ -37,12 +41,18 @@ def json_escape(s: str) -> str:
 
 
 def prepare_then_login(ctx: Context, tool: str, command: str | None) -> None:
-    """Sync-back the active seat (so its rotated token isn't lost), then launch the login."""
+    """Sync-back the active seat (so its rotated token isn't lost), then launch the login.
+
+    The sync-back reads the active seat + live creds and writes the seat's snapshot, so it holds the
+    cross-process lock (the 180s usage poll writes the same store). It does NOT mutate state.json —
+    so no state.save(). Terminal is launched AFTER releasing the lock: a subprocess must never be
+    held under the lock, and the login itself is what overwrites the live creds next.
+    """
     if tool not in TOOLS:
         raise ValueError(f"unknown tool: {tool}")
-    state = ctx.load_state()
-    sync_back(ctx, state, tool)
-    state.save()
+    with ctx.locked():
+        state = ctx.load_state()
+        sync_back(ctx, state, tool)
     if command:
         open_in_terminal(command)
 
