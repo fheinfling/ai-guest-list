@@ -83,6 +83,14 @@ def test_add_returns_login_plan(ctx):
     assert ids == {"browser", "token"}
 
 
+def test_login_command():
+    assert bridge.login_command("codex") == "codex login"
+    assert bridge.login_command("codex", "token") == "codex login"        # method ignored for codex
+    assert bridge.login_command("claude") == "claude auth login"          # default = browser
+    assert bridge.login_command("claude", "browser") == "claude auth login"
+    assert bridge.login_command("claude", "token") == "claude setup-token"
+
+
 def test_snapshot_after_login_adds_seat(ctx):
     ctx.cred["codex"].set_live(make_codex_blob("new@x.com"))
     r = bridge.handle(ctx, {"action": "snapshot", "tool": "codex", "email": "new@x.com"})

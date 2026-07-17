@@ -154,10 +154,24 @@ if objc is not None:
             self.performSelectorOnMainThread_withObject_waitUntilDone_(
                 objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
 
+        def pasteBg_(self, msg):
+            # `paste` verifies creds against the provider (Claude shells out / hits the network), so
+            # run it off the main thread — a synchronous handle() would beachball the app behind the
+            # add-seat "saving your seat…" spinner. ctx.locked() already serialises against the poll.
+            result = bridge.handle(self.ctx, dict(msg))
+            result["_action"] = "paste"
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
+
         def applyResult_(self, result):
             self._pushResult(result)
             self._updateDot(result.get("state"))
             self._notifyAccountWarnings(result)
+            # A backgrounded add (paste/snapshot) still deserves the "seat added" nudge the main-thread
+            # path fires. Keyed on `added` so it says the right thing whether it was a paste or a login.
+            if result.pop("_action", None) == "paste" and result.get("added") and result.get("ok") \
+                    and self.ctx.load_state().settings().get("notify", True):
+                self._notify("seat saved ✨", "your seat's on the floor")
 
         @objc.python_method
         def _notifyAccountWarnings(self, result):
@@ -188,9 +202,18 @@ if objc is not None:
                 # Absolute import (not `.terminal`): under py2app the main script runs as top-level
                 # __main__ with no package context, so a relative import would fail in the .app.
                 from app.terminal import prepare_then_login
-                prepare_then_login(self.ctx, msg["tool"], msg.get("command"))
+                # The old modal sent `command`; the new sub-view sends `method` and the command is
+                # resolved by the engine. Honour both while the modal is still present.
+                command = msg.get("command") or bridge.login_command(
+                    msg["tool"], msg.get("method", "browser"))
+                prepare_then_login(self.ctx, msg["tool"], command)
                 self._notify("finish signing in", "then tap ‘save my seat’ 🎟️")
                 self._pushResult({"ok": True, "await_snapshot": True, "tool": msg["tool"]})
+                return
+            if action == "paste":
+                # off the main thread (see pasteBg_) — Claude verification can touch the network.
+                self.performSelectorInBackground_withObject_(
+                    objc.selector(self.pasteBg_, signature=b"v@:@"), msg)
                 return
 
             result = bridge.handle(self.ctx, msg)

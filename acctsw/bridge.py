@@ -44,8 +44,23 @@ def snapshot_state(ctx: Context) -> dict[str, Any]:
     return data
 
 
+def login_command(tool: str, method: str = "browser") -> str:
+    """The Terminal command for an official sign-in. Kept in the bridge (not the UI) so the engine
+    stays the source of truth for how each tool logs in. The new add-seat sub-view sends
+    ``{tool, method}`` and the native side resolves the command here; ``method`` only affects Claude
+    (browser sign-in vs. the long-lived ``setup-token``)."""
+    if tool == "codex":
+        return "codex login"
+    if method == "token":
+        return "claude setup-token"
+    return "claude auth login"
+
+
 def login_plan(tool: str) -> dict[str, Any]:
-    """Describe how to add a seat (the native side runs the chosen flow in Terminal)."""
+    """Describe how to add a seat (the native side runs the chosen flow in Terminal).
+
+    DEPRECATED: the modal add-seat UI asked for this "plan"; the new sub-view sends ``{tool, method}``
+    and the command is resolved by ``login_command``. Kept only until the modal is fully removed."""
     if tool == "codex":
         return {"tool": "codex", "title": "who's joining the list?",
                 "methods": [
