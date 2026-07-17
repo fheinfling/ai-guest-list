@@ -120,7 +120,7 @@ def isolated(tmp_path, monkeypatch):
 def test_run_gate_execs_stock_when_app_closed(isolated, monkeypatch):
     from acctsw import headroom
     calls = {"stock": None, "supervised": False}
-    monkeypatch.setattr(headroom, "needs_reconcile", lambda ctx: False)  # Headroom never used → hermetic
+    monkeypatch.setattr(headroom, "legacy_present", lambda ctx: False)  # Headroom never used → hermetic
     monkeypatch.setattr(launcher, "exec_stock",
                         lambda ctx, tool, args: calls.__setitem__("stock", (tool, args)) or 0)
     monkeypatch.setattr(launcher, "run",
@@ -143,58 +143,30 @@ def test_run_gate_runs_stock_when_app_open_but_no_seats(isolated, monkeypatch):
     assert calls["stock"] == ("codex", ["hi"])
 
 
-def test_run_gate_self_heals_headroom_before_exec_when_app_closed(isolated, monkeypatch):
-    """App closed + Headroom was used → strip dangling routing / reap an orphan proxy BEFORE running
-    stock, so codex/claude don't exec into a dead-or-foreign proxy (ConnectionRefused)."""
+def test_run_gate_cleans_legacy_headroom_before_exec_when_app_closed(isolated, monkeypatch):
+    """App closed + an older build left Headroom routing → strip it BEFORE running stock, so
+    codex/claude don't exec into a dead/foreign proxy (ConnectionRefused)."""
     from acctsw import headroom
     order = []
-    monkeypatch.setattr(headroom, "needs_reconcile", lambda ctx: True)
-    monkeypatch.setattr(headroom, "heal",
-                        lambda data_dir, **k: order.append(("heal", k)) or (True, "x"))
+    monkeypatch.setattr(headroom, "legacy_present", lambda ctx: True)
+    monkeypatch.setattr(headroom, "cleanup_legacy",
+                        lambda ctx: order.append("cleanup") or (True, "x"))
     monkeypatch.setattr(launcher, "exec_stock",
-                        lambda *a, **k: order.append(("stock", None)) or 0)
+                        lambda *a, **k: order.append("stock") or 0)
     cli.main(["run", "codex", "hi"])
-    assert order == [("heal", {"blocking": False, "app_running": False}), ("stock", None)]
+    assert order == ["cleanup", "stock"]   # cleanup runs first, then stock
 
 
-def test_run_gate_skips_heal_when_headroom_never_used(isolated, monkeypatch):
-    """Hot path: no Headroom state AND no live proxy → skip the heal entirely and exec stock."""
+def test_run_gate_skips_cleanup_when_headroom_never_used(isolated, monkeypatch):
+    """Hot path: no leftover Headroom state → skip cleanup entirely and exec stock."""
     from acctsw import headroom
-    called = {"heal": False}
-    monkeypatch.setattr(headroom, "needs_reconcile", lambda ctx: False)
-    monkeypatch.setattr(headroom, "proxy_maybe_running", lambda data_dir: False)
-    monkeypatch.setattr(headroom, "heal", lambda *a, **k: called.__setitem__("heal", True) or (False, ""))
+    called = {"cleanup": False}
+    monkeypatch.setattr(headroom, "legacy_present", lambda ctx: False)
+    monkeypatch.setattr(headroom, "cleanup_legacy",
+                        lambda ctx: called.__setitem__("cleanup", True) or (False, ""))
     monkeypatch.setattr(launcher, "exec_stock", lambda *a, **k: 0)
     cli.main(["run", "codex", "hi"])
-    assert called["heal"] is False
-
-
-def test_run_gate_reaps_orphan_proxy_via_pidfile_when_reconcile_false(isolated, monkeypatch):
-    """Graceful-OFF deletes the backup → needs_reconcile False, but a live proxy pidfile must still
-    trigger the reap (otherwise the orphan leaks — the exact bug this gate exists to fix)."""
-    from acctsw import headroom
-    called = {"heal": False}
-    monkeypatch.setattr(headroom, "needs_reconcile", lambda ctx: False)
-    monkeypatch.setattr(headroom, "proxy_maybe_running", lambda data_dir: True)
-    monkeypatch.setattr(headroom, "heal",
-                        lambda data_dir, **k: called.__setitem__("heal", True) or (True, "x"))
-    monkeypatch.setattr(launcher, "exec_stock", lambda *a, **k: 0)
-    cli.main(["run", "codex", "hi"])
-    assert called["heal"] is True
-
-
-def test_run_gate_blocking_retry_when_busy_and_still_injected(isolated, monkeypatch):
-    """If a non-blocking heal is busy (e.g. quit teardown holds the lock) AND routing is still
-    injected, retry blocking — never exec stock into a half-torn-down proxy (ConnectionRefused)."""
-    from acctsw import headroom
-    calls = []
-    monkeypatch.setattr(headroom, "needs_reconcile", lambda ctx: True)
-    monkeypatch.setattr(headroom, "routing_injected", lambda: True)
-    monkeypatch.setattr(headroom, "heal",
-                        lambda data_dir, **k: calls.append(k.get("blocking")) or (False, "busy"))
-    monkeypatch.setattr(launcher, "exec_stock", lambda *a, **k: 0)
-    cli.main(["run", "codex", "hi"])
-    assert calls == [False, True]   # fast attempt, then a blocking retry
+    assert called["cleanup"] is False
 
 
 def test_run_gate_supervises_when_app_open(isolated, monkeypatch):

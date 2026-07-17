@@ -161,30 +161,26 @@ def _cmd_run(ctx: Context, ns) -> int:
     args = list(ns.args or [])
     if args and args[0] == "--":  # argparse REMAINDER keeps a leading separator
         args = args[1:]
+    # The "save credit" Headroom proxy was removed. An older build (or a hard-killed app) can leave
+    # provider routing injected in ~/.codex/~/.claude pointing at a now-dead proxy, which would crash
+    # stock codex/claude with ConnectionRefused. Clean it BEFORE the app-running split so every route
+    # out of here is covered: `launcher.run` also exec_stock's early for `login`/`auth` passthrough
+    # and raises NoSeats on a fresh install, both of which bypass its own cleanup. Cheap pre-check
+    # skips this entirely once nothing remains. Never let cleanup failure block the launch — exec'ing
+    # the tool is the promise here, and a best-effort migration must not be why `cx`/`cl` stops
+    # working.
+    try:
+        from . import headroom as hr
+        if hr.legacy_present(ctx):
+            cleaned, msg = hr.cleanup_legacy(ctx)
+            if cleaned:
+                notify(msg)     # the message distinguishes a full removal from a partial one — the
+                                # tool may still be pointing at a dead proxy, so don't claim success
+    except Exception:
+        pass
     # The app is the master switch for supervision: when it's CLOSED, behave like the stock tool
     # (no auto-switch / no seat-hopping) — exec_stock replaces this process and never returns.
     if not appalive.app_running(ctx.data_dir):
-        # First self-heal Headroom: a hard-killed app never ran its quit teardown, so it can leave
-        # (a) routing injected — stock codex/claude would then hit a now-dead/foreign proxy and crash
-        # with ConnectionRefused — and/or (b) the proxy running with no owner to reap it. heal()
-        # strips any routing AND reaps an orphaned proxy so we exec TRULY stock. Cheap pre-check skips
-        # this entirely when Headroom was never used; blocking=False so a concurrent op never hangs the
-        # launch; app_running=False tells heal the live proxy is an orphan. The save-credit SETTING is
-        # kept (heal doesn't touch it), so it re-applies when the app is reopened.
-        from . import headroom as hr
-        # Gate on the cheap pre-checks: needs_reconcile (setting/backup/injected) OR a live proxy
-        # pidfile. The pidfile case matters because a graceful-OFF deletes the backup and restores
-        # config, leaving needs_reconcile False while the proxy is still alive — without it the
-        # orphan-reap would be unreachable here (the very leak this branch exists to fix).
-        if hr.needs_reconcile(ctx) or hr.proxy_maybe_running(ctx.data_dir):
-            healed, _ = hr.heal(ctx.data_dir, blocking=False, app_running=False)
-            if not healed and hr.routing_injected():
-                # The lock was busy (e.g. the app's own quit teardown mid-flight) AND routing is
-                # still live. We must NOT exec stock into a dying proxy (ConnectionRefused), so wait
-                # out the in-flight op with a blocking retry rather than racing it.
-                healed, _ = hr.heal(ctx.data_dir, blocking=True, app_running=False)
-            if healed:
-                notify(f"the app's closed — cleaned up Headroom; running stock {ns.tool}")
         return exec_stock(ctx, ns.tool, args)
     try:
         return launch(ctx, ns.tool, args, notify=notify)

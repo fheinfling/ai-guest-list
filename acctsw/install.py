@@ -197,14 +197,7 @@ def install(ctx: Context, *, dry_run: bool = False, register: bool = True,
             t.chmod(0o755)
         plan.do(f"install {target}", _write)
 
-    # 4. bundle Headroom (save-credit) into this venv so the toggle just works — no separate install.
-    from . import headroom as hr
-    if hr.available():
-        plan.actions.append("headroom already installed (save-credit ready)")
-    else:
-        plan.do("install headroom (save-credit) into the app venv", hr.ensure_installed)
-
-    # 5. shell setup: cx/cl are useless (autoswitch never fires) unless bin_dir is on PATH. With
+    # 4. shell setup: cx/cl are useless (autoswitch never fires) unless bin_dir is on PATH. With
     #    --path we wire it (PATH + codex/claude aliases) so it "just works"; otherwise WARN loudly
     #    (not a quiet NOTE) so the gap is never silent.
     if with_path:
@@ -328,7 +321,7 @@ def _wrapper_script(name: str, python: str, pkg_root: Path, bin_dir: Path) -> st
             # so it ALWAYS resolves acctsw and the stdlib from inside the .app, machine-independently.
             # `unset` the leaked redirect vars first (a Terminal the app spawned inherits py2app's
             # PYTHONHOME/PYTHONPATH) so only our explicit PYTHONHOME on the exec line takes effect.
-            from .headroom import _PY_ENV_STRIP
+            from .procenv import _PY_ENV_STRIP
             home = shlex.quote(str(Path(python).parent.parent / "Resources"))
             return (f"#!/bin/sh\n# ai guest list engine\n"
                     f"unset {' '.join(_PY_ENV_STRIP)}\n"
@@ -358,6 +351,26 @@ def uninstall(ctx: Context, *, purge: bool = False, dry_run: bool = False,
               bin_dir: Path | None = None) -> Plan:
     plan = Plan(dry_run=dry_run)
     bin_dir = bin_dir or BIN_DIR
+
+    # 0. undo any leftover "save credit" routing FIRST. An upgraded user can run `uninstall --purge`
+    #    without ever launching the new app or `cx`/`cl`, so this may be the only chance the migration
+    #    ever gets: purge deletes the store — snapshot, PID file and venv — and if the configs are
+    #    still routed at that point they stay pointed at a dead 127.0.0.1:8787 forever, with the
+    #    original provider values gone and no acctsw left to repair them.
+    from . import headroom as _hr
+    if _hr.legacy_present(ctx) and not dry_run:
+        _hr.cleanup_legacy(ctx)
+        plan.actions.append("cleaned up leftover 'save credit' routing")
+        if purge and _hr.legacy_present(ctx):
+            # Cleanup was busy, partial, or blocked (unreadable config, live proxy it couldn't
+            # verify). Purging now destroys the ONLY copy of the user's original provider settings
+            # while their config is still routed at a dead port — and removes the tool that would
+            # have retried. Refuse: a failed uninstall they can re-run beats an unrecoverable one.
+            raise RuntimeError(
+                "refusing to --purge: leftover 'save credit' routing is still present and the "
+                "snapshot is the only copy of your original codex/claude provider settings. "
+                "Re-run `acctsw uninstall --purge` (the cleanup retries), or uninstall without "
+                "--purge to keep the store.")
 
     # 1. don't lose the active seat's freshest creds.
     state = ctx.load_state()

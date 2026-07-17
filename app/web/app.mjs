@@ -89,10 +89,6 @@ document.addEventListener("click", (e) => {
       break;
     }
     case "snapshot": closeOverlay(); send("snapshot", { tool }); break;
-    case "headroom_install": send("headroom_install"); break;
-    // auto-off banner: re-enable goes through the same toggle path as the settings switch
-    case "headroom-retoggle": send("toggle", { key: "headroom", value: true }); break;
-    case "headroom-event-dismiss": send("headroom_event_dismiss"); break;
     case "picker-close":
       // close on backdrop click or an explicit cancel/done button; ignore clicks inside the sheet
       if (el.classList.contains("backdrop") && e.target !== el) break;
@@ -102,7 +98,6 @@ document.addEventListener("click", (e) => {
     case "settings-back": screen = "main"; render(); break;
     case "set_theme": send("set_theme", { value }); break;
     case "set_strategy": send("set_strategy", { value }); break;
-    case "set_savings_level": send("set_savings_level", { value }); break;
     case "quit": send("quit"); break;
   }
 });

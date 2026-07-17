@@ -24,7 +24,7 @@ def open_in_terminal(command: str) -> None:
     # is ALREADY running (the common case), `do script` runs in Terminal.app's own environment, not
     # osascript's, so the new login shell would still inherit the frozen vars. Prepend an `unset` to the
     # command the shell actually executes so the fix holds whether or not Terminal was already open.
-    from acctsw.headroom import _PY_ENV_STRIP, harden_env
+    from acctsw.procenv import _PY_ENV_STRIP, harden_env
     scrubbed = f"unset {' '.join(_PY_ENV_STRIP)}; {command}"
     script = f'tell application "Terminal" to do script {json_escape(scrubbed)}\n' \
              'tell application "Terminal" to activate'
