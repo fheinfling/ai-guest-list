@@ -20,11 +20,12 @@ existing projects so we reuse battle-tested patterns without reinventing or trus
 > **"ai guest list"** — a warm guest-list/club theme (seats = accounts, "on the floor" = active,
 > "add a seat" = login, "no browser dance"). Full spec in the Menubar section below.
 >
-> **Headroom is integrated as a toggleable usage-saver.** It's a token/context-compression layer
-> ([headroom-ai](https://pypi.org/project/headroom-ai/), Apache-2.0) —
-> not an account manager, but turning it on compresses what each agent reads (tool outputs, history,
-> files) → **fewer tokens → you hit usage limits slower**, complementing the switching. The app
-> exposes a simple on/off toggle. See "Headroom integration" below.
+> **~~Headroom is integrated as a toggleable usage-saver.~~ Retired.** The plan called for a
+> "save credit" toggle routing agents through the [headroom-ai](https://pypi.org/project/headroom-ai/)
+> context-compression proxy. It shipped, was measured on real workloads, and saved ~1–3%
+> cache-adjusted — a guardrail against runaway outputs, not a money-saver — so it was **removed**.
+> The switcher alone is what keeps sessions going. See
+> [`SECURITY-headroom.md`](SECURITY-headroom.md) for the measurements and the retired sections below.
 
 ---
 
@@ -115,7 +116,6 @@ per-tool gradients — **Codex coral** `#e0795a`, **Claude blue** `#5b8def`, **f
 - Per tool (Codex / Claude): the seat that's **on the floor**, its **credit left** with 5h + weekly
   bars and **reset timers** (Space Mono), and a **switch** button to the other seat.
 - **auto-switch** toggle (top-level).
-- **Headroom "save credit" toggle** (see below).
 - Footer: **made with ♥**, **settings**, **quit**.
 
 **Add-a-seat flow** ("who's joining the list?" → "how should i sign you in?" → "name this seat" →
@@ -137,21 +137,18 @@ per-tool gradients — **Codex coral** `#e0795a`, **Claude blue** `#5b8def`, **f
 **Dev/QA affordances present in the sample** (keep, behind a hidden/debug area): **cap both Codex
 seats** + **reset** to simulate limits, and **"or peek at the list i've got"** to preview seats.
 
-## Headroom integration ("save credit" toggle)
-- **What it does for us:** when ON, agents run through Headroom so their context is compressed →
-  fewer tokens consumed → usage limits are reached more slowly (stretches each seat's credit).
-- **Mechanism:** the supervised launcher conditionally routes the agent through Headroom when the
-  toggle is on — `headroom wrap codex|claude …` (inner wrap, *inside* our PTY/cred layer), or
-  Headroom proxy mode if preferred. When off, the agent runs directly. The toggle just flips an env/
-  flag the `run` path reads; no restart of our app needed.
-- **Install/detect:** the engine detects whether `headroom` is installed; the toggle offers a
-  one-time `pip install "headroom-ai[all]"` (or `npm i -g headroom-ai`) if missing. Headroom stays
-  **optional** — everything works without it; it's purely a credit-saver.
-- **UI:** a single labeled switch in the main popover (themed copy, e.g. *"slow sips — make the
-  credit last"*), plus a small note that it compresses context to save tokens. Optionally surface
-  Headroom's `stats` (tokens saved) as a tiny "credit stretched" line — nice-to-have, not required.
-- **Safety:** Headroom only sits in the data path of the wrapped CLI; it never touches credentials
-  or the keychain. Toggling it never affects account state.
+## ~~Headroom integration ("save credit" toggle)~~ — retired
+Planned, built, measured, removed. The toggle routed agents through a local Headroom
+context-compression proxy to stretch each seat's credit. On real traffic the saving was ~1–3%
+cache-adjusted (the 10.8% raw reduction was mostly shrinking tokens already billed at the 0.1×
+cached rate), and it cost a hundreds-of-MB ML install, a runtime `rtk` download, an unauditable
+native blob, a babysat version pin, and invasive edits to `~/.codex/config.toml` /
+`~/.claude/settings.json`. Not worth its fragility.
+
+What remains is `acctsw/headroom.py`'s idempotent `cleanup_legacy()`: on the next app launch or
+`cx`/`cl` run it strips leftover routing (restoring the snapshotted original config when present),
+stops an orphaned proxy by PID file, and deletes the managed venv. Full measurements and the
+migration path: [`SECURITY-headroom.md`](SECURITY-headroom.md).
 
 ---
 
@@ -181,7 +178,6 @@ seats** + **reset** to simulate limits, and **"or peek at the list i've got"** t
   cleaned-up `ai guest list` HTML/CSS (Hanken Grotesk + Space Mono bundled), JS↔Python bridge to
   `acctsw`. Packaged to a `.app` (e.g. `py2app`). Source under `~/.account-switcher/app/`.
 - `~/.account-switcher/` (state + backups) at install; keychain items at `add`.
-- Headroom is an external dependency installed on demand (`pip`/`npm`), not vendored.
 - No existing file modified except, at switch time, the two canonical credential locations the
   official tools already own.
 
@@ -207,13 +203,15 @@ seats** + **reset** to simulate limits, and **"or peek at the list i've got"** t
 6. **Limit path**: on a real limit, capture exact message + reset wording, set regex, confirm
    auto-switch + resume. Force all-limited by hand-editing `state.json` → verify soonest pick +
    countdown message.
-7. **Headroom toggle**: with it ON, `cx`/`cl` route through `headroom wrap` (verify via Headroom
-   `stats` that tokens drop); OFF → direct. Toggling never changes account state.
+7. **Legacy Headroom cleanup**: on a machine that had "save credit" on, the next app launch or
+   `cx`/`cl` run leaves no `model_provider = "headroom"` in `~/.codex/config.toml` and no loopback
+   `ANTHROPIC_BASE_URL` in `~/.claude/settings.json`; plain `codex`/`claude` reach the provider
+   directly. Cleanup never changes account state.
 8. **App**: "ai guest list" popover renders the design (fonts/colors/themes), dot reflects state
-   (fresh/resting/needs-hello), switch + add-a-seat + auto-switch + save-credit toggles drive the
-   engine; notifications fire on auto-switch.
+   (fresh/resting/needs-hello), switch + add-a-seat + auto-switch drive the engine; notifications
+   fire on auto-switch.
 9. `acctsw uninstall` → `~/.codex/auth.json` + Claude keychain match `backups/` originals;
-   `--purge` leaves no trace (app, engine, state, keychain items all gone; Headroom left as-is).
+   `--purge` leaves no trace (app, engine, state, keychain items all gone).
 
 ---
 

@@ -18,13 +18,16 @@ We'll acknowledge within a few days and work with you on a fix and coordinated d
 In scope:
 - Credential handling — exposure/leakage of keychain blobs or OAuth tokens (logs, temp files,
   argv, world-readable files).
-- The local Headroom proxy — port/identity handling and routing of authenticated traffic
-  (see [`docs/SECURITY-headroom.md`](docs/SECURITY-headroom.md) for the save-credit threat model).
 - The install/uninstall and shell-wiring paths, and the supervised launcher.
+- The one-time `cleanup_legacy` migration that strips leftover Headroom routing from
+  `~/.codex/config.toml` and `~/.claude/settings.json` (see
+  [`docs/SECURITY-headroom.md`](docs/SECURITY-headroom.md)) — in particular, anything that could
+  restore the wrong config or leave a stale proxy in the authenticated traffic path.
 
 Out of scope:
-- Vulnerabilities in the upstream `codex` / `claude` tools or in `headroom-ai` itself (report those
-  to their projects).
+- Vulnerabilities in the upstream `codex` / `claude` tools (report those to their projects).
+- The `headroom-ai` package itself — the "save credit" proxy was removed; we no longer install,
+  start, or route traffic through it.
 - Social-engineering or physical access to an already-unlocked machine/keychain.
 
 ## Supported versions
