@@ -127,6 +127,7 @@ class State:
                 "last_on_floor": None,
                 "limited_until": None,
                 "limit_source": None,   # "usage" (proactive) | "reactive" (caught mid-session)
+                                        # | "hard" (tool-side billing banner; never cleared early)
                 "usage": None,
             }
             accts[email] = seat

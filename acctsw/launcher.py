@@ -34,7 +34,7 @@ from . import usage as usage_mod
 from .context import Context
 from .errors import AcctswError
 from .procenv import harden_env
-from .selection import choose
+from .selection import Selection, choose
 from .switch import switch, sync_back
 from .util import iso, now, parse_iso
 
@@ -43,8 +43,9 @@ from .util import iso, now, parse_iso
 SpawnFn = Callable[[list, Callable[[bytes], bool]], int]
 Notifier = Callable[[str], None]
 
-# Default cooldown when a limit is caught but no authoritative reset is known.
-DEFAULT_COOLDOWN = timedelta(hours=5)
+# Default cooldown when a limit is caught but no authoritative reset is known (owned by usage so
+# its limit-flagging can share it; re-exported here for the handlers and existing callers/tests).
+DEFAULT_COOLDOWN = usage_mod.DEFAULT_COOLDOWN
 MAX_SWITCHES = 6      # safety bound on auto-relaunches within one `run`
 MAX_FALSE_ALARMS = 3  # dismissed stdout matches per run before stdout scanning is switched OFF
                       # (supervision continues — only the untrustworthy signal is dropped)
@@ -52,10 +53,12 @@ PROBE_COOLDOWN_S = 30.0  # after a dismissed match, skip re-probing usage for th
                          # redraws the same prose every frame, and without a cooldown each redraw
                          # would force-hit the usage endpoint
 # A stdout limit-signal is dismissed as a false positive (model prose, not a real banner) when the
-# usage endpoint says the active seat's busiest window is still below this. Well clear of a real
-# ~100% limit even if the endpoint lags a few percent behind stdout.
-FALSE_ALARM_MAX_PCT = 90.0
+# usage endpoint says the active seat's busiest window is still below this (owned by usage, which
+# uses the same bar to clear stale reactive flags; re-exported for _seat_confirmed_healthy/tests).
+FALSE_ALARM_MAX_PCT = usage_mod.FALSE_ALARM_MAX_PCT
 EXIT_GAVE_UP = 75     # EX_TEMPFAIL: distinguishes "we gave up / all limited" from a child failure
+WAIT_ON_ALL_RESTING_ENV = "ACCTSW_WAIT_ON_ALL_RESTING"
+_ENV_FALSE = frozenset({"0", "false", "no", "off"})
 # A usage-limit exit is an ordinary POSITIVE failure code; a user abort is not. Signal deaths come
 # back NEGATIVE (os.waitstatus_to_exitcode), and a tool that catches the signal exits 128+N — so the
 # exit-time safety net skips both rather than pay a usage fetch (and delay teardown) on a Ctrl-C/kill.
@@ -178,6 +181,120 @@ class NoSeats(AcctswError):
     """No seats configured for a tool."""
 
 
+def _wait_on_all_resting_enabled(environ: dict[str, str] | None = None) -> bool:
+    environ = os.environ if environ is None else environ
+    return environ.get(WAIT_ON_ALL_RESTING_ENV, "1").strip().lower() not in _ENV_FALSE
+
+
+POLL_INTERVAL_S = 300.0  # while waiting on resting seats, wake at least this often to re-check
+POLL_MIN_FETCH_S = 240   # unforced in-wait polls: per-seat floor between usage fetches
+
+
+def _verify_capacity(ctx: Context, tool: str, get, *, at, force: bool,
+                     exclude: set | frozenset = frozenset(), ua: str | None = None) -> Selection:
+    """Fresh ground truth before blocking or giving up: fetch usage for the tool's seats, persist
+    the results (store_fetch → _apply_limit, which clears flags a confirmed-healthy fetch disproves
+    and re-stamps ones it confirms), drop rest markers that have expired by ``at``, and return a
+    fresh choose(). Local ``limited_until`` flags alone are NOT trusted — a stale reactive flag from
+    a false positive is exactly what wrongly announced "all seats resting" when capacity existed.
+
+    Lock discipline (same as _probe / store_fetch's contract): the state flock is held only for the
+    quick reads/writes on either side — NEVER across the network fetches. ``force=False`` polls are
+    gated per-seat by usage._due with a POLL_MIN_FETCH_S floor, which includes the endpoint's
+    exponential error backoff — sustained 429s stretch a seat's polls instead of hammering it."""
+    with ctx.locked():
+        state = ctx.load_state()
+        pending = []
+        for email in list(state.accounts(tool)):
+            if email in exclude:
+                continue   # auth-dead this run: choose() skips it, so its fetch is a wasted 401
+            prev = (state.get_seat(tool, email) or {}).get("usage") or {}
+            if not force and not usage_mod._due(prev, at, POLL_MIN_FETCH_S):
+                continue
+            blob = usage_mod._seat_blob(ctx, state, tool, email)
+            if blob:
+                pending.append((email, blob))
+    results = []
+    for email, blob in pending:   # network — no lock held
+        try:
+            results.append((email, usage_mod._fetch_for(tool, blob, get, ua)))
+        except Exception:
+            pass  # a broken blob/transport must not kill the wait — the seat just isn't refreshed
+    with ctx.locked():
+        state = ctx.load_state()
+        changed = False
+        for email, u in results:
+            if state.get_seat(tool, email) is not None:   # seat may have been removed mid-wait
+                usage_mod.store_fetch(state, tool, email, u, at=at)
+                changed = True
+        # Trust the clock for markers the fetches did not re-stamp: clear EVERY seat whose rest has
+        # expired by ``at`` (the old wait cleared only the one chosen seat, leaving stale siblings).
+        for email, seat in state.accounts(tool).items():
+            until = parse_iso(seat.get("limited_until"))
+            if until is not None and until <= at:
+                state.set_limited_until(tool, email, None)
+                changed = True
+        if changed:
+            state.save()   # skip the fsync'd rewrite on idle polls (nothing fetched, nothing expired)
+        return choose(state, tool, at=at, exclude=exclude)
+
+
+def _wait_for_unlock(ctx: Context, tool: str, notify: Notifier,
+                     sleep: Callable[[float], None], get=usage_mod._default_get,
+                     exclude: set | frozenset = frozenset()) -> str | None:
+    """Verify-then-poll until a seat is actually usable. Returns the seat's email, or None to give up.
+
+    Never sleeps on stored flags alone: a FORCED verify sweep runs first, so a launch against stale
+    rest markers starts immediately instead of announcing "all seats resting". While waiting it
+    wakes every POLL_INTERVAL_S to re-check (unforced, backoff-gated) and can resume EARLY the
+    moment a seat frees; at the advertised unlock time one more forced sweep is the moment of truth
+    — after its expired-flag sweep either a seat is free or a NEW future target was stamped.
+    A give_up that carries no unlock time polls too, bounded by DEFAULT_COOLDOWN, instead of
+    instantly killing the session. Ctrl-C propagates out of sleep (cli prints a clean message)."""
+    if not _wait_on_all_resting_enabled():
+        return None
+    start = now()
+    virtual = start
+
+    def vnow():
+        # Virtual clock: real sleeps track wall time via now(); the injected test sleep returns
+        # instantly, and max() with the slept-forward ``virtual`` keeps the loop terminating for both.
+        return max(now(), virtual)
+
+    # The Claude UA shells out to `claude --version` — compute it ONCE per wait, not per poll.
+    ua = usage_mod.claude_user_agent(getattr(ctx, "claude_bin", None)) if tool == "claude" else None
+    hard_cap = start + DEFAULT_COOLDOWN   # bound for a give_up that advertised NO unlock time
+    sel = _verify_capacity(ctx, tool, get, at=vnow(), force=True, exclude=exclude, ua=ua)
+    announced = None
+    while True:
+        if sel.available and sel.email:
+            return sel.email                    # capacity actually exists — use it now
+        if sel.email is None:
+            return None                         # no seats left to wait for (all excluded/removed)
+        target = sel.unlocks_at or hard_cap
+        if vnow() >= target:
+            if sel.unlocks_at is None:
+                return None                     # hard_cap exhausted
+            # An advertised unlock slipped past while a sweep's network fetches were in flight
+            # (its ``at`` is captured before the calls): re-verify with a FRESH clock instead of
+            # giving up — the expired sweep then frees the seat or stamps a new future target.
+            sel = _verify_capacity(ctx, tool, get, at=vnow(), force=True, exclude=exclude, ua=ua)
+            continue
+        if announced != target:
+            notify(f"all {tool} seats are resting; waiting until {target.isoformat()} to resume "
+                   f"on {sel.email} (re-checking every {POLL_INTERVAL_S / 60:.0f} min)")
+            announced = target
+        # +1ms pads float/µs truncation so a final chunk lands PAST the target, not 1µs short of it
+        # (which would cost a pointless extra 1s sleep before the forced moment-of-truth sweep).
+        base = vnow()
+        remaining = (target - base).total_seconds() + 0.001
+        chunk = max(1.0, min(POLL_INTERVAL_S, remaining))
+        sleep(chunk)
+        virtual = base + timedelta(seconds=chunk)   # anchor to the base ``remaining`` was cut from
+        reached = vnow() >= target
+        sel = _verify_capacity(ctx, tool, get, at=vnow(), force=reached, exclude=exclude, ua=ua)
+
+
 # --- commands ---------------------------------------------------------------------------------
 
 def build_cmd(ctx: Context, tool: str, args: list) -> list:
@@ -245,11 +362,15 @@ def _hop_or_give_up(state, tool: str, *, exclude, active) -> Decision:
 
 
 def handle_limit(ctx: Context, state, tool: str, *, get=usage_mod._default_get,
-                 exclude: set | frozenset = frozenset(), corroborated: bool = False) -> Decision:
+                 exclude: set | frozenset = frozenset(), corroborated: bool = False,
+                 hard: bool = False) -> Decision:
     """A limit was caught for the active seat. Flag it, then choose the next seat. ``exclude`` carries
     seats that already failed auth this run, so a limit never re-selects a known-dead-token seat.
     ``corroborated``: the verify-before-kill probe force-refreshed usage moments ago and it confirmed
-    the limit — don't refetch (state already carries the fresh snapshot) or second-guess it here."""
+    the limit — don't refetch (state already carries the fresh snapshot) or second-guess it here.
+    ``hard``: the signal was a trusted tool-side BILLING banner (e.g. codex "workspace out of
+    credits") — the usage windows can look healthy while the seat is unusable, so the rest is
+    stamped ``source="hard"`` and usage polls must not clear it before it expires."""
     active = state.active(tool)
     # Authoritative reset from the usage endpoint for the seat that just hit the limit (only the
     # active seat — others keep their known state; their stale snapshot tokens would 401 anyway).
@@ -280,8 +401,18 @@ def handle_limit(ctx: Context, state, tool: str, *, get=usage_mod._default_get,
             return Decision("resume", active)
     seat = state.get_seat(tool, active) if active else None
     # ...else a reactive fallback so we don't immediately re-pick the maxed seat.
-    if seat is not None and seat.get("limited_until") is None:
-        state.set_limited_until(tool, active, iso(now() + DEFAULT_COOLDOWN), source="reactive")
+    if seat is not None:
+        existing = parse_iso(seat.get("limited_until"))
+        if hard:
+            # A billing banner must ALWAYS land as source="hard" — even over an existing softer
+            # flag (e.g. a menubar poll's short "usage" stamp), which a later healthy-looking
+            # fetch would clear, re-picking the creditless seat. Keep the later unlock time.
+            until = now() + DEFAULT_COOLDOWN
+            if existing is not None and existing > until:
+                until = existing
+            state.set_limited_until(tool, active, iso(until), source="hard")
+        elif existing is None:
+            state.set_limited_until(tool, active, iso(now() + DEFAULT_COOLDOWN), source="reactive")
     state.save()
     return _hop_or_give_up(state, tool, exclude=exclude, active=active)
 
@@ -545,7 +676,8 @@ _PASSTHROUGH_CMDS = frozenset({"login", "logout", "auth", "setup-token"})
 
 def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         notify: Notifier = _noop, get=usage_mod._default_get,
-        max_switches: int = MAX_SWITCHES) -> int:
+        max_switches: int = MAX_SWITCHES,
+        sleep: Callable[[float], None] = time.sleep) -> int:
     """Launch ``tool`` with the best seat, auto-switching + resuming on limits. Returns exit code."""
     if args and args[0] in _PASSTHROUGH_CMDS:
         # Credential flow (e.g. `claude auth login`): run stock, unsupervised, so the OAuth
@@ -574,7 +706,20 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         state.data["last_switch_at"] = iso(now())
         state.save()
 
+    auth_failed: set = set()   # seats whose token died THIS run — skip them for the rest of it
+
+    def _wait_and_activate() -> bool:
+        email = _wait_for_unlock(ctx, tool, notify, sleep, get, exclude=auth_failed)
+        if email is None:
+            return False
+        with ctx.locked():
+            state = ctx.load_state()
+            if email != state.active(tool):
+                _commit_switch(state, email)
+        return True
+
     try:
+        initial_resting: Decision | None = None
         # Initial selection + switch, under the state lock (brief; never held across a spawn).
         with ctx.locked():
             state = ctx.load_state()
@@ -585,13 +730,21 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             if sel.email and sel.email != state.active(tool):
                 switch(ctx, state, tool, sel.email, sync=(tool != "codex"))
             _activate_codex_home(state.active(tool))
-        if sel.all_limited and sel.unlocks_at:
-            notify(f"all {tool} seats are resting — {sel.email} unlocks at "
-                   f"{sel.unlocks_at:%H:%M}; starting anyway")
+        if sel.all_limited:
+            # The wait verifies against the live endpoint and recomputes targets from state, so it
+            # does not need a pre-known unlock time (unlocks_at may be None for reactive marks).
+            initial_resting = Decision("give_up", sel.email,
+                                       sel.unlocks_at.isoformat() if sel.unlocks_at else None)
 
         switches = 0
         resuming = False
-        auth_failed: set = set()   # seats whose token died THIS run — skip them for the rest of it
+        if initial_resting is not None:
+            if _wait_and_activate():
+                resuming = True
+            else:
+                notify(f"all {tool} seats are resting; soonest unlocks at "
+                       f"{initial_resting.unlocks_at}")
+                return EXIT_GAVE_UP
         buf = bytearray()
         # Verify-before-kill scanning state. A stdout match is corroborated against the usage
         # endpoint while the child is STILL RUNNING; a dismissed match costs a brief stall of the
@@ -641,7 +794,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
 
         while True:
             argv = resume_cmd(ctx, tool) if resuming else build_cmd(ctx, tool, args)
-            hit = {"reason": None, "corroborated": False}  # reason: None | "limit" | "auth"
+            hit = {"reason": None, "corroborated": False, "hard": False}  # reason: None|"limit"|"auth"
             buf.clear()
 
             def on_output(chunk: bytes) -> bool:
@@ -651,6 +804,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 if detect_hard_limit(tool, text):
                     hit["reason"] = "limit"
                     hit["corroborated"] = True
+                    hit["hard"] = True
                     return True
                 if not scan["on"]:
                     return False
@@ -692,6 +846,15 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                         switches += 1
                         resuming = True
                         continue
+                    if dec.action == "give_up" and dec.unlocks_at:
+                        # (``and dec.unlocks_at`` stays: a timestamp-less give_up here means the
+                        # exit was NOT a limit — surface the child's own exit code, never wait.)
+                        if _wait_and_activate():
+                            resuming = True
+                            continue
+                        notify(f"all {tool} seats are resting"
+                               + (f"; soonest unlocks at {dec.unlocks_at}" if dec.unlocks_at else ""))
+                        return EXIT_GAVE_UP
                 return status  # clean exit, or a plain failure — child's real exit code
 
             with ctx.locked():
@@ -703,7 +866,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     dec = handle_auth_dead(ctx, state, tool, exclude=auth_failed)
                 else:
                     dec = handle_limit(ctx, state, tool, get=get, exclude=auth_failed,
-                                       corroborated=hit["corroborated"])
+                                       corroborated=hit["corroborated"], hard=hit["hard"])
                 # The switch cap gates only an actual seat hop. Classify FIRST: a false-alarm
                 # "resume" (usage says the active seat is healthy) must not be terminated just
                 # because earlier genuine switches used up the budget — that would kill a healthy
@@ -740,6 +903,9 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     notify(f"{active} needs you to sign in again (token revoked) and no other "
                            f"{tool} seat is ready — re-add it via the app or `acctsw add {tool}`")
                 return EXIT_GAVE_UP
+            if _wait_and_activate():
+                resuming = True
+                continue
             notify(f"all {tool} seats are resting"
                    + (f"; soonest unlocks at {dec.unlocks_at}" if dec.unlocks_at else ""))
             return EXIT_GAVE_UP
