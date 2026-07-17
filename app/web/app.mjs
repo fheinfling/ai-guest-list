@@ -35,9 +35,8 @@ window.AGL = {
     // Manual navigation (back/cancel) clears them, so a reply from a flow the user left is ignored.
     let addChanged = false;
     const inAdd = screen === "add" && add;
-    if (res.await_snapshot && inAdd && add.awaiting
-        && add.method === "browser" && add.provider === res.tool) {
-      add.awaiting = false;                    // login confirmed up; already on connecting → no yank
+    if (res.await_snapshot && inAdd && add.awaiting && add.provider === res.tool) {
+      add.awaiting = false;                    // login/setup-token confirmed up; already on connecting
     }
     if (res.added && inAdd && add.pending) {   // OUR paste/snapshot succeeded → celebrate then done
       add.pending = false; add.step = "done";
@@ -48,9 +47,9 @@ window.AGL = {
     }
     if (res.error && inAdd && add.pending) {    // our async op failed → clear pending, show the toast
       add.pending = false;
-      // token path: back to the form (input preserved). browser path: stay on connecting so the user
-      // can finish signing in and tap "save my seat" again — the login window is still open.
-      if (add.method === "token") add.step = "details";
+      // codex paste: back to the form (auth.json preserved). Terminal flows (browser sign-in, claude
+      // setup-token): stay on connecting so the user can finish and tap "save my seat" again.
+      if (add.method === "token" && add.provider === "codex") add.step = "details";
       addChanged = true;
     }
 
@@ -131,16 +130,18 @@ document.addEventListener("click", (e) => {
     case "add-cancel": screen = "main"; add = null; render(); break;   // add=null drops any pending op
     case "add-cta": {
       const name = add.name.trim();
-      if (add.method === "token") {
+      // Only a codex "token" paste installs an auth.json in-app; everything else (browser sign-in,
+      // and claude's setup-token) launches an official flow in Terminal and waits on the user.
+      if (add.method === "token" && add.provider === "codex") {
         const blob = add.token.trim();
         if (!blob) break;                      // empty field → no-op, not a spinner + error toast
         add.pending = true; add.step = "connecting"; render();   // paste in flight → saving spinner
         send("paste", { tool: add.provider, blob, ...(name ? { name } : {}) });
       } else {
-        // browser: launch the login and wait on the USER to finish + tap "save my seat" — not a
-        // saving spinner yet (that's add.pending, set on save).
+        // launch the login/setup-token in Terminal and wait on the USER to finish + tap "save my
+        // seat" — not a saving spinner yet (that's add.pending, set on save).
         add.awaiting = true; add.step = "connecting"; render();
-        send("login", { tool: add.provider, method: "browser" });
+        send("login", { tool: add.provider, method: add.method });
       }
       break;
     }

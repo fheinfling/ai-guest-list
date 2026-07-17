@@ -169,21 +169,31 @@ function controlBar(opts) {
 // Claude) rides a single `--accent` CSS var on the root, so step markup never branches on tool.
 // `add` is the transient flow state owned by app.mjs: {step, provider, name, method, token}.
 
+// The "paste a token" method means different things per provider:
+//   codex  — paste an auth.json blob (a textarea; the engine validates + installs it directly).
+//   claude — a `claude setup-token` is an inference credential that can't be validated/identified
+//            from a paste, so this runs `claude setup-token` in Terminal (like browser sign-in, just
+//            a different command). No textarea; identity comes from Claude's own state afterward.
 const ADD_COPY = {
   codex: {
     row: "ChatGPT sign-in · Business seat",
     chip: "Codex CLI · ChatGPT sign-in or auth.json",
+    seg: "paste auth.json",
     tokenHint: "paste your auth.json — handy for a headless or shared box.",
     tokenPh: "paste auth.json contents",
   },
   claude: {
     row: "Claude.ai sign-in · Max or Pro seat",
-    chip: "Claude Code · rotating OAuth or setup-token",
-    tokenHint: "paste a setup-token — it lasts a year and won't log you out on its own.",
-    tokenPh: "sk-ant-oat01-…  (a setup-token, lasts a year)",
+    chip: "Claude Code · browser or setup-token",
+    seg: "setup-token",
+    tokenHint: "i'll run claude setup-token in Terminal — finish there, then save your seat.",
   },
 };
 const BROWSER_HINT = "i'll pop open the official sign-in — nothing leaves your Mac, i just save the seat.";
+
+// Only a codex "token" paste uses the textarea + direct install; everything else (browser, and
+// claude's setup-token) is an official flow launched in Terminal.
+function addUsesPaste(add) { return add.method === "token" && add.provider === "codex"; }
 
 function addProviderStep() {
   const row = (tool) => `<button class="add-prov" data-action="add-provider" data-tool="${tool}"
@@ -203,12 +213,14 @@ function addDetailsStep(add) {
   const c = ADD_COPY[add.provider];
   const seg = (v, label) =>
     `<button class="sopt ${add.method === v ? "on" : ""}" data-action="add-method" data-value="${v}">${label}</button>`;
+  const paste = addUsesPaste(add);
   const hint = add.method === "token" ? c.tokenHint : BROWSER_HINT;
-  const tokenWrap = add.method === "token"
+  const tokenWrap = paste          // textarea only for a codex auth.json paste
     ? `<div class="add-tokenwrap"><textarea id="add-token" class="add-token mono"
          placeholder="${esc(c.tokenPh)}">${esc(add.token)}</textarea></div>`
     : "";
-  const cta = add.method === "token" ? "save the seat →" : "open sign-in →";
+  // CTA: a codex paste saves in-app; browser and claude's setup-token launch an official flow.
+  const cta = paste ? "save the seat →" : add.method === "token" ? "open Terminal →" : "open sign-in →";
   return `<div class="add-provcard">
       <span class="add-chip add-chip--sm"><span class="add-chip-dot"></span></span>
       <span class="add-prov-tx"><span class="add-provcard-t">new ${TOOL_META[add.provider].label} seat</span>
@@ -225,7 +237,7 @@ function addDetailsStep(add) {
       <span class="set-label">how should i sign you in?</span>
       <div class="set-card">
         <div class="add-method">
-          <div class="set-seg">${seg("browser", "open browser")}${seg("token", "paste a token")}</div>
+          <div class="set-seg">${seg("browser", "open browser")}${seg("token", c.seg)}</div>
           <div class="add-hint">${hint}</div>
         </div>
         ${tokenWrap}
@@ -235,16 +247,20 @@ function addDetailsStep(add) {
 }
 
 function addConnectingStep(add) {
-  const browser = add.method !== "token";
-  // The browser step first WAITS for the user to finish signing in and tap "save my seat"; only then
-  // (add.pending) is a snapshot in flight. The token step is always actively saving. Spinner + the
-  // "saving…" copy show whenever something is actually in flight — a lone spinner while we wait on the
-  // user would read as "hung".
-  const saving = !browser || add.pending;
-  const title = saving ? "saving your seat…" : "we opened your browser…";
-  const sub = saving ? "tucking it away safely 💛" : "say hi over there and you're on the list 💛";
+  // A Terminal flow (browser sign-in OR claude setup-token) first WAITS for the user to finish in the
+  // other window and tap "save my seat"; only then (add.pending) is a snapshot in flight. A codex
+  // paste is always actively saving. Spinner + "saving…" copy show only when something is really in
+  // flight — a lone spinner while we wait on the user would read as "hung".
+  const terminalFlow = !addUsesPaste(add);
+  const saving = !terminalFlow || add.pending;
+  const waitTitle = add.method === "browser" ? "we opened your browser…" : "we opened Terminal…";
+  const waitSub = add.method === "browser"
+    ? "say hi over there and you're on the list 💛"
+    : "finish claude setup-token there, then save your seat 💛";
+  const title = saving ? "saving your seat…" : waitTitle;
+  const sub = saving ? "tucking it away safely 💛" : waitSub;
   const spin = saving ? `<div class="add-spin"></div>` : "";
-  const cta = browser
+  const cta = terminalFlow
     ? `<button class="add-cta" data-action="add-save"${add.pending ? " disabled" : ""}>save my seat 💛</button>`
     : "";
   return `<div class="add-center">${spin}

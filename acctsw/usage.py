@@ -174,19 +174,6 @@ def claude_token(blob: str) -> str | None:
     return (data.get("claudeAiOauth") or {}).get("accessToken")
 
 
-def claude_oauth_headers(token: str, user_agent: str | None = None) -> dict:
-    """The header set the Claude OAuth endpoints require (usage + profile). One place so the token
-    validation path and the usage path can't drift when a required header (e.g. anthropic-beta) is
-    bumped — a stale value 401s every request."""
-    return {
-        "Authorization": f"Bearer {token}",
-        "anthropic-beta": P.CLAUDE_OAUTH_BETA,
-        "anthropic-version": P.ANTHROPIC_VERSION,
-        "User-Agent": user_agent or claude_user_agent(),
-        "Accept": "application/json",
-    }
-
-
 def claude_user_agent(claude_bin: str | None = None) -> str:
     exe = claude_bin or shutil.which("claude")
     if exe:
@@ -311,7 +298,13 @@ def fetch_claude(token: str | None, *, user_agent: str | None = None,
     if not token:
         u.error = "no_token"
         return u
-    headers = claude_oauth_headers(token, user_agent)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "anthropic-beta": P.CLAUDE_OAUTH_BETA,
+        "anthropic-version": P.ANTHROPIC_VERSION,
+        "User-Agent": user_agent or claude_user_agent(),
+        "Accept": "application/json",
+    }
     status, body = get(P.CLAUDE_USAGE_URL, headers, timeout)
     err = _classify(status)
     if err:

@@ -197,22 +197,31 @@ test("add: cancel only on provider|details, never connecting|done", () => {
 test("add: details (claude, browser) — accent, name, method, CTA", () => {
   const h = buildAddSeat({ settings: {} }, mkAdd({ step: "details", provider: "claude" }));
   assert.match(h, /--accent:var\(--claude\)/);
-  assert.ok(h.includes("new Claude seat") && h.includes("rotating OAuth or setup-token"));
+  assert.ok(h.includes("new Claude seat"));
   assert.match(h, /data-action="add-change"/);
   assert.match(h, /id="add-name"[^>]*placeholder="Work · Personal · Late-night"/);
   assert.match(h, /data-action="add-method" data-value="browser"/);
   assert.match(h, /data-action="add-method" data-value="token"/);
+  assert.ok(h.includes("open browser") && h.includes("setup-token"));   // claude's token segment label
   assert.ok(h.includes("i'll pop open the official sign-in"));
   assert.ok(h.includes("open sign-in →"));
   assert.doesNotMatch(h, /id="add-token"/);                    // no textarea in browser method
 });
 
-test("add: details token variant reveals the field + save CTA", () => {
+test("add: claude setup-token runs in Terminal, no textarea", () => {
+  // a claude setup-token is an inference credential that can't be pasted/validated in-app; the
+  // token method launches `claude setup-token` in Terminal instead.
   const h = buildAddSeat({ settings: {} }, mkAdd({ step: "details", provider: "claude", method: "token" }));
-  assert.match(h, /id="add-token"[^>]*placeholder="[^"]*sk-ant-oat01/);
-  assert.ok(h.includes("lasts a year"));
-  assert.ok(h.includes("save the seat →"));
-  assert.match(h, /class="sopt on" data-action="add-method" data-value="token"/);  // token selected
+  assert.doesNotMatch(h, /id="add-token"/);                    // NO textarea for claude
+  assert.ok(h.includes("run claude setup-token in Terminal"));
+  assert.ok(h.includes("open Terminal →"));                    // CTA launches the official flow
+  assert.match(h, /class="sopt on" data-action="add-method" data-value="token"/);
+});
+
+test("add: codex setup-token method DOES paste an auth.json textarea", () => {
+  const h = buildAddSeat({ settings: {} }, mkAdd({ step: "details", provider: "codex", method: "token" }));
+  assert.match(h, /id="add-token"[^>]*placeholder="[^"]*auth.json/);
+  assert.ok(h.includes("save the seat →"));                    // in-app paste, not Terminal
 });
 
 test("add: codex token copy drops the unsupported 'API key' promise", () => {
@@ -240,11 +249,16 @@ test("add: connecting — browser waits for the user, no premature spinner", () 
   assert.match(saving, /class="add-spin"/);
   assert.ok(saving.includes("saving your seat…"));
   assert.match(saving, /data-action="add-save"[^>]*disabled/);
-  // token path is always actively saving, spinner on, no manual save button
-  const t = buildAddSeat({ settings: {} }, mkAdd({ step: "connecting", provider: "claude", method: "token", pending: true }));
-  assert.match(t, /class="add-spin"/);
-  assert.ok(t.includes("saving your seat…"));
-  assert.doesNotMatch(t, /add-save/);
+  // a codex paste is always actively saving (spinner on, resolves via the bridge — no save button)
+  const paste = buildAddSeat({ settings: {} }, mkAdd({ step: "connecting", provider: "codex", method: "token", pending: true }));
+  assert.match(paste, /class="add-spin"/);
+  assert.ok(paste.includes("saving your seat…"));
+  assert.doesNotMatch(paste, /add-save/);
+  // claude setup-token is a Terminal flow: like browser, it waits with a save button, no premature spinner
+  const claude = buildAddSeat({ settings: {} }, mkAdd({ step: "connecting", provider: "claude", method: "token" }));
+  assert.doesNotMatch(claude, /class="add-spin"/);
+  assert.ok(claude.includes("we opened Terminal…"));
+  assert.match(claude, /data-action="add-save"[^>]*>save my seat 💛</);
 });
 
 test("add: done greets the seat, escapes, falls back to 'new seat'", () => {
