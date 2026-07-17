@@ -122,6 +122,8 @@ class ClaudeCredLocation:
             oauth["subscriptionType"] = plan_raw
         else:
             oauth.pop("subscriptionType", None)
-        oauth.setdefault("scopes", [])          # the from-empty case; matches the accepted shape
+        # On a merge the item's real scopes are preserved. Only the from-empty case (no prior login)
+        # needs a default — and it must carry inference authority, or stock claude refuses to run.
+        oauth.setdefault("scopes", ["user:inference", "user:profile"])
         base["claudeAiOauth"] = oauth
         return json.dumps(base)

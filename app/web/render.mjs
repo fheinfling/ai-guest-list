@@ -236,10 +236,18 @@ function addDetailsStep(add) {
 
 function addConnectingStep(add) {
   const browser = add.method !== "token";
-  const title = browser ? "we opened your browser…" : "saving your seat…";
-  const sub = browser ? "say hi over there and you're on the list 💛" : "tucking it away safely 💛";
-  const cta = browser ? `<button class="add-cta" data-action="add-save">save my seat 💛</button>` : "";
-  return `<div class="add-center"><div class="add-spin"></div>
+  // The browser step first WAITS for the user to finish signing in and tap "save my seat"; only then
+  // (add.pending) is a snapshot in flight. The token step is always actively saving. Spinner + the
+  // "saving…" copy show whenever something is actually in flight — a lone spinner while we wait on the
+  // user would read as "hung".
+  const saving = !browser || add.pending;
+  const title = saving ? "saving your seat…" : "we opened your browser…";
+  const sub = saving ? "tucking it away safely 💛" : "say hi over there and you're on the list 💛";
+  const spin = saving ? `<div class="add-spin"></div>` : "";
+  const cta = browser
+    ? `<button class="add-cta" data-action="add-save"${add.pending ? " disabled" : ""}>save my seat 💛</button>`
+    : "";
+  return `<div class="add-center">${spin}
     <div class="add-h">${title}</div><div class="add-sub">${sub}</div>${cta}</div>`;
 }
 

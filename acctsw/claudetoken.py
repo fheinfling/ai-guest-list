@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 
 from . import paths as P
-from .usage import HttpGet, _default_get, claude_user_agent
+from .usage import HttpGet, _default_get, claude_oauth_headers
 
 
 def looks_like_setup_token(blob: str) -> str | None:
@@ -40,14 +40,7 @@ def claude_identity(token: str, *, user_agent: str | None = None,
     ``plan`` is ``"max"`` / ``"pro"`` / ``None`` (unknown) — it feeds the seat's plan chip. Returns
     None for a rejected token (401), a network failure, unparseable JSON, or a body with no email.
     """
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "anthropic-beta": P.CLAUDE_OAUTH_BETA,
-        "anthropic-version": P.ANTHROPIC_VERSION,
-        "User-Agent": user_agent or claude_user_agent(),
-        "Accept": "application/json",
-    }
-    status, body = get(P.CLAUDE_PROFILE_URL, headers, timeout)
+    status, body = get(P.CLAUDE_PROFILE_URL, claude_oauth_headers(token, user_agent), timeout)
     if status != 200:
         return None
     try:

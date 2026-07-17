@@ -77,7 +77,8 @@ def _shared_item():
 def test_merge_token_from_empty():
     blob = json.loads(ClaudeCredLocation.merge_token(None, TOK, "max"))
     o = blob["claudeAiOauth"]
-    assert o["accessToken"] == TOK and o["subscriptionType"] == "max" and o["scopes"] == []
+    assert o["accessToken"] == TOK and o["subscriptionType"] == "max"
+    assert o["scopes"] == ["user:inference", "user:profile"]   # default carries inference authority
     assert "refreshToken" not in o and "refreshTokenExpiresAt" not in o
     assert o["expiresAt"] > 0 and "mcpOAuth" not in blob     # don't invent keys
 

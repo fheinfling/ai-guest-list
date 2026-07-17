@@ -228,14 +228,23 @@ test("add: typed name + token survive a re-render (escaped, controlled)", () => 
   assert.ok(h.includes("sk-x&lt;y"));                          // token reproduced, escaped
 });
 
-test("add: connecting differs by method; browser carries save-my-seat", () => {
-  const b = buildAddSeat({ settings: {} }, mkAdd({ step: "connecting", provider: "codex", method: "browser" }));
-  assert.match(b, /class="add-spin"/);
-  assert.ok(b.includes("we opened your browser…"));
-  assert.match(b, /data-action="add-save"[^>]*>save my seat 💛</);
-  const t = buildAddSeat({ settings: {} }, mkAdd({ step: "connecting", provider: "claude", method: "token" }));
+test("add: connecting — browser waits for the user, no premature spinner", () => {
+  // before "save my seat": waiting on the user, save button live, NO spinner (would read as hung)
+  const wait = buildAddSeat({ settings: {} }, mkAdd({ step: "connecting", provider: "codex", method: "browser" }));
+  assert.doesNotMatch(wait, /class="add-spin"/);
+  assert.ok(wait.includes("we opened your browser…"));
+  assert.match(wait, /data-action="add-save"[^>]*>save my seat 💛</);
+  assert.doesNotMatch(wait, /add-save"[^>]*disabled/);
+  // after clicking save (pending): spinner on, button disabled, copy switches to "saving…"
+  const saving = buildAddSeat({ settings: {} }, mkAdd({ step: "connecting", provider: "codex", method: "browser", pending: true }));
+  assert.match(saving, /class="add-spin"/);
+  assert.ok(saving.includes("saving your seat…"));
+  assert.match(saving, /data-action="add-save"[^>]*disabled/);
+  // token path is always actively saving, spinner on, no manual save button
+  const t = buildAddSeat({ settings: {} }, mkAdd({ step: "connecting", provider: "claude", method: "token", pending: true }));
+  assert.match(t, /class="add-spin"/);
   assert.ok(t.includes("saving your seat…"));
-  assert.doesNotMatch(t, /add-save/);                          // token path resolves via the bridge
+  assert.doesNotMatch(t, /add-save/);
 });
 
 test("add: done greets the seat, escapes, falls back to 'new seat'", () => {

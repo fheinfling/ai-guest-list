@@ -28,22 +28,29 @@ window.AGL = {
     // The add-seat sub-view holds transient, unsaved state (typed name/token) that render() would
     // wipe. So while it's up, only re-render when the add flow itself advances — a pure state push
     // (the 180s usage poll) updates `state` but must NOT touch the DOM, or it steals focus + caret.
+    //
+    // Two correlation flags keep a late/stale reply from hijacking the screen:
+    //   add.awaiting — a browser login was launched; we expect an await_snapshot for it.
+    //   add.pending  — a paste/snapshot that ENDS this flow is in flight.
+    // Manual navigation (back/cancel) clears them, so a reply from a flow the user left is ignored.
     let addChanged = false;
-    if (res.await_snapshot) {                  // native login launched → move to the connecting step
-      screen = "add";
-      add = { step: "connecting", provider: res.tool, method: "browser",
-              name: add && add.provider === res.tool ? add.name : "", token: "" };
-      addChanged = true;
+    const inAdd = screen === "add" && add;
+    if (res.await_snapshot && inAdd && add.awaiting
+        && add.method === "browser" && add.provider === res.tool) {
+      add.awaiting = false;                    // login confirmed up; already on connecting → no yank
     }
-    if (res.added && screen === "add" && add) {  // paste/snapshot succeeded → celebrate then done
-      add.step = "done";
+    if (res.added && inAdd && add.pending) {   // OUR paste/snapshot succeeded → celebrate then done
+      add.pending = false; add.step = "done";
       addChanged = true;
       setTimeout(() => {
         if (screen === "add" && add && add.step === "done") { screen = "main"; add = null; render(); }
       }, 1600);
     }
-    if (res.error && screen === "add" && add && add.step === "connecting" && add.method === "token") {
-      add.step = "details";                    // token rejected → back to the form (input preserved)
+    if (res.error && inAdd && add.pending) {    // our async op failed → clear pending, show the toast
+      add.pending = false;
+      // token path: back to the form (input preserved). browser path: stay on connecting so the user
+      // can finish signing in and tap "save my seat" again — the login window is still open.
+      if (add.method === "token") add.step = "details";
       addChanged = true;
     }
 
@@ -121,15 +128,25 @@ document.addEventListener("click", (e) => {
     case "add-change": add.step = "provider"; render(); break;
     case "add-method": add.method = value; render(); break;   // typed token survives via add.token
     case "add-back": addBack(); break;
-    case "add-cancel": screen = "main"; add = null; render(); break;
+    case "add-cancel": screen = "main"; add = null; render(); break;   // add=null drops any pending op
     case "add-cta": {
-      add.step = "connecting"; render();
       const name = add.name.trim();
-      if (add.method === "browser") send("login", { tool: add.provider, method: "browser" });
-      else send("paste", { tool: add.provider, blob: add.token.trim(), ...(name ? { name } : {}) });
+      if (add.method === "token") {
+        const blob = add.token.trim();
+        if (!blob) break;                      // empty field → no-op, not a spinner + error toast
+        add.pending = true; add.step = "connecting"; render();   // paste in flight → saving spinner
+        send("paste", { tool: add.provider, blob, ...(name ? { name } : {}) });
+      } else {
+        // browser: launch the login and wait on the USER to finish + tap "save my seat" — not a
+        // saving spinner yet (that's add.pending, set on save).
+        add.awaiting = true; add.step = "connecting"; render();
+        send("login", { tool: add.provider, method: "browser" });
+      }
       break;
     }
     case "add-save": {         // connecting-step CTA (browser path) → the proven snapshot handshake
+      if (add.pending) break;                  // a snapshot is already in flight — don't double-send
+      add.pending = true; render();            // re-render disables the button (addConnectingStep)
       const name = add.name.trim();
       send("snapshot", { tool: add.provider, ...(name ? { name } : {}) });
       break;
@@ -142,10 +159,11 @@ document.addEventListener("click", (e) => {
   }
 });
 
-// Back navigation within the add-seat sub-view (also used by Esc).
+// Back navigation within the add-seat sub-view (also used by Esc). Manual navigation cancels the
+// pending-op correlation, so a late login/paste reply can't yank the user back to connecting.
 function addBack() {
   if (add?.step === "details") add.step = "provider";
-  else if (add?.step === "connecting") add.step = "details";
+  else if (add?.step === "connecting") { add.step = "details"; add.pending = false; add.awaiting = false; }
   else { screen = "main"; add = null; }        // provider or done → leave the flow
   render();
 }
