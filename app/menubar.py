@@ -202,10 +202,8 @@ if objc is not None:
                 # Absolute import (not `.terminal`): under py2app the main script runs as top-level
                 # __main__ with no package context, so a relative import would fail in the .app.
                 from app.terminal import prepare_then_login
-                # The old modal sent `command`; the new sub-view sends `method` and the command is
-                # resolved by the engine. Honour both while the modal is still present.
-                command = msg.get("command") or bridge.login_command(
-                    msg["tool"], msg.get("method", "browser"))
+                # The sub-view sends {tool, method}; the engine resolves the Terminal command.
+                command = bridge.login_command(msg["tool"], msg.get("method", "browser"))
                 prepare_then_login(self.ctx, msg["tool"], command)
                 self._notify("finish signing in", "then tap ‘save my seat’ 🎟️")
                 self._pushResult({"ok": True, "await_snapshot": True, "tool": msg["tool"]})

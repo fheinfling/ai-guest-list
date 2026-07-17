@@ -57,24 +57,6 @@ def login_command(tool: str, method: str = "browser") -> str:
     return "claude auth login"
 
 
-def login_plan(tool: str) -> dict[str, Any]:
-    """Describe how to add a seat (the native side runs the chosen flow in Terminal).
-
-    DEPRECATED: the modal add-seat UI asked for this "plan"; the new sub-view sends ``{tool, method}``
-    and the command is resolved by ``login_command``. Kept only until the modal is fully removed."""
-    if tool == "codex":
-        return {"tool": "codex", "title": "who's joining the list?",
-                "methods": [
-                    {"id": "browser", "label": "ChatGPT sign-in", "command": "codex login"},
-                    {"id": "paste", "label": "paste auth.json", "command": None},
-                ]}
-    return {"tool": "claude", "title": "who's joining the list?",
-            "methods": [
-                {"id": "browser", "label": "Claude.ai sign-in", "command": "claude auth login"},
-                {"id": "token", "label": "setup-token", "command": "claude setup-token"},
-            ]}
-
-
 def handle(ctx: Context, message: dict) -> dict[str, Any]:
     action = (message or {}).get("action")
     try:
@@ -132,9 +114,6 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
                 acct.reconcile_codex(ctx, state)   # capture a fresh/out-of-band ~/.codex into its home
                 usage_mod.refresh(ctx, state, message.get("tool"))
             return {"ok": True, "state": snapshot_state(ctx)}
-
-        if action == "add":
-            return {"ok": True, "login": login_plan(message["tool"])}
 
         if action == "paste":
             tool = message["tool"]
