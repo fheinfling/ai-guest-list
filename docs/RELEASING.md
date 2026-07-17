@@ -30,6 +30,11 @@ Releases are built and published by GitHub Actions when you push a tag — see
 
 ## Notes
 
+- **README screenshots.** Regenerate with `.venv/bin/python scripts/screenshots.py` whenever the
+  popover or settings view changes (and check the version in the settings footer). It seeds sample
+  seats, runs them through the real engine, and shoots the real web UI — so the images can't drift
+  from the app. They had: the shots advertised a "save credit" toggle for months after the feature
+  was removed, captioned with a savings number the code itself disproved.
 - **Unsigned.** No Apple Developer certificate is configured, so the `.app` is unsigned/un-notarized.
   See the **Unsigned-app note** in the [README](../README.md#install) for the user-facing Gatekeeper
   workarounds. Wire signing/notarization into the workflow once a Developer ID is available.
