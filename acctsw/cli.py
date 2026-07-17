@@ -161,18 +161,25 @@ def _cmd_run(ctx: Context, ns) -> int:
     args = list(ns.args or [])
     if args and args[0] == "--":  # argparse REMAINDER keeps a leading separator
         args = args[1:]
-    # The app is the master switch for supervision: when it's CLOSED, behave like the stock tool
-    # (no auto-switch / no seat-hopping) — exec_stock replaces this process and never returns.
-    if not appalive.app_running(ctx.data_dir):
-        # The "save credit" Headroom proxy was removed. An older build (or a hard-killed app) can
-        # leave provider routing injected in ~/.codex/~/.claude pointing at a now-dead proxy, which
-        # would crash stock codex/claude with ConnectionRefused. Strip any such leftover once so we
-        # exec TRULY stock. Cheap pre-check skips this entirely once nothing remains to clean.
+    # The "save credit" Headroom proxy was removed. An older build (or a hard-killed app) can leave
+    # provider routing injected in ~/.codex/~/.claude pointing at a now-dead proxy, which would crash
+    # stock codex/claude with ConnectionRefused. Clean it BEFORE the app-running split so every route
+    # out of here is covered: `launcher.run` also exec_stock's early for `login`/`auth` passthrough
+    # and raises NoSeats on a fresh install, both of which bypass its own cleanup. Cheap pre-check
+    # skips this entirely once nothing remains. Never let cleanup failure block the launch — exec'ing
+    # the tool is the promise here, and a best-effort migration must not be why `cx`/`cl` stops
+    # working.
+    try:
         from . import headroom as hr
         if hr.legacy_present(ctx):
             cleaned, _ = hr.cleanup_legacy(ctx)
             if cleaned:
-                notify(f"cleaned up leftover 'save credit' routing; running stock {ns.tool}")
+                notify("cleaned up leftover 'save credit' routing")
+    except Exception:
+        pass
+    # The app is the master switch for supervision: when it's CLOSED, behave like the stock tool
+    # (no auto-switch / no seat-hopping) — exec_stock replaces this process and never returns.
+    if not appalive.app_running(ctx.data_dir):
         return exec_stock(ctx, ns.tool, args)
     try:
         return launch(ctx, ns.tool, args, notify=notify)

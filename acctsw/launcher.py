@@ -555,18 +555,9 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
     if not state.accounts(tool):
         raise NoSeats(f"no {tool} seats yet — add one first")
 
-    # The "save credit" Headroom proxy was removed (measured as not worth its fragility). If an older
-    # build left provider routing injected in ~/.codex or ~/.claude, strip it once so the tool runs
-    # directly instead of hitting a now-dead proxy. Cheap pre-check keeps this off the hot path once
-    # nothing remains to clean.
-    try:
-        from . import headroom as _hr
-        if _hr.legacy_present(ctx):
-            changed, _ = _hr.cleanup_legacy(ctx)
-            if changed:
-                notify("removed leftover 'save credit' routing — running directly.")
-    except Exception:
-        pass
+    # NB: legacy-Headroom cleanup deliberately lives in `cli._cmd_run`, BEFORE the app-running split
+    # — the passthrough and NoSeats branches above return without ever reaching this far, so cleaning
+    # here would miss exactly the fresh-install / `cx login` cases that most need it.
 
     def _activate_codex_home(email):
         """Point codex at the account's own home so it maintains that account's tokens in place."""
