@@ -31,7 +31,33 @@ try:
 except Exception:
     BUILD = "0"
 
-_web = [f for f in glob("app/web/*") if os.path.isfile(f)]
+def _shippable(f: str) -> bool:
+    """Keep dev-only files out of the shipped popover assets.
+
+    The app loads Resources/web/index.html, which references exactly styles.css + bundle.js (WEB_DIR
+    is relative to the py2app MAIN SCRIPT, which lands in Resources/ — not the lib/.../app/ package
+    copy). A denylist, not an allowlist: a genuinely new runtime asset should ship by default, since
+    the dev run reads the source tree and would never catch the omission — only the frozen app would.
+
+      *.test.mjs      node --test files. They assert on the RETIRED save-credit strings, so a grep of
+                      the shipped app hits "COMPRESSES CONTEXT" and reads as a contaminated build.
+      _*              scratch (scripts/screenshots.py writes app/web/_shot.{html,js} while it runs;
+                      a build racing it would ship them).
+      preview.html    dev preview page — referenced by nothing.
+      package.json    node test-runner config (`node --test`).
+      *.mjs           the ES sources bundle.js is BUILT from. WKWebView can't load module scripts
+                      over file://, which is why bundle.js exists; the sources are never fetched.
+    """
+    name = os.path.basename(f)
+    return not (
+        name.endswith(".test.mjs")
+        or name.startswith("_")
+        or name in ("preview.html", "package.json")
+        or name.endswith(".mjs")
+    )
+
+
+_web = [f for f in glob("app/web/*") if os.path.isfile(f) and _shippable(f)]
 DATA_FILES = [
     ("web", _web),
     ("web/fonts", glob("app/web/fonts/*")),
