@@ -11,6 +11,7 @@ from typing import Any
 from . import __version__, build_number
 from . import accounts as acct
 from . import usage as usage_mod
+from .claudetoken import claude_identity, looks_like_setup_token
 from .context import Context
 from .errors import AcctswError
 from .switch import sync_back
@@ -136,8 +137,39 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
             return {"ok": True, "login": login_plan(message["tool"])}
 
         if action == "paste":
-            # codex no-browser path: install a pasted auth.json, then register it as a seat.
             tool = message["tool"]
+            if tool == "claude":
+                # Claude no-browser path: install a pasted setup-token. NOTE `claude auth status` is
+                # useless as a validator here — it reads identity from ~/.claude.json, not the
+                # keychain, and says loggedIn:true for garbage. The OAuth profile endpoint validates
+                # the token itself and names ITS account, so it is both gate and identity source.
+                token = looks_like_setup_token(message["blob"])
+                if not token:
+                    return {"ok": False,
+                            "error": "that doesn't look like a setup-token (sk-ant-oat…)"}
+                ident = claude_identity(token, user_agent=usage_mod.claude_user_agent(ctx.claude_bin))
+                if ident is None:               # 401 / network / no email → reject; NOTHING WRITTEN
+                    return {"ok": False,
+                            "error": "Claude didn't accept that token — nothing was changed"}
+                email, plan_raw = ident
+                with ctx.locked():
+                    state = ctx.load_state()
+                    sync_back(ctx, state, "claude")          # INVARIANT: outgoing seat first
+                    original = ctx.cred["claude"].get_live()  # back up AFTER sync_back, BEFORE write
+                    candidate = ctx.cred["claude"].merge_token(original, token, plan_raw)
+                    try:
+                        ctx.cred["claude"].set_live(candidate)
+                        seat = acct.add(ctx, state, "claude", name=message.get("name"), email=email)
+                    except Exception:
+                        # HARD SAFETY: restore exactly what was there — stock claude keeps working.
+                        if original is not None:
+                            ctx.cred["claude"].set_live(original)
+                        else:
+                            ctx.cred["claude"].clear_live()
+                        raise
+                return {"ok": True, "celebrate": True, "added": seat["email"],
+                        "state": snapshot_state(ctx)}
+            # codex no-browser path: install a pasted auth.json, then register it as a seat.
             blob = message["blob"]
             # VALIDATE BEFORE WRITING: never overwrite the canonical auth.json with an unparseable
             # paste — that would break stock `codex` (violates "stock keeps working").

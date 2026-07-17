@@ -36,6 +36,9 @@ CLAUDE_CONFIG_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude"))
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 CODEX_ACCOUNTS_URL = "https://chatgpt.com/backend-api/accounts"
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+# Validates a token AND names its account (email + plan). `claude auth status` does NOT validate —
+# it reads identity from ~/.claude.json, so a garbage token still reports the previous account.
+CLAUDE_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 # Required Claude headers — without these the endpoint returns 401 / aggressive 429s.
 #   anthropic-beta: oauth-2025-04-20      (else 401)
 #   User-Agent: claude-code/<version>     (else aggressive 429 bucket)

@@ -1,7 +1,12 @@
 """Unit tests for the UI↔engine bridge dispatch (no pyobjc)."""
+import json
+
+import pytest
+
 from acctsw import accounts as acct
 from acctsw import bridge
-from tests.conftest import make_codex_blob
+from acctsw.errors import AcctswError
+from tests.conftest import make_claude_blob, make_codex_blob
 
 
 def _add(ctx, email):
@@ -147,6 +152,96 @@ def test_paste_installs_and_registers_codex(ctx):
     assert "pasted@x.com" in ctx.load_state().accounts("codex")
     import json
     assert json.loads(ctx.cred["codex"].get_live())  # live creds installed
+
+
+# --- claude setup-token paste (the no-browser Claude path) --------------------------------------
+
+TOK = "sk-ant-oat01-" + "a" * 40
+
+
+def _shared_claude_item():
+    """The REAL two-family keychain shape — claudeAiOauth alongside the user's MCP logins."""
+    return json.dumps({
+        "mcpOAuth": {"plugin:github:x": {"accessToken": "gh", "expiresAt": 1}},
+        "claudeAiOauth": {"accessToken": "old", "refreshToken": "r", "expiresAt": 2,
+                          "refreshTokenExpiresAt": 3, "scopes": ["user:inference"],
+                          "subscriptionType": "max", "rateLimitTier": "t1"}})
+
+
+def test_paste_claude_token_installs_and_registers(ctx, monkeypatch):
+    monkeypatch.setattr(bridge, "claude_identity", lambda *a, **k: ("c@x.com", "max"))
+    r = bridge.handle(ctx, {"action": "paste", "tool": "claude", "blob": TOK, "name": "Work"})
+    assert r["ok"] and r["added"] == "c@x.com"
+    seat = ctx.load_state().accounts("claude")["c@x.com"]
+    assert seat["name"] == "Work" and seat["plan"] == "Max"
+    o = json.loads(ctx.cred["claude"].get_live())["claudeAiOauth"]
+    assert o["accessToken"] == TOK and "refreshToken" not in o and "refreshTokenExpiresAt" not in o
+    assert o["subscriptionType"] == "max" and o["expiresAt"] > 0
+
+
+def test_paste_claude_preserves_mcp_oauth(ctx, monkeypatch):
+    ctx.cred["claude"].set_live(_shared_claude_item())
+    monkeypatch.setattr(bridge, "claude_identity", lambda *a, **k: ("b@x.com", "pro"))
+    r = bridge.handle(ctx, {"action": "paste", "tool": "claude", "blob": TOK})
+    assert r["ok"]
+    blob = json.loads(ctx.cred["claude"].get_live())
+    assert blob["mcpOAuth"] == {"plugin:github:x": {"accessToken": "gh", "expiresAt": 1}}
+    o = blob["claudeAiOauth"]
+    assert o["accessToken"] == TOK and o["scopes"] == ["user:inference"] and o["rateLimitTier"] == "t1"
+    assert o["subscriptionType"] == "pro" and "refreshToken" not in o
+
+
+def test_paste_claude_bad_format_rejected_without_write(ctx, monkeypatch):
+    monkeypatch.setattr(bridge, "claude_identity",
+                        lambda *a, **k: pytest.fail("must not validate a malformed token"))
+    ctx.cred["claude"].set_live(_shared_claude_item())
+    r = bridge.handle(ctx, {"action": "paste", "tool": "claude", "blob": "nope"})
+    assert r["ok"] is False and "setup-token" in r["error"]
+    assert ctx.cred["claude"].get_live() == _shared_claude_item()   # byte-identical, untouched
+
+
+def test_paste_claude_rejected_token_leaves_creds_untouched(ctx, monkeypatch):
+    monkeypatch.setattr(bridge, "claude_identity", lambda *a, **k: None)   # 401 / network / no email
+    ctx.cred["claude"].set_live(_shared_claude_item())
+    r = bridge.handle(ctx, {"action": "paste", "tool": "claude", "blob": TOK})
+    assert r["ok"] is False and "nothing was changed" in r["error"]
+    assert ctx.cred["claude"].get_live() == _shared_claude_item()   # no write happened at all
+    assert "b@x.com" not in ctx.load_state().accounts("claude")
+
+
+def test_paste_claude_rollback_on_write_failure_restores_original(ctx, monkeypatch):
+    monkeypatch.setattr(bridge, "claude_identity", lambda *a, **k: ("c@x.com", "max"))
+    ctx.cred["claude"].set_live(_shared_claude_item())
+
+    def boom(*a, **k):
+        raise AcctswError("boom")
+    monkeypatch.setattr(bridge.acct, "add", boom)
+    r = bridge.handle(ctx, {"action": "paste", "tool": "claude", "blob": TOK})
+    assert r["ok"] is False
+    assert ctx.cred["claude"].get_live() == _shared_claude_item()   # exact original restored
+
+
+def test_paste_claude_rollback_from_empty_clears(ctx, monkeypatch):
+    monkeypatch.setattr(bridge, "claude_identity", lambda *a, **k: ("c@x.com", "max"))
+
+    def boom(*a, **k):
+        raise AcctswError("boom")
+    monkeypatch.setattr(bridge.acct, "add", boom)
+    r = bridge.handle(ctx, {"action": "paste", "tool": "claude", "blob": TOK})
+    assert r["ok"] is False
+    assert ctx.cred["claude"].get_live() is None    # nothing was there → clear, don't leave a token
+
+
+def test_paste_claude_syncs_back_active_seat_first(ctx, monkeypatch):
+    # an active claude seat whose live creds have since rotated
+    ctx.cred["claude"].set_live(make_claude_blob("max"))
+    with ctx.locked():
+        acct.add(ctx, ctx.load_state(), "claude", email="a@x.com")
+    rotated = make_claude_blob("pro")
+    ctx.cred["claude"].set_live(rotated)            # simulate token rotation on the live item
+    monkeypatch.setattr(bridge, "claude_identity", lambda *a, **k: ("b@x.com", "max"))
+    bridge.handle(ctx, {"action": "paste", "tool": "claude", "blob": TOK})
+    assert ctx.snapshot_get("claude", "a@x.com") == rotated   # outgoing seat's fresh creds preserved
 
 
 def test_is_native_routing():

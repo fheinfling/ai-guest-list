@@ -10,6 +10,7 @@ can point them at temp files / a fake keychain.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Protocol
 
@@ -78,7 +79,48 @@ class ClaudeCredLocation:
     def set_live(self, blob: str) -> None:
         self.keychain.set(self.service, self.account, blob)
 
+    def clear_live(self) -> None:
+        """Remove the item entirely — used to roll back to 'nothing was here' when a paste fails and
+        there was no prior credential to restore."""
+        self.keychain.delete(self.service, self.account)
+
     def email_of(self, blob: str) -> str | None:
         # Not derivable from the blob (only OAuth tokens + subscriptionType). Email is captured
-        # from `claude auth status` at add-time and stored in state instead.
+        # from the OAuth profile endpoint (setup-token paste) or `claude auth status` at add-time.
         return None
+
+    @staticmethod
+    def merge_token(existing: str | None, token: str, plan_raw: str | None) -> str:
+        """Splice a setup-token into the keychain blob WITHOUT clobbering the rest of a shared item.
+
+        The real ``Claude Code-credentials`` item carries more than the login: alongside
+        ``claudeAiOauth`` it holds ``mcpOAuth`` (the user's MCP-server logins, e.g. a GitHub plugin).
+        Constructing a fresh ``{"claudeAiOauth": …}`` blob would destroy that, so we merge into the
+        existing item. Only the fields our token owns are touched:
+          - ``accessToken`` ← the pasted setup-token
+          - ``refreshToken`` / ``refreshTokenExpiresAt`` DROPPED (not nulled): setup-tokens don't
+            rotate, and a leftover refresh token from the PREVIOUS account could rotate the item back
+            to that identity.
+          - ``expiresAt`` ← ~1 year out (epoch millis).
+          - ``subscriptionType`` ← the profile's plan, or removed so the old tier can't linger.
+        Everything else in ``claudeAiOauth`` (scopes, unknown keys) and every sibling top-level key
+        (``mcpOAuth`` …) rides along untouched.
+        """
+        try:
+            base = json.loads(existing) if existing else {}
+        except (ValueError, TypeError):
+            base = {}
+        if not isinstance(base, dict):
+            base = {}
+        oauth = dict(base.get("claudeAiOauth") or {})
+        oauth["accessToken"] = token
+        oauth.pop("refreshToken", None)
+        oauth.pop("refreshTokenExpiresAt", None)
+        oauth["expiresAt"] = int(time.time() * 1000) + 365 * 24 * 3600 * 1000
+        if plan_raw:
+            oauth["subscriptionType"] = plan_raw
+        else:
+            oauth.pop("subscriptionType", None)
+        oauth.setdefault("scopes", [])          # the from-empty case; matches the accepted shape
+        base["claudeAiOauth"] = oauth
+        return json.dumps(base)
