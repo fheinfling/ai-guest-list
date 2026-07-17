@@ -78,9 +78,14 @@ def _scan(tool: str) -> tuple[bool, bool]:
     for cfg in _touched(tool):
         p = _edit_target(cfg)
         try:
-            text = p.read_text(errors="ignore")         # matches _unroute_*: never raise on bad bytes
+            text = p.read_text()
         except FileNotFoundError:
             continue                            # genuinely not there → nothing to clean
+        except UnicodeDecodeError:
+            # Not valid UTF-8. `errors="ignore"` would DROP those bytes and the rewrite would then
+            # persist the loss. Unknown: don't touch the file, and don't call it clean either.
+            unknown = True
+            continue
         except OSError:
             # Permission/stat failure. NOT "clean": `Path.exists()` also answers False here, which is
             # how an unreadable-but-routed file would sneak through as clean and get its proxy killed.
@@ -167,19 +172,44 @@ def _strip_codex_routing(content: str) -> str:
 # The provider keys `_route_codex` OVERWROTE. It stripped whatever the user had here and wrote its
 # own, so their original values survive only in the snapshot — these are the only lines worth taking
 # back out of it.
-_CODEX_OWNED_KEYS = re.compile(r'(?m)^[ \t]*(?:model_provider|openai_base_url)[ \t]*=.*(?:\r?\n|\Z)')
-# Likewise for `_route_claude`, which assigned into env unconditionally.
-_CLAUDE_OWNED_ENV = ("ANTHROPIC_BASE_URL", "ENABLE_TOOL_SEARCH")
+_CODEX_OWNED_KEYS = re.compile(
+    r'(?m)^[ \t]*(model_provider|openai_base_url)[ \t]*=.*(?:\r?\n|\Z)')
+# The exact values `_route_claude` assigned. Restoring is conditional on the live value STILL being
+# these: if the user has since set their own, theirs wins — we only undo what we did.
+_CLAUDE_INJECTED = {"ANTHROPIC_BASE_URL": _PROXY_URL, "ENABLE_TOOL_SEARCH": "true"}
 
 
-def _original_codex_keys(store: Path | None) -> str:
-    """The user's own top-level provider lines as they were BEFORE routing, from the snapshot."""
+def _codex_top_keys(text: str) -> set[str]:
+    """Which provider keys already exist at top level in ``text``."""
+    hdr = _TOML_TABLE_HDR.search(text)
+    head = text[:hdr.start()] if hdr else text
+    return {m.group(1) for m in _CODEX_OWNED_KEYS.finditer(head)}
+
+
+def _original_codex_keys(store: Path | None, present: set[str]) -> str:
+    """The user's own top-level provider lines as they were BEFORE routing, from the snapshot —
+    EXCLUDING any key that already survives in the live file.
+
+    Restoring unconditionally duplicates keys, which is invalid TOML. Two real ways a key survives:
+    the retired writer's strip required a trailing newline, so an original key at EOF was never
+    removed and is still in the live file; and the user may have edited the routed value themselves,
+    which our exact-value strip (correctly) leaves alone. In both cases the live document already
+    answers the question and the snapshot must not overrule it.
+    """
     text = _snapshot_text(store, P.CODEX_HOME / "config.toml")
     if text is None:
         return ""
     hdr = _TOML_TABLE_HDR.search(text)
     head = text[:hdr.start()] if hdr else text
-    return "".join(m.group(0) for m in _CODEX_OWNED_KEYS.finditer(head))
+    out = []
+    for m in _CODEX_OWNED_KEYS.finditer(head):
+        if m.group(1) in present:
+            continue                                    # live already has it → never duplicate
+        # The pattern ends `(?:\r?\n|\Z)`, so a snapshot whose final line has no trailing newline is
+        # captured without one — prepending that would WELD it onto the user's first line and write
+        # invalid TOML into their config. Normalise line endings while we're here.
+        out.append(m.group(0).rstrip("\r\n") + "\n")
+    return "".join(out)
 
 
 def _unroute_codex(store: Path | None = None) -> None:
@@ -188,17 +218,17 @@ def _unroute_codex(store: Path | None = None) -> None:
     if not path.exists():
         return
     try:
-        content = path.read_text(errors="ignore")       # match _scan: invalid bytes must not raise
-    except OSError:
+        content = path.read_text()      # strict, matching _scan: bad bytes are "unknown", not ours
+    except (OSError, UnicodeDecodeError):
         return
     stripped = _strip_codex_routing(content)
     if stripped == content:
         return                                          # nothing of ours in here — don't touch the file
     # Three-way merge, NOT a whole-file restore: keep the CURRENT file (every edit the user has made
     # since enabling), drop our routing, and take back from the snapshot only the provider keys our
-    # routing overwrote. Replaying the whole snapshot would revert months of unrelated edits — and
-    # delete the file outright if it was recorded "absent".
-    merged = _original_codex_keys(store) + stripped
+    # routing overwrote AND that the live file no longer carries. Replaying the whole snapshot would
+    # revert months of unrelated edits — and delete the file outright if it was recorded "absent".
+    merged = _original_codex_keys(store, _codex_top_keys(stripped)) + stripped
     atomic_write_text(path, merged if merged.strip() else "")
 
 
@@ -224,7 +254,7 @@ def _original_claude_env(store: Path | None, path: Path) -> dict:
     env = payload.get("env") if isinstance(payload, dict) else None
     if not isinstance(env, dict):
         return {}
-    return {k: env[k] for k in _CLAUDE_OWNED_ENV if k in env}
+    return {k: env[k] for k in _CLAUDE_INJECTED if k in env}
 
 
 def _unroute_claude_file(path: Path, store: Path | None = None) -> None:
@@ -240,11 +270,17 @@ def _unroute_claude_file(path: Path, store: Path | None = None) -> None:
     if not _claude_routed(payload):
         return                                          # not our routing → leave it alone
     env = payload["env"]
-    env.pop("ANTHROPIC_BASE_URL", None)
-    env.pop("ENABLE_TOOL_SEARCH", None)
-    # Three-way merge: `_route_claude` assigned into env unconditionally, so any value the user had
-    # for these keys survives only in the snapshot. Everything else in the file is theirs and stays.
-    env.update(_original_claude_env(store, orig_path))
+    # Three-way merge, per key. `_route_claude` assigned into env unconditionally, so the user's own
+    # value survives only in the snapshot — but blanket pop-then-restore also discards any value they
+    # set THEMSELVES since. Only undo a key that still holds exactly what we injected; if they have
+    # since changed it, that is their decision and it stands.
+    original = _original_claude_env(store, orig_path)
+    for k, injected in _CLAUDE_INJECTED.items():
+        if env.get(k) != injected:
+            continue                                    # not ours any more → leave it alone
+        env.pop(k, None)
+        if k in original:
+            env[k] = original[k]
     if env:
         payload["env"] = env
     else:
@@ -379,8 +415,13 @@ def _pid_is_proxy(pid: int) -> bool | None:
     for idx, tok in enumerate(parts):
         # EXACT basename, not a substring: `headroom-worker`/`headroom-proxy.log` are not our binary,
         # and a substring match would SIGKILL one holding a recycled PID.
-        if Path(tok).name.lower() in ("headroom", "headroom.py"):
-            return any(a.lower() == "proxy" for a in parts[idx + 1:])
+        if Path(tok).name.lower() not in ("headroom", "headroom.py"):
+            continue
+        # And it must plausibly BE the executable: argv[0], or a path to it. A bare `headroom` word
+        # sitting in someone's arguments (`python worker.py headroom proxy`) is not our process.
+        if idx != 0 and "/" not in tok:
+            continue
+        return any(a.lower() == "proxy" for a in parts[idx + 1:])
     return False
 
 
@@ -515,8 +556,10 @@ def _oplocked(store: Path | None):
     try:
         try:
             fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as e:
-            raise _Busy() from e
+        except BlockingIOError as e:
+            raise _Busy() from e                        # EWOULDBLOCK: genuinely held by someone else
+        # Any OTHER OSError (EINTR, locks unsupported on this fs) is a real failure, not contention —
+        # it propagates to the caller's "deferred" path rather than masquerading as a clean result.
         try:
             yield
         finally:
@@ -545,8 +588,9 @@ def cleanup_legacy(ctx) -> tuple[bool, str]:
             return _cleanup_locked(ctx, store)
     except _Busy:
         # Someone else is mid-migration (or an old app is mid-operation). Theirs will finish it;
-        # never block the launch waiting.
-        return False, "clean"
+        # never block the launch waiting. NOT "clean" — nothing here verified the config, and callers
+        # (notably uninstall --purge) must not read this as "safe to delete the recovery data".
+        return False, "another process is cleaning up legacy Headroom"
     except Exception as e:
         # Migration blew up. Report "deferred", never "clean": nothing was torn down, so a later
         # launch must retry — and callers must not be told the config is fine.

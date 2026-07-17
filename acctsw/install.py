@@ -358,8 +358,19 @@ def uninstall(ctx: Context, *, purge: bool = False, dry_run: bool = False,
     #    still routed at that point they stay pointed at a dead 127.0.0.1:8787 forever, with the
     #    original provider values gone and no acctsw left to repair them.
     from . import headroom as _hr
-    if _hr.legacy_present(ctx):
-        plan.do("clean up leftover 'save credit' routing", lambda: _hr.cleanup_legacy(ctx))
+    if _hr.legacy_present(ctx) and not dry_run:
+        _hr.cleanup_legacy(ctx)
+        plan.actions.append("cleaned up leftover 'save credit' routing")
+        if purge and _hr.legacy_present(ctx):
+            # Cleanup was busy, partial, or blocked (unreadable config, live proxy it couldn't
+            # verify). Purging now destroys the ONLY copy of the user's original provider settings
+            # while their config is still routed at a dead port — and removes the tool that would
+            # have retried. Refuse: a failed uninstall they can re-run beats an unrecoverable one.
+            raise RuntimeError(
+                "refusing to --purge: leftover 'save credit' routing is still present and the "
+                "snapshot is the only copy of your original codex/claude provider settings. "
+                "Re-run `acctsw uninstall --purge` (the cleanup retries), or uninstall without "
+                "--purge to keep the store.")
 
     # 1. don't lose the active seat's freshest creds.
     state = ctx.load_state()

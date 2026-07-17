@@ -143,6 +143,146 @@ def test_cleanup_merges_and_keeps_edits_made_since_enabling(ctx, tmp_path, monke
     assert hr.legacy_present(ctx) is False
 
 
+@pytest.mark.parametrize("snapshot", [
+    b'model_provider = "openai"',                          # no trailing newline: welded the next line
+    b'model_provider = "openai"\r\nmodel = "gpt-5"\r\n',   # CRLF
+    b'model_provider = "openai"\nopenai_base_url = "https://c/v1"\n',
+    b'model = "gpt-5"\n',                                  # no provider keys to take back
+    b'',                                                   # empty snapshot
+    b'[profiles.x]\nmodel_provider = "openai"\n',          # table-scoped: not a top-level key
+])
+def test_merge_always_writes_valid_toml_and_converges(ctx, tmp_path, monkeypatch, snapshot):
+    """The merge PREPENDS text to the user's live config, so it must never weld lines together,
+    duplicate a key, or produce something that re-detects as injected (which would re-run the whole
+    migration on every launch forever). Asserted with a real TOML parser, not by eyeballing."""
+    import base64, tomllib
+    codex = tmp_path / "codex"; codex.mkdir()
+    monkeypatch.setattr(P, "CODEX_HOME", codex)
+    monkeypatch.setattr(P, "CLAUDE_CONFIG_DIR", tmp_path / "claude")
+    cfg = codex / "config.toml"
+    bdir = hr._global_backup(ctx.data_dir); bdir.mkdir(parents=True)
+    (bdir / "manifest.json").write_text(json.dumps({"0": str(cfg)}))
+    (bdir / "0.json").write_text(json.dumps(
+        {"kind": "file", "path": str(cfg), "mode": 0o600,
+         "b64": base64.b64encode(snapshot).decode()}))
+    cfg.write_text('model_provider = "headroom"\nopenai_base_url = "http://127.0.0.1:8787/v1"\n\n'
+                   'model = "gpt-5.5"\n')
+    hr._unroute_codex(ctx.data_dir)
+    out = cfg.read_text()
+    tomllib.loads(out)                                     # must parse
+    assert 'model = "gpt-5.5"' in out                      # the user's edit survives
+    assert "headroom" not in out and "8787" not in out     # routing gone
+    assert hr._strip_codex_routing(out) == out             # converges: not re-detected as injected
+
+
+def test_merge_never_duplicates_a_key_the_live_file_still_has(ctx, tmp_path, monkeypatch):
+    """Two REAL ways an original key survives into the routed file, both of which made us prepend a
+    second copy → duplicate top-level key → invalid TOML:
+      (a) the retired writer's strip regex required a trailing newline, so a key at EOF was never
+          removed and the routed file the writer produced still contained it;
+      (b) the user edited the routed value themselves, which our exact-value strip leaves alone.
+    Uses the routed shape the old writer actually emitted, not a hand-simplified one."""
+    import base64, tomllib
+    codex = tmp_path / "codex"; codex.mkdir()
+    monkeypatch.setattr(P, "CODEX_HOME", codex)
+    monkeypatch.setattr(P, "CLAUDE_CONFIG_DIR", tmp_path / "claude")
+    cfg = codex / "config.toml"
+    bdir = hr._global_backup(ctx.data_dir); bdir.mkdir(parents=True)
+    (bdir / "manifest.json").write_text(json.dumps({"0": str(cfg)}))
+    (bdir / "0.json").write_text(json.dumps(
+        {"kind": "file", "path": str(cfg), "mode": 0o600,
+         "b64": base64.b64encode(b'model_provider = "openai"').decode()}))   # EOF, no newline
+    # What _route_codex actually wrote: its head, then the un-stripped original, then its table.
+    cfg.write_text('model_provider = "headroom"\nopenai_base_url = "http://127.0.0.1:8787/v1"\n\n'
+                   'model_provider = "openai"\n\n'
+                   '# --- acctsw headroom routing ---\n[model_providers.headroom]\n'
+                   'base_url = "http://127.0.0.1:8787/v1"\n# --- end acctsw headroom routing ---\n')
+    hr._unroute_codex(ctx.data_dir)
+    out = cfg.read_text()
+    parsed = tomllib.loads(out)                                  # must parse: no duplicate key
+    assert parsed["model_provider"] == "openai"
+    assert out.count("model_provider") == 1
+    assert "headroom" not in out
+
+
+def test_merge_does_not_overrule_a_value_the_user_changed(ctx, tmp_path, monkeypatch):
+    """The live document is the newer authority. If they set their own provider while routed, the
+    snapshot must not resurrect the old one over it."""
+    import base64, tomllib
+    codex = tmp_path / "codex"; codex.mkdir()
+    monkeypatch.setattr(P, "CODEX_HOME", codex)
+    monkeypatch.setattr(P, "CLAUDE_CONFIG_DIR", tmp_path / "claude")
+    cfg = codex / "config.toml"
+    bdir = hr._global_backup(ctx.data_dir); bdir.mkdir(parents=True)
+    (bdir / "manifest.json").write_text(json.dumps({"0": str(cfg)}))
+    (bdir / "0.json").write_text(json.dumps(
+        {"kind": "file", "path": str(cfg), "mode": 0o600,
+         "b64": base64.b64encode(b'model_provider = "openai"\n').decode()}))
+    cfg.write_text('model_provider = "azure"\nopenai_base_url = "http://127.0.0.1:8787/v1"\n')
+    hr._unroute_codex(ctx.data_dir)
+    out = cfg.read_text()
+    assert tomllib.loads(out)["model_provider"] == "azure"       # theirs wins
+    assert out.count("model_provider") == 1
+
+
+def test_claude_merge_keeps_a_value_the_user_changed_since(ctx, tmp_path, monkeypatch):
+    """Blanket pop-then-restore discards a value the user set themselves. Only undo a key that still
+    holds exactly what we injected."""
+    import base64
+    claude = tmp_path / "claude"; claude.mkdir()
+    monkeypatch.setattr(P, "CODEX_HOME", tmp_path / "codex")
+    monkeypatch.setattr(P, "CLAUDE_CONFIG_DIR", claude)
+    settings = claude / "settings.json"
+    bdir = hr._global_backup(ctx.data_dir); bdir.mkdir(parents=True)
+    (bdir / "manifest.json").write_text(json.dumps({"0": str(settings)}))
+    (bdir / "0.json").write_text(json.dumps(
+        {"kind": "file", "path": str(settings), "mode": 0o600,
+         "b64": base64.b64encode(json.dumps({"env": {"ENABLE_TOOL_SEARCH": "true"}}).encode()).decode()}))
+    settings.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787",
+                                            "ENABLE_TOOL_SEARCH": "false"}}))   # they turned it off
+    hr._unroute_claude_file(settings, ctx.data_dir)
+    env = json.loads(settings.read_text())["env"]
+    assert "ANTHROPIC_BASE_URL" not in env              # ours, still ours → removed
+    assert env["ENABLE_TOOL_SEARCH"] == "false"         # theirs since → preserved, not reset to true
+
+
+def test_busy_migration_is_not_reported_as_clean(ctx, tmp_path, monkeypatch):
+    """_Busy means nothing was verified. Reporting 'clean' would tell uninstall --purge it is safe to
+    delete the only copy of the user's original provider settings."""
+    monkeypatch.setattr(P, "CODEX_HOME", tmp_path / "codex")
+    monkeypatch.setattr(P, "CLAUDE_CONFIG_DIR", tmp_path / "claude")
+    hr.hr_venv_dir(ctx.data_dir).mkdir(parents=True)
+    with hr._oplocked(ctx.data_dir):
+        did, msg = hr.cleanup_legacy(ctx)
+    assert did is False and msg != "clean" and "another process" in msg
+
+
+def test_undecodable_config_is_left_alone_not_silently_rewritten(ctx, tmp_path, monkeypatch):
+    """read_text(errors='ignore') drops undecodable bytes; rewriting then persists the loss."""
+    codex = tmp_path / "codex"; codex.mkdir()
+    monkeypatch.setattr(P, "CODEX_HOME", codex)
+    monkeypatch.setattr(P, "CLAUDE_CONFIG_DIR", tmp_path / "claude")
+    cfg = codex / "config.toml"
+    raw = b'model_provider = "headroom"\n# \xff\xfe not utf-8\n'
+    cfg.write_bytes(raw)
+    assert hr._any_unknown() is True                    # unknown, not clean
+    hr._unroute_codex(ctx.data_dir)
+    assert cfg.read_bytes() == raw                      # untouched: bytes not silently dropped
+
+
+def test_purge_refuses_while_routing_remains(ctx, tmp_path, monkeypatch):
+    """Purge deletes the snapshot — the only copy of the user's original provider settings — and
+    removes the tool that would retry. Doing that while the config is still routed at a dead port is
+    unrecoverable, so it must abort instead."""
+    from acctsw import install as inst
+    monkeypatch.setattr(P, "CODEX_HOME", tmp_path / "codex")
+    monkeypatch.setattr(P, "CLAUDE_CONFIG_DIR", tmp_path / "claude")
+    monkeypatch.setattr(hr, "cleanup_legacy", lambda c: (True, "partial"))   # cleanup can't finish
+    monkeypatch.setattr(hr, "legacy_present", lambda c: True)
+    with pytest.raises(RuntimeError, match="refusing to --purge"):
+        inst.uninstall(ctx, purge=True)
+
+
 def test_cleanup_does_not_delete_a_config_recorded_absent(ctx, tmp_path, monkeypatch):
     """If config.toml did not exist when save-credit was enabled, the snapshot says kind='absent'.
     Replaying that DELETES the config the user has written since."""
