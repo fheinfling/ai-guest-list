@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   buildHTML, dotState, dotKey, doorKey, doorMark, creditLeft, pct, fmtCountdown, needsHello,
-  buildPicker, buildSaveSeat, buildPaste, buildSettings, buildAddSeat,
+  buildSettings, buildAddSeat,
 } from "./render.mjs";
 
 const mkAdd = (over = {}) => ({ step: "provider", provider: null, name: "", method: "browser", token: "", ...over });
@@ -134,14 +134,16 @@ test("buildHTML default light theme for unknown", () => {
   assert.match(buildHTML(state({ settings: { theme: "evil" } })), /class="app theme-light"/);
 });
 
-test("overlays wire their actions", () => {
-  assert.match(buildPicker({ tool: "codex", methods: [{ label: "ChatGPT sign-in", command: "codex login" }] }),
-    /data-action="login"[^>]*data-command="codex login"/);
-  assert.match(buildSaveSeat("claude"), /data-action="snapshot"[^>]*data-tool="claude"/);
-  assert.match(buildPaste("claude"), /sk-ant-oat/);
+test("settings wires its actions", () => {
   const set = buildSettings({ settings: { theme: "light", strategy: "soonest_back", notify: true } });
   assert.match(set, /data-action="set_strategy"[^>]*data-value="most_headroom"/);
   assert.match(set, /data-action="set_theme"[^>]*data-value="dark"/);
+});
+
+test("header ＋ opens the provider step (no hardcoded tool)", () => {
+  const html = buildHTML(state({}));
+  assert.match(html, /data-action="add" title="add a seat"/);              // header ＋ carries no tool
+  assert.doesNotMatch(html, /data-action="add" data-tool="[^"]*" title="add a seat"/);
 });
 
 test("settings is a pushed sub-view, not a modal (spec §9.1)", () => {

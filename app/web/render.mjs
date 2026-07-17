@@ -164,34 +164,6 @@ function controlBar(opts) {
   </label>`;
 }
 
-// --- overlays (add-a-seat, settings) ----------------------------------------------------------
-
-export function buildPicker(plan) {
-  const methods = (plan?.methods || []).map((m) =>
-    m.command
-      ? `<button class="pk-m" data-action="login" data-tool="${esc(plan.tool)}" data-command="${esc(m.command)}">${esc(m.label)}</button>`
-      : `<button class="pk-m" data-action="paste-open" data-tool="${esc(plan.tool)}">${esc(m.label)}</button>`
-  ).join("");
-  return `<div class="backdrop" data-action="picker-close"><div class="sheet">
-    <h3>${esc(plan?.title || "who's joining the list?")}</h3><p class="sub">how should i sign you in?</p>
-    ${methods}<button class="link" data-action="picker-close">cancel</button></div></div>`;
-}
-
-export function buildSaveSeat(tool) {
-  return `<div class="backdrop"><div class="sheet"><h3>signed in?</h3>
-    <p class="sub">i'll keep your ${esc(tool)} seat warm</p>
-    <button class="pk-m" data-action="snapshot" data-tool="${esc(tool)}">save my seat 💛</button>
-    <button class="link" data-action="picker-close">not yet</button></div></div>`;
-}
-
-export function buildPaste(tool) {
-  const hint = tool === "claude" ? "paste a setup-token (sk-ant-oat…)" : "paste auth.json";
-  return `<div class="backdrop"><div class="sheet"><h3>${hint}</h3><p class="sub">no browser dance</p>
-    <textarea id="paste-blob" class="paste mono" placeholder="${tool === "claude" ? "sk-ant-oat…" : "{ ... }"}"></textarea>
-    <button class="pk-m" data-action="paste-save" data-tool="${esc(tool)}">save my seat 💛</button>
-    <button class="link" data-action="picker-close">cancel</button></div></div>`;
-}
-
 // --- add-a-seat sub-view (spec §9) — a pushed screen like settings, NOT a modal ----------------
 // Four steps: provider → details → connecting → done. The provider accent (teal Codex / coral
 // Claude) rides a single `--accent` CSS var on the root, so step markup never branches on tool.
@@ -386,7 +358,7 @@ export function buildHTML(state) {
         <span class="substatus">${c.resting} resting · ${c.ready} ready</span></span>
       <span class="top-actions">
         <button class="ibtn" data-action="settings" title="settings">⋯</button>
-        <button class="ibtn" data-action="add" data-tool="codex" title="add a seat">＋</button>
+        <button class="ibtn" data-action="add" title="add a seat">＋</button>
       </span>
     </header>
     <div class="main-body">

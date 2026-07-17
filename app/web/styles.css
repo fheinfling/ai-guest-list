@@ -181,17 +181,8 @@ html, body { background:transparent; width:100%; overflow:hidden; }
 .link { background:none; border:none; color:var(--t2); cursor:pointer; font:inherit; }
 .link:hover { color:var(--t1); }
 
-/* overlays */
+/* overlay — now only the toast surface (add-seat is a pushed sub-view, no modal) */
 #overlay:empty { display:none; }
-.backdrop { position:fixed; inset:0; background:rgba(12,18,30,.45); display:flex; align-items:center;
-  justify-content:center; padding:18px; }
-.sheet { background:var(--popover); color:var(--t1); border:1px solid var(--line); border-radius:14px;
-  padding:16px; width:100%; max-width:300px; text-align:center; font-family:var(--sans); }
-.sheet h3 { font-size:14px; } .sheet .sub { color:var(--t2); font-size:11px; margin-bottom:12px; }
-.pk-m { display:block; width:100%; margin:6px 0; padding:10px; border:none; border-radius:9px;
-  background:var(--good); color:#04130d; font:inherit; font-weight:700; cursor:pointer; }
-.paste { width:100%; height:92px; margin-bottom:10px; border-radius:9px; border:1px solid var(--line);
-  background:var(--card); color:var(--t1); font-size:11px; padding:8px; }
 /* settings sub-view (spec §9.1) — pushed screen inside the popover, not a modal ------------------ */
 /* flex column + internal .set-body scroll come from .app; padding moves into head/body. The old
    max-height:620px exceeded the 600px popover and made the PAGE scroll — never cap past the
