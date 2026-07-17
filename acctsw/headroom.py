@@ -38,10 +38,14 @@ def _config_dir(tool: str) -> Path:
 
 
 def _touched(tool: str) -> list[Path]:
+    """The files our app-managed routing actually wrote — so detection (`_is_injected`) covers exactly
+    what cleanup (`_unroute_*`) strips, never a superset it can't fix. Codex routing went into
+    config.toml; Claude routing into settings.json AND settings.local.json (the latter overrides the
+    former, so a marker there would keep Claude pointed at the dead proxy)."""
     d = _config_dir(tool)
     if tool == "codex":
-        return [d / "config.toml", d / "AGENTS.md"]
-    return [d / "CLAUDE.md", d / "settings.json", d / "settings.local.json", d / ".mcp.json"]
+        return [d / "config.toml"]
+    return [d / "settings.json", d / "settings.local.json"]
 
 
 def _is_injected(tool: str) -> bool:
@@ -91,9 +95,8 @@ def _unroute_codex() -> None:
     atomic_write_text(path, stripped if stripped.strip() else "")
 
 
-def _unroute_claude() -> None:
+def _unroute_claude_file(path: Path) -> None:
     from .util import atomic_write_text
-    path = P.CLAUDE_CONFIG_DIR / "settings.json"
     if not path.exists():
         return
     try:
@@ -112,6 +115,11 @@ def _unroute_claude() -> None:
     else:
         payload.pop("env", None)
     atomic_write_text(path, json.dumps(payload, indent=2) + "\n")
+
+
+def _unroute_claude() -> None:
+    for path in _touched("claude"):     # settings.json + settings.local.json
+        _unroute_claude_file(path)
 
 
 def _unroute_all() -> None:
@@ -259,15 +267,20 @@ def cleanup_legacy(ctx) -> tuple[bool, str]:
     if not legacy_present(store):
         return False, "clean"
     # 1. undo routing: exact restore from snapshot beats a surgical strip (routing REPLACED user keys).
+    restore_ok = True
     if has_backup(store):
-        ok, failures = restore_global(store)
-        if not ok:
+        restore_ok, failures = restore_global(store)   # deletes the backup itself ONLY on full success
+        if not restore_ok:
             _log(store, "restore failed", "\n".join(failures))
     if _any_injected():
         _unroute_all()
-    # 2. stop any orphaned proxy, then delete the managed venv + all bookkeeping.
+    # 2. stop any orphaned proxy, then delete the managed venv + bookkeeping. KEEP the config backup
+    # when the restore failed — it's the only exact copy of the user's original provider settings (our
+    # routing overwrote them), so a later launch can retry the restore. (restore_global already removed
+    # it on success; this rmtree is the redundant success-path cleanup, skipped on failure.)
     stop_proxy(store)
-    shutil.rmtree(_global_backup(store), ignore_errors=True)
+    if restore_ok:
+        shutil.rmtree(_global_backup(store), ignore_errors=True)
     shutil.rmtree(hr_venv_dir(store), ignore_errors=True)
     for p in _leftover_files(store):
         try:
@@ -288,6 +301,12 @@ def cleanup_legacy(ctx) -> tuple[bool, str]:
                 s.save()
     except Exception:
         pass
+    # 4. Report honestly. If the config is still routed (restore failed, or a strip couldn't write),
+    # say so rather than claim a clean removal — legacy_present() stays true (backup kept / still
+    # injected) so the next launch / cx / cl retries.
+    if not restore_ok or _any_injected():
+        _log(store, "cleanup incomplete", f"restore_ok={restore_ok} injected={_any_injected()}")
+        return True, "partially cleaned up legacy Headroom (config restore incomplete — will retry)"
     return True, "removed legacy Headroom routing, proxy, and files"
 
 

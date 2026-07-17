@@ -81,6 +81,37 @@ def test_cleanup_restores_from_backup_when_present(ctx, tmp_path, monkeypatch):
     assert not bdir.exists()
 
 
+def test_cleanup_strips_claude_settings_local_json(ctx, tmp_path, monkeypatch):
+    """settings.local.json overrides settings.json, so routing there would keep Claude on the dead
+    proxy — detection scans it, and cleanup must strip it too (not just settings.json)."""
+    codex = tmp_path / "codex"; claude = tmp_path / "claude"
+    codex.mkdir(); claude.mkdir()
+    monkeypatch.setattr(P, "CODEX_HOME", codex)
+    monkeypatch.setattr(P, "CLAUDE_CONFIG_DIR", claude)
+    (claude / "settings.local.json").write_text(json.dumps(
+        {"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787", "KEEP": "1"}}))
+    assert hr.legacy_present(ctx) is True
+    did, _ = hr.cleanup_legacy(ctx)
+    assert did is True
+    env = json.loads((claude / "settings.local.json").read_text())["env"]
+    assert "ANTHROPIC_BASE_URL" not in env and env["KEEP"] == "1"
+    assert hr.legacy_present(ctx) is False        # not stuck true every launch
+
+
+def test_cleanup_keeps_backup_when_restore_fails(ctx, tmp_path, monkeypatch):
+    """A failed restore must NOT delete the snapshot — it's the only exact copy of the user's original
+    provider config (routing overwrote it). Keep it so a later launch can retry; report 'partial'."""
+    monkeypatch.setattr(P, "CODEX_HOME", tmp_path / "codex")
+    monkeypatch.setattr(P, "CLAUDE_CONFIG_DIR", tmp_path / "claude")
+    bdir = hr._global_backup(ctx.data_dir); bdir.mkdir(parents=True)
+    (bdir / "manifest.json").write_text(json.dumps({"0": str(tmp_path / "codex" / "config.toml")}))
+    monkeypatch.setattr(hr, "restore_global", lambda store=None: (False, ["boom"]))
+    did, msg = hr.cleanup_legacy(ctx)
+    assert did is True and "will retry" in msg
+    assert bdir.exists() and (bdir / "manifest.json").exists()   # backup RETAINED for a retry
+    assert hr.legacy_present(ctx) is True                        # so the next launch tries again
+
+
 def test_cleanup_removes_venv_and_leftovers_and_settings(ctx, tmp_path, monkeypatch):
     monkeypatch.setattr(P, "CODEX_HOME", tmp_path / "codex")
     monkeypatch.setattr(P, "CLAUDE_CONFIG_DIR", tmp_path / "claude")
