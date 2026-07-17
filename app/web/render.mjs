@@ -194,6 +194,52 @@ function addHasMethods(provider) { return provider === "codex"; }
 // Exported so app.mjs shares the single definition instead of re-deriving the predicate.
 export function addUsesPaste(add) { return add.method === "token" && add.provider === "codex"; }
 
+// PURE reducer for a bridge reply → next UI state + effects. All the async-correlation logic that
+// kept regressing (stale replies, poll ordering, save-in-flight, login-launch failure) lives here so
+// it can be unit-tested without a DOM. app.mjs owns the effects (render/flash/celebrate/timer).
+//   ui  = { screen, add, lastRev, state }   (add may be null; add is mutated in place and returned)
+//   res = the bridge result object
+// returns { screen, add, lastRev, state, render, flash, celebrate, closeFlow }
+//   closeFlow: the add object whose "done" screen should auto-close after a delay, or null.
+export function reduceReply(ui, res) {
+  let { screen, add, lastRev, state } = ui;
+  let render = false, flash = null, celebrate = false, closeFlow = null;
+
+  // Native "open settings" — but never interrupt an in-flight save (its reply would land off-screen).
+  if (res.settings_panel && !(add && add.pending)) screen = "settings";
+  // Drop a stale snapshot: a poll that read older state then arrived after a newer mutation would
+  // clobber the fresh view (the new seat would vanish). rev is monotonic across saves.
+  if (res.state && (res.state.rev ?? 0) >= lastRev) { state = res.state; lastRev = res.state.rev ?? 0; }
+
+  let addChanged = false;
+  const inAdd = screen === "add" && add;
+  if (res.added && inAdd && add.pending) {     // OUR paste/snapshot succeeded → celebrate then done
+    add.pending = false; add.step = "done";
+    addChanged = true; closeFlow = add;        // caller schedules the auto-close, scoped to this flow
+  }
+  if (res.error && res.add_op && inAdd) {       // OUR add op failed (not an unrelated poll error)
+    if (add.pending) {                          // a save was in flight
+      add.pending = false;
+      // codex paste → back to the form (auth.json preserved). Browser save (tapped before login
+      // finished) → stay on connecting so they can complete sign-in and tap "save my seat" again.
+      if (addUsesPaste(add)) add.step = "details";
+      addChanged = true;
+    } else if (add.step === "connecting") {     // the login LAUNCH failed (window never opened)
+      add.step = "details"; addChanged = true;  // back to the form to retry
+    }
+  }
+
+  if (screen === "add") render = addChanged;    // else swallow the poll, keep the DOM (and focus)
+  else if (res.state || res.settings_panel) render = true;
+
+  // Toast a user-action error, but not a background poll blip, nor an add-op error that resolved
+  // AFTER the user left the add flow (it would pop over main/settings out of nowhere).
+  if (res.error && !res.background && !(res.add_op && !(screen === "add" && add))) flash = res.error;
+  if (res.celebrate) celebrate = true;
+
+  return { screen, add, lastRev, state, render, flash, celebrate, closeFlow };
+}
+
 function addProviderStep() {
   const row = (tool) => `<button class="add-prov" data-action="add-provider" data-tool="${tool}"
       style="--accent:${TOOL_META[tool].accent}">

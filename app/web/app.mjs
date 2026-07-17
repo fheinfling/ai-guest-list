@@ -1,6 +1,6 @@
 // Live glue: render state into the DOM and forward user actions to the Python bridge.
 // All rendering logic lives in render.mjs (pure, unit-tested); this file is the thin wiring.
-import { buildHTML, buildSettings, buildAddSeat, addUsesPaste } from "./render.mjs";
+import { buildHTML, buildSettings, buildAddSeat, addUsesPaste, reduceReply } from "./render.mjs";
 
 const root = document.getElementById("root");
 const overlay = document.createElement("div");   // toast surface only (siblings of #root)
@@ -23,53 +23,20 @@ function send(action, payload = {}) {
 window.AGL = {
   result(res) {
     res = typeof res === "string" ? JSON.parse(res) : res;
-    // Native "open settings" entrypoint — but never interrupt an in-flight save (its reply would then
-    // land off-screen and be swallowed). (Currently reserved/unemitted; guarded for when it's wired.)
-    if (res.settings_panel && !(add && add.pending)) screen = "settings";
-    // Drop a stale snapshot: an in-flight usage poll that read older state, then arrived after a
-    // newer mutation (e.g. an add), would otherwise clobber the fresh view — the new seat would
-    // vanish until the next poll. rev is monotonic across saves.
-    if (res.state && (res.state.rev ?? 0) >= lastRev) { state = res.state; lastRev = res.state.rev ?? 0; }
-
-    // The add-seat sub-view holds transient, unsaved state (typed name/token) that render() would
-    // wipe. So while it's up, only re-render when the add flow itself advances — a pure state push
-    // (the 180s usage poll) updates `state` but must NOT touch the DOM, or it steals focus + caret.
-    // `add.pending` marks a paste/snapshot that ENDS this flow as in flight; results are applied only
-    // while it's set (and tagged add_op), so a stale reply from a flow the user left can't hijack the
-    // screen. (The login launch pushes nothing back — the connecting step is shown optimistically.)
-    let addChanged = false;
-    const inAdd = screen === "add" && add;
-    if (res.added && inAdd && add.pending) {   // OUR paste/snapshot succeeded → celebrate then done
-      add.pending = false; add.step = "done";
-      addChanged = true;
-      const doneFlow = add;                    // scope the auto-close to THIS flow object…
-      setTimeout(() => {
-        // …so a stale timer can't close a second add that reached "done" within the window.
-        if (screen === "add" && add === doneFlow && add.step === "done") { screen = "main"; add = null; render(); }
-      }, 1600);
-    }
-    if (res.error && res.add_op && inAdd) {      // OUR add op failed (not an unrelated poll error)
-      if (add.pending) {                         // a save was in flight
-        add.pending = false;
-        // codex paste: back to the form (auth.json preserved). Browser save (tapped before the login
-        // finished): stay on connecting so they can complete sign-in and tap "save my seat" again.
-        if (addUsesPaste(add)) add.step = "details";
-        addChanged = true;
-      } else if (add.step === "connecting") {    // the login LAUNCH failed (Terminal never opened)
-        add.step = "details";                    // back to the form to retry
-        addChanged = true;
+    // All the async-correlation logic lives in the pure reduceReply() (unit-tested); this just
+    // applies its decisions to the module state + DOM. The add sub-view holds unsaved typed input,
+    // so a pure state push (the 180s poll) updates `state` but the reducer returns render=false —
+    // no DOM swap, no focus/caret theft.
+    const out = reduceReply({ screen, add, lastRev, state }, res);
+    screen = out.screen; add = out.add; lastRev = out.lastRev; state = out.state;
+    if (out.render) render();
+    if (out.flash) flash(out.flash);
+    if (out.celebrate) celebrate();
+    if (out.closeFlow) setTimeout(() => {      // auto-close this flow's "done" screen; scoped by
+      if (screen === "add" && add === out.closeFlow && add.step === "done") {   // object identity so
+        screen = "main"; add = null; render();  // a stale timer can't close a later add.
       }
-    }
-
-    if (screen === "add") {
-      if (addChanged) render();                // else: swallow the poll, keep the DOM (and focus)
-    } else if (res.state || res.settings_panel) {
-      render();
-    }
-    // Toast a user-action error, but not: a background usage-poll blip, nor an add-op error that
-    // resolved AFTER the user left the add flow (it would pop over main/settings out of nowhere).
-    if (res.error && !res.background && !(res.add_op && !(screen === "add" && add))) flash(res.error);
-    if (res.celebrate) celebrate();
+    }, 1600);
   },
   // legacy single-arg state push (kept for the poll path / older callers)
   update(next) { this.result({ state: typeof next === "string" ? JSON.parse(next) : next }); },

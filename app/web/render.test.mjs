@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   buildHTML, dotState, dotKey, doorKey, doorMark, creditLeft, pct, fmtCountdown, needsHello,
-  buildSettings, buildAddSeat,
+  buildSettings, buildAddSeat, reduceReply,
 } from "./render.mjs";
 
 const mkAdd = (over = {}) => ({ step: "provider", provider: null, name: "", method: "browser", token: "", ...over });
@@ -265,4 +265,83 @@ test("buildHTML has no retired Headroom surface", () => {
   assert.doesNotMatch(html, /COMPRESSES CONTEXT|save-credit|headroom_install|fewer tokens/i);
   const set = buildSettings({ settings: { theme: "light", strategy: "soonest_back" } });
   assert.doesNotMatch(set, /set_savings_level|>headroom</);
+});
+
+// --- reduceReply: the async add-flow state machine (pure; these are the cases that kept regressing)
+const UI = (over = {}) => ({ screen: "main", add: null, lastRev: -1, state: {}, ...over });
+const stateRev = (rev) => ({ rev, settings: {}, tools: {}, counts: {} });
+
+test("reduceReply: a pure usage poll on main renders, no add involvement", () => {
+  const o = reduceReply(UI(), { ok: true, state: stateRev(1) });
+  assert.equal(o.screen, "main"); assert.equal(o.render, true); assert.equal(o.lastRev, 1);
+});
+
+test("reduceReply: a poll while on the add screen does NOT render (keeps typed input)", () => {
+  const add = mkAdd({ step: "details", provider: "codex", name: "Wo" });
+  const o = reduceReply(UI({ screen: "add", add }), { ok: true, state: stateRev(2) });
+  assert.equal(o.render, false);           // swallow — no DOM swap
+  assert.equal(o.state.rev, 2);            // but state IS updated silently
+  assert.equal(o.add.name, "Wo");          // typed input untouched
+});
+
+test("reduceReply: stale snapshot (lower rev) is ignored", () => {
+  const o = reduceReply(UI({ lastRev: 5, state: stateRev(5) }), { ok: true, state: stateRev(4) });
+  assert.equal(o.lastRev, 5); assert.equal(o.state.rev, 5);   // kept the newer state
+});
+
+test("reduceReply: our paste/snapshot success → done + schedules close", () => {
+  const add = mkAdd({ step: "connecting", provider: "codex", method: "token", pending: true });
+  const o = reduceReply(UI({ screen: "add", add }), { ok: true, added: "x@x.com", add_op: true });
+  assert.equal(o.add.step, "done"); assert.equal(o.add.pending, false);
+  assert.equal(o.render, true); assert.equal(o.closeFlow, o.add);   // caller auto-closes this flow
+});
+
+test("reduceReply: a stale success for a flow we already left is ignored (no pending)", () => {
+  const add = mkAdd({ step: "details", provider: "claude" });   // fresh flow, not pending
+  const o = reduceReply(UI({ screen: "add", add }), { ok: true, added: "stale@x.com", add_op: true });
+  assert.equal(o.add.step, "details"); assert.equal(o.render, false); assert.equal(o.closeFlow, null);
+});
+
+test("reduceReply: codex-paste error → back to details, toasts", () => {
+  const add = mkAdd({ step: "connecting", provider: "codex", method: "token", pending: true });
+  const o = reduceReply(UI({ screen: "add", add }), { ok: false, error: "bad auth.json", add_op: true });
+  assert.equal(o.add.step, "details"); assert.equal(o.add.pending, false);
+  assert.equal(o.render, true); assert.equal(o.flash, "bad auth.json");
+});
+
+test("reduceReply: browser-save error stays on connecting to retry", () => {
+  const add = mkAdd({ step: "connecting", provider: "codex", method: "browser", pending: true });
+  const o = reduceReply(UI({ screen: "add", add }), { ok: false, error: "no creds yet", add_op: true });
+  assert.equal(o.add.step, "connecting"); assert.equal(o.add.pending, false);   // save button re-enables
+});
+
+test("reduceReply: login-LAUNCH failure (not pending) → back to details", () => {
+  const add = mkAdd({ step: "connecting", provider: "claude", method: "browser" });   // awaiting user, no save
+  const o = reduceReply(UI({ screen: "add", add }), { ok: false, error: "couldn't open", add_op: true });
+  assert.equal(o.add.step, "details"); assert.equal(o.render, true); assert.equal(o.flash, "couldn't open");
+});
+
+test("reduceReply: an add-op error after the user left does NOT toast over main", () => {
+  const o = reduceReply(UI({ screen: "main", add: null }), { ok: false, error: "late fail", add_op: true });
+  assert.equal(o.flash, null);             // suppressed — user isn't in the add flow anymore
+});
+
+test("reduceReply: a background poll error never toasts", () => {
+  const o = reduceReply(UI(), { ok: false, error: "usage blip", background: true, state: stateRev(3) });
+  assert.equal(o.flash, null);
+});
+
+test("reduceReply: a normal user-action error DOES toast", () => {
+  const o = reduceReply(UI(), { ok: false, error: "switch failed" });
+  assert.equal(o.flash, "switch failed");
+});
+
+test("reduceReply: settings_panel opens settings, but not while a save is in flight", () => {
+  assert.equal(reduceReply(UI(), { settings_panel: true }).screen, "settings");
+  const add = mkAdd({ step: "connecting", provider: "codex", method: "token", pending: true });
+  assert.equal(reduceReply(UI({ screen: "add", add }), { settings_panel: true }).screen, "add");  // guarded
+});
+
+test("reduceReply: celebrate flag is passed through", () => {
+  assert.equal(reduceReply(UI(), { ok: true, celebrate: true, state: stateRev(1) }).celebrate, true);
 });
