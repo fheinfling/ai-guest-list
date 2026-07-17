@@ -213,8 +213,10 @@ if objc is not None:
                 # The sub-view sends {tool, method}; the engine resolves the Terminal command.
                 command = bridge.login_command(msg["tool"], msg.get("method", "browser"))
                 prepare_then_login(self.ctx, msg["tool"], command)
+                # The connecting step is already shown optimistically by the web add-cta handler; the
+                # notification is the only feedback needed. (No result pushed back — the flow waits
+                # for the user to finish in Terminal and tap "save my seat", which sends `snapshot`.)
                 self._notify("finish signing in", "then tap ‘save my seat’ 🎟️")
-                self._pushResult({"ok": True, "await_snapshot": True, "tool": msg["tool"]})
                 return
             if action in ("paste", "snapshot"):
                 # off the main thread (see addBg_) — both verify creds against the provider (Claude

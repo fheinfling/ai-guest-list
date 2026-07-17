@@ -424,27 +424,26 @@ function send(action, payload = {}) {
 window.AGL = {
   result(res) {
     res = typeof res === "string" ? JSON.parse(res) : res;
-    if (res.settings_panel) screen = "settings"; // native entrypoint into the settings sub-view
+    // Native "open settings" entrypoint — but never interrupt an in-flight save (its reply would then
+    // land off-screen and be swallowed). (Currently reserved/unemitted; guarded for when it's wired.)
+    if (res.settings_panel && !(add && add.pending)) screen = "settings";
     if (res.state) state = res.state;
 
     // The add-seat sub-view holds transient, unsaved state (typed name/token) that render() would
     // wipe. So while it's up, only re-render when the add flow itself advances — a pure state push
     // (the 180s usage poll) updates `state` but must NOT touch the DOM, or it steals focus + caret.
-    //
-    // Two correlation flags keep a late/stale reply from hijacking the screen:
-    //   add.awaiting — a browser login was launched; we expect an await_snapshot for it.
-    //   add.pending  — a paste/snapshot that ENDS this flow is in flight.
-    // Manual navigation (back/cancel) clears them, so a reply from a flow the user left is ignored.
+    // `add.pending` marks a paste/snapshot that ENDS this flow as in flight; results are applied only
+    // while it's set (and tagged add_op), so a stale reply from a flow the user left can't hijack the
+    // screen. (The login launch pushes nothing back — the connecting step is shown optimistically.)
     let addChanged = false;
     const inAdd = screen === "add" && add;
-    if (res.await_snapshot && inAdd && add.awaiting && add.provider === res.tool) {
-      add.awaiting = false;                    // login/setup-token confirmed up; already on connecting
-    }
     if (res.added && inAdd && add.pending) {   // OUR paste/snapshot succeeded → celebrate then done
       add.pending = false; add.step = "done";
       addChanged = true;
+      const doneFlow = add;                    // scope the auto-close to THIS flow object…
       setTimeout(() => {
-        if (screen === "add" && add && add.step === "done") { screen = "main"; add = null; render(); }
+        // …so a stale timer can't close a second add that reached "done" within the window.
+        if (screen === "add" && add === doneFlow && add.step === "done") { screen = "main"; add = null; render(); }
       }, 1600);
     }
     if (res.error && res.add_op && inAdd && add.pending) {   // OUR add op failed (not a poll error)
@@ -544,7 +543,7 @@ document.addEventListener("click", (e) => {
       } else {
         // launch the login/setup-token in Terminal and wait on the USER to finish + tap "save my
         // seat" — not a saving spinner yet (that's add.pending, set on save).
-        add.awaiting = true; add.step = "connecting"; render();
+        add.step = "connecting"; render();
         send("login", { tool: add.provider, method: add.method });
       }
       break;
@@ -570,8 +569,7 @@ function addBack() {
   // flight, back is a no-op; the reply advances to done. Backing out only makes sense before saving.
   if (add?.pending) return;
   if (add?.step === "details") add.step = "provider";
-  // leaving an un-saved login clears the await correlation so a late reply can't yank us back.
-  else if (add?.step === "connecting") { add.step = "details"; add.awaiting = false; }
+  else if (add?.step === "connecting") add.step = "details";   // abandon an un-saved login
   else { screen = "main"; add = null; }        // provider or done → leave the flow
   render();
 }
