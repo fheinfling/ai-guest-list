@@ -58,9 +58,9 @@ window.AGL = {
     } else if (res.state || res.settings_panel) {
       render();
     }
-    // Toast a user-action error, but never a background usage-poll blip (it would pop over whatever
-    // screen the user is on, unrelated to anything they did).
-    if (res.error && !res.background) flash(res.error);
+    // Toast a user-action error, but not: a background usage-poll blip, nor an add-op error that
+    // resolved AFTER the user left the add flow (it would pop over main/settings out of nowhere).
+    if (res.error && !res.background && !(res.add_op && !(screen === "add" && add))) flash(res.error);
     if (res.celebrate) celebrate();
   },
   // legacy single-arg state push (kept for the poll path / older callers)
@@ -162,11 +162,14 @@ document.addEventListener("click", (e) => {
   }
 });
 
-// Back navigation within the add-seat sub-view (also used by Esc). Manual navigation cancels the
-// pending-op correlation, so a late login/paste reply can't yank the user back to connecting.
+// Back navigation within the add-seat sub-view (also used by Esc).
 function addBack() {
+  // A dispatched save is committed (acct.add will run) and can't be un-sent — so while it's in
+  // flight, back is a no-op; the reply advances to done. Backing out only makes sense before saving.
+  if (add?.pending) return;
   if (add?.step === "details") add.step = "provider";
-  else if (add?.step === "connecting") { add.step = "details"; add.pending = false; add.awaiting = false; }
+  // leaving an un-saved login clears the await correlation so a late reply can't yank us back.
+  else if (add?.step === "connecting") { add.step = "details"; add.awaiting = false; }
   else { screen = "main"; add = null; }        // provider or done → leave the flow
   render();
 }
