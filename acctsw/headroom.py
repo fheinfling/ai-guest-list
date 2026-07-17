@@ -16,6 +16,8 @@ once there's nothing left to clean.
 from __future__ import annotations
 
 import base64
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -76,10 +78,12 @@ def _scan(tool: str) -> tuple[bool, bool]:
     for cfg in _touched(tool):
         p = _edit_target(cfg)
         try:
-            if not p.exists():
-                continue
             text = p.read_text(errors="ignore")         # matches _unroute_*: never raise on bad bytes
+        except FileNotFoundError:
+            continue                            # genuinely not there → nothing to clean
         except OSError:
+            # Permission/stat failure. NOT "clean": `Path.exists()` also answers False here, which is
+            # how an unreadable-but-routed file would sneak through as clean and get its proxy killed.
             unknown = True
             continue
         if tool == "codex":
@@ -90,7 +94,9 @@ def _scan(tool: str) -> tuple[bool, bool]:
                 if _claude_routed(json.loads(text or "{}")):
                     injected = True
             except ValueError:
-                continue                        # unparseable JSON → nothing we can safely strip
+                # Malformed JSON may still hold routing we simply can't parse yet — once the user
+                # fixes it, a torn-down proxy would leave them pointed at a dead port.
+                unknown = True
     return injected, unknown
 
 
@@ -158,7 +164,25 @@ def _strip_codex_routing(content: str) -> str:
     return out.lstrip("\n")
 
 
-def _unroute_codex() -> None:
+# The provider keys `_route_codex` OVERWROTE. It stripped whatever the user had here and wrote its
+# own, so their original values survive only in the snapshot — these are the only lines worth taking
+# back out of it.
+_CODEX_OWNED_KEYS = re.compile(r'(?m)^[ \t]*(?:model_provider|openai_base_url)[ \t]*=.*(?:\r?\n|\Z)')
+# Likewise for `_route_claude`, which assigned into env unconditionally.
+_CLAUDE_OWNED_ENV = ("ANTHROPIC_BASE_URL", "ENABLE_TOOL_SEARCH")
+
+
+def _original_codex_keys(store: Path | None) -> str:
+    """The user's own top-level provider lines as they were BEFORE routing, from the snapshot."""
+    text = _snapshot_text(store, P.CODEX_HOME / "config.toml")
+    if text is None:
+        return ""
+    hdr = _TOML_TABLE_HDR.search(text)
+    head = text[:hdr.start()] if hdr else text
+    return "".join(m.group(0) for m in _CODEX_OWNED_KEYS.finditer(head))
+
+
+def _unroute_codex(store: Path | None = None) -> None:
     from .util import atomic_write_text
     path = _edit_target(P.CODEX_HOME / "config.toml")
     if not path.exists():
@@ -170,7 +194,12 @@ def _unroute_codex() -> None:
     stripped = _strip_codex_routing(content)
     if stripped == content:
         return                                          # nothing of ours in here — don't touch the file
-    atomic_write_text(path, stripped if stripped.strip() else "")
+    # Three-way merge, NOT a whole-file restore: keep the CURRENT file (every edit the user has made
+    # since enabling), drop our routing, and take back from the snapshot only the provider keys our
+    # routing overwrote. Replaying the whole snapshot would revert months of unrelated edits — and
+    # delete the file outright if it was recorded "absent".
+    merged = _original_codex_keys(store) + stripped
+    atomic_write_text(path, merged if merged.strip() else "")
 
 
 def _claude_routed(payload) -> bool:
@@ -183,8 +212,24 @@ def _claude_routed(payload) -> bool:
     return isinstance(env, dict) and env.get("ANTHROPIC_BASE_URL") == _PROXY_URL
 
 
-def _unroute_claude_file(path: Path) -> None:
+def _original_claude_env(store: Path | None, path: Path) -> dict:
+    """The user's own values for the env keys routing overwrote, as they were BEFORE routing."""
+    text = _snapshot_text(store, path)
+    if text is None:
+        return {}
+    try:
+        payload = json.loads(text or "{}")
+    except ValueError:
+        return {}
+    env = payload.get("env") if isinstance(payload, dict) else None
+    if not isinstance(env, dict):
+        return {}
+    return {k: env[k] for k in _CLAUDE_OWNED_ENV if k in env}
+
+
+def _unroute_claude_file(path: Path, store: Path | None = None) -> None:
     from .util import atomic_write_text
+    orig_path = path
     path = _edit_target(path)
     if not path.exists():
         return
@@ -197,6 +242,9 @@ def _unroute_claude_file(path: Path) -> None:
     env = payload["env"]
     env.pop("ANTHROPIC_BASE_URL", None)
     env.pop("ENABLE_TOOL_SEARCH", None)
+    # Three-way merge: `_route_claude` assigned into env unconditionally, so any value the user had
+    # for these keys survives only in the snapshot. Everything else in the file is theirs and stays.
+    env.update(_original_claude_env(store, orig_path))
     if env:
         payload["env"] = env
     else:
@@ -204,14 +252,14 @@ def _unroute_claude_file(path: Path) -> None:
     atomic_write_text(path, json.dumps(payload, indent=2) + "\n")
 
 
-def _unroute_claude() -> None:
+def _unroute_claude(store: Path | None = None) -> None:
     for path in _touched("claude"):     # settings.json + settings.local.json
-        _unroute_claude_file(path)
+        _unroute_claude_file(path, store)
 
 
-def _unroute_all() -> None:
-    _unroute_codex()
-    _unroute_claude()
+def _unroute_all(store: Path | None = None) -> None:
+    _unroute_codex(store)
+    _unroute_claude(store)
 
 
 # --- the pre-routing config snapshot the old enable path saved -------------------------------------
@@ -221,7 +269,13 @@ def _global_backup(store: Path | None) -> Path:
 
 
 def has_backup(store: Path | None = None) -> bool:
-    return (_global_backup(store) / "manifest.json").exists()
+    """Is there a snapshot with anything usable in it? An EMPTY manifest is not a backup — treating
+    it as one keeps legacy_present() true forever and re-runs the migration on every launch."""
+    try:
+        manifest = json.loads((_global_backup(store) / "manifest.json").read_text())
+    except (OSError, ValueError):
+        return False
+    return bool(manifest) if isinstance(manifest, dict) else False
 
 
 _VALID_KINDS = ("file", "symlink", "absent")
@@ -236,116 +290,47 @@ _VALID_KINDS = ("file", "symlink", "absent")
 _ROUTING_OWNED_NAMES = frozenset({"config.toml", "settings.json"})
 
 
-def _restore_entry(bdir: Path, i: str, p: Path) -> None:
-    """Restore ONE snapshotted path, or raise leaving the target untouched.
+def _snapshot_text(store: Path | None, want: Path) -> str | None:
+    """The ORIGINAL text of ``want`` from the snapshot, or None if absent/unusable.
 
-    Every field is validated and every payload decoded BEFORE the target is touched. An entry we
-    can't fully understand must leave the user's config exactly as it is: deleting first and
-    discovering the entry is unusable afterwards destroys the only copy (the snapshot IS the backup).
+    Read-only by design. The snapshot is NOT replayed onto disk: it captured whole files at the
+    moment save-credit was first enabled, so writing one back reverts every unrelated edit the user
+    has made since — and an entry recorded "absent" would delete a file they created later. It is
+    consulted only for the handful of keys routing overwrote; the live file supplies everything else.
     """
-    from .util import atomic_write_bytes
-    if not re.fullmatch(r"\d+", str(i)):
-        # The id indexes a sibling file; a non-numeric one ("../../x") would read outside the backup.
-        raise ValueError(f"non-canonical entry id {i!r}")
-    entry = json.loads((bdir / f"{i}.json").read_text())
-    if not isinstance(entry, dict):
-        raise ValueError(f"entry is {type(entry).__name__}, expected an object")
-    kind = entry.get("kind")
-    if kind not in _VALID_KINDS:
-        raise ValueError(f"unknown kind {kind!r}")           # never fall through to a bare unlink
-    # The snapshot recorded the path in the entry as well as the manifest. Requiring them to agree
-    # stops a corrupted manifest from aiming a payload — or an "absent" DELETION — at another file.
-    ep = entry.get("path")
-    if isinstance(ep, str) and ep and ep != str(p):
-        raise ValueError(f"entry path {ep!r} disagrees with manifest {str(p)!r}")
-    data: bytes | None = None
-    mode = 0o600
-    target = ""
-    if kind == "file":
-        b64 = entry.get("b64")
-        if not isinstance(b64, str):
-            raise ValueError("file entry has no b64 payload")
-        # validate=True: the default silently DISCARDS non-alphabet chars, so a corrupt payload
-        # decodes to b"" and we'd cheerfully write an empty config over the user's real one.
-        data = base64.b64decode(b64, validate=True)
-        mode = entry.get("mode", 0o600)
-        # `type(...) is int` not isinstance: bool is an int subclass, and fchmod(True) → mode 0o1.
-        if type(mode) is not int or not 0 <= mode <= 0o7777:
-            raise ValueError(f"bad mode {mode!r}")
-    elif kind == "symlink":
-        target = entry.get("target")
-        if not isinstance(target, str) or not target:
-            raise ValueError("symlink entry has no target")
-    # --- validated; only now do we mutate ---
-    if kind == "file":
-        atomic_write_bytes(p, data, mode=mode)               # atomic replace; no unlink-first window
-        return
-    if kind == "symlink":
-        # Build the link beside the target and rename over it: unlinking first would leave the config
-        # path missing entirely if we died (or ENOSPC'd) before symlink_to landed.
-        tmp = p.parent / f".{p.name}.restore-tmp"
-        tmp.unlink(missing_ok=True)
-        tmp.symlink_to(target)
-        os.replace(tmp, p)
-        return
-    if p.is_symlink() or p.exists():                         # kind == "absent"
-        p.unlink()
-
-
-def restore_global(store: Path | None = None) -> tuple[bool, list[str]]:
-    """Restore every snapshotted path to its ORIGINAL state (bytes/mode/symlink/absent). Returns
-    (ok, failures); the backup is deleted only if every path restored cleanly."""
-    from .util import atomic_write_text
     bdir = _global_backup(store)
     mf = bdir / "manifest.json"
-    if not mf.exists():
-        return True, []
     try:
         manifest = json.loads(mf.read_text())
-    except (OSError, json.JSONDecodeError) as e:
-        return False, [f"manifest unreadable: {e}"]
+    except (OSError, ValueError):
+        return None
     if not isinstance(manifest, dict):
-        return False, [f"manifest malformed: expected an object, got {type(manifest).__name__}"]
-    failures: list[str] = []
-    done: list[str] = []
+        return None
     for i, path_s in manifest.items():
-        if not isinstance(path_s, str) or not path_s:
-            failures.append(f"entry {i}: bad path {path_s!r}")
+        if not isinstance(path_s, str) or Path(path_s) != want:
             continue
-        p = Path(path_s)
-        if p.name not in _ROUTING_OWNED_NAMES:
-            done.append(i)          # never routed → current state is correct; do not revert/delete
-            continue
-        # A corrupt entry (disk-full or a hard kill mid-snapshot) must degrade to a recorded failure,
-        # NOT an exception: this runs on the cx/cl path, where escaping would stop the user launching
-        # codex/claude at all. ValueError covers JSONDecodeError + base64's binascii.Error.
+        if not re.fullmatch(r"\d+", str(i)):
+            return None     # the id indexes a sibling file; "../../x" would read outside the backup
         try:
-            _restore_entry(bdir, i, p)
-        except (OSError, ValueError, KeyError, TypeError) as e:
-            failures.append(f"{p}: {e}")
-            continue
-        done.append(i)
-    if not failures:
-        shutil.rmtree(bdir, ignore_errors=True)
-        if mf.exists():
-            # rmtree is best-effort; if the manifest survived, the next launch would replay every
-            # entry over whatever the user edited since. Neutralise it durably instead.
-            try:
-                atomic_write_text(mf, json.dumps({}) + "\n")
-            except OSError as e:
-                return False, [f"backup not removable: {e}"]
-        return True, []
-    # Partial restore: drop what we already applied so a retry can only replay what actually FAILED.
-    # Replaying a succeeded entry would overwrite whatever the user edited in the meantime — every
-    # launch, forever, since the retained backup is re-read each time.
-    remaining = {i: path for i, path in manifest.items() if i not in done}
-    try:
-        atomic_write_text(mf, json.dumps(remaining, indent=2) + "\n")
-        for i in done:
-            (bdir / f"{i}.json").unlink(missing_ok=True)
-    except OSError as e:
-        failures.append(f"could not prune restored entries: {e}")
-    return False, failures
+            entry = json.loads((bdir / f"{i}.json").read_text())
+        except (OSError, ValueError):
+            return None
+        if not isinstance(entry, dict) or entry.get("kind") != "file":
+            return None                                 # absent/symlink → no original text to take
+        # The snapshot recorded the path in the entry too; require agreement so a corrupted manifest
+        # can't hand us another file's contents to merge into this one.
+        if entry.get("path") != path_s:
+            return None
+        b64 = entry.get("b64")
+        if not isinstance(b64, str):
+            return None
+        try:
+            # validate=True: the default silently DISCARDS non-alphabet chars, so a corrupt payload
+            # would decode to b"" and read as "the user had no provider keys".
+            return base64.b64decode(b64, validate=True).decode("utf-8", errors="ignore")
+        except ValueError:
+            return None
+    return None
 
 
 # --- stopping an orphaned proxy by its PID file ----------------------------------------------------
@@ -357,6 +342,10 @@ def _proxy_pidfile(store: Path | None) -> Path:
 def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
+    except ProcessLookupError:
+        return False                        # ESRCH — definitively gone
+    except PermissionError:
+        return True                         # EPERM — it EXISTS, just isn't ours to signal
     except OSError:
         return False
     return True
@@ -388,16 +377,31 @@ def _pid_is_proxy(pid: int) -> bool | None:
     # venv while it kept running. Find the `headroom` token wherever it sits, then require `proxy` as
     # a later argument, which still rejects bystanders like `tail -f headroom-proxy.log`.
     for idx, tok in enumerate(parts):
-        if "headroom" in Path(tok).name.lower():
+        # EXACT basename, not a substring: `headroom-worker`/`headroom-proxy.log` are not our binary,
+        # and a substring match would SIGKILL one holding a recycled PID.
+        if Path(tok).name.lower() in ("headroom", "headroom.py"):
             return any(a.lower() == "proxy" for a in parts[idx + 1:])
     return False
 
 
 def _proxy_pid(store: Path | None) -> int:
+    """The tracked PID: 0 if there is no PID file at all, -1 if one EXISTS but is unusable.
+
+    The distinction matters. The old writer wrote this file non-atomically, so a hard kill could
+    leave it empty or truncated while the proxy itself is alive. Collapsing that to "no proxy" makes
+    cleanup delete the venv out from under a live process and forget it forever; -1 keeps it tracked.
+    """
     try:
-        return int(_proxy_pidfile(store).read_text().strip())
-    except (OSError, ValueError):
+        raw = _proxy_pidfile(store).read_text()
+    except FileNotFoundError:
         return 0
+    except OSError:
+        return -1
+    try:
+        pid = int(raw.strip())
+    except ValueError:
+        return -1
+    return pid if pid > 0 else -1
 
 
 def _forget_proxy(store: Path | None) -> None:
@@ -422,7 +426,9 @@ def stop_proxy(store: Path | None = None, *, kill=None, sleep=None) -> bool:
     _kill = kill or os.kill
     _sleep = sleep or time.sleep
     pid = _proxy_pid(store)
-    if pid <= 0 or not _pid_alive(pid):
+    if pid == -1:
+        return False        # PID file exists but is unusable → a live proxy may be untrackable; keep
+    if pid == 0 or not _pid_alive(pid):
         _forget_proxy(store)
         return True                                     # nothing tracked, or already dead
     ident = _pid_is_proxy(pid)
@@ -453,14 +459,23 @@ def hr_venv_dir(store: Path | None = None) -> Path:
     return (store or P.DATA_DIR) / "hr-venv"
 
 
+def _oplock_file(store: Path | None) -> Path:
+    """The lock the OLD build took around its own enable/disable operations. The migration takes it
+    too, so an old menubar still running through an upgrade cannot re-inject routing in the gap
+    between our scan and our teardown — it would come back with the snapshot and proxy already gone.
+    Deliberately NOT swept: another process may be holding this inode."""
+    return (store or P.DATA_DIR) / ".headroom-oplock"
+
+
 def _leftover_files(store: Path | None) -> list[Path]:
     """Inert bookkeeping the old feature left behind. NB: the proxy PID file is deliberately NOT
     here — `stop_proxy` owns its lifecycle and keeps it when it cannot prove the PID is ours, so
-    sweeping it here would delete the only handle on a possibly-live proxy and make it untrackable."""
+    sweeping it here would delete the only handle on a possibly-live proxy and make it untrackable.
+    Nor is the oplock: deleting a lock file out from under a holder defeats the lock."""
     d = store or P.DATA_DIR
     return [
         d / "headroom-proxy.log", d / "headroom.log",
-        d / "rtk.sha256", d / "headroom-baseline-seeded", d / ".headroom-oplock",
+        d / "rtk.sha256", d / "headroom-baseline-seeded",
     ]
 
 
@@ -477,9 +492,37 @@ def legacy_present(ctx_or_store=None) -> bool:
     store = _data_dir(ctx_or_store)
     if has_backup(store) or _any_injected():
         return True
-    if _proxy_pid(store) > 0 or hr_venv_dir(store).exists():
-        return True
+    if _proxy_pid(store) != 0 or hr_venv_dir(store).exists():
+        return True          # != 0 covers -1: an existing-but-unusable PID file still needs reaping
     return any(p.exists() for p in _leftover_files(store))
+
+
+class _Busy(Exception):
+    """Another process holds the migration lock."""
+
+
+@contextlib.contextmanager
+def _oplocked(store: Path | None):
+    """NON-BLOCKING exclusive hold of the legacy operation lock.
+
+    Non-blocking on purpose: this sits on the `cx`/`cl` launch path, and the whole point of the app
+    being the master switch is that launching never stalls. If another process is already migrating,
+    we simply let it — the work is idempotent and its result is the same as ours would be.
+    """
+    d = store or P.DATA_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    f = open(_oplock_file(d), "a+")
+    try:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            raise _Busy() from e
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+    finally:
+        f.close()
 
 
 def cleanup_legacy(ctx) -> tuple[bool, str]:
@@ -488,41 +531,44 @@ def cleanup_legacy(ctx) -> tuple[bool, str]:
     deletes the managed venv + bookkeeping, and clears the old `headroom`/`savings_level` settings.
     ``ctx`` is duck-typed: ``data_dir``, ``locked()``, ``load_state()``. Returns (did_work, msg).
 
-    The whole migration runs under ctx.locked(): the menubar cleans up in the background at launch
-    while a concurrent `cx`/`cl` cleans up too, and unserialised they interleave — one process reads a
-    snapshot, is descheduled while the other finishes and launches the tool, then wakes and writes its
-    stale payload over the live config. Manifest pruning and backup deletion race the same way.
+    The migration serialises on the LEGACY oplock, not on ctx.locked(). Two reasons: the old build
+    took that same lock around its enable/disable, so an old menubar still running through an upgrade
+    can't re-inject routing in the gap between our scan and our teardown; and ctx.locked() is the
+    hot state lock that usage polls hold across network calls — blocking on it here would stall
+    `cx`/`cl` at launch for as long as a poll takes. We take ctx.locked() only for the state write.
     """
     store = _data_dir(ctx)
     if not legacy_present(store):
         return False, "clean"
     try:
-        with ctx.locked():
+        with _oplocked(store):
             return _cleanup_locked(ctx, store)
-    except Exception as e:                              # lock unavailable → a later launch retries
-        _log(store, "cleanup could not run", repr(e))
+    except _Busy:
+        # Someone else is mid-migration (or an old app is mid-operation). Theirs will finish it;
+        # never block the launch waiting.
         return False, "clean"
+    except Exception as e:
+        # Migration blew up. Report "deferred", never "clean": nothing was torn down, so a later
+        # launch must retry — and callers must not be told the config is fine.
+        _log(store, "cleanup could not run", repr(e))
+        return False, "deferred legacy Headroom cleanup (will retry on the next launch)"
 
 
 def _cleanup_locked(ctx, store: Path) -> tuple[bool, str]:
     if not legacy_present(store):
         return False, "clean"                           # another process won the race and finished
-    # 1. undo routing: exact restore from snapshot beats a surgical strip (routing REPLACED user keys).
-    restore_ok = True
-    if has_backup(store):
-        restore_ok, failures = restore_global(store)   # deletes the backup itself ONLY on full success
-        if not restore_ok:
-            _log(store, "restore failed", "\n".join(failures))
+    # 1. Undo routing by MERGING, not replaying: strip our keys from the live file and take back only
+    # the values routing overwrote from the snapshot. Everything else in the file is the user's.
     if _any_injected():
-        _unroute_all()
-    # 2. Tear down the proxy + venv ONLY once the configs are provably clean. Stopping the proxy
-    # while routing survives would point the tools at a dead port — strictly worse than leaving a
-    # live proxy up until the next launch can finish unrouting. "Provably" excludes `unknown`: a file
-    # that exists but can't be read is not clean, and treating it as clean strands it on a dead port.
-    # KEEP the config backup too: it's the only exact copy of the user's original provider settings
-    # (our routing overwrote them). legacy_present() stays true either way, so cleanup is retried.
+        _unroute_all(store)
+    # 2. Tear down the proxy + venv + snapshot ONLY once the configs are provably clean. Stopping the
+    # proxy while routing survives would point the tools at a dead port — strictly worse than leaving
+    # a live proxy up until the next launch can finish unrouting. "Provably" excludes `unknown`: a
+    # file that exists but can't be read is not clean, and treating it as clean strands it on a dead
+    # port. The snapshot holds the only copy of the provider values routing overwrote, so it outlives
+    # any incomplete run. legacy_present() stays true either way, so cleanup is retried.
     injected, unknown = (_any_injected(), _any_unknown())
-    routing_clean = restore_ok and not injected and not unknown
+    routing_clean = not injected and not unknown
     if routing_clean:
         # The venv is what a surviving proxy is RUNNING FROM — delete it only once the process is
         # confirmed gone, or we strand a live proxy with its executable pulled out from under it.
@@ -535,18 +581,20 @@ def _cleanup_locked(ctx, store: Path) -> tuple[bool, str]:
                     p.unlink()
                 except OSError:
                     pass
-    # 3. clear the old settings so the (removed) toggle can't linger as truthy metadata. NB: no
-    # ctx.locked() here — we already hold it, and flock'ing the same file again would self-deadlock.
+    # 3. clear the old settings so the (removed) toggle can't linger as truthy metadata. This is the
+    # ONLY part that needs the state lock, and it's a quick read-modify-write — exactly what
+    # ctx.locked() is for. (We hold the oplock, not the state lock, so there's no self-deadlock.)
     try:
-        s = ctx.load_state()
-        changed = False
-        for k in ("headroom", "savings_level", "headroom_event"):
-            if k in s.settings():
-                s.settings().pop(k, None); changed = True
-            if k in s.data:
-                s.data.pop(k, None); changed = True
-        if changed:
-            s.save()
+        with ctx.locked():
+            s = ctx.load_state()
+            changed = False
+            for k in ("headroom", "savings_level", "headroom_event"):
+                if k in s.settings():
+                    s.settings().pop(k, None); changed = True
+                if k in s.data:
+                    s.data.pop(k, None); changed = True
+            if changed:
+                s.save()
     except Exception:
         pass
     # 4. Report honestly. If anything is still routed/unreadable (restore failed, or a strip couldn't
@@ -554,8 +602,7 @@ def _cleanup_locked(ctx, store: Path) -> tuple[bool, str]:
     # still injected) so the next launch / cx / cl retries.
     if not legacy_present(store):
         return True, "removed legacy Headroom routing, proxy, and files"
-    _log(store, "cleanup incomplete",
-         f"restore_ok={restore_ok} injected={injected} unknown={unknown}")
+    _log(store, "cleanup incomplete", f"injected={injected} unknown={unknown}")
     return True, "partially cleaned up legacy Headroom (will retry on the next launch)"
 
 

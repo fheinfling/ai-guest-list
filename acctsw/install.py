@@ -352,6 +352,15 @@ def uninstall(ctx: Context, *, purge: bool = False, dry_run: bool = False,
     plan = Plan(dry_run=dry_run)
     bin_dir = bin_dir or BIN_DIR
 
+    # 0. undo any leftover "save credit" routing FIRST. An upgraded user can run `uninstall --purge`
+    #    without ever launching the new app or `cx`/`cl`, so this may be the only chance the migration
+    #    ever gets: purge deletes the store — snapshot, PID file and venv — and if the configs are
+    #    still routed at that point they stay pointed at a dead 127.0.0.1:8787 forever, with the
+    #    original provider values gone and no acctsw left to repair them.
+    from . import headroom as _hr
+    if _hr.legacy_present(ctx):
+        plan.do("clean up leftover 'save credit' routing", lambda: _hr.cleanup_legacy(ctx))
+
     # 1. don't lose the active seat's freshest creds.
     state = ctx.load_state()
     for tool in TOOLS:
