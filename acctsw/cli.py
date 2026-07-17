@@ -172,9 +172,10 @@ def _cmd_run(ctx: Context, ns) -> int:
     try:
         from . import headroom as hr
         if hr.legacy_present(ctx):
-            cleaned, _ = hr.cleanup_legacy(ctx)
+            cleaned, msg = hr.cleanup_legacy(ctx)
             if cleaned:
-                notify("cleaned up leftover 'save credit' routing")
+                notify(msg)     # the message distinguishes a full removal from a partial one — the
+                                # tool may still be pointing at a dead proxy, so don't claim success
     except Exception:
         pass
     # The app is the master switch for supervision: when it's CLOSED, behave like the stock tool

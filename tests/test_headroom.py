@@ -222,6 +222,30 @@ def test_pid_identity_accepts_the_real_proxy(monkeypatch):
     assert hr._pid_is_proxy(4242) is True
 
 
+def test_pid_identity_accepts_a_console_script_run_via_its_shebang(monkeypatch):
+    """The REAL shape. The proxy was a pip console script, so the kernel execs the interpreter and ps
+    reports `<python> .../hr-venv/bin/headroom proxy ...` — argv[0] is Python, NOT headroom. Matching
+    on argv[0] alone calls the real proxy foreign, drops its pidfile and deletes its venv while it
+    keeps running. Verified against actual `ps` output for a shebang script."""
+    class _R:
+        stdout = ("/opt/homebrew/Cellar/python@3.13/.../Resources/Python.app/Contents/MacOS/Python "
+                  "/Users/x/.account-switcher/hr-venv/bin/headroom proxy --host 127.0.0.1 --port 8787")
+    monkeypatch.setattr(hr.subprocess, "run", lambda *a, **k: _R())
+    assert hr._pid_is_proxy(4242) is True
+
+
+def test_pid_identity_rejects_a_bystander_naming_our_log_anywhere_in_argv(monkeypatch):
+    """The looser 'headroom token anywhere' match must still reject a process that merely NAMES our
+    files — `proxy` has to be an argument after the headroom binary, not just present somewhere."""
+    for cmd in ("tail -f /Users/x/.account-switcher/headroom-proxy.log",
+                "grep proxy /Users/x/.account-switcher/headroom.log",
+                "vim headroom-proxy.log"):
+        class _R:
+            stdout = cmd
+        monkeypatch.setattr(hr.subprocess, "run", lambda *a, **k: _R())
+        assert hr._pid_is_proxy(4242) is False, cmd
+
+
 def test_pid_identity_unknown_when_ps_unavailable(monkeypatch):
     """None (not False) so stop_proxy can tell 'not ours' from 'couldn't tell' and keep the pidfile."""
     def _boom(*a, **k):
@@ -267,6 +291,101 @@ def test_cleanup_keeps_proxy_and_venv_while_routing_remains(ctx, tmp_path, monke
     did, msg = hr.cleanup_legacy(ctx)
     assert did is True and "will retry" in msg
     assert stopped == [] and venv.exists()             # both retained for the retry
+
+
+def test_unreadable_config_is_not_treated_as_clean(ctx, tmp_path, monkeypatch):
+    """A file that EXISTS but can't be inspected is not 'clean'. Treating it as clean lets cleanup
+    stop the proxy and delete the venv while the file is still routed to a now-dead port."""
+    codex = tmp_path / "codex"; codex.mkdir()
+    monkeypatch.setattr(P, "CODEX_HOME", codex)
+    monkeypatch.setattr(P, "CLAUDE_CONFIG_DIR", tmp_path / "claude")
+    cfg = codex / "config.toml"
+    cfg.write_text('model_provider = "headroom"\n')
+    cfg.chmod(0o000)                                   # exists, unreadable
+    try:
+        assert hr._any_unknown() is True
+        venv = hr.hr_venv_dir(ctx.data_dir); venv.mkdir(parents=True)
+        did, msg = hr.cleanup_legacy(ctx)
+        assert did is True and "will retry" in msg
+        assert venv.exists()                           # teardown withheld until we can actually look
+    finally:
+        cfg.chmod(0o600)
+
+
+def test_venv_survives_when_the_proxy_cannot_be_confirmed_stopped(ctx, tmp_path, monkeypatch):
+    """The venv is what a surviving proxy is RUNNING FROM. Deleting it while the process is alive
+    strands a live proxy with its executable pulled out from under it."""
+    monkeypatch.setattr(P, "CODEX_HOME", tmp_path / "codex")
+    monkeypatch.setattr(P, "CLAUDE_CONFIG_DIR", tmp_path / "claude")
+    venv = hr.hr_venv_dir(ctx.data_dir); venv.mkdir(parents=True)
+    hr._proxy_pidfile(ctx.data_dir).write_text(str(os.getpid()))
+    monkeypatch.setattr(hr, "_pid_is_proxy", lambda pid: None)      # can't verify
+    did, msg = hr.cleanup_legacy(ctx)
+    assert did is True and "will retry" in msg
+    assert venv.exists() and hr._proxy_pidfile(ctx.data_dir).exists()
+
+
+def test_stop_proxy_reports_confirmed_gone_for_a_dead_pid(ctx):
+    hr._proxy_pidfile(ctx.data_dir).write_text("999999")            # not a live pid
+    assert hr.stop_proxy(ctx.data_dir) is True
+    assert not hr._proxy_pidfile(ctx.data_dir).exists()
+
+
+def test_restore_rejects_an_entry_path_disagreeing_with_the_manifest(ctx, tmp_path):
+    """The snapshot recorded the path in the entry too. Requiring them to agree stops a corrupted
+    manifest aiming a payload — or an 'absent' DELETION — at a different file with the same name."""
+    import base64
+    bdir = hr._global_backup(ctx.data_dir); bdir.mkdir(parents=True)
+    target = tmp_path / "config.toml"; target.write_text("real\n")
+    (bdir / "manifest.json").write_text(json.dumps({"0": str(target)}))
+    (bdir / "0.json").write_text(json.dumps(
+        {"kind": "file", "b64": base64.b64encode(b"x\n").decode(), "mode": 0o600,
+         "path": "/somewhere/else/config.toml"}))
+    ok, failures = hr.restore_global(ctx.data_dir)
+    assert ok is False and "disagrees" in failures[0]
+    assert target.read_text() == "real\n"
+
+
+def test_restore_rejects_a_bool_mode(ctx, tmp_path):
+    """bool is an int subclass, so isinstance(mode, int) passes for True → fchmod(1)."""
+    import base64
+    bdir = hr._global_backup(ctx.data_dir); bdir.mkdir(parents=True)
+    target = tmp_path / "config.toml"; target.write_text("real\n")
+    (bdir / "manifest.json").write_text(json.dumps({"0": str(target)}))
+    (bdir / "0.json").write_text(json.dumps(
+        {"kind": "file", "b64": base64.b64encode(b"x\n").decode(), "mode": True}))
+    ok, failures = hr.restore_global(ctx.data_dir)
+    assert ok is False and "bad mode" in failures[0]
+    assert target.read_text() == "real\n"
+
+
+def test_restore_symlink_is_atomic(ctx, tmp_path):
+    """Unlink-then-symlink leaves the config path ABSENT if we die in between."""
+    bdir = hr._global_backup(ctx.data_dir); bdir.mkdir(parents=True)
+    link = tmp_path / "config.toml"; dest = tmp_path / "real.toml"
+    dest.write_text("dest\n"); link.write_text("a regular file right now\n")
+    (bdir / "manifest.json").write_text(json.dumps({"0": str(link)}))
+    (bdir / "0.json").write_text(json.dumps({"kind": "symlink", "target": str(dest)}))
+    ok, failures = hr.restore_global(ctx.data_dir)
+    assert ok is True and failures == []
+    assert link.is_symlink() and link.resolve() == dest.resolve()
+
+
+def test_full_restore_neutralises_a_manifest_that_survives_rmtree(ctx, tmp_path, monkeypatch):
+    """rmtree is best-effort. If the manifest survives, the next launch replays every entry over
+    whatever the user edited since."""
+    import base64
+    bdir = hr._global_backup(ctx.data_dir); bdir.mkdir(parents=True)
+    target = tmp_path / "config.toml"
+    (bdir / "manifest.json").write_text(json.dumps({"0": str(target)}))
+    (bdir / "0.json").write_text(json.dumps(
+        {"kind": "file", "b64": base64.b64encode(b"restored\n").decode(), "mode": 0o600}))
+    monkeypatch.setattr(hr.shutil, "rmtree", lambda *a, **k: None)   # simulate rmtree failing
+    ok, _ = hr.restore_global(ctx.data_dir)
+    assert ok is True and target.read_text() == "restored\n"
+    target.write_text("later user edit\n")
+    hr.restore_global(ctx.data_dir)                    # a subsequent launch must not replay
+    assert target.read_text() == "later user edit\n"
 
 
 def test_restore_global_rejects_a_non_object_manifest(ctx):
