@@ -7,6 +7,7 @@ const overlay = document.createElement("div");   // toast surface only (siblings
 overlay.id = "overlay";
 document.body.appendChild(overlay);
 let state = { settings: { theme: "dark" }, tools: {} };
+let lastRev = -1;   // highest state.rev applied; a lower one is a stale snapshot and is ignored
 
 // --- bridge -----------------------------------------------------------------------------------
 function send(action, payload = {}) {
@@ -25,7 +26,10 @@ window.AGL = {
     // Native "open settings" entrypoint — but never interrupt an in-flight save (its reply would then
     // land off-screen and be swallowed). (Currently reserved/unemitted; guarded for when it's wired.)
     if (res.settings_panel && !(add && add.pending)) screen = "settings";
-    if (res.state) state = res.state;
+    // Drop a stale snapshot: an in-flight usage poll that read older state, then arrived after a
+    // newer mutation (e.g. an add), would otherwise clobber the fresh view — the new seat would
+    // vanish until the next poll. rev is monotonic across saves.
+    if (res.state && (res.state.rev ?? 0) >= lastRev) { state = res.state; lastRev = res.state.rev ?? 0; }
 
     // The add-seat sub-view holds transient, unsaved state (typed name/token) that render() would
     // wipe. So while it's up, only re-render when the add flow itself advances — a pure state push
