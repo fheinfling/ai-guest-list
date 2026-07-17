@@ -154,22 +154,28 @@ if objc is not None:
             self.performSelectorOnMainThread_withObject_waitUntilDone_(
                 objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
 
-        def pasteBg_(self, msg):
-            # `paste` verifies creds against the provider (Claude shells out / hits the network), so
-            # run it off the main thread — a synchronous handle() would beachball the app behind the
-            # add-seat "saving your seat…" spinner. ctx.locked() already serialises against the poll.
-            result = bridge.handle(self.ctx, dict(msg))
-            result["_action"] = "paste"
+        def addBg_(self, msg):
+            # `paste`/`snapshot` verify creds against the provider (Claude shells out / hits the
+            # network), so run them off the main thread — a synchronous handle() would beachball the
+            # app behind the add-seat "saving your seat…" spinner. ctx.locked() serialises the poll.
+            # Guard: an unexpected raise here would otherwise leave the user stuck on the spinner with
+            # nothing pushed back — turn it into a friendly error the connecting step can act on.
+            try:
+                result = dict(bridge.handle(self.ctx, dict(msg)))
+            except Exception:
+                result = {"ok": False, "error": "something went wrong saving that seat"}
+            result["_notify_added"] = True   # let applyResult_ fire the "seat saved" nudge
             self.performSelectorOnMainThread_withObject_waitUntilDone_(
                 objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
 
         def applyResult_(self, result):
+            # A backgrounded add still deserves the "seat added" nudge the main path fires — decide it
+            # here, and strip the marker BEFORE pushing so the internal key never reaches the webview.
+            notify_added = result.pop("_notify_added", False)
             self._pushResult(result)
             self._updateDot(result.get("state"))
             self._notifyAccountWarnings(result)
-            # A backgrounded add (paste/snapshot) still deserves the "seat added" nudge the main-thread
-            # path fires. Keyed on `added` so it says the right thing whether it was a paste or a login.
-            if result.pop("_action", None) == "paste" and result.get("added") and result.get("ok") \
+            if notify_added and result.get("added") and result.get("ok") \
                     and self.ctx.load_state().settings().get("notify", True):
                 self._notify("seat saved ✨", "your seat's on the floor")
 
@@ -208,10 +214,11 @@ if objc is not None:
                 self._notify("finish signing in", "then tap ‘save my seat’ 🎟️")
                 self._pushResult({"ok": True, "await_snapshot": True, "tool": msg["tool"]})
                 return
-            if action == "paste":
-                # off the main thread (see pasteBg_) — Claude verification can touch the network.
+            if action in ("paste", "snapshot"):
+                # off the main thread (see addBg_) — both verify creds against the provider (Claude
+                # shells out to `claude auth status` / hits the network) behind the connecting spinner.
                 self.performSelectorInBackground_withObject_(
-                    objc.selector(self.pasteBg_, signature=b"v@:@"), msg)
+                    objc.selector(self.addBg_, signature=b"v@:@"), msg)
                 return
 
             result = bridge.handle(self.ctx, msg)
@@ -220,7 +227,7 @@ if objc is not None:
                 return
             self._pushResult(result)
             self._updateDot(result.get("state"))
-            if action in ("switch", "snapshot", "paste") and result.get("ok") \
+            if action == "switch" and result.get("ok") \
                     and self.ctx.load_state().settings().get("notify", True):
                 self._notify("just switched you ✨", "your seat's on the floor")
 
