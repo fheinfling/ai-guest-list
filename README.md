@@ -7,8 +7,7 @@
 <p align="center">
   <b>Never stop coding because an AI agent hit its usage limit.</b><br>
   A lean macOS menubar app + CLI that <b>auto-switches between your Codex &amp; Claude accounts</b> when one
-  runs out — resuming your work on the next seat — and optionally <b>stretches each account further</b>
-  with context compression.
+  runs out — resuming your work on the next seat.
 </p>
 
 <p align="center">
@@ -40,18 +39,15 @@ leave the **macOS Keychain** and the locations the official tools already read �
 anywhere.
 
 <p align="center">
-  <img src="docs/assets/screenshot.png" width="340" alt="The ai guest list popover: Codex and Claude seats with live 5-hour usage bars, an active 'on the floor' seat and a resting one, auto-switch and Headroom save-credit toggles." />
+  <img src="docs/assets/screenshot.png" width="340" alt="The ai guest list popover: Codex and Claude seats with live 5-hour usage bars, an active 'on the floor' seat and a resting one, and the auto-switch toggle." />
   &nbsp;
-  <img src="docs/assets/screenshot-settings.png" width="340" alt="The settings view: auto-switch strategy and toggles, Headroom savings level, theme, and the menubar icon legend." />
-  <br><sub><i>The menubar popover and its settings view — seats, live usage, auto-switch + save-credit (sample accounts).</i></sub>
+  <img src="docs/assets/screenshot-settings.png" width="340" alt="The settings view: auto-switch strategy and toggles, theme, and the menubar icon legend." />
+  <br><sub><i>The menubar popover and its settings view — seats, live usage, auto-switch (sample accounts).</i></sub>
 </p>
 
 ## Why
 
 - **Stay on the floor.** Hit a limit → hop seats → resume — no manual re-login, no lost context.
-- **Reach limits slower (save credit).** An optional toggle routes agents through
-  [Headroom](https://pypi.org/project/headroom-ai/) to compress what the model reads → fewer tokens →
-  the limit arrives later. The proxy is local-only; toggle it off any time.
 - **Pick the smartest seat.** All seats resting? It chooses the one that unlocks soonest (or the one
   with the most headroom, your call).
 - **Non-destructive & reversible.** A factory-image backup makes uninstall a clean restore.
@@ -66,8 +62,6 @@ anywhere.
   the app is closed they behave exactly like stock.
 - **Add / remove seats** — official sign-in flow _or_ a no-browser path (Codex `auth.json`, Claude
   `setup-token`). Credentials live only in the Keychain.
-- **Save credit (Headroom)** — optional context-compression proxy with full lifecycle handling
-  (sleep/wake recovery, orphan cleanup) and an identity-checked local port.
 - **Version & build** shown at the bottom of the settings view.
 
 ## Install
@@ -128,9 +122,12 @@ Build the app locally with `pip install -e ".[build]" && python setup.py py2app`
 ## Safety & security
 
 Credentials are only ever moved between the Keychain and the locations the official tools already read
-— nothing is proxied off-device or committed to git. Writes are atomic and `0o600`; the Headroom proxy
-binds loopback only and is identity-checked before any traffic is routed through it. See
-[`docs/SECURITY-headroom.md`](docs/SECURITY-headroom.md) for the save-credit threat model.
+— nothing is proxied off-device or committed to git. Writes are atomic and `0o600`.
+
+> **Note.** Earlier versions had an optional "save credit" context-compression proxy (Headroom).
+> Measuring it on real workloads showed the savings were negligible (~1–3% cache-adjusted) and not
+> worth the proxy's fragility, so it was **removed**. The app cleans up any leftover routing on the
+> next launch or `cx`/`cl` run. See [`docs/SECURITY-headroom.md`](docs/SECURITY-headroom.md).
 
 ## License
 

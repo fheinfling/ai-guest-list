@@ -1,221 +1,43 @@
-"""Headroom integration — the "save credit" toggle.
+"""Legacy Headroom cleanup — a one-time, idempotent migration.
 
-When enabled, the supervised launcher routes the agent through Headroom
-(https://pypi.org/project/headroom-ai/), which compresses what the agent reads → fewer
-tokens → usage limits are hit more slowly. Headroom is a pure data-path wrapper: it never touches
-credentials or the keychain.
+Earlier versions offered a "save credit" toggle that routed plain `codex`/`claude` (and the GUI)
+through a local Headroom compression proxy. Measuring it on real workloads (see
+`docs/SECURITY-headroom.md` and the retire-Headroom plan) showed the compression was ~1-3%
+cache-adjusted on Claude and a rare truncation guardrail on Codex — not worth a wire-path ML proxy
+that kept turning itself off. The feature was removed.
 
-It's installed into THIS app's venv by `acctsw install` (so it "just works" — no separate install),
-and we locate it next to the running interpreter even when the venv's bin isn't on PATH.
-
-Mechanism: we DELIBERATELY do NOT use `headroom install apply`. Its macOS launchd deployment
-(`persistent-service`) is broken — silent startup failures (no log paths in the plist), a runner
-command resolved via `shutil.which` that isn't reachable in launchd's bare environment, and a
-destructive first-apply rollback that erases the deploy dir. Instead we run the proxy OURSELVES
-as a detached, PID-tracked subprocess (start_proxy) — the same launchd-free
-path `headroom init` uses (supervisor_kind=NONE) — and hand-write the minimal provider routing into the
-tools' own config files (_route_all), which we snapshot/detect/restore exactly as before.
+This module remains ONLY to clean up after it on machines that used it. `cleanup_legacy` strips any
+leftover provider routing from `~/.codex/config.toml` and `~/.claude/settings.json` (restoring the
+user's exact pre-routing config from the snapshot when present, else a surgical unroute), stops an
+orphaned proxy by its PID file, and deletes the managed venv + bookkeeping. It is safe to call on
+every app launch / `cx` / `cl` run; `legacy_present` is the cheap gate that keeps it off the hot path
+once there's nothing left to clean.
 """
 from __future__ import annotations
 
 import base64
-import contextlib
 import json
 import os
-import re
 import shutil
 import stat
 import subprocess
-import sys
 from pathlib import Path
 
 from . import paths as P
 
-PINNED_VERSION = "0.29.0"                       # pin: reviewed build (see docs/SECURITY-headroom.md)
-PACKAGE = f"headroom-ai[proxy]=={PINNED_VERSION}"
-
-# Hardening env applied to every wrapped session: telemetry off, no third-party tracing/analytics,
-# stay local-only. (All of headroom's cloud features are already opt-in via unset keys; this is
-# belt-and-suspenders so nothing can phone home even if a default ever changes.)
-HARDENING_ENV = {
-    "HEADROOM_TELEMETRY": "off",     # anonymous usage telemetry (already off by default)
-    "LITELLM_TELEMETRY": "False",    # disable litellm's own telemetry
-    "DO_NOT_TRACK": "1",             # honored by litellm + others
-}
-
-
-# The output shaper produces the token-savings number; it's env-gated and read live by the proxy.
-# Since WE start the proxy (start_proxy), we put this straight into the child's environment — no
-# env-less launchd plist to work around anymore.
-SHAPER_ENV = {"HEADROOM_OUTPUT_SHAPER": "1"}
-
-# User-selectable input-side compression profiles (the "savings level" in the UI). These shrink
-# STALE context (old file-reads, large cold tool outputs) to cut INPUT tokens — orthogonal to the
-# output shaper (SHAPER_ENV) which trims the model's replies. All levels keep the shaper + holdout.
-#   conservative — quality-neutral: only stale reads/tool outputs, strict accuracy guard, protect
-#                  recent turns. Never compresses live user/system content.
-#   moderate     — also KOMPRESS older user/system messages (small chance of dropping wanted ctx).
-#   aggressive   — Headroom's shipped agent-90 profile (~90% context reduction; can degrade answers
-#                  on long sessions).
-# NB: HEADROOM_RTK_WIRING is strictly validated by the proxy (only "enabled"/"disabled") — a wrong
-# value (e.g. "1") crashes it at boot. Keep the literal exactly "enabled".
-SAVINGS_PROFILES: dict[str, dict[str, str]] = {
-    "conservative": {
-        "HEADROOM_OPTIMIZE": "1",
-        "HEADROOM_ACCURACY_GUARD": "strict",
-        "HEADROOM_PROTECT_RECENT": "3",
-        "HEADROOM_PROTECT_ANALYSIS_CONTEXT": "1",
-        "HEADROOM_MIN_TOKENS": "200",
-        "HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS": "3",
-        "HEADROOM_COMPRESSION_STABLE_AFTER_TURN": "2",
-        "HEADROOM_RTK_WIRING": "enabled",
-    },
-    "moderate": {
-        "HEADROOM_OPTIMIZE": "1",
-        "HEADROOM_ACCURACY_GUARD": "strict",
-        "HEADROOM_PROTECT_RECENT": "2",
-        "HEADROOM_PROTECT_ANALYSIS_CONTEXT": "1",
-        "HEADROOM_MIN_TOKENS": "160",
-        "HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS": "2",
-        "HEADROOM_COMPRESSION_STABLE_AFTER_TURN": "2",
-        "HEADROOM_RTK_WIRING": "enabled",
-        "HEADROOM_COMPRESS_USER_MESSAGES": "1",
-        "HEADROOM_COMPRESS_SYSTEM_MESSAGES": "1",
-        "HEADROOM_FORCE_KOMPRESS": "1",
-    },
-    "aggressive": {
-        "HEADROOM_OPTIMIZE": "1",
-        "HEADROOM_ACCURACY_GUARD": "strict",
-        "HEADROOM_PROTECT_RECENT": "2",
-        "HEADROOM_MIN_TOKENS": "120",
-        "HEADROOM_RTK_WIRING": "enabled",
-        "HEADROOM_COMPRESS_USER_MESSAGES": "1",
-        "HEADROOM_COMPRESS_SYSTEM_MESSAGES": "1",
-        "HEADROOM_FORCE_KOMPRESS": "1",
-        "HEADROOM_SAVINGS_PROFILE": "agent-90",
-        "HEADROOM_SAVINGS_TARGET": "0.90",
-        "HEADROOM_TARGET_RATIO": "0.10",
-        "HEADROOM_MAX_ITEMS": "8",
-    },
-}
-# Default to the quality-neutral profile: it NEVER compresses live user/system content, preserving
-# the old "don't touch input context" guarantee for users who never explicitly pick a level. Opting
-# into "moderate"/"aggressive" (which KOMPRESS user/system messages) must be a deliberate choice.
-DEFAULT_SAVINGS_LEVEL = "conservative"
-
-
-def savings_env(level: str | None) -> dict[str, str]:
-    """Env for the given savings level; unknown/None → the safe default. Never raises."""
-    return dict(SAVINGS_PROFILES.get(level or "", SAVINGS_PROFILES[DEFAULT_SAVINGS_LEVEL]))
-
-
-def _persisted_savings_level(store: Path | None) -> str:
-    """Read the user's chosen savings level from state (best-effort; default on any problem). Lets
-    recovery callers (launch/wake/heal) that only have a store path pick up the current level."""
-    try:
-        from .state import State
-        lvl = State.load((store or P.DATA_DIR) / "state.json").settings().get("savings_level")
-        return lvl if lvl in SAVINGS_PROFILES else DEFAULT_SAVINGS_LEVEL
-    except Exception:
-        return DEFAULT_SAVINGS_LEVEL
-
-PROXY_PORT = 8787                  # Headroom's default; we start `headroom proxy --port 8787`
-# Hold out a fraction of conversations UNSHAPED so `headroom output-savings` can report a real
-# *measured* A/B number (unbiased shaped-vs-unshaped), not just the synthetic-control "estimate".
-# Costs ~this fraction of potential savings — a deliberate trade for a trustworthy figure.
-OUTPUT_HOLDOUT = "0.1"
-# Best-effort backstop: re-assert the shaper/holdout on the live proxy via /admin/runtime-env. The
-# primary path is start_proxy's env (above); this only matters if a proxy we didn't start (e.g. one
-# that outlived a crash) is reachable. See push_runtime_knobs().
-RUNTIME_KNOBS = {"HEADROOM_OUTPUT_SHAPER": "1", "HEADROOM_OUTPUT_HOLDOUT": OUTPUT_HOLDOUT}
-
-
-def push_runtime_knobs(port: int = PROXY_PORT, *, knobs: dict | None = None, urlopen=None) -> bool:
-    """Hot-sync the live output-shaper knobs to the running proxy via POST /admin/runtime-env — the
-    same loopback hot-reload `headroom wrap` uses. Best-effort: returns False (silent) if the proxy
-    is unreachable or predates the endpoint. Belt-and-suspenders only: start_proxy already passes
-    these in the proxy's env, so this just re-asserts them on a proxy we didn't start."""
-    import urllib.error
-    import urllib.request
-    body = json.dumps(knobs or RUNTIME_KNOBS).encode()
-    req = urllib.request.Request(f"http://127.0.0.1:{port}/admin/runtime-env",
-                                 data=body, method="POST",
-                                 headers={"Content-Type": "application/json"})
-    opener = urlopen or urllib.request.urlopen
-    try:
-        with opener(req, timeout=2) as resp:
-            resp.read()
-        return True
-    except (OSError, urllib.error.URLError, ValueError):
-        return False
-
-
-# py2app injects PYTHONHOME/PYTHONPATH (and friends) pointing at the FROZEN app's stripped, zipped
-# stdlib. Every Headroom subprocess runs a DIFFERENT interpreter (the managed venv's headroom, or
-# `python -m venv`); if these leak in, that interpreter resolves stdlib against the app bundle and dies
-# (e.g. `ModuleNotFoundError: No module named 'uuid'`). Strip them so each child python uses its own.
-_PY_ENV_STRIP = ("PYTHONHOME", "PYTHONPATH", "PYTHONEXECUTABLE", "__PYVENV_LAUNCHER__")
-
-
-def harden_env(env: dict | None = None) -> dict:
-    """Return env with hardening flags applied + interpreter-redirect vars stripped (so a child python
-    uses its own stdlib, not the frozen app's). Does not mutate the input."""
-    e = dict(os.environ if env is None else env)
-    for k in _PY_ENV_STRIP:
-        e.pop(k, None)
-    e.update(HARDENING_ENV)
-    return e
-
-
-def rtk_path() -> Path:
-    return Path.home() / ".headroom" / "bin" / "rtk"
-
-
-def verify_rtk(record_dir: Path | None) -> tuple[bool, str]:
-    """TOFU checksum-pin the runtime-downloaded `rtk` binary.
-
-    Records rtk's sha256 on first sight; on later runs, verifies it's unchanged. Returns
-    (ok, message). ok=False means rtk changed unexpectedly (possible supply-chain tamper) → caller
-    should refuse to run with Headroom until the user re-confirms.
-    """
-    import hashlib
-    from .util import sha256_text
-    rtk = rtk_path()
-    if not rtk.exists():
-        return True, "rtk not present yet (downloaded on first wrap)"
-    raw = rtk.read_bytes()
-    digest = hashlib.sha256(raw).hexdigest()
-    store = (record_dir or (Path.home() / ".account-switcher")) / "rtk.sha256"
-    if store.exists():
-        recorded = store.read_text().strip()
-        if recorded == digest:
-            return True, "rtk checksum verified"
-        # An older version recorded sha256 of the hex STRING of the bytes; transparently migrate that
-        # to the raw-bytes digest so an upgrade isn't mistaken for a supply-chain tamper.
-        if recorded == sha256_text(raw.hex()):
-            store.write_text(digest)
-            return True, "rtk checksum migrated to new format"
-        return False, f"rtk checksum changed ({recorded[:12]}… → {digest[:12]}…)"
-    store.parent.mkdir(parents=True, exist_ok=True)
-    store.write_text(digest)
-    return True, f"rtk checksum recorded ({digest[:12]}…)"
-
-# Markers our routing leaves in the tool config — used to detect a still-injected (dirty) config.
-# Deliberately CONFIG-SYNTAX strings (not prose words like "Headroom" or "headroomlabs", which a
-# user could legitimately write): a loose substring would treat such a config as still-routed and
-# let the restore backstop overwrite their real edits. `model_provider = "headroom"` is what we write
-# into Codex's config.toml; the loopback proxy URL is what we write into Claude's settings.json env
-# (ANTHROPIC_BASE_URL) and into the Codex provider block (base_url …/v1) — so both routings detect.
+PROXY_PORT = 8787                                  # the port the old proxy bound; only used for markers
 _PROXY_URL = f"http://127.0.0.1:{PROXY_PORT}"
+# Config-syntax strings our old routing wrote — used to detect a still-injected (dirty) config.
 INJECT_MARKERS = ('model_provider = "headroom"', _PROXY_URL)
 
+
+# --- detecting/stripping the old provider routing --------------------------------------------------
 
 def _config_dir(tool: str) -> Path:
     return P.CODEX_HOME if tool == "codex" else P.CLAUDE_CONFIG_DIR
 
 
 def _touched(tool: str) -> list[Path]:
-    """Files `headroom wrap <tool>` mutates. (Codex verified live; Claude best-effort superset.)"""
     d = _config_dir(tool)
     if tool == "codex":
         return [d / "config.toml", d / "AGENTS.md"]
@@ -223,12 +45,9 @@ def _touched(tool: str) -> list[Path]:
 
 
 def _is_injected(tool: str) -> bool:
-    """True if ANY file Headroom touches for this tool still carries an injection marker — not just
-    the first (Claude routing lands in settings.json, not CLAUDE.md), so we never mistake a
-    still-routed config for clean and delete the only backup."""
     for cfg in _touched(tool):
         try:
-            text = cfg.read_text(errors="ignore")   # ValueError/UnicodeDecodeError-safe (markers ASCII)
+            text = cfg.read_text(errors="ignore")
         except OSError:
             continue
         if any(m in text for m in INJECT_MARKERS):
@@ -240,45 +59,17 @@ def _any_injected() -> bool:
     return any(_is_injected(t) for t in ("codex", "claude"))
 
 
-# --- routing: hand-write minimal provider config so plain codex/claude point at our local proxy ----
-# We write just enough to route each tool at 127.0.0.1:PROXY_PORT, using the SAME markers
-# _is_injected()/INJECT_MARKERS detect and snapshot_global/restore_global back up. This avoids
-# `headroom install apply` (broken launchd deploy — see module docstring); start_proxy runs the proxy.
+import re
 
 _CODEX_MARK_START = "# --- acctsw headroom routing ---"
 _CODEX_MARK_END = "# --- end acctsw headroom routing ---"
-# Top-level Codex keys routing owns. Codex honours a single top-level model_provider/openai_base_url,
-# so to route we must REPLACE the user's (not append) — otherwise a user who already set either key
-# gets a duplicate top-level key, which is invalid TOML and stops Codex launching. So we strip ANY
-# value of these keys before writing ours; the user's original is captured in the pre-routing snapshot
-# and restored verbatim on disable (restore_global). They MUST precede any [table] header or TOML
-# scopes them into it (headroom #260), so _route_codex writes them as the first lines of the file.
 _CODEX_TOP_KEYS = (
     re.compile(r'(?m)^[ \t]*model_provider[ \t]*=.*\r?\n'),
     re.compile(r'(?m)^[ \t]*openai_base_url[ \t]*=.*\r?\n'),
 )
 
 
-def _codex_chatgpt_auth() -> bool:
-    """True if Codex authed via ChatGPT OAuth (not an API key). Only then does the provider block get
-    `requires_openai_auth = true` (restores the account menu); emitting it for API-key users would
-    force an unwanted OAuth login (headroom #406)."""
-    try:
-        data = json.loads((P.CODEX_HOME / "auth.json").read_text())
-    except (OSError, ValueError):
-        return False
-    if not isinstance(data, dict):
-        return False
-    mode = data.get("auth_mode")
-    if isinstance(mode, str):
-        return mode.lower() == "chatgpt"
-    tokens = data.get("tokens")        # older auth.json predates auth_mode → infer from an OAuth acct
-    return isinstance(tokens, dict) and bool(str(tokens.get("account_id") or "").strip())
-
-
 def _strip_codex_routing(content: str) -> str:
-    """Remove our managed Codex routing (top-level keys + marker block). Makes _route_codex idempotent
-    and serves as the surgical unroute that preserves unrelated user edits."""
     while _CODEX_MARK_START in content and _CODEX_MARK_END in content:
         s = content.index(_CODEX_MARK_START)
         e = content.index(_CODEX_MARK_END, s) + len(_CODEX_MARK_END)
@@ -288,28 +79,7 @@ def _strip_codex_routing(content: str) -> str:
     return content.lstrip("\n")
 
 
-def _route_codex(port: int = PROXY_PORT) -> None:
-    from .util import atomic_write_text
-    path = P.CODEX_HOME / "config.toml"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        body = _strip_codex_routing(path.read_text()) if path.exists() else ""
-    except OSError:
-        body = ""
-    requires = "requires_openai_auth = true\n" if _codex_chatgpt_auth() else ""
-    head = f'model_provider = "headroom"\nopenai_base_url = "http://127.0.0.1:{port}/v1"\n'
-    table = (f"{_CODEX_MARK_START}\n"
-             "[model_providers.headroom]\n"
-             'name = "Headroom proxy"\n'
-             f'base_url = "http://127.0.0.1:{port}/v1"\n'
-             "supports_websockets = true\n"
-             f"{requires}"
-             f"{_CODEX_MARK_END}\n")
-    mid = (body.strip() + "\n\n") if body.strip() else ""
-    atomic_write_text(path, f"{head}\n{mid}{table}")
-
-
-def _unroute_codex(port: int = PROXY_PORT) -> None:
+def _unroute_codex() -> None:
     from .util import atomic_write_text
     path = P.CODEX_HOME / "config.toml"
     if not path.exists():
@@ -321,29 +91,7 @@ def _unroute_codex(port: int = PROXY_PORT) -> None:
     atomic_write_text(path, stripped if stripped.strip() else "")
 
 
-def _route_claude(port: int = PROXY_PORT) -> None:
-    from .util import atomic_write_text
-    path = P.CLAUDE_CONFIG_DIR / "settings.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload: dict = {}
-    if path.exists():
-        try:
-            payload = json.loads(path.read_text() or "{}")
-        except (OSError, ValueError):
-            payload = {}
-        if not isinstance(payload, dict):
-            payload = {}
-    env = payload.get("env")
-    env = dict(env) if isinstance(env, dict) else {}
-    env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{port}"
-    # GH#746: with a custom ANTHROPIC_BASE_URL and ENABLE_TOOL_SEARCH unset, Claude Code materializes
-    # every MCP/system tool schema into context → overflow. Keep schema deferral on.
-    env["ENABLE_TOOL_SEARCH"] = "true"
-    payload["env"] = env
-    atomic_write_text(path, json.dumps(payload, indent=2) + "\n")
-
-
-def _unroute_claude(port: int = PROXY_PORT) -> None:
+def _unroute_claude() -> None:
     from .util import atomic_write_text
     path = P.CLAUDE_CONFIG_DIR / "settings.json"
     if not path.exists():
@@ -355,7 +103,7 @@ def _unroute_claude(port: int = PROXY_PORT) -> None:
     if not isinstance(payload, dict):
         return
     env = payload.get("env")
-    if not (isinstance(env, dict) and env.get("ANTHROPIC_BASE_URL") == f"http://127.0.0.1:{port}"):
+    if not (isinstance(env, dict) and env.get("ANTHROPIC_BASE_URL") == _PROXY_URL):
         return                                          # not our routing → leave it alone
     env.pop("ANTHROPIC_BASE_URL", None)
     env.pop("ENABLE_TOOL_SEARCH", None)
@@ -366,425 +114,24 @@ def _unroute_claude(port: int = PROXY_PORT) -> None:
     atomic_write_text(path, json.dumps(payload, indent=2) + "\n")
 
 
-def _route_all(port: int = PROXY_PORT) -> None:
-    _route_codex(port)
-    _route_claude(port)
+def _unroute_all() -> None:
+    _unroute_codex()
+    _unroute_claude()
 
 
-def _unroute_all(port: int = PROXY_PORT) -> None:
-    _unroute_codex(port)
-    _unroute_claude(port)
-
-
-# --- proxy: run `headroom proxy` ourselves as a detached, PID-tracked subprocess -------------------
-# Replaces `headroom install apply`'s broken launchd service. We own the child's environment, so the
-# output-shaper knobs go in at startup. start_new_session detaches it from the app's process group;
-# we track it by PID file. Teardown rule: ROUTING is always cleaned eagerly (plain codex/claude must
-# never point at a dead proxy), but the PROCESS is only stopped once idle — sessions pin the port at
-# launch and a busy proxy shot mid-flight kills their responses. A surviving proxy is re-adopted by
-# the next enable (start_proxy's adopt path) or reaped by a later heal once idle.
-
-def _proxy_pidfile(store: Path | None) -> Path:
-    return (store or P.DATA_DIR) / "headroom-proxy.pid"
-
-
-def _proxy_logfile(store: Path | None) -> Path:
-    return (store or P.DATA_DIR) / "headroom-proxy.log"
-
-
-def last_proxy_error(store: Path | None = None, *, lines: int = 5, max_chars: int = 400,
-                     tail_bytes: int = 8192) -> str:
-    """Return the last few non-empty lines of the proxy's log — its captured stdout/stderr — so a
-    crash-loop can SHOW why the proxy keeps dying instead of a bare "restarted it". Empty string if
-    the log is missing/unreadable/blank. Bounded: the log is append-only and never rotated, so we read
-    only the final ``tail_bytes`` (seek to end) rather than the whole file, then cap the joined result
-    — a huge log never blows up memory, a notification, or the persisted banner."""
-    p = _proxy_logfile(store)
-    try:
-        with p.open("rb") as f:
-            f.seek(0, os.SEEK_END)
-            f.seek(max(0, f.tell() - tail_bytes))
-            raw = f.read().decode("utf-8", "replace")
-    except OSError:
-        return ""
-    tail = [ln.strip() for ln in raw.splitlines() if ln.strip()][-lines:]
-    out = " · ".join(tail)
-    return out[-max_chars:] if len(out) > max_chars else out
-
-
-def proxy_ready(port: int = PROXY_PORT, *, urlopen=None, timeout: float = 2.0) -> bool:
-    """True iff the proxy answers GET /readyz with ready:true. Cross-process (plain HTTP), so a cx/cl
-    launcher in another process can check the GUI-started proxy."""
-    import urllib.error
-    import urllib.request
-    opener = urlopen or urllib.request.urlopen
-    try:
-        with opener(f"http://127.0.0.1:{port}/readyz", timeout=timeout) as resp:
-            data = json.loads(resp.read().decode())
-    except (OSError, urllib.error.URLError, ValueError):
-        return False
-    return bool(isinstance(data, dict) and data.get("ready"))
-
-
-def inbound_active(port: int = PROXY_PORT, *, urlopen=None, timeout: float = 2.0) -> int | None:
-    """Active inbound HTTP requests per the proxy's own Prometheus gauge, or None if unreadable.
-    NB: the scrape itself counts, so an otherwise-idle proxy reads 1, never 0."""
-    import urllib.error
-    import urllib.request
-    opener = urlopen or urllib.request.urlopen
-    try:
-        with opener(f"http://127.0.0.1:{port}/metrics", timeout=timeout) as resp:
-            body = resp.read().decode()
-        for line in body.splitlines():
-            if line.startswith("headroom_inbound_requests_active "):
-                return int(float(line.split()[1]))
-    except (OSError, urllib.error.URLError, ValueError, IndexError):
-        pass
-    return None
-
-
-def drain_proxy(port: int = PROXY_PORT, *, deadline: float = 20.0, urlopen=None,
-                sleep=None, now=None) -> bool:
-    """Best-effort wait until the proxy has no client requests in flight, so a restart doesn't kill a
-    response mid-stream ("Connection closed mid-response" in the routed session). Idle means the
-    inbound gauge reads <=1 — our own scrape is the 1. Returns True when idle was observed; False when
-    the deadline passed (a very long stream) or the gauge is unreadable — callers proceed either way,
-    the deadline just caps how long a level change can stall."""
-    import time
-    _sleep = sleep or time.sleep
-    _now = now or time.monotonic
-    cutoff = _now() + deadline
-    while True:
-        n = inbound_active(port, urlopen=urlopen)
-        if n is None:
-            return False
-        if n <= 1:
-            return True
-        if _now() >= cutoff:
-            return False
-        _sleep(0.5)
-
-
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True
-
-
-def _pid_is_proxy(pid: int) -> bool:
-    """Identity guard against PID REUSE: confirm `pid` is actually a Headroom proxy (its command line
-    runs `headroom … proxy`) before we ever treat it as ours or signal it. A bare liveness check is
-    NOT enough — the OS can recycle a dead proxy's PID for an unrelated process, and we must never
-    SIGTERM/SIGKILL an innocent bystander. ps unavailable / no match → False (we'd rather leak an
-    orphan than kill the wrong process)."""
-    if pid <= 0:
-        return False
-    try:
-        out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
-                             capture_output=True, text=True, timeout=2).stdout.lower()
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return "headroom" in out and "proxy" in out
-
-
-def _port_busy(port: int = PROXY_PORT) -> bool:
-    """True iff something is accepting TCP connections on the loopback port (may not be our proxy)."""
-    import socket
-    with socket.socket() as s:
-        s.settimeout(0.3)
-        return s.connect_ex(("127.0.0.1", port)) == 0
-
-
-def _port_listener_pid(port: int = PROXY_PORT) -> int | None:
-    """PID of whatever is LISTENing on the loopback port (via lsof), or None if unknown/none."""
-    try:
-        out = subprocess.run(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
-                             capture_output=True, text=True, timeout=5).stdout
-    except (OSError, subprocess.SubprocessError):
-        return None
-    pids = [int(p) for p in out.split() if p.strip().isdigit()]
-    return pids[0] if pids else None
-
-
-def _adopt_proxy_pid(store: Path | None, port: int = PROXY_PORT) -> None:
-    """Ensure the pidfile points at the live listener so stop_proxy can kill a proxy we didn't start
-    THIS run (e.g. one that outlived a crash). No-op if we already track a live pid — without this,
-    start_proxy's idempotent early-return would leave an untracked proxy we can never tear down."""
-    pidf = _proxy_pidfile(store)
-    try:
-        cur = int(pidf.read_text().strip())
-    except (OSError, ValueError):
-        cur = 0
-    if cur > 0 and _pid_alive(cur):
-        return
-    adopted = _port_listener_pid(port)
-    if adopted:
-        try:
-            pidf.parent.mkdir(parents=True, exist_ok=True)
-            pidf.write_text(str(adopted))
-        except OSError:
-            pass
-
-
-def start_proxy(store: Path | None = None, *, port: int = PROXY_PORT, popen=None, sleep=None,
-                ready_timeout: float = 30.0, clock=None, level: str | None = None) -> bool:
-    """Start the proxy detached + PID-tracked and block until /readyz is healthy (bounded by
-    ready_timeout, ~30s). Idempotent: if a proxy already serves the port, adopt its PID (so we can
-    still stop it) and return True. Fails fast if the port is held by a non-Headroom process. Returns
-    False if headroom is missing or the proxy never becomes ready (caller rolls back)."""
-    import time
-    _clock = clock or time.monotonic
-    if proxy_ready(port):
-        # SECURITY: /readyz answering is NOT proof it's OUR proxy. Verify the listener is a real
-        # Headroom process before adopting+routing — otherwise a local process could squat the port,
-        # fake /readyz, and harvest the OAuth bearer tokens the tools send through it.
-        lpid = _port_listener_pid(port)
-        if not (lpid and _pid_is_proxy(lpid)):
-            _log_full(store, "start_proxy foreign listener",
-                      f"port {port} answers /readyz but pid={lpid} is not a Headroom proxy; refusing")
-            return False
-        _adopt_proxy_pid(store, port)     # so a proxy we didn't start this run is still stoppable
-        return True
-    if _port_busy(port):                  # bound but not answering /readyz → foreign listener
-        _log_full(store, "start_proxy port busy",
-                  f"port {port} is held by a non-Headroom process; refusing to start")
-        return False
-    exe = headroom_path()
-    if not exe:
-        return False
-    _popen = popen or subprocess.Popen
-    _sleep = sleep or time.sleep
-    env = harden_env()
-    env.update(SHAPER_ENV)
-    env.update(savings_env(level if level is not None else _persisted_savings_level(store)))
-    env["HEADROOM_OUTPUT_HOLDOUT"] = OUTPUT_HOLDOUT
-    pidf = _proxy_pidfile(store)
-    pidf.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        logfd = os.open(_proxy_logfile(store), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    except OSError:
-        logfd = None
-    sink = logfd if logfd is not None else subprocess.DEVNULL
-    try:
-        # cwd is PINNED to our data dir, never inherited: the proxy is long-lived, and litellm does
-        # `sys.path.append(os.getcwd())` on lazy import during response finalize — if the enabling
-        # shell's directory is later deleted (a cleaned-up worktree), os.getcwd() raises
-        # FileNotFoundError and EVERY streamed response dies mid-flight. Pinning also keeps an
-        # arbitrary caller directory out of the proxy's sys.path.
-        proc = _popen([exe, "proxy", "--host", "127.0.0.1", "--port", str(port),
-                       "--mode", "token", "--backend", "anthropic", "--no-telemetry"],
-                      env=env, stdout=sink, stderr=sink, start_new_session=True,
-                      cwd=str(pidf.parent))
-    except (OSError, ValueError) as e:
-        _log_full(store, "start_proxy failed", str(e))
-        return False
-    finally:
-        if logfd is not None:
-            os.close(logfd)
-    try:
-        pidf.write_text(str(proc.pid))
-    except OSError:
-        pass
-    # Poll until a wall-clock deadline (not attempts*timeout, which could balloon to minutes when each
-    # probe hits its own timeout) so start_proxy never blocks the op_lock far longer than advertised.
-    deadline = _clock() + ready_timeout
-    while _clock() < deadline:
-        if proxy_ready(port, timeout=1.0):
-            return True
-        _sleep(0.5)
-    _log_full(store, "start_proxy timeout", f"pid={getattr(proc, 'pid', '?')} never reached /readyz")
-    stop_proxy(store)
-    return False
-
-
-def proxy_maybe_running(store: Path | None = None) -> bool:
-    """Cheap, subprocess- and network-free check: does our proxy pidfile point at a live process?
-    Used by the cx/cl gate to catch an ORPHAN proxy whose routing+backup were already cleaned (a
-    graceful-OFF that deletes the backup leaves needs_reconcile() False, so the pidfile is the only
-    remaining trace). False positives are harmless — heal() re-verifies under the lock."""
-    pidf = _proxy_pidfile(store)
-    try:
-        pid = int(pidf.read_text().strip())
-    except (OSError, ValueError):
-        return False
-    # Liveness AND identity: a recycled PID (dead proxy, PID reused by something else) must read as
-    # "not running" so we neither trigger a spurious reap nor, downstream, signal the wrong process.
-    return pid > 0 and _pid_alive(pid) and _pid_is_proxy(pid)
-
-
-def routing_injected() -> bool:
-    """True if Headroom routing is currently written into the tools' config (public predicate so
-    callers outside this module don't reach into the private _any_injected)."""
-    return _any_injected()
-
-
-def restart_proxy(store: Path | None = None, *, level: str | None = None) -> bool | None:
-    """Restart the proxy so a changed env (e.g. a new savings level) is re-read at boot — routing in
-    the tools' config already points at 127.0.0.1:PORT, so we only cycle the process, not the routing.
-    Serialized by op_lock. Tri-state return so the caller can react truthfully:
-      • None  — no proxy was running, nothing to do (the next start_proxy reads the persisted level);
-      • True  — restarted cleanly;
-      • False — the replacement failed to come up. Same port means we must stop the old proxy first, so
-                to avoid leaving routed clients pointed at a dead 127.0.0.1:PORT we unroute (restore the
-                original config) → codex/claude fall back to DIRECT. The caller should reflect that
-                Headroom is no longer active rather than claim it's reconnecting forever."""
-    with op_lock(store):
-        # Only cycle a proxy that's ACTUALLY RUNNING (checked under op_lock, the same lock
-        # global_disable holds). Rationale both directions:
-        #  • never resurrect a stopped/reaped proxy — if a concurrent toggle-OFF reaped it,
-        #    proxy_maybe_running is False here and we no-op (no orphan);
-        #  • DO re-apply the new env to a live routed proxy AND to a retained graceful-OFF proxy
-        #    (routing torn down but proxy kept for open sessions) — otherwise start_proxy would later
-        #    ADOPT that stale-env proxy on re-enable and the selected level would never take effect.
-        # When no proxy runs, the next start_proxy reads the persisted level, so a no-op is correct.
-        if not proxy_maybe_running(store):
-            return None
-        routed = _any_injected()
-        # Wait (bounded) for in-flight client requests to finish: stopping the proxy mid-stream kills
-        # the response in the routed session ("Connection closed mid-response"). Best-effort — after
-        # the deadline (or if the gauge is unreadable) we cycle anyway, matching the old behavior.
-        drain_proxy()
-        stop_proxy(store)
-        # start_proxy already does the None→persisted fallback, so pass level straight through — one
-        # source of truth for how the level is resolved.
-        if start_proxy(store, level=level):
-            return True
-        # Replacement failed (bad env / startup timeout) and the old proxy is already gone. If we were
-        # routed, restore the original config so requests go direct instead of hitting a dead port —
-        # mirrors global_enable's "never leave clients on a dead port" invariant. (A retained
-        # graceful-OFF proxy wasn't routed, so there's nothing to unroute — clients already go direct.)
-        _log_full(store, "restart_proxy failed", f"proxy did not come back for level={level}; "
-                  + ("unrouting to avoid a dead port" if routed else "was not routed, nothing to unroute"))
-        if routed:
-            _remove_and_restore(store, reap_proxy=True)
-        return False
-
-
-def stop_proxy(store: Path | None = None, *, kill=None, sleep=None) -> None:
-    """Stop the proxy we started (by PID file) and clear the file. Best-effort; safe if not running."""
-    import signal
-    import time
-    _kill = kill or os.kill
-    _sleep = sleep or time.sleep
-    pidf = _proxy_pidfile(store)
-    try:
-        pid = int(pidf.read_text().strip())
-    except (OSError, ValueError):
-        pid = 0
-    # Kill ONLY if the PID is alive AND is really our proxy — never signal a recycled PID that the OS
-    # has handed to an unrelated process (the pidfile can outlive the proxy).
-    if pid > 0 and _pid_alive(pid) and _pid_is_proxy(pid):
-        for sig in (signal.SIGTERM, signal.SIGKILL):
-            try:
-                _kill(pid, sig)
-            except OSError:
-                break
-            _sleep(0.3)
-            if not _pid_alive(pid):
-                break
-    try:
-        pidf.unlink()
-    except OSError:
-        pass
-
-
-# --- global (app-managed) mode: route plain codex/claude + GUI through Headroom ----------------
-# Driven by the app's "save credit" toggle. ON = start our own proxy (start_proxy) + write routing
-# into the tools' config (_route_all) + an on-disk config backstop; OFF/quit/health-fail = strip
-# routing (_unroute_all) + restore the backstop + stop the proxy (stop_proxy). App-managed: torn down
-# on quit/health-fail so codex/claude never point at a dead proxy.
-# All ops are serialized by an flock op-lock so concurrent toggle/poll/recovery can't interleave.
+# --- the pre-routing config snapshot the old enable path saved -------------------------------------
 
 def _global_backup(store: Path | None) -> Path:
     return (store or P.DATA_DIR) / "headroom-global-backup"
-
-
-def _global_files() -> list[Path]:
-    return _touched("codex") + _touched("claude")
-
-
-def _log_full(store: Path | None, label: str, text: str) -> None:
-    """Append full headroom output to a private 0600 log for debugging (append, not read+rewrite, so
-    repeated logging stays O(1) per call)."""
-    from .util import now, iso
-    try:
-        p = (store or P.DATA_DIR) / "headroom.log"   # ~/.account-switcher/headroom.log (matches msgs)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        # create 0600 up-front so the log is never briefly world-readable
-        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        try:
-            os.write(fd, f"\n[{iso(now())}] {label}\n{text}\n".encode())
-        finally:
-            os.close(fd)
-    except OSError:
-        pass
-
-
-@contextlib.contextmanager
-def op_lock(store: Path | None = None, *, blocking: bool = True):
-    """Exclusive cross-process lock for the whole enable/disable/recover operation (apply + snapshot
-    + restore), so a background toggle, usage poll, launch recovery, and quit teardown can't race.
-
-    Yields True if the lock was acquired, False if ``blocking=False`` and another op holds it. The
-    blocking callers (enable/disable/heal, quit teardown — quit runs on a background thread, so
-    waiting out an in-flight op is safe) ignore the value; non-blocking callers (the poll health
-    check, cx/cl's first heal attempt) skip their work instead of stacking up behind a slow op."""
-    import fcntl
-    # The lock file lives BESIDE the backup dir, never inside it — restore_global/_rm_backup rmtree
-    # the backup dir, which would otherwise swap the lock's inode mid-hold and break serialization.
-    base = _global_backup(store).parent
-    base.mkdir(parents=True, exist_ok=True)
-    f = open(base / ".headroom-oplock", "w")
-    acquired = False
-    try:
-        try:
-            fcntl.flock(f, fcntl.LOCK_EX if blocking else (fcntl.LOCK_EX | fcntl.LOCK_NB))
-            acquired = True
-        except BlockingIOError:
-            acquired = False
-        yield acquired
-    finally:
-        if acquired:
-            fcntl.flock(f, fcntl.LOCK_UN)
-        f.close()
-
-
-def _rm_backup(store: Path | None = None) -> None:
-    shutil.rmtree(_global_backup(store), ignore_errors=True)
 
 
 def has_backup(store: Path | None = None) -> bool:
     return (_global_backup(store) / "manifest.json").exists()
 
 
-def snapshot_global(store: Path | None = None) -> None:
-    """Snapshot the user's ORIGINAL config (bytes + mode + symlink target). Idempotent: never
-    overwrites an existing backup, so a second enable can't capture the already-routed config."""
-    from .util import atomic_write_text
-    bdir = _global_backup(store)
-    if (bdir / "manifest.json").exists():
-        return  # original already captured — do NOT re-baseline a possibly-routed config
-    bdir.mkdir(parents=True, exist_ok=True)
-    manifest = {}
-    for i, p in enumerate(_global_files()):
-        if p.is_symlink():
-            entry = {"kind": "symlink", "target": os.readlink(p)}
-        elif p.exists():
-            entry = {"kind": "file", "b64": base64.b64encode(p.read_bytes()).decode(),
-                     "mode": stat.S_IMODE(p.lstat().st_mode)}
-        else:
-            entry = {"kind": "absent"}
-        entry["path"] = str(p)
-        (bdir / f"{i}.json").write_text(json.dumps(entry))
-        manifest[str(i)] = str(p)
-    atomic_write_text(bdir / "manifest.json", json.dumps(manifest))
-
-
 def restore_global(store: Path | None = None) -> tuple[bool, list[str]]:
-    """Atomically restore every snapshotted path to its ORIGINAL state (bytes/mode/symlink/absent).
-    Returns (ok, failures). The backup is deleted ONLY if every path restored cleanly."""
+    """Restore every snapshotted path to its ORIGINAL state (bytes/mode/symlink/absent). Returns
+    (ok, failures); the backup is deleted only if every path restored cleanly."""
     from .util import atomic_write_bytes
     bdir = _global_backup(store)
     mf = bdir / "manifest.json"
@@ -813,343 +160,146 @@ def restore_global(store: Path | None = None) -> tuple[bool, list[str]]:
     return (not failures), failures
 
 
-def _hr_run(args: list, *, run=subprocess.run, timeout: float = 120):
-    """Run a headroom CLI subcommand with hardening env. Used for `learn` (baseline seeding); the
-    proxy/routing paths no longer shell out to `install`."""
-    exe = headroom_path()
-    if not exe:
-        return 1, "headroom not installed"
+# --- stopping an orphaned proxy by its PID file ----------------------------------------------------
+
+def _proxy_pidfile(store: Path | None) -> Path:
+    return (store or P.DATA_DIR) / "headroom-proxy.pid"
+
+
+def _pid_alive(pid: int) -> bool:
     try:
-        p = run([exe, *args], capture_output=True, text=True, timeout=timeout, env=harden_env())
-        return p.returncode, (p.stdout or "") + (p.stderr or "")
-    except (subprocess.SubprocessError, OSError) as e:
-        return 1, str(e)
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
 
 
-def global_running() -> bool:
-    """True iff our proxy is up and healthy (GET /readyz returns ready:true). We run the proxy
-    ourselves now, so readiness is the source of truth — no `headroom install status` round-trip."""
-    return proxy_ready()
-
-
-def _remove_and_restore(store: Path | None, *, reap_proxy: bool = True) -> tuple[bool, str]:
-    """Undo routing (and optionally stop our proxy). Routing REPLACES user keys (codex
-    model_provider/openai_base_url, claude ANTHROPIC_BASE_URL/ENABLE_TOOL_SEARCH), so a surgical strip
-    can't bring the user's original values back — only the exact pre-routing snapshot can. So restore
-    from the snapshot when we have one; fall back to a surgical strip ONLY for an orphan/desync with no
-    backup. reap_proxy=False keeps the proxy alive (graceful toggle-OFF: a Claude/Codex session that
-    pinned 127.0.0.1:PORT at launch can't be repointed, so killing the proxy would drop it — leaving it
-    up lets open sessions drain while new ones, now unrouted, go direct). CALLER MUST HOLD op_lock."""
+def _pid_is_proxy(pid: int) -> bool:
+    """Identity guard against PID REUSE: confirm `pid` is actually a Headroom proxy before signalling
+    it — the OS can recycle a dead proxy's PID for an unrelated process, and we must never kill a
+    bystander. ps unavailable / no match → False (we'd rather leak than kill the wrong process)."""
+    if pid <= 0:
+        return False
     try:
-        if has_backup(store):
-            ok, failures = restore_global(store)      # exact original, incl. any keys routing overwrote
-            if not ok:
-                _log_full(store, "restore failures", "\n".join(failures))
-                return False, "Headroom removed but config restore incomplete (see ~/.account-switcher/headroom.log)"
-            if _any_injected():                       # snapshot itself was routed (shouldn't happen) → don't lie
-                _log_full(store, "still injected after restore", "snapshot restore left routing")
-                return False, "Headroom routing still present after restore (see ~/.account-switcher/headroom.log)"
-            return True, "headroom routing removed; config restored from backup"
-        # No backup (orphan/desync left by a crash): surgical strip is the best we can do.
-        _unroute_all()
-        if _any_injected():
-            _log_full(store, "still injected, no backup", "surgical unroute left routing and no backup to restore")
-            return False, "Headroom routing still present and no backup to restore (see ~/.account-switcher/headroom.log)"
-        return True, "headroom routing removed"
-    finally:
-        # reap_proxy=False only ever RETAINS a live proxy (for open sessions). A dead one still gets
-        # stop_proxy so its stale pidfile is cleared — a lingering pidfile widens the PID-recycling
-        # exposure of the _pid_is_proxy heuristic for nothing.
-        if reap_proxy or not proxy_maybe_running(store):
-            stop_proxy(store)
+        out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=2).stdout.lower()
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "headroom" in out and "proxy" in out
 
 
-def global_enable(store: Path | None = None, *, push=None) -> tuple[bool, str]:
-    """Route plain codex/claude (+GUI) through Headroom. Verifies the rtk helper, snapshots the
-    ORIGINAL config, starts our own proxy and waits for it to be healthy, THEN writes routing — so
-    clients are never left pointing at a dead port. Rolls back fully on any failure. Serialized by
-    op_lock."""
-    with op_lock(store):
-        ok_rtk, rtk_msg = verify_rtk(store)           # supply-chain TOFU check — BEFORE the early
-        if not ok_rtk:                                # return, so a tampered rtk is caught even when
-            return False, f"Headroom rtk integrity check failed — {rtk_msg}"   # routing's already up
-        if has_backup(store) and proxy_ready():
-            return True, "headroom already on"
-        # If config is already injected without a backup (state desync), strip it first so the
-        # snapshot we baseline is the user's ORIGINAL, not a routed config. If the strip doesn't
-        # clean it, ABORT — baselining a routed config would make a later restore reinstate routing.
-        if not has_backup(store) and _any_injected():
-            _unroute_all()
-            if _any_injected():
-                _log_full(store, "global_enable baseline dirty", "config still routed after unroute")
-                return False, "couldn't establish a clean Headroom baseline (config already routed)"
-        snapshot_global(store)                        # idempotent: keeps the original if already saved
-        # Start the proxy and wait for /readyz BEFORE writing any routing — so a client that picks up
-        # the config can never hit a dead port.
-        if not start_proxy(store):
-            _log_full(store, "global_enable failed", "proxy never reached /readyz")
-            stop_proxy(store)                         # clean up any half-started proxy + pidfile
-            ok, failures = restore_global(store)      # restore the original config exactly
-            if not ok:
-                _log_full(store, "global_enable rollback restore failures", "\n".join(failures))
-                return False, ("couldn't enable Headroom and config restore is incomplete — run "
-                               "save-credit again to retry (see ~/.account-switcher/headroom.log)")
-            return False, "couldn't start Headroom proxy (see ~/.account-switcher/headroom.log)"
-        # Proxy is healthy → write routing into the tools' OWN config files (codex config.toml, claude
-        # settings.json) — the files we snapshot/detect/restore.
-        try:
-            _route_all()
-        except OSError as e:
-            _log_full(store, "global_enable routing failed", str(e))
-            _unroute_all(); stop_proxy(store); restore_global(store)
-            return False, "couldn't enable Headroom (see ~/.account-switcher/headroom.log)"
-        (push or push_runtime_knobs)()  # re-assert shaper/holdout on the live proxy (best-effort backstop)
-        return True, "headroom routing enabled for codex & claude"
-
-
-def baseline_seeded(store: Path | None = None) -> bool:
-    return ((store or P.DATA_DIR) / "headroom-baseline-seeded").exists()
-
-
-def seed_baseline(store: Path | None = None, *, run=subprocess.run) -> tuple[bool, str]:
-    """Seed Headroom's verbosity baseline so output-savings can report a real number (the shaper's
-    'estimated' savings are measured against this baseline). Runs `headroom learn --verbosity --apply
-    --all` ONCE (guarded by a marker), best-effort and non-fatal — it's a slow, LLM-driven analysis
-    of your coding history, so callers run it in the background after enabling save-credit. Returns
-    (ok, msg)."""
-    marker = (store or P.DATA_DIR) / "headroom-baseline-seeded"
-    if marker.exists():
-        return True, "baseline already seeded"
-    rc, out = _hr_run(["learn", "--verbosity", "--apply", "--all"], run=run, timeout=600)
-    if rc != 0:
-        _log_full(store, "seed_baseline failed", out)
-        return False, "couldn't seed Headroom savings baseline (see ~/.account-switcher/headroom.log)"
+def _proxy_pid(store: Path | None) -> int:
     try:
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text("seeded")
+        return int(_proxy_pidfile(store).read_text().strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def stop_proxy(store: Path | None = None, *, kill=None, sleep=None) -> None:
+    """Stop the old proxy (by PID file) and clear the file. Best-effort; safe if not running. Kills
+    ONLY if the PID is alive AND is really a Headroom proxy (never a recycled/unrelated PID)."""
+    import signal
+    import time
+    _kill = kill or os.kill
+    _sleep = sleep or time.sleep
+    pid = _proxy_pid(store)
+    if pid > 0 and _pid_alive(pid) and _pid_is_proxy(pid):
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                _kill(pid, sig)
+            except OSError:
+                break
+            _sleep(0.3)
+            if not _pid_alive(pid):
+                break
+    try:
+        _proxy_pidfile(store).unlink()
     except OSError:
         pass
-    return True, "headroom savings baseline seeded"
 
 
-def global_disable(store: Path | None = None, *, blocking: bool = True,
-                   reap_proxy: bool = True) -> tuple[bool, str]:
-    """Undo routing (and, by default, stop the proxy). Serialized by op_lock. With blocking=False,
-    returns (False, 'busy') immediately rather than waiting on a concurrent op — the next
-    launch / cx / cl heal() is a reliable backstop.
+# --- the managed venv + bookkeeping the old feature created ----------------------------------------
 
-    reap_proxy=False = graceful toggle-OFF: unroute (new codex/claude go direct) but LEAVE the proxy
-    running, so an already-open session that pinned 127.0.0.1:PORT at launch keeps working instead of
-    hitting ConnectionRefused. A retained proxy is later reaped once idle by graceful_shutdown
-    (quit) or heal's orphan cleanup, or re-adopted by the next enable. Callers wanting the busy-aware
-    strip-drain-reap sequence itself should use graceful_shutdown, not this."""
-    with op_lock(store, blocking=blocking) as acquired:
-        if not acquired:
-            return False, "headroom busy (another operation in progress)"
-        return _remove_and_restore(store, reap_proxy=reap_proxy)
+def hr_venv_dir(store: Path | None = None) -> Path:
+    return (store or P.DATA_DIR) / "hr-venv"
 
 
-def reconcile(ctx, *, blocking: bool = True) -> tuple[bool, str]:
-    """heal() + reflect the result in the save-credit setting, so the launcher (cx/cl) and the GUI
-    poll share ONE recovery policy (instead of each clearing/keeping the setting differently). The
-    setting is cleared ONLY on a successful heal (healed=True) — a failed restore leaves it ON so
-    recovery keeps retrying. blocking=False (cx/cl) skips healing when the GUI holds the lock (e.g.
-    mid-enable), so a launch never hangs waiting on a long enable. ctx is duck-typed:
-    data_dir, locked(), load_state()."""
-    healed, msg = heal(ctx.data_dir, blocking=blocking)
-    if healed:
-        with ctx.locked():
-            s = ctx.load_state(); s.set_setting("headroom", False); s.save()
-    return healed, msg
+def _leftover_files(store: Path | None) -> list[Path]:
+    d = store or P.DATA_DIR
+    return [
+        d / "headroom-proxy.pid", d / "headroom-proxy.log", d / "headroom.log",
+        d / "rtk.sha256", d / "headroom-baseline-seeded", d / ".headroom-oplock",
+    ]
 
 
-def needs_reconcile(ctx) -> bool:
-    """Cheap, subprocess-free pre-check: is there any reason routing might need healing? Lets the
-    cx/cl hot path skip the /readyz round-trip entirely when save-credit was never used (no setting,
-    no backup, no on-disk injection)."""
+# --- public migration API --------------------------------------------------------------------------
+
+def _data_dir(ctx_or_store) -> Path:
+    """Accept a Context (``.data_dir``) or a plain store Path."""
+    return getattr(ctx_or_store, "data_dir", ctx_or_store) or P.DATA_DIR
+
+
+def legacy_present(ctx_or_store=None) -> bool:
+    """Cheap, subprocess-free check: is there any leftover Headroom state to clean? Lets the launch /
+    cx / cl hot path skip cleanup entirely once nothing remains (the common case going forward)."""
+    store = _data_dir(ctx_or_store)
+    if has_backup(store) or _any_injected():
+        return True
+    if _proxy_pid(store) > 0 or hr_venv_dir(store).exists():
+        return True
+    return any(p.exists() for p in _leftover_files(store))
+
+
+def cleanup_legacy(ctx) -> tuple[bool, str]:
+    """One-time, idempotent teardown of the retired Headroom feature. Strips any leftover routing
+    (restoring the exact pre-routing config from the snapshot when present), stops an orphaned proxy,
+    deletes the managed venv + bookkeeping, and clears the old `headroom`/`savings_level` settings.
+    ``ctx`` is duck-typed: ``data_dir``, ``locked()``, ``load_state()``. Returns (did_work, msg)."""
+    store = _data_dir(ctx)
+    if not legacy_present(store):
+        return False, "clean"
+    # 1. undo routing: exact restore from snapshot beats a surgical strip (routing REPLACED user keys).
+    if has_backup(store):
+        ok, failures = restore_global(store)
+        if not ok:
+            _log(store, "restore failed", "\n".join(failures))
+    if _any_injected():
+        _unroute_all()
+    # 2. stop any orphaned proxy, then delete the managed venv + all bookkeeping.
+    stop_proxy(store)
+    shutil.rmtree(_global_backup(store), ignore_errors=True)
+    shutil.rmtree(hr_venv_dir(store), ignore_errors=True)
+    for p in _leftover_files(store):
+        try:
+            p.unlink()
+        except OSError:
+            pass
+    # 3. clear the old settings so the (removed) toggle can't linger as truthy metadata.
     try:
-        if ctx.load_state().settings().get("headroom"):
-            return True
+        with ctx.locked():
+            s = ctx.load_state()
+            changed = False
+            for k in ("headroom", "savings_level", "headroom_event"):
+                if k in s.settings():
+                    s.settings().pop(k, None); changed = True
+                if k in s.data:
+                    s.data.pop(k, None); changed = True
+            if changed:
+                s.save()
     except Exception:
         pass
-    return has_backup(ctx.data_dir) or _any_injected()
+    return True, "removed legacy Headroom routing, proxy, and files"
 
 
-def record_event(state, reason: str) -> None:
-    """Stamp the save-credit auto-off event onto a LOADED State (caller holds ctx.locked() and saves;
-    the flock is not reentrant, so this must not lock itself): {at, reason} under
-    state.data['headroom_event']. The popover renders it as a PERSISTENT banner — a transient
-    notification alone is missable, and the toggle silently reading OFF is how a user finds out hours
-    later that sessions broke. Cleared when the user re-enables save-credit or dismisses the banner."""
-    from .util import iso, now
-    state.data["headroom_event"] = {"at": iso(now()), "reason": reason}
-
-
-def proxy_busy(port: int = PROXY_PORT, *, urlopen=None) -> bool:
-    """True iff the proxy is serving real client requests right now (inbound gauge above our own
-    probe). Unreadable gauge → False: a wedged proxy must not pass as busy and dodge its reap."""
-    n = inbound_active(port, urlopen=urlopen)
-    return n is not None and n > 1
-
-
-def _graceful_shutdown(store: Path | None, *, drain: bool = False) -> tuple[bool, str]:
-    """THE proxy-shutdown sequence — every teardown path (quit, orphan heal) funnels through here so
-    the ordering can't drift between call sites. Caller holds op_lock.
-
-    1. Strip routing FIRST (new sessions go direct; probing before unrouting is a check-then-act
-       race — a session could pick up fresh work between the probe and the reap). This also clears
-       a dead proxy's stale pidfile (reap_proxy=False only ever retains a LIVE proxy).
-    2. If the strip failed (config still injected), leave the proxy ALIVE: reaping now would strand
-       routed clients on a dead port. The next launch / cx / cl heal retries the cleanup.
-    3. Otherwise optionally drain (bounded; quit can afford the wait, a cx/cl launch cannot), then
-       reap only an IDLE proxy — one still serving open sessions is left for them and reaped by a
-       later heal. The not-busy branch calls stop_proxy UNCONDITIONALLY: it reaps a live-idle proxy,
-       kills a wedged one (unreadable gauge is never busy), and merely clears the pidfile of a dead
-       one — probing liveness first would just reopen the died-between-probes pidfile leak.
-
-    The drain runs under the caller's op_lock. That's deliberate, not an oversight: routing is
-    already stripped by then, so the only op that could contend — a cx/cl launch's blocking heal
-    retry — gates on routing_injected() and sails through; everything else is app-internal and the
-    app is quitting."""
-    ok, msg = _remove_and_restore(store, reap_proxy=False)
-    if ok:
-        if drain:
-            drain_proxy()
-        if proxy_busy():
-            _log_full(store, "proxy busy", "requests in flight — left alive for open sessions")
-        else:
-            stop_proxy(store)
-    return ok, msg
-
-
-def graceful_shutdown(store: Path | None = None, *, blocking: bool = True,
-                      drain: bool = False) -> tuple[bool, str]:
-    """Public, op_lock-serialized wrapper around _graceful_shutdown (see there for the sequence)."""
-    with op_lock(store, blocking=blocking) as acquired:
-        if not acquired:
-            return False, "headroom busy (another operation in progress)"
-        return _graceful_shutdown(store, drain=drain)
-
-
-def heal(store: Path | None = None, *, blocking: bool = True, push=None,
-         app_running: bool = True) -> tuple[bool, str]:
-    """Serialized self-heal that keys off ACTUAL state, not any setting — so it fixes orphans left by
-    a failed enable/disable, a crash, or a force-quit, regardless of how the setting reads.
-
-    Returns (healed, msg) where healed=True ONLY when routing/proxy was found AND successfully cleaned
-    up. healed=False covers: lock busy, proxy healthy (app running), config already clean, OR a restore
-    that FAILED (config still injected) — so callers never mistake an incomplete restore for success.
-
-    ``app_running`` is the master switch: the proxy's lifecycle belongs to the menubar app, so a
-    proxy that is up while the app is GONE is an ORPHAN (a hard-killed app never ran its quit teardown).
-    Routing is always stripped eagerly; the PROCESS is only reaped once idle — an orphan still serving
-    requests is kept alive for the open sessions pinned to its port and reaped by a later heal (or
-    re-adopted by the next enable via start_proxy). cx/cl pass app_running=False (the app is closed
-    when they exec stock); the GUI poll / launcher leave the default True.
-
-    Inside op_lock:
-      • busy (blocking=False, another op holds it) → (False, "busy"): let that op finish.
-      • proxy running, app alive → no-op. Re-checking `proxy_ready` here, under the same lock the
-        toggle holds, closes the enable/health-check TOCTOU: a heal that fires while an enable is
-        still bringing the proxy up blocks on the lock, then sees it ready and leaves it.
-      • proxy running, app GONE → orphan: strip any routing + restore config + reap the proxy.
-      • routing injected but proxy dead → remove routing + restore config + stop the proxy.
-      • nothing injected → no-op.
-    """
-    with op_lock(store, blocking=blocking) as acquired:
-        if not acquired:
-            return False, "busy"
-        if not app_running and proxy_maybe_running(store):
-            # App gone + a live proxy PROCESS (ready, wedged, OR still starting) → orphan. Reap it by
-            # PID, not by /readyz: a wedged proxy that never answers /readyz would otherwise survive
-            # (proxy_ready() False), yet the pidfile is right there to kill it. Strip routing too —
-            # but a busy orphan is left alive for its open sessions (see _graceful_shutdown).
-            return _graceful_shutdown(store)
-        if proxy_ready():
-            if app_running:
-                (push or push_runtime_knobs)()  # best-effort: re-assert knobs on a proxy we may not have started
-                return False, "healthy"
-            # App is gone but the proxy is still up → orphan. Strip/restore routing if any was left
-            # injected; reap the proxy only once idle (see _graceful_shutdown).
-            return _graceful_shutdown(store)
-        if not (_any_injected() or has_backup(store)):
-            return False, "clean"
-        ok, msg = _remove_and_restore(store)
-        return ok, msg                            # ok=False ⇒ still injected; NOT a successful heal
-
-
-# Managed on-demand venv for the proxy. The packaged .app is intentionally slim — it does NOT freeze
-# the proxy stack (litellm/onnxruntime/transformers are huge native/ML wheels py2app can't freeze
-# cleanly, but pip handles them fine). On first enable we create this venv and pip-install
-# headroom-ai[proxy] into it; headroom_path() then finds its real `headroom` console script.
-def hr_venv_dir() -> Path:
-    return P.DATA_DIR / "hr-venv"
-
-
-def headroom_path() -> str | None:
-    """Absolute path to the `headroom` CLI. Checks, in order: the managed on-demand venv (used by the
-    packaged .app), then PATH, then the running interpreter's bin dir (the dev source venv)."""
-    managed = hr_venv_dir() / "bin" / "headroom"
-    if managed.exists():
-        return str(managed)
-    found = shutil.which("headroom")
-    if found:
-        return found
-    cand = Path(sys.executable).parent / "headroom"
-    return str(cand) if cand.exists() else None
-
-
-def available() -> bool:
-    return headroom_path() is not None
-
-
-def venv_bin_dir() -> str:
-    return str(Path(sys.executable).parent)
-
-
-def _base_python() -> str | None:
-    """A real Python >=3.11 to build the managed venv from. Prefer a system python3.11/3.12 (handles
-    the native/ML wheels cleanly); fall back to our own interpreter (the dev venv is already 3.11; a
-    py2app-frozen python has venv+ensurepip too)."""
-    for name in ("python3.11", "python3.12", "python3.13"):
-        p = shutil.which(name)
-        if p:
-            return p
-    p = shutil.which("python3")
-    if p:
-        try:
-            out = subprocess.run([p, "-c", "import sys;print(sys.version_info[:2]>=(3,11))"],
-                                 capture_output=True, text=True, timeout=15)
-            if out.stdout.strip() == "True":
-                return p
-        except (subprocess.SubprocessError, OSError):
-            pass
-    return sys.executable
-
-
-def ensure_installed() -> bool:
-    """Make the `headroom` CLI available. No-op if already found. Otherwise create the managed venv
-    (~/.account-switcher/hr-venv) and pip-install headroom-ai[proxy] into it — a one-time, ~hundreds-
-    of-MB download (the proxy's litellm/onnxruntime/transformers wheels). Best-effort; returns
-    availability."""
-    if available():
-        return True
-    base = _base_python()
-    if not base:
-        return False
-    venv = hr_venv_dir()
-    vpy = venv / "bin" / "python"
-    env = harden_env()        # strip the frozen-app PYTHONHOME/PYTHONPATH so base/venv python is clean
+def _log(store: Path | None, label: str, text: str) -> None:
+    from .util import now, iso
     try:
-        if not vpy.exists():
-            venv.parent.mkdir(parents=True, exist_ok=True)
-            subprocess.run([base, "-m", "venv", str(venv)], capture_output=True, timeout=180,
-                           check=True, env=env)
-        subprocess.run([str(vpy), "-m", "pip", "install", "-q", "--upgrade", "pip"],
-                       capture_output=True, timeout=300, env=env)
-        subprocess.run([str(vpy), "-m", "pip", "install", "-q", PACKAGE],
-                       capture_output=True, timeout=1800, check=True, env=env)
-    except (subprocess.SubprocessError, OSError) as e:
-        _log_full(None, "ensure_installed failed", str(e))
-        return False
-    return available()
+        p = (store or P.DATA_DIR) / "headroom-cleanup.log"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, f"\n[{iso(now())}] {label}\n{text}\n".encode())
+        finally:
+            os.close(fd)
+    except OSError:
+        pass

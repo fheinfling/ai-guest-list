@@ -153,10 +153,6 @@ function toolGroup(tool, t) {
   </section>`;
 }
 
-// funnel icon (three stacked bars narrowing) for Headroom — inline SVG, currentColor.
-const FUNNEL = `<svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><g fill="currentColor">
-  <rect x="2" y="3" width="12" height="2" rx="1"/><rect x="4" y="7" width="8" height="2" rx="1"/>
-  <rect x="6" y="11" width="4" height="2" rx="1"/></g></svg>`;
 const REFRESH = `<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="none"
   stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
   d="M12.5 4.5a5 5 0 1 0 1.2 3.3"/><path fill="currentColor" d="M13.5 2.2l.6 2.8-2.8.2z"/></svg>`;
@@ -206,11 +202,6 @@ const STRATEGY_OPTS = [
   { v: "most_headroom", label: "most headroom" },
   { v: "soonest_back", label: "soonest back" },
 ];
-const SAVINGS_OPTS = [
-  { v: "conservative", label: "easy" },
-  { v: "moderate", label: "balanced" },
-  { v: "aggressive", label: "max" },
-];
 const THEME_OPTS = [{ v: "light", label: "light" }, { v: "dark", label: "dark" }];
 
 function strategyHint(strat) {
@@ -218,12 +209,6 @@ function strategyHint(strat) {
     ? "i jump to whoever's got the most room left to breathe"
     : "if everyone's capped, i hold the seat that wakes up first — shortest wait wins";
 }
-function savingsHint(level) {
-  if (level === "conservative") return "trims the obvious. safest, smallest savings";
-  if (level === "aggressive") return "squeezes hardest. most tokens saved 💛";
-  return "balanced — strong savings, full fidelity";
-}
-
 // A toggle row: title + subtitle on the left, 42×24 switch on the right.
 function toggleRow(key, title, subtitle, on) {
   return `<label class="set-toggle-row">
@@ -240,31 +225,12 @@ function segBlock(label, hint, action, current, options) {
     <div class="set-seg">${segs}</div></div>`;
 }
 
-function fmtTokens(n) {
-  // Threshold at 999_500, not 1e6: Math.round(999_600 / 1e3) is 1000, which would render "1000k"
-  // instead of rolling over to "1.0M". Anything that rounds to >= 1000k belongs in the M bucket.
-  return n >= 999500 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : `${n}`;
-}
-
-// Lifetime totals from the proxy /stats endpoint, e.g. " · 12.7M tokens · $63 saved".
-function hrLifetime(stats) {
-  if (!stats) return "";
-  const bits = [];
-  // Number.isFinite (not truthy): a legitimately-zero total is still real info and must render, but
-  // anything non-numeric is rejected — /stats is an untrusted loopback response and these values go
-  // into innerHTML, so a stray string must never reach fmtTokens' `${n}` fallback.
-  if (Number.isFinite(stats.tokens_saved)) bits.push(`${fmtTokens(stats.tokens_saved)} tokens`);
-  if (Number.isFinite(stats.usd_saved)) bits.push(`$${Math.round(stats.usd_saved)} saved`);
-  return bits.length ? ` · ${bits.join(" · ")}` : "";
-}
-
 // Settings sub-view (spec §9.1) — a full-panel pushed screen, NOT a modal. Renders into #root in
 // place of the popover; back chevron / done / Esc pop back to main. Every change persists live.
 function buildSettings(state) {
   const s = state?.settings || {};
   const theme = s.theme === "dark" ? "dark" : "light";
   const strat = s.strategy === "most_headroom" ? "most_headroom" : "soonest_back";
-  const level = SAVINGS_OPTS.some((o) => o.v === s.savings_level) ? s.savings_level : "conservative";
   const app = state?.app;
   const ver = app ? `v${app.version}${app.build && app.build !== "dev" ? ` · build ${app.build}` : ""}` : "";
 
@@ -274,12 +240,6 @@ function buildSettings(state) {
       ${toggleRow("same_tool_only", "keep me on the same tool", "a Codex limit hops to your other Codex seat, never to Claude", s.same_tool_only)}
       ${toggleRow("notify", "tell me when it switches", "a gentle notification with who's on now", s.notify)}
       ${toggleRow("restart_app", "restart Codex after a swap", "Codex needs a fresh start · Claude picks it up live", s.restart_app)}
-    </div></section>`;
-
-  const headroom = `<section class="set-sec"><span class="set-label">headroom</span>
-    <div class="set-card">
-      ${toggleRow("headroom", "wrap new sessions", "compress context so every limit stretches further", s.headroom)}
-      ${s.headroom ? segBlock("savings level", savingsHint(level), "set_savings_level", level, SAVINGS_OPTS) : ""}
     </div></section>`;
 
   const appearance = `<section class="set-sec"><span class="set-label">appearance</span>
@@ -302,7 +262,6 @@ function buildSettings(state) {
     </header>
     <div class="set-body">
       ${autoSwitch}
-      ${headroom}
       ${appearance}
       <div class="set-ver">ai guest list ${ver}</div>
     </div>
@@ -314,26 +273,8 @@ function buildSettings(state) {
 function buildHTML(state) {
   const s = state?.settings || {};
   const theme = s.theme === "dark" ? "dark" : "light";
-  const hr = state?.headroom_available;
   const c = state?.counts || { resting: 0, ready: 0 };
   const moved = state?.moved_note ? `<div class="event mono">↪ ${esc(state.moved_note)}</div>` : "";
-  // Persistent auto-off banner: save-credit turned ITSELF off (crash loop, failed restart…). Unlike
-  // the transient macOS notification this stays until the user re-enables or dismisses — silently
-  // discovering the toggle off hours later is exactly what it exists to prevent.
-  const hrEvent = state?.headroom_event
-    ? `<div class="event hr-off mono">save-credit turned itself off — ${esc(state.headroom_event.reason)} · ${fmtClock(state.headroom_event.at)}
-        <button class="link" data-action="headroom-retoggle">turn it back on</button>
-        <button class="link" data-action="headroom-event-dismiss">dismiss</button></div>`
-    : "";
-  const hrSub = !hr
-    ? "install Headroom to enable"
-    : state?.headroom_proxy_down
-      // toggled on but the proxy isn't actually running (e.g. a restart failed) — say so rather than
-      // claim it's wrapping; recovery restarts it, so this clears itself.
-      ? "save-credit paused — reconnecting…"
-      : (state?.headroom_savings != null
-          ? `wrapping Codex &amp; Claude · ~${state.headroom_savings}% fewer tokens (${state?.headroom_savings_measured ? "measured" : "est."})${hrLifetime(state?.headroom_stats)}`
-          : "wrapping Codex &amp; Claude");
   return `<div class="app theme-${theme}">
     <header class="top">
       ${doorMark(state)}
@@ -347,10 +288,6 @@ function buildHTML(state) {
     <div class="main-body">
       ${controlBar({ icon: REFRESH, title: "auto-switch", sub: "next ready seat · soonest-reset wins",
                      key: "auto_switch", on: s.auto_switch, accentClass: "ic-auto" })}
-      ${controlBar({ icon: FUNNEL, title: "Headroom", chip: "COMPRESSES CONTEXT", sub: hrSub,
-                     key: "headroom", on: s.headroom && hr, accentClass: "ic-hr" })}
-      ${hr ? "" : `<button class="hr-install" data-action="headroom_install">install Headroom →</button>`}
-      ${hrEvent}
       ${moved}
       ${toolGroup("codex", state?.tools?.codex)}
       ${toolGroup("claude", state?.tools?.claude)}
@@ -450,10 +387,6 @@ document.addEventListener("click", (e) => {
       break;
     }
     case "snapshot": closeOverlay(); send("snapshot", { tool }); break;
-    case "headroom_install": send("headroom_install"); break;
-    // auto-off banner: re-enable goes through the same toggle path as the settings switch
-    case "headroom-retoggle": send("toggle", { key: "headroom", value: true }); break;
-    case "headroom-event-dismiss": send("headroom_event_dismiss"); break;
     case "picker-close":
       // close on backdrop click or an explicit cancel/done button; ignore clicks inside the sheet
       if (el.classList.contains("backdrop") && e.target !== el) break;
@@ -463,7 +396,6 @@ document.addEventListener("click", (e) => {
     case "settings-back": screen = "main"; render(); break;
     case "set_theme": send("set_theme", { value }); break;
     case "set_strategy": send("set_strategy", { value }); break;
-    case "set_savings_level": send("set_savings_level", { value }); break;
     case "quit": send("quit"); break;
   }
 });

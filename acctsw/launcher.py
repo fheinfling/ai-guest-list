@@ -33,7 +33,7 @@ from typing import Callable
 from . import usage as usage_mod
 from .context import Context
 from .errors import AcctswError
-from .headroom import harden_env
+from .procenv import harden_env
 from .selection import choose
 from .switch import switch, sync_back
 from .util import iso, now, parse_iso
@@ -555,28 +555,16 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
     if not state.accounts(tool):
         raise NoSeats(f"no {tool} seats yet — add one first")
 
-    # Headroom is GLOBAL/app-managed now (the app toggle starts our own proxy + writes provider
-    # routing, so plain codex, the GUI, AND cx all route through the proxy). cx/cl therefore do NOT
-    # per-session-wrap — global mode owns Headroom — so the launcher just runs the tool plain.
-    # Self-heal: if a force-quit/crash left routing injected but the proxy dead, reconcile() strips
-    # the dangling injection (and clears the setting) so the tool runs plain instead of hitting a
-    # dead proxy. A cheap, subprocess-free pre-check (needs_reconcile) keeps this off the hot path
-    # when save-credit was never used; reconcile()'s restore backstop works even if the headroom
-    # binary is gone, so it is NOT gated on headroom_path().
+    # The "save credit" Headroom proxy was removed (measured as not worth its fragility). If an older
+    # build left provider routing injected in ~/.codex or ~/.claude, strip it once so the tool runs
+    # directly instead of hitting a now-dead proxy. Cheap pre-check keeps this off the hot path once
+    # nothing remains to clean.
     try:
         from . import headroom as _hr
-        if _hr.needs_reconcile(ctx):
-            # blocking=False: if the GUI is mid-enable holding the lock (starting the proxy + waiting
-            # on /readyz can take ~30s), skip self-heal rather than hang the launch — the GUI owns it.
-            changed, _ = _hr.reconcile(ctx, blocking=False)
+        if _hr.legacy_present(ctx):
+            changed, _ = _hr.cleanup_legacy(ctx)
             if changed:
-                notify("Headroom's proxy wasn't running — removed its routing so this runs directly. "
-                       "Open the ai guest list app to turn save-credit back on.")
-            elif state.settings().get("headroom") and not _hr.available():
-                # setting persisted on but Headroom is gone (venv rebuilt / uninstalled): tell the
-                # user they're NOT saving tokens rather than silently running plain.
-                notify("save-credit is on but Headroom isn't installed — running without it. "
-                       "Reinstall with the ai guest list app, or turn save-credit off.")
+                notify("removed leftover 'save credit' routing — running directly.")
     except Exception:
         pass
 
@@ -661,7 +649,6 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 return "unknown"
 
         while True:
-            # Headroom is applied globally (app toggle), not per-session, so we run the tool plain.
             argv = resume_cmd(ctx, tool) if resuming else build_cmd(ctx, tool, args)
             hit = {"reason": None, "corroborated": False}  # reason: None | "limit" | "auth"
             buf.clear()

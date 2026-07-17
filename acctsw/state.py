@@ -8,8 +8,8 @@ Holds only metadata — NEVER credentials (those live in the Keychain). Shape::
         "codex":  {"active": "<email>|null", "accounts": {"<email>": <Seat>}},
         "claude": {"active": "<email>|null", "accounts": {"<email>": <Seat>}}
       },
-      "settings": {"auto_switch": true, "same_tool_only": true, "headroom": false,
-                   "notify": true, "restart_app": false, "celebrations": true, "theme": "dark"}
+      "settings": {"auto_switch": true, "same_tool_only": true, "notify": true,
+                   "restart_app": false, "celebrations": true, "theme": "dark"}
     }
 
 A ``Seat`` is::
@@ -25,7 +25,6 @@ from pathlib import Path
 from typing import Any
 
 from . import TOOLS
-from .headroom import DEFAULT_SAVINGS_LEVEL
 from .util import now, iso, write_json
 
 STATE_VERSION = 1
@@ -48,14 +47,10 @@ def _label_from_email(email: str) -> str:
 DEFAULT_SETTINGS: dict[str, Any] = {
     "auto_switch": True,
     "same_tool_only": True,   # "keep me on the same tool"
-    "headroom": False,        # "save credit" toggle
     "notify": True,           # "tell me when it switches"
     "restart_app": False,     # "restart Codex after a swap"
     "celebrations": True,     # "little celebrations"
     "strategy": "soonest_back",  # "soonest_back" | "most_headroom"
-    # Headroom compression level: "conservative" | "moderate" | "aggressive". Default sourced from
-    # headroom (single source of truth) so state files and the proxy-boot fallback never disagree.
-    "savings_level": DEFAULT_SAVINGS_LEVEL,
     "theme": "light",         # the design default
 }
 

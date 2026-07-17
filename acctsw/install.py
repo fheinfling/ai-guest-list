@@ -197,14 +197,7 @@ def install(ctx: Context, *, dry_run: bool = False, register: bool = True,
             t.chmod(0o755)
         plan.do(f"install {target}", _write)
 
-    # 4. bundle Headroom (save-credit) into this venv so the toggle just works — no separate install.
-    from . import headroom as hr
-    if hr.available():
-        plan.actions.append("headroom already installed (save-credit ready)")
-    else:
-        plan.do("install headroom (save-credit) into the app venv", hr.ensure_installed)
-
-    # 5. shell setup: cx/cl are useless (autoswitch never fires) unless bin_dir is on PATH. With
+    # 4. shell setup: cx/cl are useless (autoswitch never fires) unless bin_dir is on PATH. With
     #    --path we wire it (PATH + codex/claude aliases) so it "just works"; otherwise WARN loudly
     #    (not a quiet NOTE) so the gap is never silent.
     if with_path:
@@ -328,7 +321,7 @@ def _wrapper_script(name: str, python: str, pkg_root: Path, bin_dir: Path) -> st
             # so it ALWAYS resolves acctsw and the stdlib from inside the .app, machine-independently.
             # `unset` the leaked redirect vars first (a Terminal the app spawned inherits py2app's
             # PYTHONHOME/PYTHONPATH) so only our explicit PYTHONHOME on the exec line takes effect.
-            from .headroom import _PY_ENV_STRIP
+            from .procenv import _PY_ENV_STRIP
             home = shlex.quote(str(Path(python).parent.parent / "Resources"))
             return (f"#!/bin/sh\n# ai guest list engine\n"
                     f"unset {' '.join(_PY_ENV_STRIP)}\n"
