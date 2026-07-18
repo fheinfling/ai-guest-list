@@ -162,6 +162,32 @@ if objc is not None:
             blob = self.ctx.cred[tool].get_live()
             return hashlib.sha256(blob.encode()).hexdigest() if blob else None
 
+        def loginBg_(self, msg):
+            # sync-back-before-login (invariant) + launch the official flow in Terminal, off the main
+            # thread. Absolute import (not `.terminal`): under py2app the main script runs as top-level
+            # __main__ with no package context, so a relative import would fail in the .app.
+            from app.terminal import prepare_then_login
+            command = bridge.login_command(msg["tool"], msg.get("method", "browser"))
+            try:
+                prepare_then_login(self.ctx, msg["tool"], command)
+            except Exception:
+                # Launch failed (sync-back error / Terminal automation blocked) → the baseline is
+                # meaningless; drop it and tell the web flow so it doesn't wait on a window that never
+                # opened. applyResult_ pushes it to the JS reducer (which returns to details).
+                self._login_baseline.pop(msg["tool"], None)
+                result = {"ok": False, "add_op": True, "tool": msg["tool"],
+                          "error": "couldn't open the sign-in — try again"}
+                self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                    objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
+                return
+            # Success: the connecting step is already shown optimistically; just nudge the user. The
+            # notification must fire on the main thread.
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                objc.selector(self.loginNudge_, signature=b"v@:@"), None, False)
+
+        def loginNudge_(self, _arg):
+            self._notify("finish signing in", "then tap ‘save my seat’ 🎟️")
+
         def addBg_(self, msg):
             # `paste`/`snapshot` verify creds against the provider (Claude shells out / hits the
             # network), so run them off the main thread — a synchronous handle() would beachball the
@@ -226,27 +252,15 @@ if objc is not None:
             if action == "settings":
                 return  # reserved
             if action == "login":
-                # native: sync-back-before-login (invariant) + run the chosen flow in Terminal.
-                # Absolute import (not `.terminal`): under py2app the main script runs as top-level
-                # __main__ with no package context, so a relative import would fail in the .app.
-                from app.terminal import prepare_then_login
-                # The sub-view sends {tool, method}; the engine resolves the Terminal command.
-                command = bridge.login_command(msg["tool"], msg.get("method", "browser"))
-                try:
-                    prepare_then_login(self.ctx, msg["tool"], command)
-                except Exception:
-                    # Launch failed (sync-back error / Terminal automation blocked). Tell the web flow
-                    # so it doesn't sit on the connecting step waiting for a login that never opened.
-                    self._pushResult({"ok": False, "add_op": True, "tool": msg["tool"],
-                                      "error": "couldn't open the sign-in — try again"})
-                    return
-                # Baseline the outgoing live creds so a "save my seat" tapped BEFORE the login actually
-                # completes (creds unchanged) is rejected instead of silently re-adding the old seat.
+                # Baseline the OUTGOING live creds NOW — before anything can rewrite them — so a "save
+                # my seat" tapped before sign-in completes (creds unchanged) is rejected instead of
+                # silently re-adding the old seat. (sync_back doesn't change live creds, so capturing
+                # here == capturing just before launch.) Reading creds is a quick, lock-free read.
                 self._login_baseline[msg["tool"]] = self._credDigest(msg["tool"])
-                # The connecting step is already shown optimistically by the web add-cta handler; the
-                # notification is the only feedback needed. (No result pushed back on success — the
-                # flow waits for the user to finish in Terminal and tap "save my seat" → `snapshot`.)
-                self._notify("finish signing in", "then tap ‘save my seat’ 🎟️")
+                # Off the main thread: prepare_then_login holds ctx.locked() and runs osascript — on
+                # the main thread it would beachball behind a usage poll holding the same lock.
+                self.performSelectorInBackground_withObject_(
+                    objc.selector(self.loginBg_, signature=b"v@:@"), msg)
                 return
             if action in ("paste", "snapshot"):
                 # off the main thread (see addBg_) — both verify creds against the provider (Claude

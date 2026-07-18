@@ -114,9 +114,9 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
 
         if action == "paste":
             # Codex no-browser path only: install a pasted auth.json, then register it as a seat.
-            # (Claude has no paste path — a `claude setup-token` is an inference credential that 403s
-            # on the OAuth account endpoints, so it can't be validated or identified from a paste;
-            # Claude's no-browser flow runs `claude setup-token` in Terminal instead.)
+            # (Claude has no paste path AND no no-browser add path at all — a `claude setup-token` is
+            # an env-var inference credential that 403s on the OAuth endpoints and doesn't write the
+            # Keychain login this app snapshots. Claude seats are added via browser sign-in only.)
             tool = message["tool"]
             blob = message["blob"]
             # VALIDATE BEFORE WRITING: never overwrite the canonical auth.json with an unparseable

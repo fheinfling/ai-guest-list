@@ -121,8 +121,9 @@ per-tool gradients — **Codex coral** `#e0795a`, **Claude blue** `#5b8def`, **f
 **Add-a-seat flow** ("who's joining the list?" → "how should i sign you in?" → "name this seat" →
 "your seat's saved — i'll keep it warm"):
 - **Codex:** browser **ChatGPT sign-in** *or* paste **auth.json** (no-browser path).
-- **Claude:** **Claude.ai sign-in** *or* **`claude setup-token`** long-lived token (no-browser path).
-- These map to engine `add codex` / `add claude`; both honor the "no browser dance" promise.
+- **Claude:** **Claude.ai sign-in** only. *(Investigated: `claude setup-token` is an env-var
+  inference token that 403s on the OAuth endpoints and doesn't write the Keychain login this app
+  snapshots — so there's no working no-browser path for Claude. See PR #32.)*
 
 **Settings (exactly the sample's set):**
 - **keep me on the same tool** — *"a Codex limit hops to your other Codex seat, never to Claude."*
