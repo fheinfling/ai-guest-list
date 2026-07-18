@@ -216,11 +216,15 @@ function reduceReply(ui, res) {
 
   let addChanged = false;
   const inAdd = screen === "add" && add;
-  if (res.added && inAdd && add.pending) {     // OUR paste/snapshot succeeded → celebrate then done
+  // An add-op reply applies to the CURRENT flow only if it's for the same tool — a late reply from a
+  // login the user abandoned (possibly for the other provider) must not steer the flow they restarted.
+  // (res.tool may be absent on a generic failure; then fall back to "current flow".)
+  const forThisFlow = inAdd && res.add_op && (res.tool == null || res.tool === add.provider);
+  if (res.added && forThisFlow && add.pending) { // OUR paste/snapshot succeeded → celebrate then done
     add.pending = false; add.step = "done";
     addChanged = true; closeFlow = add;        // caller schedules the auto-close, scoped to this flow
   }
-  if (res.error && res.add_op && inAdd) {       // OUR add op failed (not an unrelated poll error)
+  if (res.error && forThisFlow) {               // OUR add op failed (not an unrelated / other-tool one)
     if (add.pending) {                          // a save was in flight
       add.pending = false;
       // codex paste → back to the form (auth.json preserved). Browser save (tapped before login
@@ -235,9 +239,9 @@ function reduceReply(ui, res) {
   if (screen === "add") render = addChanged;    // else swallow the poll, keep the DOM (and focus)
   else if (res.state || res.settings_panel) render = true;
 
-  // Toast a user-action error, but not a background poll blip, nor an add-op error that resolved
-  // AFTER the user left the add flow (it would pop over main/settings out of nowhere).
-  if (res.error && !res.background && !(res.add_op && !(screen === "add" && add))) flash = res.error;
+  // Toast a user-action error, but not a background poll blip, nor an add-op error that isn't for the
+  // current flow (a stale/other-tool one would pop over main/settings or the wrong add out of nowhere).
+  if (res.error && !res.background && (!res.add_op || forThisFlow)) flash = res.error;
   if (res.celebrate) celebrate = true;
 
   return { screen, add, lastRev, state, render, flash, celebrate, closeFlow };
@@ -300,9 +304,9 @@ function addDetailsStep(add) {
 }
 
 function addConnectingStep(add) {
-  // A Terminal flow (browser sign-in OR claude setup-token) first WAITS for the user to finish in the
-  // other window and tap "save my seat"; only then (add.pending) is a snapshot in flight. A codex
-  // paste is always actively saving. Spinner + "saving…" copy show only when something is really in
+  // A browser sign-in first WAITS for the user to finish in the browser and tap "save my seat"; only
+  // then (add.pending) is a snapshot in flight. A codex auth.json paste is always actively saving.
+  // Spinner + "saving…" copy show only when something is really in
   // flight — a lone spinner while we wait on the user would read as "hung".
   const terminalFlow = !addUsesPaste(add);        // a browser sign-in (codex or claude) waits on the user
   const saving = !terminalFlow || add.pending;
@@ -554,16 +558,16 @@ document.addEventListener("click", (e) => {
     case "add-cancel": screen = "main"; add = null; render(); break;   // add=null drops any pending op
     case "add-cta": {
       const name = add.name.trim();
-      // Only a codex "token" paste installs an auth.json in-app; everything else (browser sign-in,
-      // and claude's setup-token) launches an official flow in Terminal and waits on the user.
+      // Only a codex "token" paste installs an auth.json in-app; browser sign-in (both providers)
+      // launches the official flow in Terminal and waits on the user.
       if (addUsesPaste(add)) {
         const blob = add.token.trim();
         if (!blob) break;                      // empty field → no-op, not a spinner + error toast
         add.pending = true; add.step = "connecting"; render();   // paste in flight → saving spinner
         send("paste", { tool: add.provider, blob, ...(name ? { name } : {}) });
       } else {
-        // launch the login/setup-token in Terminal and wait on the USER to finish + tap "save my
-        // seat" — not a saving spinner yet (that's add.pending, set on save).
+        // launch the browser sign-in and wait on the USER to finish + tap "save my seat" — not a
+        // saving spinner yet (that's add.pending, set on save).
         add.step = "connecting"; render();
         send("login", { tool: add.provider, method: add.method });
       }

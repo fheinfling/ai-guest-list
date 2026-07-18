@@ -48,7 +48,8 @@ if objc is not None:
             self.popover = None
             self.webview = None
             self._acctWarned = set()              # shared-account warnings already toasted this session
-            self._login_baseline = {}             # tool → digest of live creds when a login was launched
+            self._login_baseline = {}             # tool → (op, digest of live creds at that login launch)
+            self._login_seq = 0                   # monotonic login op id (see the login handler)
             return self
 
         # --- lifecycle ----------------------------------------------------------------------
@@ -164,18 +165,24 @@ if objc is not None:
 
         def loginBg_(self, msg):
             # sync-back-before-login (invariant) + launch the official flow in Terminal, off the main
-            # thread. Absolute import (not `.terminal`): under py2app the main script runs as top-level
-            # __main__ with no package context, so a relative import would fail in the .app.
-            from app.terminal import prepare_then_login
-            command = bridge.login_command(msg["tool"], msg.get("method", "browser"))
+            # thread. Everything is inside the try so ANY startup failure (the absolute py2app import,
+            # command resolution, the launch) surfaces as one correlated error and drops the baseline.
+            tool = msg["tool"]
+            op = msg.get("_op")
             try:
-                prepare_then_login(self.ctx, msg["tool"], command)
+                # Absolute import (not `.terminal`): under py2app the main script runs as top-level
+                # __main__ with no package context, so a relative import would fail in the .app.
+                from app.terminal import prepare_then_login
+                command = bridge.login_command(tool, msg.get("method", "browser"))
+                prepare_then_login(self.ctx, tool, command)
             except Exception:
-                # Launch failed (sync-back error / Terminal automation blocked) → the baseline is
-                # meaningless; drop it and tell the web flow so it doesn't wait on a window that never
-                # opened. applyResult_ pushes it to the JS reducer (which returns to details).
-                self._login_baseline.pop(msg["tool"], None)
-                result = {"ok": False, "add_op": True, "tool": msg["tool"],
+                # Launch failed → drop OUR baseline (only if a newer login for this tool hasn't already
+                # replaced it — op identity) and tell the web flow so it doesn't wait on a window that
+                # never opened. applyResult_ pushes it to the reducer, which returns THIS flow to details.
+                cur = self._login_baseline.get(tool)
+                if cur is not None and cur[0] == op:
+                    self._login_baseline.pop(tool, None)
+                result = {"ok": False, "add_op": True, "tool": tool,
                           "error": "couldn't open the sign-in — try again"}
                 self.performSelectorOnMainThread_withObject_waitUntilDone_(
                     objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
@@ -194,11 +201,11 @@ if objc is not None:
             # app behind the add-seat "saving your seat…" spinner. ctx.locked() serialises the poll.
             # Guard: an unexpected raise here would otherwise leave the user stuck on the spinner with
             # nothing pushed back — turn it into a friendly error the connecting step can act on.
+            tool = msg.get("tool")
             try:
-                tool = msg.get("tool")
                 if msg.get("action") == "snapshot":
-                    base = self._login_baseline.get(tool)
-                    if base is not None and self._credDigest(tool) == base:
+                    base = self._login_baseline.get(tool)   # (op, digest)
+                    if base is not None and self._credDigest(tool) == base[1]:
                         # Live creds are unchanged since the login launched → the browser sign-in
                         # isn't finished. Snapshotting now would just re-add the OUTGOING seat.
                         result = {"ok": False, "add_op": True, "tool": tool,
@@ -211,9 +218,10 @@ if objc is not None:
                     self._login_baseline.pop(tool, None)   # consumed — a real add completed
             except Exception:
                 result = {"ok": False, "error": "something went wrong saving that seat"}
-            # Tag it as an add-op reply. The JS uses this to attribute an error to THIS paste/snapshot
-            # (vs. a 180s usage-poll error landing mid-add), and it also gates the "seat saved" nudge.
+            # Tag it as an add-op reply FOR THIS TOOL. The JS reducer uses both to attribute the reply
+            # to the right flow (vs. a poll error, or a late reply from another tool's abandoned add).
             result["add_op"] = True
+            result["tool"] = tool
             self.performSelectorOnMainThread_withObject_waitUntilDone_(
                 objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
 
@@ -252,15 +260,20 @@ if objc is not None:
             if action == "settings":
                 return  # reserved
             if action == "login":
+                # Give each login an op id so a late failure from an abandoned attempt can only drop
+                # ITS OWN baseline, not a newer one for the same tool.
+                self._login_seq += 1
+                op = self._login_seq
                 # Baseline the OUTGOING live creds NOW — before anything can rewrite them — so a "save
                 # my seat" tapped before sign-in completes (creds unchanged) is rejected instead of
                 # silently re-adding the old seat. (sync_back doesn't change live creds, so capturing
                 # here == capturing just before launch.) Reading creds is a quick, lock-free read.
-                self._login_baseline[msg["tool"]] = self._credDigest(msg["tool"])
+                self._login_baseline[msg["tool"]] = (op, self._credDigest(msg["tool"]))
                 # Off the main thread: prepare_then_login holds ctx.locked() and runs osascript — on
                 # the main thread it would beachball behind a usage poll holding the same lock.
+                m = dict(msg); m["_op"] = op
                 self.performSelectorInBackground_withObject_(
-                    objc.selector(self.loginBg_, signature=b"v@:@"), msg)
+                    objc.selector(self.loginBg_, signature=b"v@:@"), m)
                 return
             if action in ("paste", "snapshot"):
                 # off the main thread (see addBg_) — both verify creds against the provider (Claude

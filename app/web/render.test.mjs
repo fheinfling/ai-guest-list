@@ -345,3 +345,24 @@ test("reduceReply: settings_panel opens settings, but not while a save is in fli
 test("reduceReply: celebrate flag is passed through", () => {
   assert.equal(reduceReply(UI(), { ok: true, celebrate: true, state: stateRev(1) }).celebrate, true);
 });
+
+test("reduceReply: an add-op error for ANOTHER tool does not steer the current flow", () => {
+  // user abandoned a codex login, is now on a claude connecting step; the stale codex failure lands
+  const add = mkAdd({ step: "connecting", provider: "claude", method: "browser" });
+  const o = reduceReply(UI({ screen: "add", add }), { ok: false, error: "codex fail", add_op: true, tool: "codex" });
+  assert.equal(o.add.step, "connecting");   // NOT sent back to details
+  assert.equal(o.render, false);
+  assert.equal(o.flash, null);              // and not toasted over the claude flow
+});
+
+test("reduceReply: an add-op reply for the SAME tool still applies", () => {
+  const add = mkAdd({ step: "connecting", provider: "claude", method: "browser" });
+  const o = reduceReply(UI({ screen: "add", add }), { ok: false, error: "claude fail", add_op: true, tool: "claude" });
+  assert.equal(o.add.step, "details"); assert.equal(o.flash, "claude fail");
+});
+
+test("reduceReply: a tool-less add-op error falls back to the current flow", () => {
+  const add = mkAdd({ step: "connecting", provider: "codex", method: "token", pending: true });
+  const o = reduceReply(UI({ screen: "add", add }), { ok: false, error: "generic", add_op: true });
+  assert.equal(o.add.step, "details"); assert.equal(o.flash, "generic");   // no tool → still ours
+});

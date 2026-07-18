@@ -107,16 +107,16 @@ document.addEventListener("click", (e) => {
     case "add-cancel": screen = "main"; add = null; render(); break;   // add=null drops any pending op
     case "add-cta": {
       const name = add.name.trim();
-      // Only a codex "token" paste installs an auth.json in-app; everything else (browser sign-in,
-      // and claude's setup-token) launches an official flow in Terminal and waits on the user.
+      // Only a codex "token" paste installs an auth.json in-app; browser sign-in (both providers)
+      // launches the official flow in Terminal and waits on the user.
       if (addUsesPaste(add)) {
         const blob = add.token.trim();
         if (!blob) break;                      // empty field → no-op, not a spinner + error toast
         add.pending = true; add.step = "connecting"; render();   // paste in flight → saving spinner
         send("paste", { tool: add.provider, blob, ...(name ? { name } : {}) });
       } else {
-        // launch the login/setup-token in Terminal and wait on the USER to finish + tap "save my
-        // seat" — not a saving spinner yet (that's add.pending, set on save).
+        // launch the browser sign-in and wait on the USER to finish + tap "save my seat" — not a
+        // saving spinner yet (that's add.pending, set on save).
         add.step = "connecting"; render();
         send("login", { tool: add.provider, method: add.method });
       }
