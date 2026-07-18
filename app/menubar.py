@@ -176,12 +176,14 @@ if objc is not None:
                 command = bridge.login_command(tool, msg.get("method", "browser"))
                 prepare_then_login(self.ctx, tool, command)
             except Exception:
-                # Launch failed → drop OUR baseline (only if a newer login for this tool hasn't already
-                # replaced it — op identity) and tell the web flow so it doesn't wait on a window that
-                # never opened. applyResult_ pushes it to the reducer, which returns THIS flow to details.
+                # Launch failed. If a NEWER login for this tool has since superseded us (op identity),
+                # this failure is stale — the user restarted, so stay silent: pushing it would send
+                # the restarted same-tool flow back to details and toast over it. Only the current
+                # attempt reports, drops its own baseline, and returns THIS flow to details.
                 cur = self._login_baseline.get(tool)
-                if cur is not None and cur[0] == op:
-                    self._login_baseline.pop(tool, None)
+                if cur is None or cur[0] != op:
+                    return
+                self._login_baseline.pop(tool, None)
                 result = {"ok": False, "add_op": True, "tool": tool,
                           "error": "couldn't open the sign-in — try again"}
                 self.performSelectorOnMainThread_withObject_waitUntilDone_(

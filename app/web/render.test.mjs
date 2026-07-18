@@ -208,7 +208,7 @@ test("add: claude is browser-only — no method chooser, no token surface", () =
   assert.ok(h.includes("open sign-in →"));                     // single browser CTA
 });
 
-test("add: codex setup-token method DOES paste an auth.json textarea", () => {
+test("add: codex 'token' method pastes an auth.json textarea in-app", () => {
   const h = buildAddSeat({ settings: {} }, mkAdd({ step: "details", provider: "codex", method: "token" }));
   assert.match(h, /id="add-token"[^>]*placeholder="[^"]*auth.json/);
   assert.ok(h.includes("save the seat →"));                    // in-app paste, not Terminal
