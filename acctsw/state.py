@@ -88,6 +88,10 @@ class State:
         return cls(path=path, data=data)
 
     def save(self) -> None:
+        # Monotonic revision: lets a UI reject a stale snapshot (an in-flight usage poll that read an
+        # older state, then arrived after a newer mutation like an add) instead of clobbering the
+        # fresh view. Bumped under the same lock every mutation holds.
+        self.data["rev"] = int(self.data.get("rev", 0)) + 1
         write_json(self.path, self.data, mode=0o600)
 
     # --- accessors ---------------------------------------------------------------------------

@@ -181,17 +181,8 @@ html, body { background:transparent; width:100%; overflow:hidden; }
 .link { background:none; border:none; color:var(--t2); cursor:pointer; font:inherit; }
 .link:hover { color:var(--t1); }
 
-/* overlays */
+/* overlay — now only the toast surface (add-seat is a pushed sub-view, no modal) */
 #overlay:empty { display:none; }
-.backdrop { position:fixed; inset:0; background:rgba(12,18,30,.45); display:flex; align-items:center;
-  justify-content:center; padding:18px; }
-.sheet { background:var(--popover); color:var(--t1); border:1px solid var(--line); border-radius:14px;
-  padding:16px; width:100%; max-width:300px; text-align:center; font-family:var(--sans); }
-.sheet h3 { font-size:14px; } .sheet .sub { color:var(--t2); font-size:11px; margin-bottom:12px; }
-.pk-m { display:block; width:100%; margin:6px 0; padding:10px; border:none; border-radius:9px;
-  background:var(--good); color:#04130d; font:inherit; font-weight:700; cursor:pointer; }
-.paste { width:100%; height:92px; margin-bottom:10px; border-radius:9px; border:1px solid var(--line);
-  background:var(--card); color:var(--t1); font-size:11px; padding:8px; }
 /* settings sub-view (spec §9.1) — pushed screen inside the popover, not a modal ------------------ */
 /* flex column + internal .set-body scroll come from .app; padding moves into head/body. The old
    max-height:620px exceeded the 600px popover and made the PAGE scroll — never cap past the
@@ -219,6 +210,61 @@ html, body { background:transparent; width:100%; overflow:hidden; }
 .set-legend { display:flex; flex-direction:column; gap:8px; padding:12px 13px; }
 .set-legend-row { display:flex; align-items:center; gap:8px; }
 .set-ver { text-align:center; font-size:11px; color:var(--t3); padding:4px 0 8px; }
+
+/* add-a-seat sub-view (spec §9) — reuses the .set-* chrome; provider accent rides --accent.
+   The settings segmented "on" state is hardcoded teal; scope it to the add accent here (don't edit
+   .sopt.on, settings must stay teal). */
+.add-app .set-seg .sopt.on { background:var(--accent); }
+.add-cancel { background:none; border:none; cursor:pointer; font:inherit; font-weight:700; font-size:13px; color:var(--t3); padding:4px; }
+.add-prov { display:flex; align-items:center; gap:12px; width:100%; padding:13px; background:transparent;
+  border:none; cursor:pointer; font:inherit; text-align:left; color:var(--t1); }
+.add-prov:hover { background:var(--elevated); }
+.add-chip { width:36px; height:36px; border-radius:10px; flex:none; display:flex; align-items:center;
+  justify-content:center; background:color-mix(in srgb, var(--accent) 14%, var(--popover)); }
+.add-chip-dot { width:13px; height:13px; border-radius:4px; background:var(--accent); }
+.add-chip--sm { width:30px; height:30px; border-radius:9px; }
+.add-chip--sm .add-chip-dot { width:12px; height:12px; }
+.add-prov-tx { flex:1; display:flex; flex-direction:column; gap:1px; min-width:0; }
+.add-prov-name { font-size:14px; font-weight:700; }
+.add-prov-sub { font-size:11.5px; color:var(--t2); }
+.add-chev { font-size:18px; color:var(--t3); flex:none; }
+.add-foot { font-size:11.5px; color:var(--t2); line-height:1.45; padding:2px 3px; }
+/* NOT .set-card: the .set-card > *+* hairline rule would draw borders between the chip/text/link. */
+.add-provcard { display:flex; align-items:center; gap:11px; padding:11px 13px; border-radius:13px;
+  background:var(--card); border:1px solid var(--line); }
+.add-provcard-t { font-weight:700; font-size:13.5px; }
+.add-provcard-s { font-size:11px; color:var(--t2); }
+.add-change { background:none; border:none; cursor:pointer; font:inherit; font-size:11.5px; font-weight:700;
+  color:var(--accent); flex:none; }
+.add-input { width:100%; height:46px; padding:0 14px; background:transparent; border:none; outline:none;
+  font:inherit; font-size:14px; color:var(--t1); }
+.add-method { display:flex; flex-direction:column; gap:9px; padding:12px 13px; }
+.add-hint { font-size:11.5px; color:var(--t2); line-height:1.4; }
+.add-tokenwrap { padding:12px 13px; }  /* second child of .set-card → gets the hairline for free */
+.add-token { width:100%; height:60px; border-radius:10px; background:var(--elevated); border:1px solid var(--line);
+  color:var(--t1); font-size:11.5px; padding:8px 10px; resize:none; box-sizing:border-box; }
+.add-cta { height:46px; border-radius:13px; border:none; cursor:pointer; background:var(--accent); color:#fff;
+  font:inherit; font-weight:800; font-size:14.5px;
+  box-shadow:0 8px 20px color-mix(in srgb, var(--accent) 30%, transparent); }
+.add-center { display:flex; flex-direction:column; align-items:center; text-align:center; gap:16px; padding:44px 10px; }
+.add-center--done { gap:14px; padding:40px 10px; }
+.add-center .add-cta { align-self:stretch; margin-top:8px; }
+.add-spin { width:46px; height:46px; border-radius:50%; border:3px solid var(--elevated);
+  border-top-color:var(--accent); animation:gl-spin .8s linear infinite; }
+.add-heart { font-size:46px; animation:gl-breathe .9s ease infinite; }
+.add-h { font-weight:700; font-size:15px; }
+.add-welcome { font-family:"Outfit", var(--sans); font-weight:700; font-size:16px; }
+.add-sub { font-size:12.5px; color:var(--t2); }
+@keyframes gl-spin { to { transform:rotate(360deg); } }
+@keyframes gl-breathe { 0%,100% { transform:scale(1); } 50% { transform:scale(1.07); } }
+/* keep the spinner turning even under reduced-motion — a frozen ring reads as "hung", and it's a
+   progress indicator, not decoration; only still the decorative heart pulse. */
+@media (prefers-reduced-motion: reduce) { .add-heart { animation:none; } }
+
+/* toast — flash() renders .toast into #overlay; no rule existed, so errors were unstyled. */
+.toast { position:fixed; left:50%; bottom:18px; transform:translateX(-50%); max-width:330px;
+  background:var(--elevated); color:var(--t1); border:1px solid var(--line); border-radius:10px;
+  padding:9px 13px; font-family:var(--sans); font-size:12px; box-shadow:0 8px 24px rgba(0,0,0,.3); }
 
 .celebrate { animation:pop .5s ease; }
 @keyframes pop { 0%{transform:scale(.99)} 50%{transform:scale(1.01)} 100%{transform:scale(1)} }

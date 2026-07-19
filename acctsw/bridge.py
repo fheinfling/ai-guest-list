@@ -41,22 +41,17 @@ def snapshot_state(ctx: Context) -> dict[str, Any]:
     data["dot"] = dot_for(data)  # single source of truth for the dot (JS + native both read this)
     data["door"] = door_for(data)  # shut/open door icon — same state feeds native glyph + web header
     data["app"] = {"version": __version__, "build": build_number()}  # shown in the settings sheet
+    data["rev"] = int(state.data.get("rev", 0))  # monotonic; the UI drops a snapshot older than one it applied
     return data
 
 
-def login_plan(tool: str) -> dict[str, Any]:
-    """Describe how to add a seat (the native side runs the chosen flow in Terminal)."""
-    if tool == "codex":
-        return {"tool": "codex", "title": "who's joining the list?",
-                "methods": [
-                    {"id": "browser", "label": "ChatGPT sign-in", "command": "codex login"},
-                    {"id": "paste", "label": "paste auth.json", "command": None},
-                ]}
-    return {"tool": "claude", "title": "who's joining the list?",
-            "methods": [
-                {"id": "browser", "label": "Claude.ai sign-in", "command": "claude auth login"},
-                {"id": "token", "label": "setup-token", "command": "claude setup-token"},
-            ]}
+def login_command(tool: str, method: str = "browser") -> str:
+    """The Terminal command for an official browser sign-in. Kept in the bridge (not the UI) so the
+    engine stays the source of truth for how each tool logs in. ``method`` is reserved but currently
+    unused: both tools' only Terminal path is the browser sign-in (codex's no-browser option pastes
+    an auth.json in-app; Claude has no working no-browser path — `claude setup-token` produces an
+    env-var token, not the Keychain login this app snapshots)."""
+    return "codex login" if tool == "codex" else "claude auth login"
 
 
 def handle(ctx: Context, message: dict) -> dict[str, Any]:
@@ -117,11 +112,11 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
                 usage_mod.refresh(ctx, state, message.get("tool"))
             return {"ok": True, "state": snapshot_state(ctx)}
 
-        if action == "add":
-            return {"ok": True, "login": login_plan(message["tool"])}
-
         if action == "paste":
-            # codex no-browser path: install a pasted auth.json, then register it as a seat.
+            # Codex no-browser path only: install a pasted auth.json, then register it as a seat.
+            # (Claude has no paste path AND no no-browser add path at all — a `claude setup-token` is
+            # an env-var inference credential that 403s on the OAuth endpoints and doesn't write the
+            # Keychain login this app snapshots. Claude seats are added via browser sign-in only.)
             tool = message["tool"]
             blob = message["blob"]
             # VALIDATE BEFORE WRITING: never overwrite the canonical auth.json with an unparseable

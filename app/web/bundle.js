@@ -167,32 +167,185 @@ function controlBar(opts) {
   </label>`;
 }
 
-// --- overlays (add-a-seat, settings) ----------------------------------------------------------
+// --- add-a-seat sub-view (spec §9) — a pushed screen like settings, NOT a modal ----------------
+// Four steps: provider → details → connecting → done. The provider accent (teal Codex / coral
+// Claude) rides a single `--accent` CSS var on the root, so step markup never branches on tool.
+// `add` is the transient flow state owned by app.mjs: {step, provider, name, method, token}.
 
-function buildPicker(plan) {
-  const methods = (plan?.methods || []).map((m) =>
-    m.command
-      ? `<button class="pk-m" data-action="login" data-tool="${esc(plan.tool)}" data-command="${esc(m.command)}">${esc(m.label)}</button>`
-      : `<button class="pk-m" data-action="paste-open" data-tool="${esc(plan.tool)}">${esc(m.label)}</button>`
-  ).join("");
-  return `<div class="backdrop" data-action="picker-close"><div class="sheet">
-    <h3>${esc(plan?.title || "who's joining the list?")}</h3><p class="sub">how should i sign you in?</p>
-    ${methods}<button class="link" data-action="picker-close">cancel</button></div></div>`;
+// Sign-in methods per provider:
+//   codex  — browser sign-in, OR paste an auth.json blob (a textarea the engine installs directly).
+//   claude — browser sign-in ONLY. A `claude setup-token` is a long-lived token for the
+//            CLAUDE_CODE_OAUTH_TOKEN env var; it does NOT write the Keychain login our snapshot
+//            pipeline reads, so there is no working paste/Terminal no-browser path for Claude today.
+const ADD_COPY = {
+  codex: {
+    row: "ChatGPT sign-in · Business seat",
+    chip: "Codex CLI · ChatGPT sign-in or auth.json",
+    tokenHint: "paste your auth.json — handy for a headless or shared box.",
+    tokenPh: "paste auth.json contents",
+  },
+  claude: {
+    row: "Claude.ai sign-in · Max or Pro seat",
+    chip: "Claude Code · Claude.ai sign-in",
+  },
+};
+const BROWSER_HINT = "i'll pop open the official sign-in — nothing leaves your Mac, i just save the seat.";
+
+// Which providers offer a no-browser method (a method choice at all). Only codex, via auth.json.
+function addHasMethods(provider) { return provider === "codex"; }
+// A codex "token" is the only in-app paste; everything else is an official flow launched in a window.
+// Exported so app.mjs shares the single definition instead of re-deriving the predicate.
+function addUsesPaste(add) { return add.method === "token" && add.provider === "codex"; }
+
+// PURE reducer for a bridge reply → next UI state + effects. All the async-correlation logic that
+// kept regressing (stale replies, poll ordering, save-in-flight, login-launch failure) lives here so
+// it can be unit-tested without a DOM. app.mjs owns the effects (render/flash/celebrate/timer).
+//   ui  = { screen, add, lastRev, state }   (add may be null; add is mutated in place and returned)
+//   res = the bridge result object
+// returns { screen, add, lastRev, state, render, flash, celebrate, closeFlow }
+//   closeFlow: the add object whose "done" screen should auto-close after a delay, or null.
+function reduceReply(ui, res) {
+  let { screen, add, lastRev, state } = ui;
+  let render = false, flash = null, celebrate = false, closeFlow = null;
+
+  // Native "open settings" — but never interrupt an in-flight save (its reply would land off-screen).
+  if (res.settings_panel && !(add && add.pending)) screen = "settings";
+  // Drop a stale snapshot: a poll that read older state then arrived after a newer mutation would
+  // clobber the fresh view (the new seat would vanish). rev is monotonic across saves.
+  if (res.state && (res.state.rev ?? 0) >= lastRev) { state = res.state; lastRev = res.state.rev ?? 0; }
+
+  let addChanged = false;
+  const inAdd = screen === "add" && add;
+  // An add-op reply applies to the CURRENT flow only if it's for the same tool — a late reply from a
+  // login the user abandoned (possibly for the other provider) must not steer the flow they restarted.
+  // (res.tool may be absent on a generic failure; then fall back to "current flow".)
+  const forThisFlow = inAdd && res.add_op && (res.tool == null || res.tool === add.provider);
+  if (res.added && forThisFlow && add.pending) { // OUR paste/snapshot succeeded → celebrate then done
+    add.pending = false; add.step = "done";
+    addChanged = true; closeFlow = add;        // caller schedules the auto-close, scoped to this flow
+  }
+  if (res.error && forThisFlow) {               // OUR add op failed (not an unrelated / other-tool one)
+    if (add.pending) {                          // a save was in flight
+      add.pending = false;
+      // codex paste → back to the form (auth.json preserved). Browser save (tapped before login
+      // finished) → stay on connecting so they can complete sign-in and tap "save my seat" again.
+      if (addUsesPaste(add)) add.step = "details";
+      addChanged = true;
+    } else if (add.step === "connecting") {     // the login LAUNCH failed (window never opened)
+      add.step = "details"; addChanged = true;  // back to the form to retry
+    }
+  }
+
+  if (screen === "add") render = addChanged;    // else swallow the poll, keep the DOM (and focus)
+  else if (res.state || res.settings_panel) render = true;
+
+  // Toast a user-action error, but not a background poll blip, nor an add-op error that isn't for the
+  // current flow (a stale/other-tool one would pop over main/settings or the wrong add out of nowhere).
+  if (res.error && !res.background && (!res.add_op || forThisFlow)) flash = res.error;
+  if (res.celebrate) celebrate = true;
+
+  return { screen, add, lastRev, state, render, flash, celebrate, closeFlow };
 }
 
-function buildSaveSeat(tool) {
-  return `<div class="backdrop"><div class="sheet"><h3>signed in?</h3>
-    <p class="sub">i'll keep your ${esc(tool)} seat warm</p>
-    <button class="pk-m" data-action="snapshot" data-tool="${esc(tool)}">save my seat 💛</button>
-    <button class="link" data-action="picker-close">not yet</button></div></div>`;
+function addProviderStep() {
+  const row = (tool) => `<button class="add-prov" data-action="add-provider" data-tool="${tool}"
+      style="--accent:${TOOL_META[tool].accent}">
+      <span class="add-chip"><span class="add-chip-dot"></span></span>
+      <span class="add-prov-tx"><span class="add-prov-name">${TOOL_META[tool].label}</span>
+        <span class="add-prov-sub">${ADD_COPY[tool].row}</span></span>
+      <span class="add-chev">›</span></button>`;
+  return `<section class="set-sec">
+    <span class="set-label">who's joining the list?</span>
+    <div class="set-card">${row("codex")}${row("claude")}</div>
+    <div class="add-foot">nothing leaves your Mac — i just save the seat's credentials so you can hop between them.</div>
+  </section>`;
 }
 
-function buildPaste(tool) {
-  const hint = tool === "claude" ? "paste a setup-token (sk-ant-oat…)" : "paste auth.json";
-  return `<div class="backdrop"><div class="sheet"><h3>${hint}</h3><p class="sub">no browser dance</p>
-    <textarea id="paste-blob" class="paste mono" placeholder="${tool === "claude" ? "sk-ant-oat…" : "{ ... }"}"></textarea>
-    <button class="pk-m" data-action="paste-save" data-tool="${esc(tool)}">save my seat 💛</button>
-    <button class="link" data-action="picker-close">cancel</button></div></div>`;
+function addDetailsStep(add) {
+  const c = ADD_COPY[add.provider];
+  const paste = addUsesPaste(add);
+  const cta = paste ? "save the seat →" : "open sign-in →";
+  // The method chooser shows only for a provider that has a no-browser option (codex). Claude is
+  // browser-only, so it renders name + a single "open sign-in" CTA with no segmented control.
+  let methodSection = "";
+  if (addHasMethods(add.provider)) {
+    const seg = (v, label) =>
+      `<button class="sopt ${add.method === v ? "on" : ""}" data-action="add-method" data-value="${v}">${label}</button>`;
+    const hint = add.method === "token" ? c.tokenHint : BROWSER_HINT;
+    const tokenWrap = paste
+      ? `<div class="add-tokenwrap"><textarea id="add-token" class="add-token mono"
+           placeholder="${esc(c.tokenPh)}">${esc(add.token)}</textarea></div>`
+      : "";
+    methodSection = `<section class="set-sec">
+      <span class="set-label">how should i sign you in?</span>
+      <div class="set-card">
+        <div class="add-method">
+          <div class="set-seg">${seg("browser", "open browser")}${seg("token", "paste auth.json")}</div>
+          <div class="add-hint">${hint}</div>
+        </div>
+        ${tokenWrap}
+      </div>
+    </section>`;
+  }
+  return `<div class="add-provcard">
+      <span class="add-chip add-chip--sm"><span class="add-chip-dot"></span></span>
+      <span class="add-prov-tx"><span class="add-provcard-t">new ${TOOL_META[add.provider].label} seat</span>
+        <span class="add-provcard-s">${c.chip}</span></span>
+      <button class="add-change" data-action="add-change">change</button>
+    </div>
+    <section class="set-sec">
+      <span class="set-label">name this seat</span>
+      <div class="set-card">
+        <input id="add-name" class="add-input" placeholder="Work · Personal · Late-night" value="${esc(add.name)}">
+      </div>
+    </section>
+    ${methodSection}
+    <button class="add-cta" data-action="add-cta">${cta}</button>`;
+}
+
+function addConnectingStep(add) {
+  // A browser sign-in first WAITS for the user to finish in the browser and tap "save my seat"; only
+  // then (add.pending) is a snapshot in flight. A codex auth.json paste is always actively saving.
+  // Spinner + "saving…" copy show only when something is really in
+  // flight — a lone spinner while we wait on the user would read as "hung".
+  const terminalFlow = !addUsesPaste(add);        // a browser sign-in (codex or claude) waits on the user
+  const saving = !terminalFlow || add.pending;
+  const title = saving ? "saving your seat…" : "we opened your browser…";
+  const sub = saving ? "tucking it away safely 💛" : "say hi over there and you're on the list 💛";
+  const spin = saving ? `<div class="add-spin"></div>` : "";
+  const cta = terminalFlow
+    ? `<button class="add-cta" data-action="add-save"${add.pending ? " disabled" : ""}>save my seat 💛</button>`
+    : "";
+  return `<div class="add-center">${spin}
+    <div class="add-h">${title}</div><div class="add-sub">${sub}</div>${cta}</div>`;
+}
+
+function addDoneStep(add) {
+  return `<div class="add-center add-center--done"><div class="add-heart">💛</div>
+    <div class="add-welcome">welcome, ${esc(add.name.trim() || "new seat")}</div>
+    <div class="add-sub">your seat's saved — i'll keep it warm</div></div>`;
+}
+
+// A pushed sub-view (§9): renders into #root in place of the popover. Reuses the settings chrome
+// (.set-app / .set-head / .set-body) so header + scroll metrics match exactly.
+function buildAddSeat(state, add) {
+  const theme = state?.settings?.theme === "dark" ? "dark" : "light";
+  const step = add?.step || "provider";
+  const accent = add?.provider ? ` style="--accent:${TOOL_META[add.provider].accent}"` : "";
+  const cancel = step === "provider" || step === "details"
+    ? `<button class="add-cancel" data-action="add-cancel">cancel</button>` : "";
+  const body = step === "details" ? addDetailsStep(add)
+    : step === "connecting" ? addConnectingStep(add)
+    : step === "done" ? addDoneStep(add)
+    : addProviderStep();
+  return `<div class="app set-app add-app theme-${theme}"${accent}>
+    <header class="set-head">
+      <button class="set-back" data-action="add-back" title="back">‹</button>
+      <span class="set-title">add a seat</span>
+      ${cancel}
+    </header>
+    <div class="set-body">${body}</div>
+  </div>`;
 }
 
 // Settings sub-view building blocks (spec §9.1): grouped iOS-style cards, every row a subtitle,
@@ -282,7 +435,7 @@ function buildHTML(state) {
         <span class="substatus">${c.resting} resting · ${c.ready} ready</span></span>
       <span class="top-actions">
         <button class="ibtn" data-action="settings" title="settings">⋯</button>
-        <button class="ibtn" data-action="add" data-tool="codex" title="add a seat">＋</button>
+        <button class="ibtn" data-action="add" title="add a seat">＋</button>
       </span>
     </header>
     <div class="main-body">
@@ -301,10 +454,11 @@ function buildHTML(state) {
 // All rendering logic lives in render.mjs (pure, unit-tested); this file is the thin wiring.
 
 const root = document.getElementById("root");
-const overlay = document.createElement("div");
+const overlay = document.createElement("div");   // toast surface only (siblings of #root)
 overlay.id = "overlay";
 document.body.appendChild(overlay);
 let state = { settings: { theme: "dark" }, tools: {} };
+let lastRev = -1;   // highest state.rev applied; a lower one is a stale snapshot and is ignored
 
 // --- bridge -----------------------------------------------------------------------------------
 function send(action, payload = {}) {
@@ -320,13 +474,20 @@ function send(action, payload = {}) {
 window.AGL = {
   result(res) {
     res = typeof res === "string" ? JSON.parse(res) : res;
-    if (res.settings_panel) screen = "settings"; // native entrypoint into the settings sub-view
-    if (res.state) state = res.state;
-    if (res.state || res.settings_panel) render(); // re-renders current screen (settings live-updates)
-    if (res.error) flash(res.error);
-    if (res.login) { overlay.innerHTML = buildPicker(res.login); }
-    if (res.await_snapshot) { overlay.innerHTML = buildSaveSeat(res.tool); }
-    if (res.celebrate) celebrate();
+    // All the async-correlation logic lives in the pure reduceReply() (unit-tested); this just
+    // applies its decisions to the module state + DOM. The add sub-view holds unsaved typed input,
+    // so a pure state push (the 180s poll) updates `state` but the reducer returns render=false —
+    // no DOM swap, no focus/caret theft.
+    const out = reduceReply({ screen, add, lastRev, state }, res);
+    screen = out.screen; add = out.add; lastRev = out.lastRev; state = out.state;
+    if (out.render) render();
+    if (out.flash) flash(out.flash);
+    if (out.celebrate) celebrate();
+    if (out.closeFlow) setTimeout(() => {      // auto-close this flow's "done" screen; scoped by
+      if (screen === "add" && add === out.closeFlow && add.step === "done") {   // object identity so
+        screen = "main"; add = null; render();  // a stale timer can't close a later add.
+      }
+    }, 1600);
   },
   // legacy single-arg state push (kept for the poll path / older callers)
   update(next) { this.result({ state: typeof next === "string" ? JSON.parse(next) : next }); },
@@ -341,12 +502,14 @@ function flash(text) {
   overlay.innerHTML = `<div class="toast">${text}</div>`;
   setTimeout(() => { if (overlay.querySelector(".toast")) overlay.innerHTML = ""; }, 3000);
 }
-function closeOverlay() { overlay.innerHTML = ""; }
 
-// which screen occupies the popover: "main" or the settings sub-view (spec §9.1 — a pushed
-// sub-view on the same surface, never a modal).
+// which screen occupies the popover: "main", the settings sub-view, or the add-seat sub-view
+// (spec §9 — pushed sub-views on the same surface, never a modal).
 let screen = "main";
 let renderedScreen = null;  // what the last render() actually drew — gates scroll preservation
+// transient add-a-seat flow state; non-null only while screen === "add". Held here (not in `state`,
+// which the poll overwrites) so typed name/token survive a background re-render.
+let add = null;
 
 function render() {
   // A background state push (the usage poll) re-renders whatever screen is up; carry the current
@@ -354,7 +517,9 @@ function render() {
   // Only when the screen is unchanged — navigating must start the new screen at the top.
   const prevBody = root.querySelector(".main-body, .set-body");
   const scrollTop = screen === renderedScreen && prevBody ? prevBody.scrollTop : 0;
-  root.innerHTML = screen === "settings" ? buildSettings(state) : buildHTML(state);
+  root.innerHTML = screen === "settings" ? buildSettings(state)
+    : screen === "add" ? buildAddSeat(state, add)
+    : buildHTML(state);
   renderedScreen = screen;
   if (scrollTop) {
     const nextBody = root.querySelector(".main-body, .set-body");
@@ -374,24 +539,47 @@ document.addEventListener("click", (e) => {
     if (card) card.classList.toggle("expanded");
     return;
   }
-  const { action, tool, email, key, command, value } = el.dataset;
+  const { action, tool, email, value } = el.dataset;
   switch (action) {
     case "switch": send("switch", { tool, email }); break;
     case "remove": if (confirm(`wave goodbye to ${email}?`)) send("remove", { tool, email }); break;
-    case "add": send("add", { tool }); break;
-    case "login": closeOverlay(); send("login", { tool, command }); break;
-    case "paste-open": overlay.innerHTML = buildPaste(tool); break;
-    case "paste-save": {
-      const blob = document.getElementById("paste-blob")?.value?.trim();
-      if (blob) { closeOverlay(); send("paste", { tool, blob }); }
+    // add-a-seat sub-view (spec §9). Header ＋ (no tool) → provider step; per-provider add-row and
+    // the needs-login "log in" button carry a tool → deep-link straight to details, provider preset.
+    case "add":
+      add = { step: tool ? "details" : "provider", provider: tool || null,
+              name: "", method: "browser", token: "" };
+      screen = "add"; render(); break;
+    case "add-provider":       // picking a provider (re)starts details; clears the name (prototype)
+      add = { step: "details", provider: tool, name: "", method: "browser", token: "" };
+      render(); break;
+    case "add-change": add.step = "provider"; render(); break;
+    case "add-method": add.method = value; render(); break;   // typed token survives via add.token
+    case "add-back": addBack(); break;
+    case "add-cancel": screen = "main"; add = null; render(); break;   // add=null drops any pending op
+    case "add-cta": {
+      const name = add.name.trim();
+      // Only a codex "token" paste installs an auth.json in-app; browser sign-in (both providers)
+      // launches the official flow in Terminal and waits on the user.
+      if (addUsesPaste(add)) {
+        const blob = add.token.trim();
+        if (!blob) break;                      // empty field → no-op, not a spinner + error toast
+        add.pending = true; add.step = "connecting"; render();   // paste in flight → saving spinner
+        send("paste", { tool: add.provider, blob, ...(name ? { name } : {}) });
+      } else {
+        // launch the browser sign-in and wait on the USER to finish + tap "save my seat" — not a
+        // saving spinner yet (that's add.pending, set on save).
+        add.step = "connecting"; render();
+        send("login", { tool: add.provider, method: add.method });
+      }
       break;
     }
-    case "snapshot": closeOverlay(); send("snapshot", { tool }); break;
-    case "picker-close":
-      // close on backdrop click or an explicit cancel/done button; ignore clicks inside the sheet
-      if (el.classList.contains("backdrop") && e.target !== el) break;
-      closeOverlay();
+    case "add-save": {         // connecting-step CTA (browser path) → the proven snapshot handshake
+      if (add.pending) break;                  // a snapshot is already in flight — don't double-send
+      add.pending = true; render();            // re-render disables the button (addConnectingStep)
+      const name = add.name.trim();
+      send("snapshot", { tool: add.provider, ...(name ? { name } : {}) });
       break;
+    }
     case "settings": screen = "settings"; render(); break;
     case "settings-back": screen = "main"; render(); break;
     case "set_theme": send("set_theme", { value }); break;
@@ -400,15 +588,36 @@ document.addEventListener("click", (e) => {
   }
 });
 
+// Back navigation within the add-seat sub-view (also used by Esc).
+function addBack() {
+  // A dispatched save is committed (acct.add will run) and can't be un-sent — so while it's in
+  // flight, back is a no-op; the reply advances to done. Backing out only makes sense before saving.
+  if (add?.pending) return;
+  if (add?.step === "details") add.step = "provider";
+  else if (add?.step === "connecting") add.step = "details";   // abandon an un-saved login
+  else { screen = "main"; add = null; }        // provider or done → leave the flow
+  render();
+}
+
+// Controlled inputs: mirror the add-seat fields into `add` on each keystroke so a background poll
+// re-render (which re-emits value="${...}") reproduces exactly what's typed — no lost text.
+document.addEventListener("input", (e) => {
+  if (!add) return;
+  if (e.target.id === "add-name") add.name = e.target.value;
+  else if (e.target.id === "add-token") add.token = e.target.value;
+});
+
 // toggles fire 'change' (clicking the switch graphic doesn't bubble a data-action click)
 document.addEventListener("change", (e) => {
   const inp = e.target.closest('input[data-action="toggle"]');
   if (inp) send("toggle", { key: inp.dataset.key, value: inp.checked });
 });
 
-// Esc pops the settings sub-view back to main (spec §9.1)
+// Esc pops a sub-view (spec §9): settings → main; add → one step back (like the chevron).
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && screen === "settings") { screen = "main"; render(); }
+  if (e.key !== "Escape") return;
+  if (screen === "settings") { screen = "main"; render(); }
+  else if (screen === "add") addBack();
 });
 
 // initial paint + ask the native side for fresh state

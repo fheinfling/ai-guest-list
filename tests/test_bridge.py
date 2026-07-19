@@ -1,4 +1,6 @@
 """Unit tests for the UI↔engine bridge dispatch (no pyobjc)."""
+import json
+
 from acctsw import accounts as acct
 from acctsw import bridge
 from tests.conftest import make_codex_blob
@@ -76,11 +78,18 @@ def test_remove_action(ctx):
     assert r["ok"] and r["state"]["tools"]["codex"]["seats"] == []
 
 
-def test_add_returns_login_plan(ctx):
+def test_add_action_is_gone(ctx):
+    # `add` was the modal's round-trip for a login plan; the sub-view resolves everything client-side.
     r = bridge.handle(ctx, {"action": "add", "tool": "claude"})
-    assert r["ok"] and r["login"]["tool"] == "claude"
-    ids = {m["id"] for m in r["login"]["methods"]}
-    assert ids == {"browser", "token"}
+    assert r["ok"] is False and "unknown action" in r["error"]
+
+
+def test_login_command():
+    # both tools' only Terminal path is the browser sign-in; method is reserved but unused
+    assert bridge.login_command("codex") == "codex login"
+    assert bridge.login_command("codex", "token") == "codex login"
+    assert bridge.login_command("claude") == "claude auth login"
+    assert bridge.login_command("claude", "token") == "claude auth login"
 
 
 def test_snapshot_after_login_adds_seat(ctx):

@@ -60,8 +60,9 @@ anywhere.
   endpoints (cached, gently polled).
 - **Zero-touch setup** — installing the app wires `codex` / `claude` to the supervised launchers; when
   the app is closed they behave exactly like stock.
-- **Add / remove seats** — official sign-in flow _or_ a no-browser path (Codex `auth.json`, Claude
-  `setup-token`). Credentials live only in the Keychain.
+- **Add / remove seats** — official browser sign-in, plus a no-browser path for Codex (paste an
+  `auth.json`). Claude is browser sign-in only: a `claude setup-token` is an env-var token, not the
+  Keychain login the switcher reads. Credentials live only in the Keychain / the tools' own stores.
 - **Version & build** shown at the bottom of the settings view.
 
 ## Install
