@@ -4,12 +4,15 @@ IMPORTANT (invariant from docs/PLAN.md): before the official login overwrites th
 currently-active seat must be synced back, or its rotated refresh token is lost. Call
 ``prepare_then_login`` (which sync-backs first) rather than launching the login directly.
 
-We launch the login by writing a tiny ``*.command`` script and handing it to LaunchServices via
-``open`` — NOT by driving Terminal.app with AppleEvents (``osascript … tell application "Terminal"``).
-AppleEvents are gated by macOS TCC "Automation" permission: on a fresh machine that consent hasn't
-been granted, ``osascript`` fails and the sign-in silently never opens (the field bug we're fixing).
-``open`` needs no Automation grant and honours the user's DEFAULT handler for ``.command`` (Terminal
-out of the box, iTerm/Ghostty/etc. if they set it) instead of being hard-wired to Terminal.app.
+We launch the login by writing a tiny ``*.command`` script and running it with ``open -a Terminal``
+(LaunchServices) — NOT by driving Terminal.app with AppleEvents (``osascript … tell application
+"Terminal"``). AppleEvents are gated by macOS TCC "Automation" permission: on a fresh machine that
+consent hasn't been granted, ``osascript`` fails and the sign-in silently never opens (the field bug
+we're fixing). ``open`` needs no Automation grant. We pass ``-a Terminal`` (rather than a bare
+``open`` that would honour the user's default ``.command`` handler) ON PURPOSE: a bare ``open`` returns
+success on the LaunchServices hand-off even if the ``.command`` extension was remapped to a
+non-terminal app, silently never running the sign-in. Forcing Terminal.app guarantees a real terminal
+executes it — at the cost of not honouring an iTerm/Ghostty preference; reliability wins.
 """
 from __future__ import annotations
 
