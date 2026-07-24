@@ -101,24 +101,13 @@ _ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 # killed healthy sessions), so an explicit disclaimer vetoes an otherwise-matching limit phrase.
 _NOT_A_LIMIT = re.compile(r"not (?:your|a) usage limit|temporarily limiting requests", re.IGNORECASE)
 
-# Claude Code prints its OWN pre-limit WARNING (a heads-up, NOT an out-of-quota HIT) at startup and
-# mid-session: "Approaching your 5-hour limit", "Approaching weekly limit". That benign status trips
-# the deliberately loose "5-hour limit"/"weekly limit" patterns. Without a veto it would classify as a
-# real limit — and because an "approaching" warning only appears in the 90-100% band, the usage-probe
-# fallback (healthy only BELOW FALSE_ALARM_MAX_PCT=90) cannot dismiss it, so a still-usable seat gets
-# rested for a full cooldown and a switch is burned. The veto (see _is_limit) is WINDOW-scoped around
-# each match, not line- or buffer-scoped: veto only when "approaching" sits just BEFORE the matched
-# limit phrase AND no committal word ("reached/exceeded/resets/…") sits just AFTER it. That is robust
-# to the ways a TUI mangles the rolling byte tail — a real hit on the same physical line or in an
-# in-place \r-redraw ("…limit\r5-hour limit reached") still fires via its own committal, a warning
-# wrapped across a newline ("Approaching your\n5-hour limit") is still caught, and unrelated buffer
-# text ("hit enter") far from the match can't defeat it.
-_APPROACHING_BEFORE = 40   # chars before a limit match to scan for "approaching"
-_HIT_AFTER = 30            # chars after a limit match to scan for a committal (real-hit) word
-# Committal words that mean the limit IS consumed. Deliberately EXCLUDES "resets": a warning may name
-# its own reset time ("Approaching your limit, resets 3pm") and must still veto; a REAL reset-paired
-# banner ("5-hour limit · resets 8pm") has no "approaching" prefix, so the veto never applies to it.
-_HIT_NEARBY = re.compile(r"reach|exceed|run out|used up|out of", re.IGNORECASE)
+# NOTE (deferred): Claude Code also prints a benign pre-limit WARNING ("Approaching your 5-hour limit")
+# that trips the loose window patterns and, in the 90-100% band, the usage-probe corroboration cannot
+# dismiss it (healthy requires < FALSE_ALARM_MAX_PCT). A text veto for it was attempted and removed:
+# distinguishing the warning from a real hit in the ANSI-mangled rolling byte tail is not reliably
+# doable by proximity heuristics (a fixed window either crosses a newline and masks a real reset-paired
+# banner, or admits benign trailing text and misfires). This matches shipped behaviour and is best
+# fixed with real Claude output samples in a focused change, not guessed at here.
 
 # Auth-death signals (token revoked / signed out). DISTINCT from a usage limit: switching+resuming on
 # the SAME seat can't help — the seat needs re-login — so we hop to a DIFFERENT seat. Kept to the
@@ -158,18 +147,7 @@ _HARD_LIMIT_RE = {
 def _is_limit(tool: str, clean: str) -> bool:
     if _NOT_A_LIMIT.search(clean):
         return False  # server throttle explicitly disclaims the usage limit → not a limit banner
-    for rx in _LIMIT_RE[tool]:
-        for m in rx.finditer(clean):
-            if tool == "claude":
-                # Benign "approaching … limit" heads-up: "approaching" shortly before the match and no
-                # committal (real-hit) word shortly after. Window-scoped around the match so a real hit
-                # (…limit reached / …limit\r… reached) still fires and stray text can't defeat it.
-                pre = clean[max(0, m.start() - _APPROACHING_BEFORE):m.start()].lower()
-                post = clean[m.end():m.end() + _HIT_AFTER]
-                if "approaching" in pre and not _HIT_NEARBY.search(post):
-                    continue
-            return True
-    return False
+    return any(rx.search(clean) for rx in _LIMIT_RE[tool])
 
 
 def _is_auth_dead(tool: str, clean: str) -> bool:
