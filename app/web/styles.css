@@ -216,9 +216,9 @@ html, body { background:transparent; width:100%; overflow:hidden; }
    .sopt.on, settings must stay teal). */
 .add-app .set-seg .sopt.on { background:var(--accent); }
 .add-cancel { background:none; border:none; cursor:pointer; font:inherit; font-weight:700; font-size:13px; color:var(--t3); padding:4px; }
-.add-prov { display:flex; align-items:center; gap:12px; width:100%; padding:13px; background:transparent;
+.add-prov, .add-import { display:flex; align-items:center; gap:12px; width:100%; padding:13px; background:transparent;
   border:none; cursor:pointer; font:inherit; text-align:left; color:var(--t1); }
-.add-prov:hover { background:var(--elevated); }
+.add-prov:hover, .add-import:hover { background:var(--elevated); }
 .add-chip { width:36px; height:36px; border-radius:10px; flex:none; display:flex; align-items:center;
   justify-content:center; background:color-mix(in srgb, var(--accent) 14%, var(--popover)); }
 .add-chip-dot { width:13px; height:13px; border-radius:4px; background:var(--accent); }
@@ -243,6 +243,12 @@ html, body { background:transparent; width:100%; overflow:hidden; }
 .add-tokenwrap { padding:12px 13px; }  /* second child of .set-card → gets the hairline for free */
 .add-token { width:100%; height:60px; border-radius:10px; background:var(--elevated); border:1px solid var(--line);
   color:var(--t1); font-size:11.5px; padding:8px 10px; resize:none; box-sizing:border-box; }
+/* paste flow: shows WHERE auth.json lives + a Finder shortcut. Third child of .set-card → hairline free. */
+.add-pathrow { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:10px 13px; }
+.add-path { font-family:"SFMono-Regular", ui-monospace, Menlo, monospace; font-size:11px; color:var(--t2);
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.add-reveal { background:none; border:none; cursor:pointer; font:inherit; font-size:11.5px; font-weight:700;
+  color:var(--accent); flex:none; }
 .add-cta { height:46px; border-radius:13px; border:none; cursor:pointer; background:var(--accent); color:#fff;
   font:inherit; font-weight:800; font-size:14.5px;
   box-shadow:0 8px 20px color-mix(in srgb, var(--accent) 30%, transparent); }

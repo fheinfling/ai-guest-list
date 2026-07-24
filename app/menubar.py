@@ -163,6 +163,22 @@ if objc is not None:
             blob = self.ctx.cred[tool].get_live()
             return hashlib.sha256(blob.encode()).hexdigest() if blob else None
 
+        @objc.python_method
+        def _revealCodexAuth(self):
+            """Reveal ~/.codex/auth.json in Finder (or its folder if the file isn't there yet) as a
+            helper for the paste flow. Best-effort, non-blocking; any failure is swallowed — revealing
+            a file must never surface an error or beachball the app."""
+            import subprocess
+            from acctsw.procenv import harden_env
+            try:
+                path = self.ctx.cred["codex"].auth_path
+                if path.exists():
+                    subprocess.Popen(["open", "-R", str(path)], env=harden_env())
+                elif path.parent.exists():
+                    subprocess.Popen(["open", str(path.parent)], env=harden_env())
+            except Exception:
+                pass
+
         def loginBg_(self, msg):
             # sync-back-before-login (invariant) + launch the official flow in Terminal, off the main
             # thread. Everything is inside the try so ANY startup failure (the absolute py2app import,
@@ -172,10 +188,11 @@ if objc is not None:
             try:
                 # Absolute import (not `.terminal`): under py2app the main script runs as top-level
                 # __main__ with no package context, so a relative import would fail in the .app.
+                # prepare_then_login resolves the CLI's ABSOLUTE path itself (raising a clear error if
+                # the CLI is missing) and launches via `open` — no AppleEvents/Automation permission.
                 from app.terminal import prepare_then_login
-                command = bridge.login_command(tool, msg.get("method", "browser"))
-                prepare_then_login(self.ctx, tool, command)
-            except Exception:
+                prepare_then_login(self.ctx, tool)
+            except Exception as e:
                 # Launch failed. If a NEWER login for this tool has since superseded us (op identity),
                 # this failure is stale — the user restarted, so stay silent: pushing it would send
                 # the restarted same-tool flow back to details and toast over it. Only the current
@@ -184,8 +201,10 @@ if objc is not None:
                 if cur is None or cur[0] != op:
                     return
                 self._login_baseline.pop(tool, None)
-                result = {"ok": False, "add_op": True, "tool": tool,
-                          "error": "couldn't open the sign-in — try again"}
+                # Surface the specific reason (e.g. "can't find the codex command — install codex
+                # first…") instead of a generic line, so a missing CLI or a failed launch is actionable.
+                error = str(e).strip() or "couldn't open the sign-in — try again"
+                result = {"ok": False, "add_op": True, "tool": tool, "error": error}
                 self.performSelectorOnMainThread_withObject_waitUntilDone_(
                     objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
                 return
@@ -277,9 +296,15 @@ if objc is not None:
                 self.performSelectorInBackground_withObject_(
                     objc.selector(self.loginBg_, signature=b"v@:@"), m)
                 return
-            if action in ("paste", "snapshot"):
-                # off the main thread (see addBg_) — both verify creds against the provider (Claude
-                # shells out to `claude auth status` / hits the network) behind the connecting spinner.
+            if action == "reveal":
+                # Reveal ~/.codex/auth.json in Finder (helper for the paste flow). OS-level, so it's
+                # handled natively rather than via the bridge. Fire-and-forget so it can't block the UI.
+                self._revealCodexAuth()
+                return
+            if action in ("paste", "snapshot", "import_current"):
+                # off the main thread (see addBg_) — paste/snapshot verify creds against the provider
+                # (Claude shells out / hits the network); import_current does a keychain snapshot. All
+                # run behind the connecting spinner and would otherwise beachball the app.
                 self.performSelectorInBackground_withObject_(
                     objc.selector(self.addBg_, signature=b"v@:@"), msg)
                 return

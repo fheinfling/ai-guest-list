@@ -220,6 +220,40 @@ test("add: codex token copy drops the unsupported 'API key' promise", () => {
   assert.doesNotMatch(h, /API key/i);                          // engine can't accept one → don't promise it
 });
 
+test("add: codex offers one-tap import when signed in to an unregistered account", () => {
+  const st = { settings: {}, codex_live_unregistered: { email: "live@x.com" } };
+  const h = buildAddSeat(st, mkAdd({ step: "details", provider: "codex" }));
+  assert.match(h, /data-action="add-import"/);           // the one-tap card
+  assert.ok(h.includes("use live@x.com"));                // shows the detected account
+  assert.ok(h.includes("already signed in on this Mac"));
+});
+
+test("add: no import card when there's no unregistered live codex account", () => {
+  assert.doesNotMatch(buildAddSeat({ settings: {} }, mkAdd({ step: "details", provider: "codex" })),
+    /data-action="add-import"/);
+  // and never for claude (its live creds carry no derivable email — import is codex-only)
+  assert.doesNotMatch(
+    buildAddSeat({ settings: {}, codex_live_unregistered: { email: "x@x.com" } },
+      mkAdd({ step: "details", provider: "claude" })),
+    /data-action="add-import"/);
+});
+
+test("add: import card escapes the detected email", () => {
+  const st = { settings: {}, codex_live_unregistered: { email: 'a<b>"@x.com' } };
+  const h = buildAddSeat(st, mkAdd({ step: "details", provider: "codex" }));
+  assert.ok(h.includes("use a&lt;b&gt;&quot;@x.com"));
+  assert.doesNotMatch(h, /use a<b>/);
+});
+
+test("add: paste flow surfaces the auth.json path + a Reveal in Finder shortcut", () => {
+  const h = buildAddSeat({ settings: {} }, mkAdd({ step: "details", provider: "codex", method: "token" }));
+  assert.ok(h.includes("~/.codex/auth.json"));           // tells the user WHERE the file is
+  assert.match(h, /data-action="add-reveal"/);           // Finder shortcut
+  // the browser method shows neither the path row nor a reveal button
+  const browser = buildAddSeat({ settings: {} }, mkAdd({ step: "details", provider: "codex", method: "browser" }));
+  assert.doesNotMatch(browser, /data-action="add-reveal"/);
+});
+
 test("add: typed name + token survive a re-render (escaped, controlled)", () => {
   const h = buildAddSeat({ settings: {} },
     mkAdd({ step: "details", provider: "codex", method: "token", name: 'Wo"rk', token: "sk-x<y" }));
@@ -313,6 +347,29 @@ test("reduceReply: browser-save error stays on connecting to retry", () => {
   const add = mkAdd({ step: "connecting", provider: "codex", method: "browser", pending: true });
   const o = reduceReply(UI({ screen: "add", add }), { ok: false, error: "no creds yet", add_op: true });
   assert.equal(o.add.step, "connecting"); assert.equal(o.add.pending, false);   // save button re-enables
+});
+
+test("reduceReply: one-tap import success → done (importing cleared)", () => {
+  const add = mkAdd({ step: "connecting", provider: "codex", method: "browser", pending: true, importing: true });
+  const o = reduceReply(UI({ screen: "add", add }), { ok: true, added: "live@x.com", add_op: true });
+  assert.equal(o.add.step, "done"); assert.equal(o.add.pending, false); assert.equal(o.add.importing, false);
+  assert.equal(o.closeFlow, o.add);
+});
+
+test("reduceReply: import error → back to details (unlike a browser-save), importing cleared", () => {
+  const add = mkAdd({ step: "connecting", provider: "codex", method: "browser", pending: true, importing: true });
+  const o = reduceReply(UI({ screen: "add", add }), { ok: false, error: "already on the list", add_op: true });
+  assert.equal(o.add.step, "details");            // an in-app save returns to the form, not connecting
+  assert.equal(o.add.pending, false); assert.equal(o.add.importing, false);
+  assert.equal(o.flash, "already on the list");
+});
+
+test("add: connecting shows a saving spinner and NO save button while importing", () => {
+  const h = buildAddSeat({ settings: {} },
+    mkAdd({ step: "connecting", provider: "codex", method: "browser", pending: true, importing: true }));
+  assert.match(h, /class="add-spin"/);
+  assert.ok(h.includes("saving your seat…"));
+  assert.doesNotMatch(h, /add-save/);             // import is not the browser "save my seat" handshake
 });
 
 test("reduceReply: login-LAUNCH failure (not pending) → back to details", () => {

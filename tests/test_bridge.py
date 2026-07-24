@@ -99,6 +99,41 @@ def test_snapshot_after_login_adds_seat(ctx):
     assert "new@x.com" in ctx.load_state().accounts("codex")
 
 
+def test_import_current_adds_the_live_codex_account(ctx):
+    # one-tap "use the login you already have": no blob, engine reads ~/.codex/auth.json itself
+    ctx.cred["codex"].set_live(make_codex_blob("live@x.com"))
+    r = bridge.handle(ctx, {"action": "import_current", "tool": "codex", "name": "Work"})
+    assert r["ok"] and r["added"] == "live@x.com"
+    st = ctx.load_state()
+    assert "live@x.com" in st.accounts("codex")
+    assert st.get_seat("codex", "live@x.com")["name"] == "Work"
+
+
+def test_import_current_rejects_when_not_signed_in(ctx):
+    r = bridge.handle(ctx, {"action": "import_current", "tool": "codex"})
+    assert r["ok"] is False and "signed in" in r["error"]
+
+
+def test_import_current_rejects_already_a_seat(ctx):
+    _add(ctx, "dup@x.com")                       # already on the list + live
+    r = bridge.handle(ctx, {"action": "import_current", "tool": "codex"})
+    assert r["ok"] is False and "already on the list" in r["error"]
+
+
+def test_import_current_is_codex_only(ctx):
+    r = bridge.handle(ctx, {"action": "import_current", "tool": "claude"})
+    assert r["ok"] is False and "codex-only" in r["error"]
+
+
+def test_snapshot_state_exposes_unregistered_live_codex(ctx):
+    # signed in but NOT a seat → surfaced for the one-tap import affordance
+    ctx.cred["codex"].set_live(make_codex_blob("live@x.com"))
+    assert bridge.snapshot_state(ctx)["codex_live_unregistered"] == {"email": "live@x.com"}
+    # once it's a seat, the affordance disappears
+    _add(ctx, "live@x.com")
+    assert bridge.snapshot_state(ctx)["codex_live_unregistered"] is None
+
+
 def test_missing_field_error(ctx):
     r = bridge.handle(ctx, {"action": "switch", "tool": "codex"})  # no email
     assert r["ok"] is False and "email" in r["error"]
