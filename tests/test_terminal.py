@@ -40,6 +40,8 @@ def test_open_in_terminal_launches_via_open_and_scrubs_python_env(monkeypatch):
 
     # LaunchServices `open`, NOT osascript/AppleEvents (which would need Automation permission).
     assert seen["argv"][0] == "open"
+    # -a Terminal forces a REAL terminal to run it (a remapped .command handler would silently no-op)
+    assert seen["argv"][1:3] == ["-a", "Terminal"]
     assert seen["argv"][-1].endswith(".command")
     # a cleaned env is passed to `open` and is free of the frozen interpreter vars
     assert seen["env"] is not None
@@ -48,9 +50,10 @@ def test_open_in_terminal_launches_via_open_and_scrubs_python_env(monkeypatch):
     assert "unset " in seen["script"] and "PYTHONPATH" in seen["script"] and "PYTHONHOME" in seen["script"]
     assert "/abs/codex login" in seen["script"]
     assert seen["script"].startswith("#!/bin/zsh")
-    # the login runs through a LOGIN + INTERACTIVE shell so PATH (node + version-manager shims) matches
-    # the user's own terminal — a bare non-login script would miss them.
-    assert '"${SHELL:-/bin/zsh}" -lic' in seen["script"]
+    # runs through a HARD-CODED login+interactive zsh (always present, always parses -lic) so PATH
+    # (node etc.) matches a terminal — NOT $SHELL, which fish/tcsh would reject on the combined flags.
+    assert "/bin/zsh -lic" in seen["script"]
+    assert "$SHELL" not in seen["script"]
     # the script deletes itself once the login shell returns → no leaked temp file
     assert 'rm -f -- "$0"' in seen["script"]
     # the .command must be executable or `open` would fail to run it
@@ -96,7 +99,3 @@ def test_resolve_login_command_quotes_a_spacey_path(ctx):
     cmd = terminal.resolve_login_command(ctx, "codex")
     # a path with a space must be shell-quoted so the login shell runs the right binary
     assert "'/Users/a b/bin/codex'" in cmd and cmd.endswith("login")
-
-
-def test_json_escape():
-    assert terminal.json_escape('a "b" c') == '"a \\"b\\" c"'

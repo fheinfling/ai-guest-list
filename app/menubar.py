@@ -290,8 +290,9 @@ if objc is not None:
                 # silently re-adding the old seat. (sync_back doesn't change live creds, so capturing
                 # here == capturing just before launch.) Reading creds is a quick, lock-free read.
                 self._login_baseline[msg["tool"]] = (op, self._credDigest(msg["tool"]))
-                # Off the main thread: prepare_then_login holds ctx.locked() and runs osascript — on
-                # the main thread it would beachball behind a usage poll holding the same lock.
+                # Off the main thread: prepare_then_login holds ctx.locked() and spawns `open` to launch
+                # the sign-in terminal — on the main thread it would beachball behind a usage poll
+                # holding the same lock.
                 m = dict(msg); m["_op"] = op
                 self.performSelectorInBackground_withObject_(
                     objc.selector(self.loginBg_, signature=b"v@:@"), m)
