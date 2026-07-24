@@ -23,26 +23,6 @@ from acctsw.context import Context
 from acctsw.switch import sync_back
 
 
-def _cleanup_old_signin_scripts() -> None:
-    """Best-effort: remove leftover sign-in scripts from PRIOR attempts. Each ``open`` launches its
-    script asynchronously, so the current one can't be deleted inline; instead we sweep older ones on
-    the next launch. Only files older than two minutes are touched, so a near-concurrent sign-in's
-    script is never yanked before its terminal has read it. All errors are swallowed — cleanup must
-    never break a sign-in."""
-    import glob
-    import time
-    try:
-        cutoff = time.time() - 120
-        for p in glob.glob(os.path.join(tempfile.gettempdir(), "ai-guest-list-signin-*.command")):
-            try:
-                if os.path.getmtime(p) < cutoff:
-                    os.unlink(p)
-            except OSError:
-                pass
-    except Exception:
-        pass
-
-
 def open_in_terminal(command: str) -> None:
     """Launch ``command`` in the user's terminal via a ``*.command`` script + ``open`` (LaunchServices).
 
@@ -54,18 +34,21 @@ def open_in_terminal(command: str) -> None:
     script is neither, so it would get launchd's minimal PATH and miss both ``node`` (which
     ``codex``/``claude`` need) and any version-manager shim (asdf/volta/nvm) the user's CLI lives on.
     Sourcing the user's profile+rc reproduces the PATH they have in their own terminal — matching the
-    old osascript ``do script`` behaviour this replaced."""
+    old osascript ``do script`` behaviour this replaced. The script deletes ITSELF once the login shell
+    returns (``rm -- "$0"``), so no temp file is left behind and none is ever swept out from under an
+    in-flight sign-in."""
     if not command:
         return
     from acctsw.procenv import _PY_ENV_STRIP, harden_env
-    _cleanup_old_signin_scripts()
     # Scrub PYTHONPATH/PYTHONHOME etc before handing off to the login shell: py2app's launcher exports
     # them pointing at the frozen app's stdlib zip and a child python3 would break with "can't find
     # module 'encodings'". (A separately-launched terminal generally won't inherit our env, but this is
     # cheap belt-and-suspenders that holds regardless.)
     unset = " ".join(_PY_ENV_STRIP)
+    # NOTE: no `exec` — the login shell runs as a child so control returns to delete this script.
     script = (f"#!/bin/zsh\nunset {unset}\n"
-              f'exec "${{SHELL:-/bin/zsh}}" -lic {shell_quote([command])}\n')
+              f'"${{SHELL:-/bin/zsh}}" -lic {shell_quote([command])}\n'
+              f'rm -f -- "$0"\n')
     fd, path = tempfile.mkstemp(suffix=".command", prefix="ai-guest-list-signin-")
     try:
         with os.fdopen(fd, "w") as f:
@@ -76,24 +59,58 @@ def open_in_terminal(command: str) -> None:
     except OSError as e:
         raise RuntimeError("couldn't open a terminal for the sign-in — try again") from e
     if proc.returncode != 0:
+        try:
+            os.unlink(path)          # launch failed → nothing will run the script, so don't leak it
+        except OSError:
+            pass
         detail = (proc.stderr or "").strip()   # surface the real LaunchServices reason when there is one
         base = "couldn't open a terminal for the sign-in — try again"
         raise RuntimeError(f"{base} ({detail})" if detail else base)
 
 
+def _login_shell_path(tool: str) -> str | None:
+    """Resolve ``tool``'s path the way the user's TERMINAL would: via their login+interactive shell,
+    which sources rc so a version-manager shim (asdf/volta/nvm) on the rc-only PATH resolves. Returns
+    the absolute path (found), ``""`` (the shell ran and the CLI is genuinely NOT installed), or
+    ``None`` (the probe couldn't run — the caller then falls back to the bare name rather than a wrong
+    'not installed')."""
+    from acctsw.procenv import harden_env
+    shell = os.environ.get("SHELL") or "/bin/zsh"
+    try:
+        proc = subprocess.run([shell, "-lic", f"command -v {shlex.quote(tool)}"],
+                              capture_output=True, text=True, env=harden_env(), timeout=6)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    lines = (proc.stdout or "").strip().splitlines()
+    path = lines[-1].strip() if lines else ""   # last line — an interactive rc may print noise first
+    if proc.returncode == 0 and path:
+        return path
+    if proc.returncode != 0 and not path:
+        return ""                                # `command -v` exits nonzero when not found
+    return None                                  # ambiguous → let the caller fall back to bare
+
+
 def resolve_login_command(ctx: Context, tool: str) -> str:
     """Build the official sign-in command as a shell string, preferring the CLI's ABSOLUTE path.
 
-    Prefer the absolute binary the engine already found (``ctx.codex_bin``/``ctx.claude_bin``), so a
-    GUI app's minimal PATH can't hide a CLI that IS installed. But fall back to the BARE command name
-    when the absolute path is unknown rather than hard-failing: the login runs in a login+interactive
-    shell (see ``open_in_terminal``) that sources the user's rc, so a version-manager shim on the
-    rc-only PATH still resolves. Hard-failing here would wrongly block sign-in for a CLI the user has
-    working in their own terminal."""
+    Resolution order: the binary the engine already found (``ctx.codex_bin``/``ctx.claude_bin``) →
+    a login-shell probe (so an rc-only shim the GUI's PATH can't see still resolves) → for a probe
+    that proves the CLI is genuinely absent, a clear "install it first" error → otherwise the bare
+    command name (the login+interactive shell in ``open_in_terminal`` sources rc and resolves it).
+    Only a PROVEN-missing CLI hard-fails: an inconclusive probe must not block sign-in for a CLI the
+    user has working in their own terminal."""
     from acctsw.bridge import LOGIN_SUBCMD
     if tool not in TOOLS:
         raise ValueError(f"unknown tool: {tool}")
-    exe = (ctx.codex_bin if tool == "codex" else ctx.claude_bin) or tool
+    exe = ctx.codex_bin if tool == "codex" else ctx.claude_bin
+    if not exe:
+        probed = _login_shell_path(tool)
+        if probed:
+            exe = probed
+        elif probed == "":
+            raise RuntimeError(f"can't find the {tool} command — install {tool} first, then sign in")
+        else:
+            exe = tool                            # inconclusive probe → bare; the login shell resolves it
     return shell_quote([exe, *LOGIN_SUBCMD[tool]])
 
 

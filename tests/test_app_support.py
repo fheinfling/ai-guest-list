@@ -56,11 +56,12 @@ def test_prepare_then_login_resolves_absolute_command_when_none(ctx, monkeypatch
 
 
 def test_prepare_then_login_unresolved_cli_falls_back_to_bare(ctx, monkeypatch):
-    """An unresolved CLI (rc-only shim not on the GUI PATH) must NOT block sign-in: fall back to the
-    bare command, which the login+interactive shell resolves from the user's rc."""
+    """An unresolved CLI (rc-only shim not on the GUI PATH) with an inconclusive probe must NOT block
+    sign-in: fall back to the bare command, which the login+interactive shell resolves from rc."""
     ctx.cred["codex"].set_live(make_codex_blob("a@x.com"))
     acct.add(ctx, ctx.load_state(), "codex", email="a@x.com")
     ctx.codex_bin = None
+    monkeypatch.setattr(terminal, "_login_shell_path", lambda tool: None)   # probe inconclusive
     opened = {}
     monkeypatch.setattr(terminal, "open_in_terminal", lambda cmd: opened.setdefault("cmd", cmd))
     terminal.prepare_then_login(ctx, "codex")

@@ -101,6 +101,17 @@ _ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 # killed healthy sessions), so an explicit disclaimer vetoes an otherwise-matching limit phrase.
 _NOT_A_LIMIT = re.compile(r"not (?:your|a) usage limit|temporarily limiting requests", re.IGNORECASE)
 
+# Claude Code prints its OWN pre-limit WARNING (a heads-up, NOT an out-of-quota HIT) at startup and
+# mid-session: "Approaching your 5-hour limit", "Approaching weekly limit". That benign status trips
+# the deliberately loose "5-hour limit"/"weekly limit" patterns. Without a veto it would classify as a
+# real limit — and because an "approaching" warning only appears in the 90-100% band, the usage-probe
+# fallback (healthy only BELOW FALSE_ALARM_MAX_PCT=90) cannot dismiss it, so a still-usable seat gets
+# rested for a full cooldown and a switch is burned. The veto is scoped to the MATCHED LINE (see
+# _is_limit), not the whole rolling buffer: a real hit on another line ("5-hour limit reached") still
+# fires, and unrelated buffer text ("hit enter") can't defeat it. A line saying "approaching … limit"
+# is by definition not-yet-reached, so vetoing exactly those lines cannot mask a genuine hit.
+_CLAUDE_APPROACHING = re.compile(r"approaching\b[^.\n]{0,40}\blimit", re.IGNORECASE)
+
 # Auth-death signals (token revoked / signed out). DISTINCT from a usage limit: switching+resuming on
 # the SAME seat can't help — the seat needs re-login — so we hop to a DIFFERENT seat. Kept to the
 # tools' SPECIFIC error wording (not loose phrases like "sign in again") because this buffer also
@@ -139,12 +150,19 @@ _HARD_LIMIT_RE = {
 def _is_limit(tool: str, clean: str) -> bool:
     if _NOT_A_LIMIT.search(clean):
         return False  # server throttle explicitly disclaims the usage limit → not a limit banner
-    # NOTE: Claude Code's benign "approaching … limit" pre-limit WARNING still matches the loose
-    # window patterns here, but it is NOT special-cased: the usage-endpoint corroboration in
-    # handle_limit dismisses it (a healthy fetch → "dismiss", session continues) — same as shipped.
-    # A committal-word veto was tried and dropped: scanned over the rolling buffer it was defeated by
-    # unrelated words (e.g. "hit enter") and risked masking a real hit worded without a committal word.
-    return any(rx.search(clean) for rx in _LIMIT_RE[tool])
+    for rx in _LIMIT_RE[tool]:
+        for m in rx.finditer(clean):
+            if tool == "claude":
+                # Veto ONLY if THIS match sits on a benign "approaching … limit" line (a heads-up).
+                # Scoping to the match's own line — not the whole buffer — means a real hit elsewhere
+                # ("5-hour limit reached") still fires and stray words ("hit enter") can't defeat it.
+                ls = clean.rfind("\n", 0, m.start()) + 1
+                le = clean.find("\n", m.end())
+                line = clean[ls:le if le != -1 else len(clean)]
+                if _CLAUDE_APPROACHING.search(line):
+                    continue
+            return True
+    return False
 
 
 def _is_auth_dead(tool: str, clean: str) -> bool:

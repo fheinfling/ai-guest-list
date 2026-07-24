@@ -51,6 +51,8 @@ def test_open_in_terminal_launches_via_open_and_scrubs_python_env(monkeypatch):
     # the login runs through a LOGIN + INTERACTIVE shell so PATH (node + version-manager shims) matches
     # the user's own terminal — a bare non-login script would miss them.
     assert '"${SHELL:-/bin/zsh}" -lic' in seen["script"]
+    # the script deletes itself once the login shell returns → no leaked temp file
+    assert 'rm -f -- "$0"' in seen["script"]
     # the .command must be executable or `open` would fail to run it
     assert seen["mode"] & 0o100
 
@@ -79,14 +81,48 @@ def test_resolve_login_command_uses_absolute_binary(ctx):
     assert terminal.resolve_login_command(ctx, "claude") == "/opt/homebrew/bin/claude auth login"
 
 
-def test_resolve_login_command_falls_back_to_bare_when_unresolved(ctx):
-    # a CLI on an rc-only shim (asdf/volta/nvm) isn't on the GUI app's PATH → ctx.codex_bin is None.
-    # We must NOT hard-fail (that regressed those users); fall back to the bare name — the login shell
-    # sources their rc and finds it.
+def test_resolve_login_command_probes_login_shell_when_bin_unresolved(ctx, monkeypatch):
+    # a CLI on an rc-only shim (asdf/volta/nvm) isn't on the GUI app's PATH → ctx.codex_bin is None,
+    # but a login-shell probe finds it. Use that absolute path.
     ctx.codex_bin = None
+    monkeypatch.setattr(terminal, "_login_shell_path", lambda tool: "/Users/me/.asdf/shims/codex")
+    assert terminal.resolve_login_command(ctx, "codex") == "/Users/me/.asdf/shims/codex login"
+
+
+def test_resolve_login_command_bare_fallback_when_probe_inconclusive(ctx, monkeypatch):
+    # probe couldn't run (returns None) → fall back to the bare name rather than a wrong "not installed";
+    # the login+interactive shell sources rc and resolves it. Must NOT hard-fail (that regressed users).
+    ctx.codex_bin = None
+    monkeypatch.setattr(terminal, "_login_shell_path", lambda tool: None)
     assert terminal.resolve_login_command(ctx, "codex") == "codex login"
     ctx.claude_bin = None
     assert terminal.resolve_login_command(ctx, "claude") == "claude auth login"
+
+
+def test_resolve_login_command_hard_fails_only_when_proven_missing(ctx, monkeypatch):
+    # probe proves the CLI is genuinely NOT installed ("") → a clear, actionable error before launching.
+    ctx.codex_bin = None
+    monkeypatch.setattr(terminal, "_login_shell_path", lambda tool: "")
+    with pytest.raises(RuntimeError) as e:
+        terminal.resolve_login_command(ctx, "codex")
+    assert "codex" in str(e.value)
+
+
+def test_login_shell_path_parses_probe_result(monkeypatch):
+    def fake_run(argv, **kw):
+        assert argv[1:3] == ["-lic"] or "-lic" in argv   # login+interactive
+        return types.SimpleNamespace(returncode=0, stdout="/opt/homebrew/bin/codex\n", stderr="")
+    monkeypatch.setattr(terminal.subprocess, "run", fake_run)
+    assert terminal._login_shell_path("codex") == "/opt/homebrew/bin/codex"
+
+    monkeypatch.setattr(terminal.subprocess, "run",
+                        lambda *a, **k: types.SimpleNamespace(returncode=1, stdout="", stderr=""))
+    assert terminal._login_shell_path("codex") == ""      # not found
+
+    def boom(*a, **k):
+        raise OSError("no shell")
+    monkeypatch.setattr(terminal.subprocess, "run", boom)
+    assert terminal._login_shell_path("codex") is None    # couldn't probe
 
 
 def test_resolve_login_command_quotes_a_spacey_path(ctx):
