@@ -44,12 +44,24 @@ def test_prepare_then_login_syncs_back_active_before_login(ctx, monkeypatch):
     assert opened["cmd"] == "codex login"
 
 
-def test_prepare_then_login_no_command_is_noop(ctx, monkeypatch):
-    called = {"n": 0}
-    monkeypatch.setattr(terminal, "open_in_terminal", lambda cmd: called.__setitem__("n", called["n"] + 1))
-    terminal.prepare_then_login(ctx, "codex", None)  # paste flow → no terminal
-    assert called["n"] == 0
+def test_prepare_then_login_resolves_absolute_command_when_none(ctx, monkeypatch):
+    """With no explicit command, prepare_then_login resolves the CLI's absolute path and launches it."""
+    ctx.cred["codex"].set_live(make_codex_blob("a@x.com"))
+    acct.add(ctx, ctx.load_state(), "codex", email="a@x.com")
+    ctx.codex_bin = "/opt/homebrew/bin/codex"
+    opened = {}
+    monkeypatch.setattr(terminal, "open_in_terminal", lambda cmd: opened.setdefault("cmd", cmd))
+    terminal.prepare_then_login(ctx, "codex")  # command defaults to None → resolve
+    assert opened["cmd"] == "/opt/homebrew/bin/codex login"
 
 
-def test_json_escape():
-    assert terminal.json_escape('a "b" c') == '"a \\"b\\" c"'
+def test_prepare_then_login_unresolved_cli_falls_back_to_bare(ctx, monkeypatch):
+    """An unresolved CLI (rc-only shim not on the GUI PATH) with an inconclusive probe must NOT block
+    sign-in: fall back to the bare command, which the login+interactive shell resolves from rc."""
+    ctx.cred["codex"].set_live(make_codex_blob("a@x.com"))
+    acct.add(ctx, ctx.load_state(), "codex", email="a@x.com")
+    ctx.codex_bin = None
+    opened = {}
+    monkeypatch.setattr(terminal, "open_in_terminal", lambda cmd: opened.setdefault("cmd", cmd))
+    terminal.prepare_then_login(ctx, "codex")
+    assert opened["cmd"] == "codex login"  # launched with the bare name, not aborted

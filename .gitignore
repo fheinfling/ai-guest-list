@@ -33,3 +33,6 @@ auth.json
 .idea/
 .vscode/
 *.swp
+
+# Claude Code local scratch (agent worktrees, plans)
+.claude/

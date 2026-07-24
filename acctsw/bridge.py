@@ -32,6 +32,24 @@ def is_native(action: str | None) -> bool:
     return action in NATIVE_ACTIONS
 
 
+def _codex_live_unregistered(ctx: Context, state) -> dict[str, Any] | None:
+    """The codex account currently signed in on this Mac (``~/.codex/auth.json``) that ISN'T a seat yet.
+
+    Surfaced so the add-seat view can offer a one-tap "use the login you already have" import — the
+    easiest add path, no auth.json paste. None when nothing is live or the live account is already a
+    seat. Best-effort + defensive: a broken/unreadable auth.json must never break the whole snapshot."""
+    try:
+        live = ctx.cred["codex"].get_live()
+        if not live:
+            return None
+        email = ctx.cred["codex"].email_of(live)
+        if not email or email in state.accounts("codex"):
+            return None
+        return {"email": email}
+    except Exception:
+        return None
+
+
 def snapshot_state(ctx: Context) -> dict[str, Any]:
     state = ctx.load_state()
     data = acct.status(ctx, state)
@@ -41,17 +59,28 @@ def snapshot_state(ctx: Context) -> dict[str, Any]:
     data["dot"] = dot_for(data)  # single source of truth for the dot (JS + native both read this)
     data["door"] = door_for(data)  # shut/open door icon — same state feeds native glyph + web header
     data["app"] = {"version": __version__, "build": build_number()}  # shown in the settings sheet
+    # the signed-in-but-not-added codex account (if any) → drives the one-tap import affordance
+    data["codex_live_unregistered"] = _codex_live_unregistered(ctx, state)
     data["rev"] = int(state.data.get("rev", 0))  # monotonic; the UI drops a snapshot older than one it applied
     return data
 
 
+# The official browser sign-in sub-command per tool (the binary is prepended by the launcher with its
+# ABSOLUTE path — see terminal.resolve_login_command — so a GUI app's minimal PATH can't hide the CLI).
+# Single source of truth for "how each tool logs in", shared by login_command (logical string) and the
+# terminal launcher (absolute argv).
+LOGIN_SUBCMD = {"codex": ["login"], "claude": ["auth", "login"]}
+
+
 def login_command(tool: str, method: str = "browser") -> str:
-    """The Terminal command for an official browser sign-in. Kept in the bridge (not the UI) so the
-    engine stays the source of truth for how each tool logs in. ``method`` is reserved but currently
-    unused: both tools' only Terminal path is the browser sign-in (codex's no-browser option pastes
-    an auth.json in-app; Claude has no working no-browser path — `claude setup-token` produces an
-    env-var token, not the Keychain login this app snapshots)."""
-    return "codex login" if tool == "codex" else "claude auth login"
+    """The logical Terminal command for an official browser sign-in, e.g. ``"codex login"``. Kept in
+    the bridge (not the UI) so the engine stays the source of truth for how each tool logs in.
+    ``method`` is reserved but currently unused: both tools' only Terminal path is the browser sign-in
+    (codex's no-browser option pastes an auth.json / imports the current login in-app; Claude has no
+    working no-browser path — `claude setup-token` produces an env-var token, not the Keychain login
+    this app snapshots). The actual launch resolves the CLI's absolute path via
+    ``terminal.resolve_login_command``; this string is the logical form used in tests/messages."""
+    return " ".join([tool, *LOGIN_SUBCMD[tool]])
 
 
 def handle(ctx: Context, message: dict) -> dict[str, Any]:
@@ -129,6 +158,33 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
                 sync_back(ctx, state, tool)         # preserve the outgoing seat's rotated token
                 ctx.cred[tool].set_live(blob)
                 seat = acct.add(ctx, state, tool, name=message.get("name"), email=email)
+            return {"ok": True, "celebrate": True, "added": seat["email"],
+                    "state": snapshot_state(ctx)}
+
+        if action == "import_current":
+            # One-tap "use the login you already have": register the codex account currently signed in
+            # on this Mac (~/.codex/auth.json) as a seat, with NO paste and NO browser dance. acct.add
+            # snapshots the live creds directly (it does NOT overwrite them), so — unlike `paste` — there
+            # is nothing to sync-back: the live account IS the one being added. Codex-only (Claude's live
+            # creds carry no derivable email; it has no no-browser add path).
+            tool = message["tool"]
+            if tool != "codex":
+                return {"ok": False, "error": "importing the current login is codex-only"}
+            # Read the live creds, derive the email, and snapshot — all under ONE lock, passing the
+            # exact blob to acct.add. That closes the TOCTOU where acct.add's own second get_live()
+            # could read a DIFFERENT account (an out-of-band `codex login` mid-flow) than the email
+            # was derived from, storing account C's creds under account A's label.
+            with ctx.locked():
+                live = ctx.cred[tool].get_live()
+                if not live:
+                    return {"ok": False, "error": "you're not signed in to codex on this Mac yet"}
+                email = ctx.cred[tool].email_of(live)
+                if not email:
+                    return {"ok": False, "error": "couldn't read the codex account you're signed into"}
+                state = ctx.load_state()
+                if email in state.accounts(tool):
+                    return {"ok": False, "error": f"{email} is already on the list"}
+                seat = acct.add(ctx, state, tool, name=message.get("name"), email=email, blob=live)
             return {"ok": True, "celebrate": True, "added": seat["email"],
                     "state": snapshot_state(ctx)}
 

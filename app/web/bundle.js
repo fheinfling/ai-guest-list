@@ -177,11 +177,12 @@ function controlBar(opts) {
 //   claude — browser sign-in ONLY. A `claude setup-token` is a long-lived token for the
 //            CLAUDE_CODE_OAUTH_TOKEN env var; it does NOT write the Keychain login our snapshot
 //            pipeline reads, so there is no working paste/Terminal no-browser path for Claude today.
+const CODEX_AUTH_PATH = "~/.codex/auth.json";
 const ADD_COPY = {
   codex: {
     row: "ChatGPT sign-in · Business seat",
     chip: "Codex CLI · ChatGPT sign-in or auth.json",
-    tokenHint: "paste your auth.json — handy for a headless or shared box.",
+    tokenHint: `paste the contents of ${CODEX_AUTH_PATH} — handy for a headless or shared box.`,
     tokenPh: "paste auth.json contents",
   },
   claude: {
@@ -220,16 +221,18 @@ function reduceReply(ui, res) {
   // login the user abandoned (possibly for the other provider) must not steer the flow they restarted.
   // (res.tool may be absent on a generic failure; then fall back to "current flow".)
   const forThisFlow = inAdd && res.add_op && (res.tool == null || res.tool === add.provider);
-  if (res.added && forThisFlow && add.pending) { // OUR paste/snapshot succeeded → celebrate then done
-    add.pending = false; add.step = "done";
+  if (res.added && forThisFlow && add.pending) { // OUR paste/snapshot/import succeeded → celebrate then done
+    add.pending = false; add.importing = false; add.step = "done";
     addChanged = true; closeFlow = add;        // caller schedules the auto-close, scoped to this flow
   }
   if (res.error && forThisFlow) {               // OUR add op failed (not an unrelated / other-tool one)
     if (add.pending) {                          // a save was in flight
       add.pending = false;
-      // codex paste → back to the form (auth.json preserved). Browser save (tapped before login
-      // finished) → stay on connecting so they can complete sign-in and tap "save my seat" again.
-      if (addUsesPaste(add)) add.step = "details";
+      // An IN-APP save (codex paste or one-tap import) → back to the form (auth.json preserved).
+      // A browser save (tapped before login finished) → stay on connecting so they can complete
+      // sign-in and tap "save my seat" again.
+      if (addUsesPaste(add) || add.importing) add.step = "details";
+      add.importing = false;
       addChanged = true;
     } else if (add.step === "connecting") {     // the login LAUNCH failed (window never opened)
       add.step = "details"; addChanged = true;  // back to the form to retry
@@ -261,10 +264,26 @@ function addProviderStep() {
   </section>`;
 }
 
-function addDetailsStep(add) {
+function addDetailsStep(add, state) {
   const c = ADD_COPY[add.provider];
   const paste = addUsesPaste(add);
   const cta = paste ? "save the seat →" : "open sign-in →";
+  // One-tap "use the login you already have": when codex is signed in on this Mac to an account that
+  // isn't a seat yet, offer to import it directly — the easiest path, no browser dance, no paste.
+  const liveEmail = add.provider === "codex" ? state?.codex_live_unregistered?.email : null;
+  const importCard = liveEmail
+    ? `<section class="set-sec">
+        <span class="set-label">already signed in on this Mac</span>
+        <div class="set-card">
+          <button class="add-import" data-action="add-import">
+            <span class="add-chip add-chip--sm"><span class="add-chip-dot"></span></span>
+            <span class="add-prov-tx"><span class="add-provcard-t">use ${esc(liveEmail)}</span>
+              <span class="add-provcard-s">one tap — no auth.json needed</span></span>
+            <span class="add-chev">＋</span></button>
+        </div>
+        <div class="add-hint">or add a different account below.</div>
+      </section>`
+    : "";
   // The method chooser shows only for a provider that has a no-browser option (codex). Claude is
   // browser-only, so it renders name + a single "open sign-in" CTA with no segmented control.
   let methodSection = "";
@@ -272,9 +291,12 @@ function addDetailsStep(add) {
     const seg = (v, label) =>
       `<button class="sopt ${add.method === v ? "on" : ""}" data-action="add-method" data-value="${v}">${label}</button>`;
     const hint = add.method === "token" ? c.tokenHint : BROWSER_HINT;
+    // paste flow: show WHERE the file lives + a Finder shortcut, so the user isn't left guessing.
     const tokenWrap = paste
       ? `<div class="add-tokenwrap"><textarea id="add-token" class="add-token mono"
-           placeholder="${esc(c.tokenPh)}">${esc(add.token)}</textarea></div>`
+           placeholder="${esc(c.tokenPh)}">${esc(add.token)}</textarea></div>
+         <div class="add-pathrow"><code class="add-path">${esc(CODEX_AUTH_PATH)}</code>
+           <button class="add-reveal" data-action="add-reveal">reveal in Finder</button></div>`
       : "";
     methodSection = `<section class="set-sec">
       <span class="set-label">how should i sign you in?</span>
@@ -293,6 +315,7 @@ function addDetailsStep(add) {
         <span class="add-provcard-s">${c.chip}</span></span>
       <button class="add-change" data-action="add-change">change</button>
     </div>
+    ${importCard}
     <section class="set-sec">
       <span class="set-label">name this seat</span>
       <div class="set-card">
@@ -308,11 +331,12 @@ function addConnectingStep(add) {
   // then (add.pending) is a snapshot in flight. A codex auth.json paste is always actively saving.
   // Spinner + "saving…" copy show only when something is really in
   // flight — a lone spinner while we wait on the user would read as "hung".
-  const terminalFlow = !addUsesPaste(add);        // a browser sign-in (codex or claude) waits on the user
+  const terminalFlow = !addUsesPaste(add) && !add.importing;  // a browser sign-in waits on the user
   const saving = !terminalFlow || add.pending;
   const title = saving ? "saving your seat…" : "we opened your browser…";
   const sub = saving ? "tucking it away safely 💛" : "say hi over there and you're on the list 💛";
   const spin = saving ? `<div class="add-spin"></div>` : "";
+  // The "save my seat" handshake is only for the browser flow; a paste/import is already saving.
   const cta = terminalFlow
     ? `<button class="add-cta" data-action="add-save"${add.pending ? " disabled" : ""}>save my seat 💛</button>`
     : "";
@@ -334,7 +358,7 @@ function buildAddSeat(state, add) {
   const accent = add?.provider ? ` style="--accent:${TOOL_META[add.provider].accent}"` : "";
   const cancel = step === "provider" || step === "details"
     ? `<button class="add-cancel" data-action="add-cancel">cancel</button>` : "";
-  const body = step === "details" ? addDetailsStep(add)
+  const body = step === "details" ? addDetailsStep(add, state)
     : step === "connecting" ? addConnectingStep(add)
     : step === "done" ? addDoneStep(add)
     : addProviderStep();
@@ -580,6 +604,15 @@ document.addEventListener("click", (e) => {
       send("snapshot", { tool: add.provider, ...(name ? { name } : {}) });
       break;
     }
+    case "add-import": {       // one-tap: register the codex account already signed in on this Mac
+      if (add.pending) break;
+      const name = add.name.trim();
+      // in-app save (like paste): pending + importing → saving spinner, no "save my seat" handshake.
+      add.pending = true; add.importing = true; add.step = "connecting"; render();
+      send("import_current", { tool: add.provider, ...(name ? { name } : {}) });
+      break;
+    }
+    case "add-reveal": send("reveal"); break;   // native: reveal ~/.codex/auth.json in Finder
     case "settings": screen = "settings"; render(); break;
     case "settings-back": screen = "main"; render(); break;
     case "set_theme": send("set_theme", { value }); break;

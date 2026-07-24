@@ -9,8 +9,10 @@ Endpoints (see docs/PLAN.md):
 
 The exact JSON field names are not officially documented, so the parsers are DEFENSIVE: they
 look for utilization/percent + reset/resets_at under 5h and weekly buckets, and degrade gracefully.
-Live field shapes are confirmed during end-to-end verification (M8); fixtures below encode the
-assumed shape plus fallbacks so the normaliser is regression-tested.
+Claude's field shape is CONFIRMED live (2026-07-24): ``GET /api/oauth/usage`` returns ``utilization``
+(and ``limits[].percent``) as USED percent — e.g. ``five_hour.utilization: 24.0`` means 24% used —
+under ``five_hour`` (5h) and ``seven_day`` (weekly). So ``used_pct = utilization`` is correct: there
+is NO inversion. The fixtures below encode this confirmed shape plus fallbacks (regression-tested).
 
 Network access is injected (``get`` parameter) so unit tests never hit the wire.
 """
@@ -417,18 +419,20 @@ def refresh(ctx, state, tool: str | None = None, *, only: str | None = None,
     return summary
 
 
-def store_fetch(state, tool: str, email: str, u: Usage, at=None) -> str:
+def store_fetch(state, tool: str, email: str, u: Usage, at=None, *,
+                trust_reactive_lag: bool = True) -> str:
     """Persist ONE fetch result onto a seat (windows, limit flags, error backoff) and return its
     summary status ("ok" or the error kind). Shared by refresh() and the launcher's inline probe,
     which must fetch WITHOUT the state lock held and only take it for this quick write. The caller
-    saves state."""
+    saves state. ``trust_reactive_lag`` is threaded to _apply_limit (see there): default True keeps
+    in-session/poll behaviour; the launcher's cold-start sweep passes False."""
     at = at if at is not None else now()
     prev_usage = (state.get_seat(tool, email) or {}).get("usage") or {}
     d = u.to_dict()
     if u.ok:
         d["error_streak"] = 0
         state.set_usage(tool, email, d)
-        _apply_limit(state, tool, email, u, at)
+        _apply_limit(state, tool, email, u, at, trust_reactive_lag=trust_reactive_lag)
     else:
         # preserve last-known-good windows; bump the error streak for backoff
         d["windows"] = prev_usage.get("windows", d["windows"])
@@ -474,7 +478,8 @@ def _confirmed_healthy(u: Usage) -> bool:
     return bool(pcts) and max(pcts) < FALSE_ALARM_MAX_PCT
 
 
-def _apply_limit(state, tool: str, email: str, u: Usage, at) -> None:
+def _apply_limit(state, tool: str, email: str, u: Usage, at, *,
+                 trust_reactive_lag: bool = True) -> None:
     """Update limited_until from usage, without prematurely clearing a rest the fetch can't disprove.
 
     - A still-future ``hard`` flag (tool-side billing banner, e.g. codex "workspace out of credits")
@@ -488,6 +493,20 @@ def _apply_limit(state, tool: str, email: str, u: Usage, at) -> None:
       real limit — but a CONFIRMED-healthy fetch (<FALSE_ALARM_MAX_PCT, no limit flag) cannot be
       lag, so it clears the flag: that stale false positive is what wrongly blocked launches with
       "all seats resting" when capacity actually existed.
+
+    ``trust_reactive_lag`` (default True) governs ONLY the near-max reactive branch below:
+      - True  (in-session probes, menubar poll, in-wait polling sweeps): keep a reactive rest whenever
+        the busiest window sits in the lag band (>=FALSE_ALARM_MAX_PCT). Mid-run the endpoint can trail
+        a real limit by a few percent, and clearing it here would ping-pong the launcher back onto a
+        seat that's genuinely out.
+      - False (the launcher's PRE-LAUNCH / cold-start forced sweep only): clear a reactive flag as long
+        as the fetch is ok and NOT actually limited (below the real 100% limit / no limit_reached).
+        Rationale for the startup difference — a reactive flag is the WEAKEST evidence we hold (a guess
+        stamped from a prior stdout match, not the authoritative API), the endpoint says there is still
+        credit, and if the seat really is out the in-session limit guard will re-catch it and hop. So at
+        cold start we start the session rather than kill it on a stale near-max guess.
+        TRADEOFF (flagged for review): a seat truly sitting at e.g. 95-99% used gets ONE launch attempt
+        before in-session detection rests it again, instead of waiting out the 5h cooldown up front.
     """
     from .util import parse_iso
     seat = state.get_seat(tool, email)
@@ -503,6 +522,6 @@ def _apply_limit(state, tool: str, email: str, u: Usage, at) -> None:
         elif not live:
             state.set_limited_until(tool, email, iso(at + DEFAULT_COOLDOWN), source="usage")
         return
-    if live and src == "reactive" and not _confirmed_healthy(u):
-        return  # inconclusive / near-max reading: keep the rest until it expires
+    if live and src == "reactive" and not _confirmed_healthy(u) and trust_reactive_lag:
+        return  # inconclusive / near-max reading: keep the rest until it expires (in-session guard)
     state.set_limited_until(tool, email, None)

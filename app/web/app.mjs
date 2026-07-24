@@ -129,6 +129,15 @@ document.addEventListener("click", (e) => {
       send("snapshot", { tool: add.provider, ...(name ? { name } : {}) });
       break;
     }
+    case "add-import": {       // one-tap: register the codex account already signed in on this Mac
+      if (add.pending) break;
+      const name = add.name.trim();
+      // in-app save (like paste): pending + importing → saving spinner, no "save my seat" handshake.
+      add.pending = true; add.importing = true; add.step = "connecting"; render();
+      send("import_current", { tool: add.provider, ...(name ? { name } : {}) });
+      break;
+    }
+    case "add-reveal": send("reveal"); break;   // native: reveal ~/.codex/auth.json in Finder
     case "settings": screen = "settings"; render(); break;
     case "settings-back": screen = "main"; render(); break;
     case "set_theme": send("set_theme", { value }); break;
