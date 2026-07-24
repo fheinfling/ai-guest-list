@@ -50,67 +50,45 @@ def open_in_terminal(command: str) -> None:
               f'"${{SHELL:-/bin/zsh}}" -lic {shell_quote([command])}\n'
               f'rm -f -- "$0"\n')
     fd, path = tempfile.mkstemp(suffix=".command", prefix="ai-guest-list-signin-")
+    launched = False
     try:
         with os.fdopen(fd, "w") as f:
             f.write(script)
         os.chmod(path, 0o700)  # owner-only executable; content is just the login command, not a secret
         # env=harden_env() keeps the frozen interpreter vars out of the `open` process too.
         proc = subprocess.run(["open", path], capture_output=True, text=True, env=harden_env())
+        launched = proc.returncode == 0
+        if not launched:
+            detail = (proc.stderr or "").strip()   # surface the real LaunchServices reason if any
+            base = "couldn't open a terminal for the sign-in — try again"
+            raise RuntimeError(f"{base} ({detail})" if detail else base)
     except OSError as e:
         raise RuntimeError("couldn't open a terminal for the sign-in — try again") from e
-    if proc.returncode != 0:
-        try:
-            os.unlink(path)          # launch failed → nothing will run the script, so don't leak it
-        except OSError:
-            pass
-        detail = (proc.stderr or "").strip()   # surface the real LaunchServices reason when there is one
-        base = "couldn't open a terminal for the sign-in — try again"
-        raise RuntimeError(f"{base} ({detail})" if detail else base)
-
-
-def _login_shell_path(tool: str) -> str | None:
-    """Resolve ``tool``'s path the way the user's TERMINAL would: via their login+interactive shell,
-    which sources rc so a version-manager shim (asdf/volta/nvm) on the rc-only PATH resolves. Returns
-    the absolute path (found), ``""`` (the shell ran and the CLI is genuinely NOT installed), or
-    ``None`` (the probe couldn't run — the caller then falls back to the bare name rather than a wrong
-    'not installed')."""
-    from acctsw.procenv import harden_env
-    shell = os.environ.get("SHELL") or "/bin/zsh"
-    try:
-        proc = subprocess.run([shell, "-lic", f"command -v {shlex.quote(tool)}"],
-                              capture_output=True, text=True, env=harden_env(), timeout=6)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    lines = (proc.stdout or "").strip().splitlines()
-    path = lines[-1].strip() if lines else ""   # last line — an interactive rc may print noise first
-    if proc.returncode == 0 and path:
-        return path
-    if proc.returncode != 0 and not path:
-        return ""                                # `command -v` exits nonzero when not found
-    return None                                  # ambiguous → let the caller fall back to bare
+    finally:
+        if not launched:
+            # The script self-deletes only once a terminal RUNS it; if the launch failed, nothing will,
+            # so remove it here (both the RuntimeError and OSError paths) rather than leak an executable.
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
 
 def resolve_login_command(ctx: Context, tool: str) -> str:
     """Build the official sign-in command as a shell string, preferring the CLI's ABSOLUTE path.
 
-    Resolution order: the binary the engine already found (``ctx.codex_bin``/``ctx.claude_bin``) →
-    a login-shell probe (so an rc-only shim the GUI's PATH can't see still resolves) → for a probe
-    that proves the CLI is genuinely absent, a clear "install it first" error → otherwise the bare
-    command name (the login+interactive shell in ``open_in_terminal`` sources rc and resolves it).
-    Only a PROVEN-missing CLI hard-fails: an inconclusive probe must not block sign-in for a CLI the
-    user has working in their own terminal."""
+    Prefer the absolute binary the engine already found (``ctx.codex_bin``/``ctx.claude_bin``), so a
+    GUI app's minimal PATH can't hide a CLI that IS installed. Otherwise fall back to the BARE command
+    name — never hard-fail here: the login runs in a login+interactive shell (see ``open_in_terminal``)
+    that sources the user's rc, so a version-manager shim (asdf/volta/nvm) on the rc-only PATH still
+    resolves. If the CLI is genuinely absent the bare command surfaces a visible "command not found" in
+    the terminal we opened (same as the previous osascript path) — we deliberately do NOT probe the
+    login shell to pre-detect that: an interactive-shell probe misreads aliases/wrappers, can false-
+    fail a TTY-guarded shim, and adds seconds of latency, all to improve one rare error message."""
     from acctsw.bridge import LOGIN_SUBCMD
     if tool not in TOOLS:
         raise ValueError(f"unknown tool: {tool}")
-    exe = ctx.codex_bin if tool == "codex" else ctx.claude_bin
-    if not exe:
-        probed = _login_shell_path(tool)
-        if probed:
-            exe = probed
-        elif probed == "":
-            raise RuntimeError(f"can't find the {tool} command — install {tool} first, then sign in")
-        else:
-            exe = tool                            # inconclusive probe → bare; the login shell resolves it
+    exe = (ctx.codex_bin if tool == "codex" else ctx.claude_bin) or tool
     return shell_quote([exe, *LOGIN_SUBCMD[tool]])
 
 

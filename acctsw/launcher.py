@@ -106,11 +106,19 @@ _NOT_A_LIMIT = re.compile(r"not (?:your|a) usage limit|temporarily limiting requ
 # the deliberately loose "5-hour limit"/"weekly limit" patterns. Without a veto it would classify as a
 # real limit — and because an "approaching" warning only appears in the 90-100% band, the usage-probe
 # fallback (healthy only BELOW FALSE_ALARM_MAX_PCT=90) cannot dismiss it, so a still-usable seat gets
-# rested for a full cooldown and a switch is burned. The veto is scoped to the MATCHED LINE (see
-# _is_limit), not the whole rolling buffer: a real hit on another line ("5-hour limit reached") still
-# fires, and unrelated buffer text ("hit enter") can't defeat it. A line saying "approaching … limit"
-# is by definition not-yet-reached, so vetoing exactly those lines cannot mask a genuine hit.
-_CLAUDE_APPROACHING = re.compile(r"approaching\b[^.\n]{0,40}\blimit", re.IGNORECASE)
+# rested for a full cooldown and a switch is burned. The veto (see _is_limit) is WINDOW-scoped around
+# each match, not line- or buffer-scoped: veto only when "approaching" sits just BEFORE the matched
+# limit phrase AND no committal word ("reached/exceeded/resets/…") sits just AFTER it. That is robust
+# to the ways a TUI mangles the rolling byte tail — a real hit on the same physical line or in an
+# in-place \r-redraw ("…limit\r5-hour limit reached") still fires via its own committal, a warning
+# wrapped across a newline ("Approaching your\n5-hour limit") is still caught, and unrelated buffer
+# text ("hit enter") far from the match can't defeat it.
+_APPROACHING_BEFORE = 40   # chars before a limit match to scan for "approaching"
+_HIT_AFTER = 30            # chars after a limit match to scan for a committal (real-hit) word
+# Committal words that mean the limit IS consumed. Deliberately EXCLUDES "resets": a warning may name
+# its own reset time ("Approaching your limit, resets 3pm") and must still veto; a REAL reset-paired
+# banner ("5-hour limit · resets 8pm") has no "approaching" prefix, so the veto never applies to it.
+_HIT_NEARBY = re.compile(r"reach|exceed|run out|used up|out of", re.IGNORECASE)
 
 # Auth-death signals (token revoked / signed out). DISTINCT from a usage limit: switching+resuming on
 # the SAME seat can't help — the seat needs re-login — so we hop to a DIFFERENT seat. Kept to the
@@ -153,13 +161,12 @@ def _is_limit(tool: str, clean: str) -> bool:
     for rx in _LIMIT_RE[tool]:
         for m in rx.finditer(clean):
             if tool == "claude":
-                # Veto ONLY if THIS match sits on a benign "approaching … limit" line (a heads-up).
-                # Scoping to the match's own line — not the whole buffer — means a real hit elsewhere
-                # ("5-hour limit reached") still fires and stray words ("hit enter") can't defeat it.
-                ls = clean.rfind("\n", 0, m.start()) + 1
-                le = clean.find("\n", m.end())
-                line = clean[ls:le if le != -1 else len(clean)]
-                if _CLAUDE_APPROACHING.search(line):
+                # Benign "approaching … limit" heads-up: "approaching" shortly before the match and no
+                # committal (real-hit) word shortly after. Window-scoped around the match so a real hit
+                # (…limit reached / …limit\r… reached) still fires and stray text can't defeat it.
+                pre = clean[max(0, m.start() - _APPROACHING_BEFORE):m.start()].lower()
+                post = clean[m.end():m.end() + _HIT_AFTER]
+                if "approaching" in pre and not _HIT_NEARBY.search(post):
                     continue
             return True
     return False

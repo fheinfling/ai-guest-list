@@ -73,13 +73,15 @@ def test_detect_limit_ignores_server_throttle(text):
 
 @pytest.mark.parametrize("benign", [
     "Approaching your 5-hour limit", "Approaching weekly limit",
-    # stray words that a buffer-wide committal scan would trip on must NOT defeat the line-scoped veto
+    # stray words a buffer-wide committal scan would trip on must NOT defeat the window-scoped veto
     "hit enter to continue\nApproaching your 5-hour limit",
     "Approaching your 5-hour limit\nrun /resume when ready",
+    "Approaching your\n5-hour limit",                 # warning wrapped across a newline (round-3 V2)
+    "Approaching your 5-hour limit · resets 3pm",      # a warning naming its own reset time is benign
 ])
 def test_detect_limit_vetoes_claude_approaching_warning(benign):
     """Claude Code's benign pre-limit WARNING ('approaching … limit') is a heads-up, not a HIT — it must
-    not classify as a limit event, and unrelated buffer text must not defeat the (line-scoped) veto."""
+    not classify as a limit event, and unrelated/newline-wrapped buffer text must not defeat the veto."""
     assert not detect_limit("claude", benign)
     from acctsw.launcher import detect_event
     assert detect_event("claude", benign) is None
@@ -89,10 +91,12 @@ def test_detect_limit_vetoes_claude_approaching_warning(benign):
     "5-hour limit reached", "you've hit your 5-hour limit", "weekly limit · resets Monday",
     # an approaching warning earlier in the buffer must NOT suppress a real hit on a LATER line
     "Approaching your 5-hour limit\n... work ...\n5-hour limit reached",
+    # in-place \r redraw: warning then a real hit concatenated on one physical line still fires (V1)
+    "Approaching your 5-hour limit\r5-hour limit reached",
 ])
 def test_detect_limit_still_catches_real_claude_limit(real):
-    """The line-scoped approaching-veto must never weaken real limit detection: a genuine hit on its
-    own line still fires, even if a benign 'approaching' warning shares the rolling buffer."""
+    """The window-scoped approaching-veto must never weaken real limit detection: a genuine hit still
+    fires via its own committal word, even sharing the rolling buffer/line with an 'approaching' warning."""
     assert detect_limit("claude", real)
 
 
