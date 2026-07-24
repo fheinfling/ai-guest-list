@@ -55,12 +55,13 @@ def test_prepare_then_login_resolves_absolute_command_when_none(ctx, monkeypatch
     assert opened["cmd"] == "/opt/homebrew/bin/codex login"
 
 
-def test_prepare_then_login_missing_cli_raises_before_launch(ctx, monkeypatch):
-    """A missing CLI is reported (loudly) instead of silently 'opening' a sign-in that can't run."""
+def test_prepare_then_login_unresolved_cli_falls_back_to_bare(ctx, monkeypatch):
+    """An unresolved CLI (rc-only shim not on the GUI PATH) must NOT block sign-in: fall back to the
+    bare command, which the login+interactive shell resolves from the user's rc."""
+    ctx.cred["codex"].set_live(make_codex_blob("a@x.com"))
+    acct.add(ctx, ctx.load_state(), "codex", email="a@x.com")
     ctx.codex_bin = None
-    launched = {"n": 0}
-    monkeypatch.setattr(terminal, "open_in_terminal", lambda cmd: launched.__setitem__("n", launched["n"] + 1))
-    import pytest
-    with pytest.raises(RuntimeError):
-        terminal.prepare_then_login(ctx, "codex")
-    assert launched["n"] == 0  # never launched
+    opened = {}
+    monkeypatch.setattr(terminal, "open_in_terminal", lambda cmd: opened.setdefault("cmd", cmd))
+    terminal.prepare_then_login(ctx, "codex")
+    assert opened["cmd"] == "codex login"  # launched with the bare name, not aborted

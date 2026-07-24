@@ -170,17 +170,21 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
             tool = message["tool"]
             if tool != "codex":
                 return {"ok": False, "error": "importing the current login is codex-only"}
-            live = ctx.cred[tool].get_live()
-            if not live:
-                return {"ok": False, "error": "you're not signed in to codex on this Mac yet"}
-            email = ctx.cred[tool].email_of(live)
-            if not email:
-                return {"ok": False, "error": "couldn't read the codex account you're signed into"}
+            # Read the live creds, derive the email, and snapshot — all under ONE lock, passing the
+            # exact blob to acct.add. That closes the TOCTOU where acct.add's own second get_live()
+            # could read a DIFFERENT account (an out-of-band `codex login` mid-flow) than the email
+            # was derived from, storing account C's creds under account A's label.
             with ctx.locked():
+                live = ctx.cred[tool].get_live()
+                if not live:
+                    return {"ok": False, "error": "you're not signed in to codex on this Mac yet"}
+                email = ctx.cred[tool].email_of(live)
+                if not email:
+                    return {"ok": False, "error": "couldn't read the codex account you're signed into"}
                 state = ctx.load_state()
                 if email in state.accounts(tool):
                     return {"ok": False, "error": f"{email} is already on the list"}
-                seat = acct.add(ctx, state, tool, name=message.get("name"), email=email)
+                seat = acct.add(ctx, state, tool, name=message.get("name"), email=email, blob=live)
             return {"ok": True, "celebrate": True, "added": seat["email"],
                     "state": snapshot_state(ctx)}
 

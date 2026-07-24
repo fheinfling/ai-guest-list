@@ -109,6 +109,18 @@ def test_import_current_adds_the_live_codex_account(ctx):
     assert st.get_seat("codex", "live@x.com")["name"] == "Work"
 
 
+def test_add_snapshots_passed_blob_not_a_second_live_read(ctx):
+    # TOCTOU guard: acct.add must snapshot the EXACT blob passed, even if a second get_live() would now
+    # see a DIFFERENT account (an out-of-band `codex login` mid-flow). Otherwise a seat labeled A could
+    # silently store account C's credentials.
+    ctx.cred["codex"].set_live(make_codex_blob("live-now@x.com"))     # what a bare get_live() would see
+    passed = make_codex_blob("validated@x.com")
+    seat = acct.add(ctx, ctx.load_state(), "codex", email="validated@x.com", blob=passed)
+    assert seat["email"] == "validated@x.com"
+    stored = ctx.snapshot_get("codex", "validated@x.com")
+    assert ctx.cred["codex"].email_of(stored) == "validated@x.com"   # the passed blob, not live-now@
+
+
 def test_import_current_rejects_when_not_signed_in(ctx):
     r = bridge.handle(ctx, {"action": "import_current", "tool": "codex"})
     assert r["ok"] is False and "signed in" in r["error"]

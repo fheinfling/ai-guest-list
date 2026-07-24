@@ -48,6 +48,9 @@ def test_open_in_terminal_launches_via_open_and_scrubs_python_env(monkeypatch):
     assert "unset " in seen["script"] and "PYTHONPATH" in seen["script"] and "PYTHONHOME" in seen["script"]
     assert "/abs/codex login" in seen["script"]
     assert seen["script"].startswith("#!/bin/zsh")
+    # the login runs through a LOGIN + INTERACTIVE shell so PATH (node + version-manager shims) matches
+    # the user's own terminal — a bare non-login script would miss them.
+    assert '"${SHELL:-/bin/zsh}" -lic' in seen["script"]
     # the .command must be executable or `open` would fail to run it
     assert seen["mode"] & 0o100
 
@@ -59,12 +62,14 @@ def test_open_in_terminal_noop_on_empty_command(monkeypatch):
     assert called == []
 
 
-def test_open_in_terminal_raises_when_open_fails(monkeypatch):
+def test_open_in_terminal_raises_and_surfaces_reason_when_open_fails(monkeypatch):
     def fake_run(argv, **kw):
+        # the fake writes no file, so cleanup/read is skipped; return a descriptive failure
         return types.SimpleNamespace(returncode=1, stderr="LSOpenURLsWithRole failed")
     monkeypatch.setattr(terminal.subprocess, "run", fake_run)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError) as e:
         terminal.open_in_terminal("/abs/codex login")
+    assert "LSOpenURLsWithRole failed" in str(e.value)  # the real reason is surfaced, not just "try again"
 
 
 def test_resolve_login_command_uses_absolute_binary(ctx):
@@ -74,11 +79,14 @@ def test_resolve_login_command_uses_absolute_binary(ctx):
     assert terminal.resolve_login_command(ctx, "claude") == "/opt/homebrew/bin/claude auth login"
 
 
-def test_resolve_login_command_missing_cli_raises_clearly(ctx):
+def test_resolve_login_command_falls_back_to_bare_when_unresolved(ctx):
+    # a CLI on an rc-only shim (asdf/volta/nvm) isn't on the GUI app's PATH → ctx.codex_bin is None.
+    # We must NOT hard-fail (that regressed those users); fall back to the bare name — the login shell
+    # sources their rc and finds it.
     ctx.codex_bin = None
-    with pytest.raises(RuntimeError) as e:
-        terminal.resolve_login_command(ctx, "codex")
-    assert "codex" in str(e.value)  # actionable: names the missing tool
+    assert terminal.resolve_login_command(ctx, "codex") == "codex login"
+    ctx.claude_bin = None
+    assert terminal.resolve_login_command(ctx, "claude") == "claude auth login"
 
 
 def test_resolve_login_command_quotes_a_spacey_path(ctx):

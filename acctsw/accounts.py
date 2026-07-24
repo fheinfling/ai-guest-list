@@ -36,13 +36,18 @@ def plan_of(tool: str, blob: str | None) -> str | None:
 
 
 def add(ctx: Context, state: State, tool: str, *, name: str | None = None,
-        email: str | None = None) -> dict[str, Any]:
+        email: str | None = None, blob: str | None = None) -> dict[str, Any]:
     """Snapshot the currently-live account for ``tool`` into a seat.
 
     The caller is expected to have signed in via the official flow first (so the live creds are
     the account being added). After adding, that account becomes the active seat (it *is* live).
+
+    ``blob`` lets a caller that already read the live creds (under a lock) pass the EXACT bytes to
+    snapshot, closing a TOCTOU where a second get_live() here could read a different account than the
+    caller validated the email from. When ``blob`` is given, ``email`` should be too (this does not
+    re-derive it). When omitted, the live creds are read here as before.
     """
-    live = ctx.cred[tool].get_live()
+    live = blob if blob is not None else ctx.cred[tool].get_live()
     if not live:
         raise NoLiveCreds(f"no live {tool} credentials — sign in with the official tool first")
     em = email or live_email(ctx, tool)

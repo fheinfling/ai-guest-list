@@ -851,26 +851,6 @@ def test_wait_for_unlock_forced_verify_clears_stale_reactive_flag_when_waiting_e
     assert ctx.load_state().get_seat("claude", "solo@x.com").get("limited_until") is None
 
 
-@pytest.mark.parametrize("benign", [
-    "Approaching your 5-hour limit", "Approaching weekly limit",
-])
-def test_detect_limit_ignores_claude_approaching_warning(benign):
-    """Fix C: Claude Code's benign pre-limit WARNING mentions the window-limit wording but is not an
-    out-of-quota HIT — it must not classify as a limit event."""
-    assert not detect_limit("claude", benign)
-    from acctsw.launcher import detect_event
-    assert detect_event("claude", benign) is None
-
-
-@pytest.mark.parametrize("real", [
-    "5-hour limit reached", "you've hit your 5-hour limit",
-    "Approaching your 5-hour limit — 5-hour limit reached",  # a later real hit still fires
-])
-def test_detect_limit_still_catches_real_claude_limit(real):
-    """The approaching veto must NOT weaken real limit detection: a committal hit still fires."""
-    assert detect_limit("claude", real)
-
-
 def test_wait_for_unlock_returns_seat_even_without_advertised_unlock(ctx):
     """Direct contract check for the give-up-without-timestamp path: the loop needs no pre-known
     unlock time — it verifies live capacity itself and returns a usable seat instead of None
@@ -898,6 +878,29 @@ def test_run_pre_launch_sweep_clears_near_max_reactive_flag(ctx):
     assert len(spawn.calls) == 1
     assert sleeps == []
     assert ctx.load_state().get_seat("claude", "solo@x.com").get("limited_until") is None
+
+
+def test_wait_mid_session_keeps_near_max_reactive_flag(ctx, monkeypatch):
+    """Regression (review F1): the near-max reactive relaxation is COLD-START ONLY. A mid-session wait
+    (cold_start=False, the default) must NOT clear a just-stamped near-max reactive rest on an endpoint
+    lagging below 100% — otherwise the maxed seat is resumed at once in a same-seat busy-loop. Cold
+    start (cold_start=True) DOES clear the stale guess. Waiting is disabled so the forced sweep is the
+    only step (no poll loop)."""
+    monkeypatch.setenv(L.WAIT_ON_ALL_RESTING_ENV, "0")
+    _two_claude(ctx)  # c1 active, c2
+    state = ctx.load_state()
+    for e in ("c1@x.com", "c2@x.com"):
+        state.set_limited_until("claude", e, iso(now() + timedelta(hours=2)), source="reactive")
+    state.save()
+    get = fake_get({P.CLAUDE_USAGE_URL: (200, claude_ok_body(five=96.0, week=20.0))})
+
+    # mid-session (default cold_start=False): near-max reactive flags are KEPT → no seat freed → None
+    assert L._wait_for_unlock(ctx, "claude", lambda m: None, lambda s: None, get) is None
+    assert ctx.load_state().get_seat("claude", "c1@x.com")["limited_until"] is not None
+
+    # cold start: the same lagging reading clears the stale guess and a seat is returned
+    email = L._wait_for_unlock(ctx, "claude", lambda m: None, lambda s: None, get, cold_start=True)
+    assert email in ("c1@x.com", "c2@x.com")
 
 
 def test_run_wait_hard_rested_seat_not_repicked(ctx):
