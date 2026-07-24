@@ -817,6 +817,60 @@ def test_run_wait_clears_expired_flags_for_all_seats(ctx):
     assert state.get_seat("claude", "c2@x.com")["limited_until"] is None
 
 
+def test_wait_for_unlock_forced_verify_clears_stale_reactive_flag_when_waiting_disabled(ctx, monkeypatch):
+    """Fix A / Issue 3: a single seat carrying a STALE FUTURE reactive flag (a leftover false
+    positive) must not instant-give-up when waiting is DISABLED. The forced cold-start verify sweep
+    still runs; a healthy (5% used) fetch clears the flag, so the wait returns the seat — not None."""
+    ctx.cred["claude"].set_live(make_claude_blob())
+    state = ctx.load_state()
+    acct.add(ctx, state, "claude", email="solo@x.com")
+    state.set_limited_until("claude", "solo@x.com", iso(now() + timedelta(hours=4)), source="reactive")
+    state.save()
+    monkeypatch.setenv(L.WAIT_ON_ALL_RESTING_ENV, "0")
+    get = fake_get({P.CLAUDE_USAGE_URL: (200, claude_ok_body(five=5.0, week=10.0))})
+    sleeps = []
+    email = L._wait_for_unlock(ctx, "claude", lambda m: None, sleeps.append, get)
+    assert email == "solo@x.com"
+    assert sleeps == []  # waiting disabled → verified, never polled
+    assert ctx.load_state().get_seat("claude", "solo@x.com").get("limited_until") is None
+
+
+def test_wait_for_unlock_forced_verify_clears_stale_reactive_flag_when_waiting_enabled(ctx):
+    """Same self-heal with waiting ENABLED: the forced sweep clears the stale reactive flag and the
+    seat is returned immediately, without any sleep."""
+    ctx.cred["claude"].set_live(make_claude_blob())
+    state = ctx.load_state()
+    acct.add(ctx, state, "claude", email="solo@x.com")
+    state.set_limited_until("claude", "solo@x.com", iso(now() + timedelta(hours=4)), source="reactive")
+    state.save()
+    get = fake_get({P.CLAUDE_USAGE_URL: (200, claude_ok_body(five=5.0, week=10.0))})
+    sleeps = []
+    email = L._wait_for_unlock(ctx, "claude", lambda m: None, sleeps.append, get)
+    assert email == "solo@x.com"
+    assert sleeps == []
+    assert ctx.load_state().get_seat("claude", "solo@x.com").get("limited_until") is None
+
+
+@pytest.mark.parametrize("benign", [
+    "Approaching your 5-hour limit", "Approaching weekly limit",
+])
+def test_detect_limit_ignores_claude_approaching_warning(benign):
+    """Fix C: Claude Code's benign pre-limit WARNING mentions the window-limit wording but is not an
+    out-of-quota HIT — it must not classify as a limit event."""
+    assert not detect_limit("claude", benign)
+    from acctsw.launcher import detect_event
+    assert detect_event("claude", benign) is None
+
+
+@pytest.mark.parametrize("real", [
+    "5-hour limit reached", "you've hit your 5-hour limit",
+    "Approaching your 5-hour limit — 5-hour limit reached",  # a later real hit still fires
+])
+def test_detect_limit_still_catches_real_claude_limit(real):
+    """The approaching veto must NOT weaken real limit detection: a committal hit still fires."""
+    assert detect_limit("claude", real)
+
+
 def test_wait_for_unlock_returns_seat_even_without_advertised_unlock(ctx):
     """Direct contract check for the give-up-without-timestamp path: the loop needs no pre-known
     unlock time — it verifies live capacity itself and returns a usable seat instead of None
@@ -825,6 +879,25 @@ def test_wait_for_unlock_returns_seat_even_without_advertised_unlock(ctx):
     get = fake_get({P.CLAUDE_USAGE_URL: (200, claude_ok_body(five=5.0, week=10.0))})
     email = L._wait_for_unlock(ctx, "claude", lambda m: None, lambda s: None, get)
     assert email in ("c1@x.com", "c2@x.com")
+
+
+def test_run_pre_launch_sweep_clears_near_max_reactive_flag(ctx):
+    """Fix B end-to-end: a single seat carrying a near-max (95%) reactive flag reads all_limited at
+    startup, but the pre-launch forced sweep (trust_reactive_lag=False) sees the seat is below the
+    real limit, clears the stale guess, and the session starts immediately — no instant give-up."""
+    ctx.cred["claude"].set_live(make_claude_blob())
+    state = ctx.load_state()
+    acct.add(ctx, state, "claude", email="solo@x.com")
+    state.set_limited_until("claude", "solo@x.com", iso(now() + timedelta(hours=4)), source="reactive")
+    state.save()
+    get = fake_get({P.CLAUDE_USAGE_URL: (200, claude_ok_body(five=95.0, week=20.0))})
+    sleeps = []
+    spawn = FakeSpawn([(b"resumed, all good\n", 0)])
+    rc = run(ctx, "claude", [], spawn=spawn, get=get, notify=lambda m: None, sleep=sleeps.append)
+    assert rc == 0
+    assert len(spawn.calls) == 1
+    assert sleeps == []
+    assert ctx.load_state().get_seat("claude", "solo@x.com").get("limited_until") is None
 
 
 def test_run_wait_hard_rested_seat_not_repicked(ctx):

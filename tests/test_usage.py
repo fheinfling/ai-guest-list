@@ -224,6 +224,54 @@ def test_refresh_clears_reactive_limit_when_confirmed_healthy(ctx):
     assert state.get_seat("codex", "a@x.com")["limited_until"] is None
 
 
+def _reactive_seat(ctx):
+    state = _seed_two_codex(ctx)
+    state.set_limited_until("codex", "a@x.com", iso(now() + timedelta(hours=2)), source="reactive")
+    state.save()
+    return state
+
+
+def test_apply_limit_keeps_near_max_reactive_when_trusting_lag(ctx):
+    """Fix B (in-session/poll default): a 95%-used ok fetch is inconclusive lag — with
+    trust_reactive_lag=True the reactive rest is kept, so a mid-run poll never ping-pongs."""
+    state = _reactive_seat(ctx)
+    u = U.Usage(ok=True, windows={"5h": U.Window(used_pct=95.0), "weekly": U.Window(used_pct=20.0)})
+    U.store_fetch(state, "codex", "a@x.com", u, at=now())  # default trust_reactive_lag=True
+    assert state.get_seat("codex", "a@x.com")["limited_until"] is not None
+
+
+def test_apply_limit_clears_near_max_reactive_at_cold_start(ctx):
+    """Fix B (cold start): the same 95%-used ok fetch (below the real 100% limit → credit exists)
+    clears the weakest-evidence reactive guess when trust_reactive_lag=False, so a stale false
+    positive doesn't kill a launch that still has credit."""
+    state = _reactive_seat(ctx)
+    u = U.Usage(ok=True, windows={"5h": U.Window(used_pct=95.0), "weekly": U.Window(used_pct=20.0)})
+    U.store_fetch(state, "codex", "a@x.com", u, at=now(), trust_reactive_lag=False)
+    assert state.get_seat("codex", "a@x.com")["limited_until"] is None
+
+
+@pytest.mark.parametrize("trust", [True, False])
+def test_apply_limit_genuinely_limited_rests_under_both(ctx, trust):
+    """A genuinely-limited fetch (window ≥100% / limit_reached) rests the seat under BOTH modes —
+    the cold-start relaxation only touches the near-max (below-limit) reactive band."""
+    state = _reactive_seat(ctx)
+    reset = iso(now() + timedelta(hours=3))
+    u = U.Usage(ok=True, limit_reached=True,
+                windows={"5h": U.Window(used_pct=100.0, resets_at=reset)})
+    U.store_fetch(state, "codex", "a@x.com", u, at=now(), trust_reactive_lag=trust)
+    assert state.get_seat("codex", "a@x.com")["limited_until"] is not None
+
+
+def test_refresh_poll_path_keeps_near_max_reactive_flag(ctx):
+    """The menubar/poll path (refresh) uses the default trust_reactive_lag=True, so a 95% reading
+    keeps the reactive rest — the cold-start relaxation is threaded ONLY through the launcher's
+    pre-launch sweep, never through polling."""
+    state = _reactive_seat(ctx)
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=95.0, secondary=5.0))})
+    U.refresh(ctx, state, "codex", only="a@x.com", force=True, get=get)
+    assert state.get_seat("codex", "a@x.com")["limited_until"] is not None
+
+
 def test_refresh_never_clears_hard_limit_early(ctx):
     """A ``hard`` flag (tool-side billing banner, e.g. codex out of credits) survives even a fully
     healthy poll: the usage windows can look fine while the workspace has no credits."""
