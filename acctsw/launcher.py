@@ -101,6 +101,19 @@ _ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 # killed healthy sessions), so an explicit disclaimer vetoes an otherwise-matching limit phrase.
 _NOT_A_LIMIT = re.compile(r"not (?:your|a) usage limit|temporarily limiting requests", re.IGNORECASE)
 
+# Claude Code prints its OWN pre-limit WARNING (a heads-up, not an out-of-quota HIT) at startup and
+# mid-session — "Approaching your 5-hour limit", "Approaching weekly limit". That benign status trips
+# the deliberately loose "5-hour limit"/"weekly limit" patterns, so a CLAUDE-ONLY veto drops a
+# window-limit match whose only trigger is an "approaching" warning carrying no committal signal.
+# Kept narrow on purpose: a real hit ("5-hour limit reached", "you've hit your 5-hour limit") has a
+# committal word and still fires, and a reset-paired status line ("5-hour limit · resets 8pm") is NOT
+# vetoed here — it is indistinguishable from Claude's real reset-paired banner (the test suite asserts
+# it MUST be caught), so it is left to the shared limit+resets pattern and, like every claude limit
+# signal, to the usage-endpoint corroboration (handle_limit) before any kill.
+_CLAUDE_APPROACHING = re.compile(r"approaching\b[^.\n]{0,40}\blimit", re.IGNORECASE)
+_LIMIT_COMMITTAL = re.compile(r"reach|\bhit\b|exceed|resets?\b|out of|too many requests",
+                              re.IGNORECASE)
+
 # Auth-death signals (token revoked / signed out). DISTINCT from a usage limit: switching+resuming on
 # the SAME seat can't help — the seat needs re-login — so we hop to a DIFFERENT seat. Kept to the
 # tools' SPECIFIC error wording (not loose phrases like "sign in again") because this buffer also
@@ -139,6 +152,9 @@ _HARD_LIMIT_RE = {
 def _is_limit(tool: str, clean: str) -> bool:
     if _NOT_A_LIMIT.search(clean):
         return False  # server throttle explicitly disclaims the usage limit → not a limit banner
+    if (tool == "claude" and _CLAUDE_APPROACHING.search(clean)
+            and not _LIMIT_COMMITTAL.search(clean)):
+        return False  # Claude Code's benign "approaching … limit" warning, no committal hit → not a hit
     return any(rx.search(clean) for rx in _LIMIT_RE[tool])
 
 
@@ -191,7 +207,8 @@ POLL_MIN_FETCH_S = 240   # unforced in-wait polls: per-seat floor between usage 
 
 
 def _verify_capacity(ctx: Context, tool: str, get, *, at, force: bool,
-                     exclude: set | frozenset = frozenset(), ua: str | None = None) -> Selection:
+                     exclude: set | frozenset = frozenset(), ua: str | None = None,
+                     trust_reactive_lag: bool = True) -> Selection:
     """Fresh ground truth before blocking or giving up: fetch usage for the tool's seats, persist
     the results (store_fetch → _apply_limit, which clears flags a confirmed-healthy fetch disproves
     and re-stamps ones it confirms), drop rest markers that have expired by ``at``, and return a
@@ -225,7 +242,8 @@ def _verify_capacity(ctx: Context, tool: str, get, *, at, force: bool,
         changed = False
         for email, u in results:
             if state.get_seat(tool, email) is not None:   # seat may have been removed mid-wait
-                usage_mod.store_fetch(state, tool, email, u, at=at)
+                usage_mod.store_fetch(state, tool, email, u, at=at,
+                                      trust_reactive_lag=trust_reactive_lag)
                 changed = True
         # Trust the clock for markers the fetches did not re-stamp: clear EVERY seat whose rest has
         # expired by ``at`` (the old wait cleared only the one chosen seat, leaving stale siblings).
@@ -250,9 +268,13 @@ def _wait_for_unlock(ctx: Context, tool: str, notify: Notifier,
     moment a seat frees; at the advertised unlock time one more forced sweep is the moment of truth
     — after its expired-flag sweep either a seat is free or a NEW future target was stamped.
     A give_up that carries no unlock time polls too, bounded by DEFAULT_COOLDOWN, instead of
-    instantly killing the session. Ctrl-C propagates out of sleep (cli prints a clean message)."""
-    if not _wait_on_all_resting_enabled():
-        return None
+    instantly killing the session. Ctrl-C propagates out of sleep (cli prints a clean message).
+
+    Even with waiting DISABLED we still run ONE forced verify sweep first: a stale reactive flag left
+    over from a prior false positive is exactly what wrongly reports "all seats resting" at startup,
+    and the forced sweep (cold-start, trust_reactive_lag=False) self-heals it — so if capacity really
+    exists now the session starts immediately instead of an instant give-up. Only if that authoritative
+    sweep still finds no free seat do we give up (without waiting)."""
     start = now()
     virtual = start
 
@@ -264,7 +286,14 @@ def _wait_for_unlock(ctx: Context, tool: str, notify: Notifier,
     # The Claude UA shells out to `claude --version` — compute it ONCE per wait, not per poll.
     ua = usage_mod.claude_user_agent(getattr(ctx, "claude_bin", None)) if tool == "claude" else None
     hard_cap = start + DEFAULT_COOLDOWN   # bound for a give_up that advertised NO unlock time
-    sel = _verify_capacity(ctx, tool, get, at=vnow(), force=True, exclude=exclude, ua=ua)
+    # Cold-start sweep: trust_reactive_lag=False lets a fresh "still has credit" reading clear a stale
+    # near-max reactive guess (see usage._apply_limit) — the in-session guard re-catches a real limit.
+    sel = _verify_capacity(ctx, tool, get, at=vnow(), force=True, exclude=exclude, ua=ua,
+                           trust_reactive_lag=False)
+    if not _wait_on_all_resting_enabled():
+        # Waiting disabled: don't poll, but the forced verify above still self-heals a stale reactive
+        # flag — start immediately if capacity actually exists now, else give up as before.
+        return sel.email if (sel.available and sel.email) else None
     announced = None
     while True:
         if sel.available and sel.email:
