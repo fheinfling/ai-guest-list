@@ -466,7 +466,8 @@ def store_fetch(state, tool: str, email: str, u: Usage, at=None, *,
                     # Same email, different provider account means cancellation/re-subscription or
                     # a workspace move. Old rests and auth backoff belong to the old subscription.
                     state.set_limited_until(tool, email, None)
-                    accounts._creds_refreshed(state, tool, email)
+                    # ``d`` is this fresh successful fetch and already carries a cleared error,
+                    # zero streak and non-stale status; set_usage below replaces the old dict whole.
                     state.data["moved_note"] = (
                         f"new {tool} subscription detected for {email} — saved limits were reset"
                     )

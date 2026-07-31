@@ -144,6 +144,28 @@ def test_successful_poll_detects_new_subscription_under_same_email(ctx):
     assert "new codex subscription" in snapshot_state(ctx)["moved_note"]
 
 
+def test_new_subscription_success_does_not_touch_discarded_usage(ctx, monkeypatch):
+    """The fresh successful usage dict already clears error/streak. Account-change handling must
+    not mutate the old usage object that `set_usage` immediately replaces wholesale."""
+    ctx.cred["codex"].set_live(make_codex_blob("a@x.com", account_id="old-sub"))
+    state = ctx.load_state()
+    acct.add(ctx, state, "codex", email="a@x.com")
+    state.get_seat("codex", "a@x.com")["usage"] = {
+        "error": "forbidden", "error_streak": 4, "stale": True,
+    }
+    ctx.cred["codex"].set_live(make_codex_blob("a@x.com", account_id="new-sub"))
+
+    def dead_write(*_args, **_kwargs):
+        raise AssertionError("old usage is discarded; refreshing it here is a dead write")
+
+    monkeypatch.setattr(acct, "_creds_refreshed", dead_write)
+    U.refresh(ctx, state, "codex", force=True,
+              get=fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=5, secondary=5))}))
+
+    usage = state.get_seat("codex", "a@x.com")["usage"]
+    assert usage["error"] is None and usage["error_streak"] == 0
+
+
 # --- error classification ---------------------------------------------------------------------
 
 @pytest.mark.parametrize("status,err", [(200, None), (401, "unauthorized"),

@@ -22,6 +22,7 @@ import subprocess
 import tempfile
 
 from acctsw import TOOLS
+from acctsw import identity as identity_mod
 from acctsw.context import Context
 from acctsw.switch import sync_back
 
@@ -119,9 +120,10 @@ def prepare_then_login(ctx: Context, tool: str, command: str | None = None) -> N
         raise ValueError(f"unknown tool: {tool}")
     if command is None:
         command = resolve_login_command(ctx, tool)
+    live_identity = identity_mod.claude_live_identity(ctx) if tool == "claude" else None
     with ctx.locked():
         state = ctx.load_state()
-        sync_back(ctx, state, tool)
+        sync_back(ctx, state, tool, live_identity=live_identity)
     if command:
         open_in_terminal(command)
 

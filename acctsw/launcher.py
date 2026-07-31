@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Callable
 
+from . import identity as identity_mod
 from . import usage as usage_mod
 from .context import Context
 from .errors import AcctswError
@@ -51,9 +52,9 @@ DEFAULT_COOLDOWN = usage_mod.DEFAULT_COOLDOWN
 MAX_SWITCHES = 6      # safety bound on auto-relaunches within one `run`
 MAX_FALSE_ALARMS = 3  # dismissed stdout matches per run before stdout scanning is switched OFF
                       # (supervision continues — only the untrustworthy signal is dropped)
-PROBE_COOLDOWN_S = 30.0  # after a dismissed match, skip re-probing usage for this long: a TUI
-                         # redraws the same prose every frame, and without a cooldown each redraw
-                         # would force-hit the usage endpoint
+PROBE_COOLDOWN_S = 30.0  # after a dismissed or inconclusive match, skip re-probing usage for this
+                         # long: a TUI redraws the same prose every frame, and without a cooldown
+                         # each redraw would force-hit the usage endpoint
 # A stdout limit-signal is dismissed as a false positive (model prose, not a real banner) when the
 # usage endpoint says the active seat's busiest window is still below this (owned by usage, which
 # uses the same bar to clear stale reactive flags; re-exported for _seat_confirmed_healthy/tests).
@@ -428,8 +429,9 @@ def handle_limit(ctx: Context, state, tool: str, *, get=usage_mod._default_get,
         #     usage._backoff_seconds), NOT the account's quota; a transient server 429 is not an out-
         #     of-quota banner (Claude Code even says "temporarily limiting requests (not your usage
         #     limit)").
-        # So on anything but "ok" we keep working on the same seat — bounded by the false-alarm
-        # counter, which turns scanning off after MAX_FALSE_ALARMS so a genuine limit still stops.
+        # So on anything but "ok" we keep working on the same seat. In the live supervisor `_probe`
+        # tracks these unknowns separately from PROVEN false alarms, keeping scanning enabled so a
+        # later genuine limit is still caught after the endpoint recovers.
         # (Only when the active seat is still a real, selectable seat; if the active pointer is stale
         # — the account was removed mid-run — fall through to choose() a valid seat instead of
         # resuming a phantom, exactly as the pre-guard reactive path did.)
@@ -438,6 +440,8 @@ def handle_limit(ctx: Context, state, tool: str, *, get=usage_mod._default_get,
         # answered "this account is not entitled" — a cancelled/terminated subscription, not a
         # quota. Resting it would advertise a reset that will never come, so treat it exactly like
         # a dead token: leave this seat for an entitled one (or, with none, keep running and say so).
+        # The production live path normally catches this earlier as `_probe`'s "revoked" verdict;
+        # keep this branch as the defensive fallback for direct/non-corroborated callers.
         if status == "forbidden":
             return handle_auth_dead(ctx, state, tool, exclude=exclude)
         if status != "ok" and state.get_seat(tool, active) is not None:
@@ -474,7 +478,8 @@ def handle_auth_dead(ctx: Context, state, tool: str, *, exclude: set | frozenset
 
 
 def handle_exhausted(ctx: Context, state, tool: str, *, get=usage_mod._default_get,
-                     exclude: set | frozenset = frozenset()) -> Decision:
+                     exclude: set | frozenset = frozenset(),
+                     user_agent: str | None = None) -> Decision:
     """Post-exit safety net: the child exited on its own WITHOUT a stdout limit banner we could catch
     mid-session (codex often just errors/exits on a real limit, and this repo's own limit-prose can
     have turned scanning off earlier in the run). FORCE-refresh the active seat; only if the endpoint
@@ -484,7 +489,9 @@ def handle_exhausted(ctx: Context, state, tool: str, *, get=usage_mod._default_g
     active = state.active(tool)
     if not active or state.get_seat(tool, active) is None:
         return Decision("give_up", active)
-    summary = usage_mod.refresh(ctx, state, tool, only=active, force=True, get=get)
+    summary = usage_mod.refresh(
+        ctx, state, tool, only=active, force=True, get=get, user_agent=user_agent
+    )
     until = parse_iso((state.get_seat(tool, active) or {}).get("limited_until"))
     out = until is not None and until > now()
     # A seat can be authoritatively out (limit_reached / a window at 100%) yet carry NO reset
@@ -744,10 +751,28 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             codexhome.ensure_home(email, codex_home=ctx._codex_real, root=ctx._homes_root)
             os.environ["CODEX_HOME"] = str(ctx.codex_home(email))
 
-    def _commit_switch(state, email):
+    # Claude's official identity command can stall for 30 seconds. Resolve it with NO state flock,
+    # and memoise the answer only for the exact live Keychain blob: each distinct credential value
+    # gets its own answer, while initial selection, a hop, and exit cleanup cannot serially respawn
+    # the CLI for unchanged bytes. The reconcile write rechecks that the same blob is still live.
+    claude_identities: dict[str | None, identity_mod.ClaudeLiveIdentity] = {}
+
+    def _claude_live_identity() -> identity_mod.ClaudeLiveIdentity | None:
+        if tool != "claude":
+            return None
+        live = ctx.cred["claude"].get_live()
+        if live in claude_identities:
+            return claude_identities[live]
+        resolved = identity_mod.claude_live_identity(ctx)  # subprocess — caller holds no state lock
+        if resolved.blob == live:
+            claude_identities[live] = resolved
+        return resolved
+
+    def _commit_switch(state, email, live_identity=None):
         """Persist a seat hop: switch creds, repoint codex's home, stamp the switch time. Caller holds
-        ctx.locked() and owns the surrounding notify/budget bookkeeping."""
-        switch(ctx, state, tool, email, sync=(tool != "codex"))
+        ctx.locked(), having resolved any Claude identity before the lock, and owns the surrounding
+        notify/budget bookkeeping."""
+        switch(ctx, state, tool, email, sync=(tool != "codex"), live_identity=live_identity)
         _activate_codex_home(email)
         state.data["last_switch_at"] = iso(now())
         state.save()
@@ -760,10 +785,11 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         if email is None:
             return False
         hopped = False
+        live_identity = _claude_live_identity()  # slow Claude status happens before the flock
         with ctx.locked():
             state = ctx.load_state()
             if email != state.active(tool):
-                _commit_switch(state, email)
+                _commit_switch(state, email, live_identity)
                 hopped = True
         if hopped:
             mark_session(ctx.data_dir, tool, email)
@@ -815,6 +841,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
     try:
         initial_resting: Decision | None = None
         # Initial selection + switch, under the state lock (brief; never held across a spawn).
+        live_identity = _claude_live_identity()  # slow Claude status happens before the flock
         with ctx.locked():
             state = ctx.load_state()
             if tool == "codex":
@@ -822,7 +849,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 _acct.reconcile_codex(ctx, state)   # freshen home(s) from ~/.codex before using them
             sel = choose(state, tool)
             if sel.email and sel.email != state.active(tool):
-                switch(ctx, state, tool, sel.email, sync=(tool != "codex"))
+                switch(ctx, state, tool, sel.email, sync=(tool != "codex"),
+                       live_identity=live_identity)
             _activate_codex_home(state.active(tool))
         if sel.all_limited:
             # The wait verifies against the live endpoint and recomputes targets from state, so it
@@ -842,13 +870,15 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         buf = bytearray()
         # Decide-before-kill scanning state. A stdout match is corroborated and its landing seat is
         # selected while the child is STILL RUNNING. A dismissed or unverifiable match costs only a
-        # brief output-copy stall; past MAX_FALSE_ALARMS the generic scan turns off while the session
-        # continues. Trusted hard-limit banners bypass that off switch but still need a free landing
-        # seat and switch budget before they may stop the child.
+        # brief output-copy stall. Only PROVEN dismissals consume MAX_FALSE_ALARMS and can turn the
+        # generic scan off; endpoint noise is tracked separately so recovery can reveal a later real
+        # limit. Trusted hard-limit banners bypass that off switch but still need a free landing seat
+        # and switch budget before they may stop the child.
         scan = {
             "on": True,
             "next_probe": 0.0,
             "dismissed": 0,
+            "unknown": 0,
             "unknown_notified": False,
             "limit_stay_notified": False,
             "auth_stay_notified": False,
@@ -863,10 +893,20 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 notify(f"{tool}'s output keeps mentioning limits while usage says the seat is fine "
                        f"— ignoring limit/auth text for the rest of this session")
 
+        def _unknown() -> None:
+            # A failed/throttled endpoint says nothing about whether the text is trustworthy. Keep a
+            # separate count for diagnosis and only rate-limit retries; unlike _dismissed this may
+            # never disable scanning during the Headroom-proxy-flapping field failure.
+            scan["unknown"] += 1
+            scan["next_probe"] = time.monotonic() + PROBE_COOLDOWN_S
+
         def _probe(reason: str) -> str:
             """Fresh usage check for the active seat while the child is still running. Returns
-            "dismiss" (provably prose), "confirmed" (endpoint agrees the seat is out), or "unknown"
-            (couldn't tell — never authority to stop a live child).
+            "dismiss" when fresh usage disproves the signal; "confirmed" when a LIMIT signal agrees
+            the seat is out; "revoked" when a 403 positively proves the seat lost entitlement; or
+            "unknown" when the endpoint could not decide. For a limit, unknown always leaves the
+            child alive. For a tool-specific auth-death banner, unknown does not override that
+            trusted signal, so the supervisor may still hop after it preflights a healthy landing.
 
             The state flock is held only for the quick reads/writes on either side of the fetch —
             NEVER across the network call (locked()'s contract; a slow endpoint must stall neither
@@ -885,6 +925,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     st = ctx.load_state()
                     status = usage_mod.store_fetch(st, tool, seat, u, blob=blob)
                     st.save()
+                    if status == "forbidden":
+                        return "revoked"  # positive lost-entitlement evidence, never a quota rest
                     if reason == "auth":
                         # the creds just authenticated a usage fetch → they aren't dead
                         return "dismiss" if status == "ok" else "unknown"
@@ -904,7 +946,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             # deliberately leave this child alive, preventing the post-exit safety net from turning
             # that same banner into a re-derived hop after the child later exits on its own.
             hit = {
-                "reason": None,       # None | "limit" | "auth"
+                "reason": None,       # None | "limit" | "auth" | "revoked"
                 "email": None,        # exact pre-flight landing seat
                 "active": None,       # seat the still-live child was using
                 "hard": False,
@@ -942,23 +984,25 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     return False
                 if reason == "limit" and verdict == "unknown":
                     # Endpoint down / 429 / stale token is absence of evidence, never authority to
-                    # Ctrl-C a live session. Count it in the existing cooldown/false-alarm budget so
-                    # a repainting TUI cannot hammer the endpoint, but tell the user only once.
+                    # Ctrl-C a live session. Rate-limit repeated probes without spending the proven
+                    # false-alarm budget, and tell the user only once.
                     if not scan["unknown_notified"]:
                         notify(f"{tool}: couldn't verify — staying on this seat")
                         scan["unknown_notified"] = True
                     buf.clear()
-                    _dismissed()
+                    _unknown()
                     return False
 
                 # Confirmation alone is insufficient. While the child is alive, stamp the failed
                 # seat and choose the exact different landing seat we would use. Auth banners remain
                 # a separate trusted signal: a successful usage call dismissed them above; otherwise
-                # the token-dead seat is excluded for every later decision in this run.
+                # the token-dead seat is excluded for every later decision in this run. A 403 reached
+                # through a limit banner is the same leave-this-seat decision, but it is never rested.
+                decision_reason = "revoked" if verdict == "revoked" else reason
                 with ctx.locked():
                     state = ctx.load_state()
                     active = state.active(tool)
-                    if reason == "auth":
+                    if decision_reason in ("auth", "revoked"):
                         if active:
                             auth_failed.add(active)
                         dec = handle_auth_dead(ctx, state, tool, exclude=auth_failed)
@@ -968,7 +1012,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
 
                 if dec.action == "switch" and switches < max_switches:
                     hit.update({
-                        "reason": reason,
+                        "reason": decision_reason,
                         "email": dec.email,
                         "active": active,
                         "hard": hard,
@@ -981,12 +1025,15 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 scan["next_probe"] = time.monotonic() + PROBE_COOLDOWN_S
                 if dec.action == "switch":  # a seat exists, but the budget is already spent
                     if not scan["budget_notified"]:
-                        suffix = (f"; {active} needs you to sign in again"
-                                  if reason == "auth" else "")
+                        suffix = (
+                            f"; {active} needs you to sign in again" if decision_reason == "auth"
+                            else (f"; {active} is no longer entitled"
+                                  if decision_reason == "revoked" else "")
+                        )
                         notify(f"hit the switch limit ({max_switches}){suffix} — staying on this seat")
                         scan["budget_notified"] = True
                     return False
-                if reason == "auth":
+                if decision_reason == "auth":
                     if not scan["auth_stay_notified"]:
                         if dec.unlocks_at:
                             notify(f"{active} needs you to sign in again 🔑 — the only other {tool} "
@@ -995,6 +1042,12 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                             notify(f"{active} needs you to sign in again (token revoked) and no "
                                    f"other {tool} seat is ready — re-add it via the app or "
                                    f"`acctsw add {tool}`; staying on this seat")
+                        scan["auth_stay_notified"] = True
+                    return False
+                if decision_reason == "revoked":
+                    if not scan["auth_stay_notified"]:
+                        notify(f"{active} is no longer entitled and no other {tool} seat is ready "
+                               f"— staying on this seat")
                         scan["auth_stay_notified"] = True
                     return False
                 if not scan["limit_stay_notified"]:
@@ -1018,12 +1071,17 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 # never second-guess it, and a user abort (Ctrl-C/kill) is not a limit — only a
                 # POSITIVE, non-abort failure code is worth a usage check. See handle_exhausted.
                 if status > 0 and status not in _ABORT_EXITS and switches < max_switches:
+                    live_identity = _claude_live_identity()  # before handle/commit's state flock
+                    ua = (usage_mod.claude_user_agent(getattr(ctx, "claude_bin", None))
+                          if tool == "claude" else None)  # subprocess — still before the flock
                     with ctx.locked():
                         state = ctx.load_state()
                         active = state.active(tool)
-                        dec = handle_exhausted(ctx, state, tool, get=get, exclude=auth_failed)
+                        dec = handle_exhausted(
+                            ctx, state, tool, get=get, exclude=auth_failed, user_agent=ua
+                        )
                         if dec.action == "switch":
-                            _commit_switch(state, dec.email)
+                            _commit_switch(state, dec.email, live_identity)
                     if dec.action == "switch":
                         mark_session(ctx.data_dir, tool, dec.email)
                         notify(f"{active} hit its usage limit — hopping to {dec.email}, "
@@ -1045,12 +1103,15 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             # The callback already classified the banner, selected this exact landing seat, and
             # checked the budget while the child was alive. Commit that decision without choose() or
             # another usage fetch on the corpse.
+            live_identity = _claude_live_identity()  # slow Claude status happens before the flock
             with ctx.locked():
                 state = ctx.load_state()
-                _commit_switch(state, hit["email"])
+                _commit_switch(state, hit["email"], live_identity)
             mark_session(ctx.data_dir, tool, hit["email"])
-            reason_msg = ("needs you to sign in again 🔑" if hit["reason"] == "auth"
-                          else "needs a rest 💤")
+            reason_msg = (
+                "needs you to sign in again 🔑" if hit["reason"] == "auth"
+                else ("is no longer entitled" if hit["reason"] == "revoked" else "needs a rest 💤")
+            )
             notify(f"{hit['active']} {reason_msg} — hopping to {hit['email']}, "
                    f"your work's coming with you ✨")
             switches += 1
@@ -1068,6 +1129,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         #    plain codex / the GUI follow the active account.
         #  - claude: sync the live keychain item back into the account's snapshot.
         try:
+            live_identity = _claude_live_identity()  # subprocess — never under the state flock
             with ctx.locked():
                 st = ctx.load_state()
                 active = st.active(tool)
@@ -1075,7 +1137,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     blob = ctx.snapshot_get("codex", active)   # home = source of truth
                     if blob:
                         ctx.cred["codex"].set_live(blob)        # mirror → ~/.codex
-                elif sync_back(ctx, st, tool):
+                elif sync_back(ctx, st, tool, live_identity=live_identity):
                     st.save()
         except Exception:
             pass

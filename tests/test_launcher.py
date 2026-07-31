@@ -436,6 +436,44 @@ def test_run_switches_and_resumes_on_limit(ctx):
     assert any("hopping to b@x.com" in m for m in msgs)
 
 
+def test_run_hops_off_forbidden_seat_without_resting_it(ctx):
+    """A live limit banner plus a 403 is positive proof that the subscription is gone. The
+    supervisor must treat that verdict like dead credentials, stop only after preflighting the
+    healthy sibling, and carry the work there without inventing a reset for the revoked seat."""
+    _two_codex(ctx)  # active a, healthy b
+    get = fake_get({P.CODEX_USAGE_URL: (403, "")})
+    spawn = FakeSpawn([
+        (b"usage limit reached\n", 1),
+        (b"resumed on entitled seat\n", 0),
+    ])
+
+    rc = run(ctx, "codex", ["--foo"], spawn=spawn, get=get, notify=lambda m: None)
+
+    assert rc == 0
+    assert len(spawn.calls) == 2 and spawn.stops == 1
+    assert spawn.calls[1][-2:] == ["resume", "--last"]
+    state = ctx.load_state()
+    assert state.active("codex") == "b@x.com"
+    assert state.get_seat("codex", "a@x.com").get("limited_until") is None
+
+
+def test_run_forbidden_only_seat_keeps_child_running_without_rest(ctx):
+    """A revoked subscription with no entitled landing seat is still positive evidence to leave,
+    but never permission to stop with nowhere to go. The one child owns its exit and no phantom
+    cooldown is persisted."""
+    ctx.cred["codex"].set_live(make_codex_blob("solo@x.com"))
+    acct.add(ctx, ctx.load_state(), "codex", email="solo@x.com")
+    get = fake_get({P.CODEX_USAGE_URL: (403, "")})
+    spawn = FakeSpawn([(b"usage limit reached\n", 17)])
+
+    rc = run(ctx, "codex", ["--foo"], spawn=spawn, get=get, notify=lambda m: None)
+
+    assert rc == 17 and rc != L.EXIT_GAVE_UP
+    assert len(spawn.calls) == 1 and spawn.stops == 0
+    seat = ctx.load_state().get_seat("codex", "solo@x.com")
+    assert seat.get("limited_until") is None
+
+
 def test_run_single_seat_confirmed_limit_does_not_stop_child(ctx):
     """Positive confirmation is necessary but not sufficient: without another available seat the
     callback leaves the only child alive and surfaces that child's own exit status."""
@@ -614,6 +652,35 @@ def test_run_unverifiable_limit_never_gives_up(ctx, monkeypatch, transport_statu
     assert ctx.load_state().active("codex") == "a@x.com"     # never switched away
     assert ctx.load_state().get_seat("codex", "a@x.com").get("limited_until") is None  # never rested
     assert sum("couldn't verify" in m for m in msgs) == 1
+
+
+def test_run_unknown_probes_never_disable_later_limit_detection(ctx, monkeypatch):
+    """Endpoint noise is not proof that stdout is untrustworthy. More than the false-alarm bound
+    worth of inconclusive probes must leave scanning alive so a later confirmed limit still hops."""
+    _two_codex(ctx)  # active a, healthy b
+    monkeypatch.setattr(L, "PROBE_COOLDOWN_S", 0.0)
+    unknowns = L.MAX_FALSE_ALARMS + 2
+    probes = {"n": 0}
+    reset = iso(now() + timedelta(hours=3))
+
+    def get(url, headers, timeout):
+        probes["n"] += 1
+        if probes["n"] <= unknowns:
+            return 0, ""
+        return 200, codex_ok_body(primary=100.0, p_reset=reset)
+
+    chunks = [b"... you've hit your usage limit ...\n"] * (unknowns + 1)
+    spawn = FakeSpawn([
+        (chunks, 1),
+        (b"resumed after the endpoint recovered\n", 0),
+    ])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=lambda m: None)
+
+    assert rc == 0
+    assert probes["n"] == unknowns + 1
+    assert len(spawn.calls) == 2 and spawn.stops == 1
+    assert ctx.load_state().active("codex") == "b@x.com"
 
 
 @pytest.mark.parametrize("text", [

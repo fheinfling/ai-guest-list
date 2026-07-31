@@ -10,9 +10,11 @@ from typing import Any
 
 from . import __version__, build_number
 from . import accounts as acct
+from . import identity as identity_mod
+from . import paths as P
 from . import usage as usage_mod
 from .context import Context
-from .errors import AcctswError
+from .errors import AcctswError, CannotIdentify, NoLiveCreds
 from .switch import sync_back
 from .switch import switch as do_switch
 from .util import now, iso, parse_iso
@@ -121,9 +123,16 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
             return {"ok": True, "state": snapshot_state(ctx)}
 
         if action == "switch":
+            tool = message["tool"]
+            # Claude's blob has no email, and its official identity probe can wait 30 seconds.
+            # Resolve the blob/email pair before taking the cross-process flock; reconcile_claude
+            # rechecks the exact blob under the lock before trusting the answer.
+            live_identity = (
+                identity_mod.claude_live_identity(ctx) if tool == "claude" else None
+            )
             with ctx.locked():
                 state = ctx.load_state()
-                do_switch(ctx, state, message["tool"], message["email"])
+                do_switch(ctx, state, tool, message["email"], live_identity=live_identity)
                 state.data["last_switch_at"] = iso(now())
                 state.save()
             return {"ok": True, "celebrate": True, "state": snapshot_state(ctx)}
@@ -135,11 +144,26 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
             return {"ok": True, "state": snapshot_state(ctx)}
 
         if action == "usage":
+            # Both Claude helper commands are subprocesses. Compute their answers before the flock:
+            # auth status can stall for 30s and --version for 10s, neither of which may freeze the
+            # menubar or another launcher. Passing the fallback when no Claude seat exists also keeps
+            # a seat added in the tiny read→lock race from spawning --version under the lock.
+            before = ctx.load_state()
+            if before.accounts("claude"):
+                live_identity = identity_mod.claude_live_identity(ctx)
+                claude_ua = usage_mod.claude_user_agent(ctx.claude_bin)
+            else:
+                live_identity = identity_mod.ClaudeLiveIdentity(
+                    blob=ctx.cred["claude"].get_live(), email=None
+                )
+                claude_ua = P.CLAUDE_USER_AGENT_FALLBACK
             with ctx.locked():
                 state = ctx.load_state()
                 acct.reconcile_codex(ctx, state)   # capture a fresh/out-of-band ~/.codex into its home
-                acct.reconcile_claude(ctx, state)  # Claude identity comes from auth status, not its blob
-                usage_mod.refresh(ctx, state, message.get("tool"))
+                # Claude identity comes from auth status, not its blob; the slow answer was resolved
+                # above and remains a no-op if unknown or if the live bytes changed meanwhile.
+                acct.reconcile_claude(ctx, state, live_identity=live_identity)
+                usage_mod.refresh(ctx, state, message.get("tool"), user_agent=claude_ua)
             return {"ok": True, "state": snapshot_state(ctx)}
 
         if action == "paste":
@@ -191,10 +215,24 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
 
         if action == "snapshot":
             # called after the user completed the official login in Terminal
+            tool = message["tool"]
+            email = message.get("email")
+            live = None
+            if tool == "claude" and not email:
+                # The Claude blob cannot identify itself. Resolve auth status before the flock and
+                # pass the exact bytes into add(), closing both the 30s lock stall and a login TOCTOU.
+                resolved = identity_mod.claude_live_identity(ctx)
+                if not resolved.blob:
+                    raise NoLiveCreds(
+                        "no live claude credentials — sign in with the official tool first"
+                    )
+                if not resolved.email:
+                    raise CannotIdentify("could not determine the account email for claude")
+                live, email = resolved.blob, resolved.email
             with ctx.locked():
                 state = ctx.load_state()
-                seat = acct.add(ctx, state, message["tool"],
-                                name=message.get("name"), email=message.get("email"))
+                seat = acct.add(ctx, state, tool, name=message.get("name"),
+                                email=email, blob=live)
             return {"ok": True, "celebrate": True, "added": seat["email"],
                     "state": snapshot_state(ctx)}
 

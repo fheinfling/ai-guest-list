@@ -119,20 +119,30 @@ def reconcile_codex(ctx: Context, state: State) -> str | None:
     return em
 
 
-def reconcile_claude(ctx: Context, state: State) -> str | None:
+def reconcile_claude(
+        ctx: Context, state: State,
+        *, live_identity: identity.ClaudeLiveIdentity | None = None) -> str | None:
     """Capture a fresh/out-of-band Claude Keychain login into the matching seat snapshot.
 
     Claude's credential blob has no email, so comparing it with ``state.active`` cannot identify its
     owner. The official ``claude auth status --json`` identity is the guard: a known out-of-band
     login is adopted and captured under its real seat, while an unknown/inconclusive identity is
-    never written over the old active seat's snapshot.
+    never written over the old active seat's snapshot. Lock-owning callers resolve and pass
+    ``live_identity`` before taking the flock; direct callers may omit it when no lock is held.
+    The blob/email pair is revalidated here so a login racing between those phases is also a no-op.
     """
     if not state.accounts("claude"):
         return None
-    live = ctx.cred["claude"].get_live()
+    resolved = live_identity or identity.claude_live_identity(ctx)
+    live = resolved.blob
     if not live:
         return None
-    em = identity.claude_status_email(ctx.claude_bin)
+    # The identity answer belongs only to the exact bytes observed before the subprocess. If an
+    # official login replaced the Keychain item while the caller waited for the flock, writing the
+    # new bytes under the old answer would recreate the cross-account snapshot corruption guard.
+    if ctx.cred["claude"].get_live() != live:
+        return None
+    em = resolved.email
     if not em or em not in state.accounts("claude"):
         return None
     changed = ctx.snapshot_get("claude", em) != live

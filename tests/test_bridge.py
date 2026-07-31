@@ -35,9 +35,12 @@ def test_usage_reconciles_both_provider_identities_before_poll(ctx, monkeypatch)
     """A popover usage poll must capture Claude out-of-band login identity just like Codex."""
     seen = []
     monkeypatch.setattr(acct, "reconcile_codex", lambda _ctx, _state: seen.append("codex"))
-    monkeypatch.setattr(acct, "reconcile_claude", lambda _ctx, _state: seen.append("claude"))
+    monkeypatch.setattr(
+        acct, "reconcile_claude",
+        lambda _ctx, _state, **_kwargs: seen.append("claude"),
+    )
     monkeypatch.setattr(bridge.usage_mod, "refresh",
-                        lambda _ctx, _state, _tool=None: {"codex": {}, "claude": {}})
+                        lambda _ctx, _state, _tool=None, **_kwargs: {"codex": {}, "claude": {}})
     result = bridge.handle(ctx, {"action": "usage"})
     assert result["ok"] is True
     assert seen == ["codex", "claude"]

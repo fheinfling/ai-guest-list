@@ -1,9 +1,11 @@
 """Partial-failure & corruption-safety tests for the switch primitive (reviewer gap #1-3)."""
+import contextlib
 import json
 
 import pytest
 
 from acctsw import accounts as acct
+from acctsw import bridge
 from acctsw.errors import MissingSnapshot
 from acctsw.switch import switch, sync_back
 from tests.conftest import make_codex_blob, make_claude_blob
@@ -81,3 +83,36 @@ def test_sync_back_claude_unknown_identity_never_clobbers_old_seat(ctx, monkeypa
 
     assert sync_back(ctx, state, "claude") is False
     assert ctx.snapshot_get("claude", "a@x.com") == before
+
+
+def test_bridge_claude_switch_resolves_identity_before_state_lock(ctx, monkeypatch):
+    """`claude auth status --json` may stall for 30 seconds. A UI switch must resolve it before
+    taking the cross-process state flock while still tying that identity to the exact live blob."""
+    ctx.cred["claude"].set_live(make_claude_blob("max"))
+    acct.add(ctx, ctx.load_state(), "claude", email="a@x.com")
+    ctx.cred["claude"].set_live(make_claude_blob("pro"))
+    acct.add(ctx, ctx.load_state(), "claude", email="b@x.com")  # active/live b
+
+    held = {"value": False}
+    real_locked = ctx.locked
+
+    @contextlib.contextmanager
+    def tracked_locked():
+        with real_locked():
+            held["value"] = True
+            try:
+                yield
+            finally:
+                held["value"] = False
+
+    def status_email(_claude_bin):
+        assert held["value"] is False, "Claude identity subprocess ran under the state flock"
+        return "b@x.com"
+
+    monkeypatch.setattr(ctx, "locked", tracked_locked)
+    monkeypatch.setattr(acct.identity, "claude_status_email", status_email)
+
+    result = bridge.handle(ctx, {"action": "switch", "tool": "claude", "email": "a@x.com"})
+
+    assert result["ok"] is True
+    assert ctx.load_state().active("claude") == "a@x.com"
