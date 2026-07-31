@@ -62,6 +62,7 @@ export function pct(seat, win) {
 }
 
 export function creditLeft(seat) {
+  if (seat?.usage_unknown) return null;
   const used = ["5h", "weekly"].map((w) => pct(seat, w)).filter((v) => v !== null);
   return used.length ? Math.round(100 - Math.max(...used)) : null;
 }
@@ -79,6 +80,7 @@ export function fmtCountdown(iso, now = Date.now()) {
 function fmtClock(iso) {
   if (!iso) return "";
   const d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
   let h = d.getHours(); const m = String(d.getMinutes()).padStart(2, "0");
   const ap = h >= 12 ? "PM" : "AM"; h = h % 12 || 12;
   return `${h}:${m} ${ap}`;
@@ -92,12 +94,17 @@ function esc(s) {
 
 function statusBit(tool, seat) {
   switch (seat.status) {
-    case "active": return `<span class="pill floor">on the floor</span>`;
+    case "active":
+      return seat.in_session
+        ? `<span class="pill floor floor--live"><span class="live-dot" aria-hidden="true"></span>on the floor</span>`
+        : `<span class="pill floor floor--idle">on the floor</span>`;
     case "queued": return `<span class="pill queued">up next 💛</span>`;
     case "resting":
       return `<span class="mono rest-count">back in ${fmtCountdown(seat.limited_until)}</span>`;
     case "needs-login":
-      return `<button class="btn rose" data-action="add" data-tool="${tool}">log in</button>`;
+      return seat.entitlement_revoked
+        ? `<button class="btn rose revoked" data-action="add" data-tool="${tool}">subscription ended — sign in again</button>`
+        : `<button class="btn rose" data-action="add" data-tool="${tool}">log in</button>`;
     default:
       return `<button class="btn switch" data-action="switch" data-tool="${tool}" data-email="${esc(seat.email)}">switch</button>`;
   }
@@ -105,21 +112,26 @@ function statusBit(tool, seat) {
 
 function bar(seat, win, label) {
   const v = pct(seat, win);
-  const known = v !== null;
-  return `<div class="usage"><span class="mono u-k">${label}</span>
+  const known = !seat?.usage_unknown && v !== null;
+  return `<div class="usage${seat?.usage_stale ? " usage--stale" : ""}"><span class="mono u-k">${label}</span>
     <span class="track"><span class="fill" style="width:${known ? v : 0}%"></span></span>
     <span class="mono u-v">${known ? `${Math.round(v)}%` : "—"}</span></div>`;
 }
 
 function seatCard(tool, seat) {
   const plan = seat.plan ? `<span class="mono chip">${esc(seat.plan)}</span>` : "";
+  const lastChecked = fmtClock(seat.usage_fetched_at);
+  const freshness = seat.usage_stale
+    ? `<div class="reassure mono">last checked ${esc(lastChecked || "—")}</div>` : "";
   const reassure = seat.status === "resting"
     ? `<div class="reassure mono">taking a breather — back ${fmtClock(seat.limited_until)}</div>` : "";
   const credit = creditLeft(seat);
+  const sessionStarted = fmtClock(seat.session_started_at);
   const expanded = `<div class="expand">
     ${bar(seat, "weekly", "7d")}
     ${credit !== null ? `<div class="x-row"><span>credit left</span><span class="mono">${credit}%</span></div>` : ""}
     ${seat.last_on_floor ? `<div class="x-row"><span>last on the floor</span><span class="mono">${esc(fmtClock(seat.last_on_floor))}</span></div>` : ""}
+    ${sessionStarted ? `<div class="x-row"><span>session started</span><span class="mono">${esc(sessionStarted)}</span></div>` : ""}
     <button class="logout" data-action="remove" data-tool="${tool}" data-email="${esc(seat.email)}">log out ↗</button>
   </div>`;
   return `<div class="seat seat--${seat.status}" data-card data-tool="${tool}" data-email="${esc(seat.email)}">
@@ -130,6 +142,7 @@ function seatCard(tool, seat) {
     </div>
     <div class="seat-email mono">${esc(seat.email)}</div>
     ${bar(seat, "5h", "5h")}
+    ${freshness}
     ${reassure}
     ${expanded}
   </div>`;

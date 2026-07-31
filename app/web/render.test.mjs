@@ -84,13 +84,69 @@ test("type discipline: Outfit wordmark w/ gold 'ai', email mono, seat name NOT m
 test("status: active=pill, ready=switch btn, resting=countdown+reassurance, needs-login=log in", () => {
   const mk = (st, extra) => buildHTML(state({ tools: {
     codex: { plan_label: "CHATGPT BUSINESS", seats: [seat({ status: st, ...extra })] }, claude: { seats: [] } } }));
-  assert.match(mk("active", { active: true }), /pill floor">on the floor/);
+  assert.match(mk("active", { active: true }), /pill floor floor--idle">on the floor/);
   assert.match(mk("ready"), /btn switch"[^>]*data-action="switch"/);
   const resting = mk("resting", { limited: true, limited_until: new Date(Date.now() + 6e6).toISOString() });
   assert.match(resting, /back in/);
   assert.match(resting, /taking a breather/);            // reassurance ONLY here
   assert.match(mk("queued", { limited: true }), /pill queued">up next/);
   assert.match(mk("needs-login"), /btn rose"[^>]*data-action="add"/);
+});
+
+test("stale usage dims bars and says when it was last checked", () => {
+  const html = buildHTML(state({ tools: {
+    codex: { seats: [seat({
+      usage_stale: true,
+      usage_fetched_at: "2026-06-28T12:12:00Z",
+    })] },
+    claude: { seats: [] },
+  } }));
+  assert.equal((html.match(/class="usage usage--stale"/g) || []).length, 2);
+  assert.match(html, /class="reassure mono">last checked \d{1,2}:12 (?:AM|PM)</);
+  assert.match(html, /20%/);  // stale is last-known and labeled; only unknown suppresses the number
+});
+
+test("unknown usage renders dashes instead of unsupported percentages", () => {
+  const html = buildHTML(state({ tools: {
+    codex: { seats: [seat({ usage_unknown: true, usage5h: 25, usageWeek: 60 })] },
+    claude: { seats: [] },
+  } }));
+  assert.equal((html.match(/class="mono u-v">—/g) || []).length, 2);
+  assert.equal((html.match(/style="width:0%"/g) || []).length, 2);
+  assert.doesNotMatch(html, /25%|60%|credit left/);
+});
+
+test("active seats distinguish a live session from loaded-but-idle credentials", () => {
+  const mk = (over) => buildHTML(state({ tools: {
+    codex: { seats: [seat({ status: "active", active: true, ...over })] },
+    claude: { seats: [] },
+  } }));
+  const live = mk({
+    in_session: true,
+    session_started_at: "2026-06-28T12:12:00Z",
+    last_on_floor: "2026-06-28T11:45:00Z",
+  });
+  assert.match(live, /pill floor floor--live/);
+  assert.match(live, /class="live-dot"/);
+  assert.match(live, /last on the floor/);
+  assert.match(live, /session started/);
+
+  const idle = mk({ in_session: false });
+  assert.match(idle, /pill floor floor--idle">on the floor/);
+  assert.doesNotMatch(idle, /live-dot|session started/);
+});
+
+test("revoked entitlement has distinct sign-in copy on a non-active seat", () => {
+  const html = buildHTML(state({ tools: {
+    codex: { seats: [seat({
+      status: "needs-login",
+      active: false,
+      entitlement_revoked: true,
+    })] },
+    claude: { seats: [] },
+  } }));
+  assert.match(html, /class="btn rose revoked"[^>]*>subscription ended — sign in again</);
+  assert.doesNotMatch(html, />log in</);
 });
 
 test("reassurance never appears on active/ready seats", () => {
