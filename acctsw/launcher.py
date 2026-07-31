@@ -7,10 +7,10 @@ with a scripted fake child (no real PTY, no network).
 Flow:
   1. pick a seat (prefer active; else available; else soonest-unlock + report) and switch to it
   2. spawn the agent under a PTY, teeing output while scanning for the limit signal
-  3. on a stdout limit-signal: VERIFY BEFORE KILLING — probe the usage endpoint while the child is
-     still running; a false positive (the model narrating about limits) is dismissed in place and
-     the session lives on. Only a corroborated (or unverifiable) signal stops the child, flags the
-     seat (reactive), picks another seat, and relaunches with the tool's RESUME command; repeat
+  3. on a stdout limit-signal: DECIDE BEFORE KILLING — while the child is still running, positively
+     verify the limit (or trust a hard billing banner), choose a different seat, and check the switch
+     budget. Only when all three pass do we stop, commit that exact hop, and relaunch with RESUME;
+     unverifiable signals and confirmed limits with nowhere to land leave the live session alone
   4. on normal exit: sync-back the (refreshed) creds and return the child's exit status
 """
 from __future__ import annotations
@@ -24,6 +24,7 @@ import signal
 import struct
 import sys
 import termios
+import threading
 import time
 import tty
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ from .context import Context
 from .errors import AcctswError
 from .procenv import harden_env
 from .selection import Selection, choose
+from .session import clear_session, mark_session
 from .switch import switch, sync_back
 from .util import iso, now, parse_iso
 
@@ -671,9 +673,12 @@ def _terminate(pid: int) -> int:
             except ProcessLookupError:
                 pass
 
-    for sig in (signal.SIGTERM, signal.SIGKILL):
+    # A TUI may need several seconds to flush the session file that `resume --last` immediately
+    # consumes. Keep the 50ms fast-path polling, but give SIGTERM about five seconds before the
+    # same SIGKILL backstop used previously.
+    for sig, polls in ((signal.SIGTERM, 100), (signal.SIGKILL, 20)):
         _signal(sig)
-        for _ in range(20):
+        for _ in range(polls):
             try:
                 wpid, status = os.waitpid(pid, os.WNOHANG)
             except ChildProcessError:
@@ -742,11 +747,58 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                                  cold_start=cold_start)
         if email is None:
             return False
+        hopped = False
         with ctx.locked():
             state = ctx.load_state()
             if email != state.active(tool):
                 _commit_switch(state, email)
+                hopped = True
+        if hopped:
+            mark_session(ctx.data_dir, tool, email)
         return True
+
+    # A confirmed limit with no landing seat must not kill the live child. Keep one lightweight
+    # watcher beside it so the user gets a single heads-up when another seat later becomes usable;
+    # the watcher is advisory only — it never signals the child or commits a switch.
+    watcher_stop = threading.Event()
+    watcher_thread: threading.Thread | None = None
+    watcher_started = False
+
+    def _start_capacity_watcher(blocked_email: str | None) -> None:
+        nonlocal watcher_thread, watcher_started
+        if watcher_started:
+            return
+        watcher_started = True
+        excluded = set(auth_failed)
+        if blocked_email:
+            excluded.add(blocked_email)  # a landing seat must differ from the still-running seat
+        ua = (usage_mod.claude_user_agent(getattr(ctx, "claude_bin", None))
+              if tool == "claude" else None)
+
+        def _watch() -> None:
+            while not watcher_stop.is_set():
+                # Default real sleeps are made interruptible so run()'s finally can always join
+                # promptly. Injected sleeps mirror _wait_for_unlock and make watcher tests instant.
+                if sleep is time.sleep:
+                    if watcher_stop.wait(POLL_INTERVAL_S):
+                        return
+                else:
+                    sleep(POLL_INTERVAL_S)
+                    if watcher_stop.is_set():
+                        return
+                try:
+                    sel = _verify_capacity(ctx, tool, get, at=now(), force=False,
+                                           exclude=excluded, ua=ua)
+                except Exception:
+                    continue
+                if sel.email and sel.available:
+                    notify(f"{sel.email} is available for {tool} now")
+                    return
+
+        watcher_thread = threading.Thread(
+            target=_watch, name=f"acctsw-{tool}-seat-watcher", daemon=True
+        )
+        watcher_thread.start()
 
     try:
         initial_resting: Decision | None = None
@@ -776,12 +828,20 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                        f"{initial_resting.unlocks_at}")
                 return EXIT_GAVE_UP
         buf = bytearray()
-        # Verify-before-kill scanning state. A stdout match is corroborated against the usage
-        # endpoint while the child is STILL RUNNING; a dismissed match costs a brief stall of the
-        # output copy loop, never the session. Past MAX_FALSE_ALARMS dismissals the generic output
-        # scan turns OFF while supervision continues. Trusted hard-limit banners still bypass that
-        # off switch, because they are tool-side stop messages rather than model prose.
-        scan = {"on": True, "next_probe": 0.0, "dismissed": 0}
+        # Decide-before-kill scanning state. A stdout match is corroborated and its landing seat is
+        # selected while the child is STILL RUNNING. A dismissed or unverifiable match costs only a
+        # brief output-copy stall; past MAX_FALSE_ALARMS the generic scan turns off while the session
+        # continues. Trusted hard-limit banners bypass that off switch but still need a free landing
+        # seat and switch budget before they may stop the child.
+        scan = {
+            "on": True,
+            "next_probe": 0.0,
+            "dismissed": 0,
+            "unknown_notified": False,
+            "limit_stay_notified": False,
+            "auth_stay_notified": False,
+            "budget_notified": False,
+        }
 
         def _dismissed() -> None:
             scan["dismissed"] += 1
@@ -794,7 +854,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         def _probe(reason: str) -> str:
             """Fresh usage check for the active seat while the child is still running. Returns
             "dismiss" (provably prose), "confirmed" (endpoint agrees the seat is out), or "unknown"
-            (couldn't tell — the stdout signal is then trusted, exactly as before this guard).
+            (couldn't tell — never authority to stop a live child).
 
             The state flock is held only for the quick reads/writes on either side of the fetch —
             NEVER across the network call (locked()'s contract; a slow endpoint must stall neither
@@ -824,38 +884,120 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
 
         while True:
             argv = resume_cmd(ctx, tool) if resuming else build_cmd(ctx, tool, args)
-            hit = {"reason": None, "corroborated": False, "hard": False}  # reason: None|"limit"|"auth"
+            with ctx.locked():
+                launch_email = ctx.load_state().active(tool)
+            if launch_email:
+                mark_session(ctx.data_dir, tool, launch_email)
+            # ``reason`` is set ONLY for a fully approved stop. ``handled`` also covers matches that
+            # deliberately leave this child alive, preventing the post-exit safety net from turning
+            # that same banner into a re-derived hop after the child later exits on its own.
+            hit = {
+                "reason": None,       # None | "limit" | "auth"
+                "email": None,        # exact pre-flight landing seat
+                "active": None,       # seat the still-live child was using
+                "hard": False,
+                "handled": False,
+            }
             buf.clear()
 
             def on_output(chunk: bytes) -> bool:
                 buf.extend(chunk)
                 del buf[:-4096]  # keep a rolling tail
                 text = buf.decode("utf-8", "replace")
-                if detect_hard_limit(tool, text):
-                    hit["reason"] = "limit"
-                    hit["corroborated"] = True
-                    hit["hard"] = True
-                    return True
-                if not scan["on"]:
-                    return False
-                reason = detect_event(tool, text)  # one ANSI strip per chunk
+                hard = detect_hard_limit(tool, text)
+                if hard:
+                    reason = "limit"
+                    verdict = "confirmed"  # trusted tool-side billing stop; no usage probe needed
+                else:
+                    if not scan["on"]:
+                        return False
+                    reason = detect_event(tool, text)  # one ANSI strip per chunk
+                    if reason is None:
+                        return False
+                    hit["handled"] = True
+                    if time.monotonic() < scan["next_probe"]:
+                        # Same banner/prose redrawn inside the cooldown. It has already been handled,
+                        # so neither re-probe nor the exit-time fallback gets a second bite at it.
+                        buf.clear()
+                        return False
+                    verdict = _probe(reason)
                 if reason is None:
                     return False
-                if time.monotonic() < scan["next_probe"]:
-                    buf.clear()  # same prose redrawn within a dismissal's cooldown — skip re-probing
-                    return False
-                verdict = _probe(reason)
+                hit["handled"] = True
                 if verdict == "dismiss":
                     buf.clear()  # don't re-trip on the text still sitting in the rolling tail
                     _dismissed()
                     return False
-                hit["reason"] = reason
-                hit["corroborated"] = verdict == "confirmed"
-                return True
+                if reason == "limit" and verdict == "unknown":
+                    # Endpoint down / 429 / stale token is absence of evidence, never authority to
+                    # Ctrl-C a live session. Count it in the existing cooldown/false-alarm budget so
+                    # a repainting TUI cannot hammer the endpoint, but tell the user only once.
+                    if not scan["unknown_notified"]:
+                        notify(f"{tool}: couldn't verify — staying on this seat")
+                        scan["unknown_notified"] = True
+                    buf.clear()
+                    _dismissed()
+                    return False
+
+                # Confirmation alone is insufficient. While the child is alive, stamp the failed
+                # seat and choose the exact different landing seat we would use. Auth banners remain
+                # a separate trusted signal: a successful usage call dismissed them above; otherwise
+                # the token-dead seat is excluded for every later decision in this run.
+                with ctx.locked():
+                    state = ctx.load_state()
+                    active = state.active(tool)
+                    if reason == "auth":
+                        if active:
+                            auth_failed.add(active)
+                        dec = handle_auth_dead(ctx, state, tool, exclude=auth_failed)
+                    else:
+                        dec = handle_limit(ctx, state, tool, get=get, exclude=auth_failed,
+                                           corroborated=True, hard=hard)
+
+                if dec.action == "switch" and switches < max_switches:
+                    hit.update({
+                        "reason": reason,
+                        "email": dec.email,
+                        "active": active,
+                        "hard": hard,
+                    })
+                    return True
+
+                # No approved landing means no stop. Clear the rolling match so subsequent ordinary
+                # output is not mistaken for a fresh banner; the child keeps its terminal and argv.
+                buf.clear()
+                scan["next_probe"] = time.monotonic() + PROBE_COOLDOWN_S
+                if dec.action == "switch":  # a seat exists, but the budget is already spent
+                    if not scan["budget_notified"]:
+                        suffix = (f"; {active} needs you to sign in again"
+                                  if reason == "auth" else "")
+                        notify(f"hit the switch limit ({max_switches}){suffix} — staying on this seat")
+                        scan["budget_notified"] = True
+                    return False
+                if reason == "auth":
+                    if not scan["auth_stay_notified"]:
+                        if dec.unlocks_at:
+                            notify(f"{active} needs you to sign in again 🔑 — the only other {tool} "
+                                   f"seat is resting until {dec.unlocks_at}; staying on this seat")
+                        else:
+                            notify(f"{active} needs you to sign in again (token revoked) and no "
+                                   f"other {tool} seat is ready — re-add it via the app or "
+                                   f"`acctsw add {tool}`; staying on this seat")
+                        scan["auth_stay_notified"] = True
+                    return False
+                if not scan["limit_stay_notified"]:
+                    label = "hit a hard billing limit" if hard else "hit its usage limit"
+                    notify(f"{active} {label}, but no other {tool} seat is ready — staying on this "
+                           f"seat")
+                    scan["limit_stay_notified"] = True
+                _start_capacity_watcher(active)
+                return False
 
             status = spawn(argv, on_output)  # NO lock held during the session
 
             if hit["reason"] is None:
+                if hit["handled"]:
+                    return status  # recognized but intentionally left alive: surface its own exit
                 # No stdout limit banner was caught — but a NON-ZERO exit can be a real limit codex
                 # surfaced as a plain error (or one that slipped past after scanning turned off). Last
                 # resort: confirm via the usage endpoint; if the active seat is genuinely out and a
@@ -871,6 +1013,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                         if dec.action == "switch":
                             _commit_switch(state, dec.email)
                     if dec.action == "switch":
+                        mark_session(ctx.data_dir, tool, dec.email)
                         notify(f"{active} hit its usage limit — hopping to {dec.email}, "
                                f"resuming your work ✨")
                         switches += 1
@@ -887,59 +1030,27 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                         return EXIT_GAVE_UP
                 return status  # clean exit, or a plain failure — child's real exit code
 
+            # The callback already classified the banner, selected this exact landing seat, and
+            # checked the budget while the child was alive. Commit that decision without choose() or
+            # another usage fetch on the corpse.
             with ctx.locked():
                 state = ctx.load_state()
-                active = state.active(tool)
-                if hit["reason"] == "auth":
-                    if active:
-                        auth_failed.add(active)
-                    dec = handle_auth_dead(ctx, state, tool, exclude=auth_failed)
-                else:
-                    dec = handle_limit(ctx, state, tool, get=get, exclude=auth_failed,
-                                       corroborated=hit["corroborated"], hard=hit["hard"])
-                # The switch cap gates only an actual seat hop. Classify FIRST: a false-alarm
-                # "resume" (usage says the active seat is healthy) must not be terminated just
-                # because earlier genuine switches used up the budget — that would kill a healthy
-                # session, the very bug this supervisor is meant to avoid.
-                hop_capped = dec.action == "switch" and switches >= max_switches
-                if dec.action == "switch" and not hop_capped:
-                    _commit_switch(state, dec.email)
-            if hop_capped:
-                notify(f"hit the switch limit ({max_switches}); stopping")
-                return EXIT_GAVE_UP
-            if dec.action == "switch":
-                reason_msg = ("needs you to sign in again 🔑" if hit["reason"] == "auth"
-                              else "needs a rest 💤")
-                notify(f"{active} {reason_msg} — hopping to {dec.email}, "
-                       f"your work's coming with you ✨")
-                switches += 1
-                resuming = True
-                continue
-            if dec.action == "resume":
-                # Kill-path false alarm: the probe couldn't tell (endpoint error mid-session) so the
-                # child was stopped on the stdout signal alone — but handle_limit's own fresh fetch
-                # then confirmed the seat healthy. Resume the SAME seat and carry the work on. It
-                # counts toward the SAME false-alarm bound as an in-flight dismissal (one counter,
-                # one message, and the probe cooldown), past which scanning turns off — the text is
-                # provably untrustworthy — while supervision continues.
-                _dismissed()
-                resuming = True
-                continue
-            if hit["reason"] == "auth":
-                if dec.unlocks_at:
-                    notify(f"{active} needs you to sign in again 🔑 — the only other {tool} seat is "
-                           f"resting until {dec.unlocks_at}")
-                else:
-                    notify(f"{active} needs you to sign in again (token revoked) and no other "
-                           f"{tool} seat is ready — re-add it via the app or `acctsw add {tool}`")
-                return EXIT_GAVE_UP
-            if _wait_and_activate():
-                resuming = True
-                continue
-            notify(f"all {tool} seats are resting"
-                   + (f"; soonest unlocks at {dec.unlocks_at}" if dec.unlocks_at else ""))
-            return EXIT_GAVE_UP
+                _commit_switch(state, hit["email"])
+            mark_session(ctx.data_dir, tool, hit["email"])
+            reason_msg = ("needs you to sign in again 🔑" if hit["reason"] == "auth"
+                          else "needs a rest 💤")
+            notify(f"{hit['active']} {reason_msg} — hopping to {hit['email']}, "
+                   f"your work's coming with you ✨")
+            switches += 1
+            resuming = True
+            continue
     finally:
+        watcher_stop.set()
+        if watcher_thread is not None:
+            watcher_thread.join()
+        # Clear before credential reconciliation so observers never report a session whose child has
+        # already exited merely because sync-back is waiting on the state lock or filesystem.
+        clear_session(ctx.data_dir, tool)
         # On exit, reconcile the active account's creds (the just-run seat may carry a rotated token).
         #  - codex: it maintained its own home via CODEX_HOME → mirror the home into ~/.codex so
         #    plain codex / the GUI follow the active account.
