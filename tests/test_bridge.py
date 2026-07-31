@@ -31,6 +31,18 @@ def test_shared_account_warning_rides_the_nested_state(ctx):
     assert len(r["state"]["warnings"]) == 1 and "same account" in r["state"]["warnings"][0]
 
 
+def test_usage_reconciles_both_provider_identities_before_poll(ctx, monkeypatch):
+    """A popover usage poll must capture Claude out-of-band login identity just like Codex."""
+    seen = []
+    monkeypatch.setattr(acct, "reconcile_codex", lambda _ctx, _state: seen.append("codex"))
+    monkeypatch.setattr(acct, "reconcile_claude", lambda _ctx, _state: seen.append("claude"))
+    monkeypatch.setattr(bridge.usage_mod, "refresh",
+                        lambda _ctx, _state, _tool=None: {"codex": {}, "claude": {}})
+    result = bridge.handle(ctx, {"action": "usage"})
+    assert result["ok"] is True
+    assert seen == ["codex", "claude"]
+
+
 def test_state_carries_app_version_and_build(ctx):
     _add(ctx, "a@x.com")
     import acctsw
@@ -186,6 +198,8 @@ def test_switch_sets_recently_switched_dot(ctx):
     r = bridge.handle(ctx, {"action": "switch", "tool": "codex", "email": "a@x.com"})
     assert r["state"]["recently_switched"] is True
     assert r["state"]["dot"] == "switched"
+    seat = next(s for s in r["state"]["tools"]["codex"]["seats"] if s["email"] == "a@x.com")
+    assert seat["last_on_floor"] is not None
 
 
 def test_paste_installs_and_registers_codex(ctx):

@@ -138,6 +138,7 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
             with ctx.locked():
                 state = ctx.load_state()
                 acct.reconcile_codex(ctx, state)   # capture a fresh/out-of-band ~/.codex into its home
+                acct.reconcile_claude(ctx, state)  # Claude identity comes from auth status, not its blob
                 usage_mod.refresh(ctx, state, message.get("tool"))
             return {"ok": True, "state": snapshot_state(ctx)}
 

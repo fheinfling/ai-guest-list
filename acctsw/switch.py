@@ -14,16 +14,24 @@ from __future__ import annotations
 from .context import Context
 from .errors import MissingSnapshot, UnknownSeat
 from .state import State
+from .util import iso, now
 
 
 def sync_back(ctx: Context, state: State, tool: str) -> bool:
     """Persist the live creds of the currently-active seat into its snapshot. Returns True if done.
 
-    Guard: if the live creds clearly belong to a *different* account than ``state.active`` (e.g.
-    the user ran stock ``codex login`` or switched in the GUI — an in-scope scenario), we skip the
-    sync-back instead of corrupting the active seat's snapshot with foreign creds. Detectable for
-    Codex (email is in the JWT); best-effort for Claude (no email in the blob → proceed).
+    Guard: if the live creds belong to a *different* account than ``state.active`` (e.g. the user ran
+    a stock login or switched in the GUI), capture/adopt a known identity or skip the sync-back
+    instead of corrupting the old seat's snapshot with foreign bytes. Codex identifies from its JWT;
+    Claude must reconcile through ``claude auth status --json`` because its blob has no email.
     """
+    if tool == "claude":
+        # Lazy import avoids accounts -> usage/state imports becoming a module cycle. An unknown or
+        # unreadable CLI identity is deliberately a no-op: proceeding was the permanent guard bypass
+        # that let account B's Keychain bytes overwrite active seat A.
+        from .accounts import reconcile_claude
+        if reconcile_claude(ctx, state) is None:
+            return False
     active = state.active(tool)
     if not active:
         return False
@@ -58,4 +66,5 @@ def switch(ctx: Context, state: State, tool: str, email: str, *, sync: bool = Tr
 
     # 3. record active
     state.set_active(tool, email)
+    state.set_last_on_floor(tool, email, iso(now()))
     state.save()
