@@ -8,6 +8,7 @@ import json
 import pytest
 
 from acctsw import paths as P
+from acctsw import install as install_mod
 from acctsw.context import Context
 
 
@@ -38,6 +39,10 @@ def _isolate_tool_config_dirs(tmp_path, monkeypatch):
     """
     monkeypatch.setattr(P, "CODEX_HOME", tmp_path / "_home_codex")
     monkeypatch.setattr(P, "CLAUDE_CONFIG_DIR", tmp_path / "_home_claude")
+    # Supervision status is included in every bridge snapshot. Keep both its read-only rc probe and
+    # toggle/bootstrap writes inside tmp so no test ever inspects or edits the developer's shell rc.
+    monkeypatch.setattr(install_mod, "BIN_DIR", tmp_path / "_home_local" / "bin")
+    monkeypatch.setattr(install_mod.Path, "home", classmethod(lambda cls: tmp_path / "_home"))
 
 
 @pytest.fixture

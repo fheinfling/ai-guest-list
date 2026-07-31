@@ -3,12 +3,60 @@ import json
 from pathlib import Path
 
 from acctsw import accounts as acct
+from acctsw import install as inst
 from acctsw.web_dot import dot_for, door_for
+from app.menubar import bootstrap_supervision
 from app import terminal
 from tests.conftest import make_codex_blob
 
 FIXTURE = Path(__file__).parent / "fixtures" / "dot_cases.json"
 DOOR_FIXTURE = Path(__file__).parent / "fixtures" / "door_cases.json"
+
+
+def test_bootstrap_repairs_missing_rc_block_and_stays_idempotent(ctx):
+    """An old sentinel cannot suppress repair of the maintainer's wrappers-only failure state."""
+    (ctx.data_dir / ".cli-bootstrapped").write_text("")
+    inst.ensure_launchers(wire_rc=False)
+    rc = inst.shell_rc_path()
+    assert not rc.exists()
+
+    first = bootstrap_supervision(ctx, lambda *_args: None)
+    assert first["ok"] is True and first["changed"] is True
+    assert inst.supervision_status()["active"] is True
+    assert rc.read_text().count(inst.BLOCK_BEGIN) == 1
+
+    second = bootstrap_supervision(ctx, lambda *_args: None)
+    assert second["ok"] is True and second["changed"] is False
+    assert rc.read_text().count(inst.BLOCK_BEGIN) == 1
+
+
+def test_bootstrap_honours_explicit_supervision_opt_out(ctx):
+    state = ctx.load_state()
+    state.set_setting("supervise_shell", False)
+    state.save()
+    (ctx.data_dir / ".cli-bootstrapped").write_text("")
+
+    result = bootstrap_supervision(ctx, lambda *_args: None)
+
+    assert result["ok"] is True
+    assert inst.supervision_status()["wrappers"] is True   # wrappers still heal every launch
+    assert inst.supervision_status()["block"] is False
+    assert not inst.shell_rc_path().exists()
+
+
+def test_bootstrap_failure_is_reported_without_raising(ctx, monkeypatch):
+    notices = []
+
+    def fail(**_kwargs):
+        raise PermissionError("rc is read-only")
+
+    monkeypatch.setattr(inst, "ensure_launchers", fail)
+    result = bootstrap_supervision(ctx, lambda title, text: notices.append((title, text)))
+
+    assert result["ok"] is False
+    assert "rc is read-only" in result["error"]
+    assert notices and "needs attention" in notices[0][0]
+    assert "rc is read-only" in notices[0][1]
 
 
 def test_dot_for_golden_fixture():

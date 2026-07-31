@@ -59,6 +59,38 @@ def on_path(bin_dir: Path) -> bool:
     return str(bin_dir) in os.environ.get("PATH", "").split(os.pathsep)
 
 
+def supervision_status(bin_dir: Path | None = None, rc_path: Path | None = None) -> dict:
+    """Read-only status for the terminal supervision wiring.
+
+    ``active`` deliberately does not depend on the current process's ``PATH``.  A managed rc block
+    is effective for new terminals as soon as it is written, while the app/current terminal keeps
+    its old environment until it is restarted.  ``on_path`` lets the UI explain that distinction.
+    """
+    bin_dir = Path(bin_dir or BIN_DIR)
+    rc_path = Path(rc_path or shell_rc_path())
+    wrappers = all(
+        (bin_dir / name).is_file() and os.access(bin_dir / name, os.X_OK)
+        for name in BIN_NAMES
+    )
+    block = False
+    error = None
+    try:
+        existing = rc_path.read_text() if rc_path.exists() else ""
+        block = BLOCK_BEGIN in existing and _BLOCK_RE.search(existing) is not None
+    except (OSError, UnicodeError) as exc:
+        error = f"couldn't read {rc_path}: {exc}"
+    status = {
+        "wrappers": wrappers,
+        "block": block,
+        "rc_path": str(rc_path),
+        "on_path": on_path(bin_dir),
+        "active": wrappers and block,
+    }
+    if error:
+        status["error"] = error
+    return status
+
+
 def shell_block(bin_dir: Path, *, aliases: bool = True) -> str:
     """The exact rc block we manage: put cx/cl on PATH and (optionally) alias codex/claude → cx/cl
     so a plain ``codex``/``claude`` is supervised (auto-switch + resume on limits)."""
@@ -294,6 +326,13 @@ def ensure_launchers(*, bin_dir: Path | None = None, python: str | None = None,
             except OSError:
                 continue
             if body == desired or not _wrapper_stale(body):
+                # Presence is not enough: a wrapper whose execute bit was stripped is just as
+                # unreachable as a missing one. Restore owner-execute without rewriting a good or
+                # hand-maintained body (and without broadening its read/write permissions).
+                if not os.access(target, os.X_OK):
+                    target.chmod(target.stat().st_mode | stat.S_IXUSR)
+                    changed = True
+                    msgs.append(f"made executable {target}")
                 continue
             verb = "healed"
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -430,9 +469,8 @@ def uninstall(ctx: Context, *, purge: bool = False, dry_run: bool = False,
     else:
         plan.actions.append(f"NOTE: if you added it manually, remove the cx/cl block for {bin_dir} from your shell rc")
 
-    # clear the first-launch bootstrap sentinel so reopening the app re-wires cx/cl (we just removed
-    # the wrappers + rc block; without this, the sentinel makes bootstrapBg_ skip ensure_launchers and
-    # a reinstall-by-relaunch would silently NOT restore them).
+    # Clear the one-time welcome-notification sentinel so a reinstall can announce that it is ready.
+    # Wiring no longer depends on this marker; bootstrap heals wrappers/rc from their actual status.
     sentinel = ctx.data_dir / ".cli-bootstrapped"
     if sentinel.exists():
         plan.do(f"clear bootstrap sentinel {sentinel.name}", lambda s=sentinel: s.unlink(missing_ok=True))

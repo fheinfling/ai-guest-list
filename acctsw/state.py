@@ -9,7 +9,8 @@ Holds only metadata — NEVER credentials (those live in the Keychain). Shape::
         "claude": {"active": "<email>|null", "accounts": {"<email>": <Seat>}}
       },
       "settings": {"auto_switch": true, "same_tool_only": true, "notify": true,
-                   "restart_app": false, "celebrations": true, "theme": "dark"}
+                   "restart_app": false, "celebrations": true, "supervise_shell": true,
+                   "theme": "dark"}
     }
 
 A ``Seat`` is::
@@ -50,6 +51,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "notify": True,           # "tell me when it switches"
     "restart_app": False,     # "restart Codex after a swap"
     "celebrations": True,     # "little celebrations"
+    "supervise_shell": True,  # wire terminal codex/claude through the supervised cx/cl launchers
     "strategy": "soonest_back",  # "soonest_back" | "most_headroom"
     "theme": "light",         # the design default
 }

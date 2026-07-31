@@ -37,6 +37,81 @@ DOOR_EMOJI = {"open": "🪩", "shut": "🚪"}
 NS_TERMINATE_NOW = 1      # NSApplicationTerminateReply.terminateNow
 
 
+def _bootstrap_notice(notify, title: str, text: str) -> None:
+    """Best-effort user notification with a stderr fallback for non-AppKit/test callers."""
+    try:
+        notify(title, text)
+    except Exception as exc:
+        print(f"{title}: {text} (notification failed: {exc})", file=sys.stderr)
+
+
+def bootstrap_supervision(ctx: Context, notify) -> dict:
+    """Heal terminal supervision without letting a background bootstrap failure crash the app.
+
+    Wrapper validation runs on every launch.  The rc block is repaired only while the explicit
+    ``supervise_shell`` setting is enabled; the legacy sentinel now controls only the one-time
+    welcome notification.
+    """
+    from acctsw import install
+
+    sentinel = ctx.data_dir / ".cli-bootstrapped"
+    first_run = not sentinel.exists()
+    try:
+        enabled = bool(ctx.load_state().settings().get("supervise_shell", True))
+    except Exception as exc:
+        detail = str(exc).strip() or exc.__class__.__name__
+        error = f"couldn't read the terminal supervision setting: {detail}"
+        _bootstrap_notice(notify, "terminal supervision needs attention", error)
+        return {"ok": False, "error": error}
+
+    try:
+        status = install.supervision_status()
+    except Exception as exc:
+        detail = str(exc).strip() or exc.__class__.__name__
+        error = f"couldn't inspect terminal supervision: {detail}"
+        _bootstrap_notice(notify, "terminal supervision needs attention", error)
+        return {"ok": False, "error": error}
+    wire_rc = enabled and not status["block"]
+    try:
+        changed, messages = install.ensure_launchers(wire_rc=wire_rc)
+    except Exception as exc:
+        detail = str(exc).strip() or exc.__class__.__name__
+        error = f"couldn't wire codex/claude supervision: {detail}"
+        _bootstrap_notice(notify, "terminal supervision needs attention", error)
+        return {"ok": False, "error": error, "status": status}
+
+    try:
+        final_status = install.supervision_status()
+    except Exception as exc:
+        detail = str(exc).strip() or exc.__class__.__name__
+        error = f"terminal supervision was wired, but couldn't be verified: {detail}"
+        _bootstrap_notice(notify, "terminal supervision needs attention", error)
+        return {"ok": False, "error": error}
+
+    if first_run:
+        try:
+            sentinel.write_text("")
+        except OSError as exc:
+            detail = str(exc).strip() or exc.__class__.__name__
+            _bootstrap_notice(
+                notify,
+                "ai guest list setup needs attention",
+                f"terminal supervision is ready, but setup couldn't be recorded: {detail}",
+            )
+        if changed and enabled and final_status["active"]:
+            _bootstrap_notice(
+                notify,
+                "ai guest list is ready",
+                "wired up codex/claude — open a new terminal to use them",
+            )
+    return {
+        "ok": True,
+        "changed": changed,
+        "messages": messages,
+        "status": final_status,
+    }
+
+
 if objc is not None:
 
     class AGLDelegate(NSObject):
@@ -82,20 +157,22 @@ if objc is not None:
             #  - bin wrappers: validate/heal EVERY launch (idempotent) so a wrapper an older build
             #    baked with a broken interpreter — e.g. system python3 + the frozen 3.11 zip, which
             #    crashed `claude auth login` with "can't find module 'encodings'" — gets corrected.
-            #  - shell rc block: wire ONCE (first launch), gated by a sentinel, so we don't fight a
-            #    user who later removes our rc block / aliases by re-adding them.
+            #  - shell rc block: repair it whenever it is missing, unless the explicit setting says
+            #    the user opted out. The sentinel is only the one-time welcome-notification marker.
+            bootstrap_supervision(self.ctx, self._notify)
+            # Refresh the popover after the background repair. A ready/usage reply may have raced and
+            # rendered the pre-heal status; pushing a fresh snapshot makes the banner self-heal too.
             try:
-                from acctsw import install
-                sentinel = self.ctx.data_dir / ".cli-bootstrapped"
-                first_run = not sentinel.exists()
-                changed, _ = install.ensure_launchers(wire_rc=first_run)
-                if first_run:
-                    sentinel.write_text("")   # mark rc wired even if unchanged, so we never re-edit it
-                    if changed:
-                        self._notify("ai guest list is ready",
-                                     "wired up codex/claude — open a new terminal to use them")
-            except Exception:
-                pass
+                result = {"ok": True, "state": bridge.snapshot_state(self.ctx), "background": True}
+                self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                    objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
+            except Exception as exc:
+                detail = str(exc).strip() or exc.__class__.__name__
+                _bootstrap_notice(
+                    self._notify,
+                    "terminal supervision needs attention",
+                    f"setup finished, but its status couldn't be refreshed: {detail}",
+                )
 
         def applicationShouldTerminate_(self, _sender):
             """Single quit gate for BOTH the in-app quit button (terminate_) AND OS-level quit
