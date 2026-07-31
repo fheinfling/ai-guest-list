@@ -180,6 +180,25 @@ function controlBar(opts) {
   </label>`;
 }
 
+// Terminal supervision is infrastructure, not a seat-health signal. Keep this decision pure so a
+// missing rc block/wrapper can never be hidden by an otherwise healthy usage snapshot.
+function supervisionBanner(state) {
+  if (state?.settings?.supervise_shell === false || !state?.supervision) return "";
+  const supervision = state.supervision;
+  if (!supervision.active) {
+    return `<div class="supervision-banner supervision-banner--error" role="alert">
+      <span>terminal supervision is off — <span class="mono">codex/claude</span> won't auto-switch</span>
+      <button data-action="supervision-on">turn it on</button>
+    </div>`;
+  }
+  if (!supervision.on_path) {
+    return `<div class="supervision-banner supervision-banner--info" role="status">
+      open a new terminal to finish setup
+    </div>`;
+  }
+  return "";
+}
+
 // --- add-a-seat sub-view (spec §9) — a pushed screen like settings, NOT a modal ----------------
 // Four steps: provider → details → connecting → done. The provider accent (teal Codex / coral
 // Claude) rides a single `--accent` CSS var on the root, so step markup never branches on tool.
@@ -258,6 +277,7 @@ function reduceReply(ui, res) {
   // Toast a user-action error, but not a background poll blip, nor an add-op error that isn't for the
   // current flow (a stale/other-tool one would pop over main/settings or the wrong add out of nowhere).
   if (res.error && !res.background && (!res.add_op || forThisFlow)) flash = res.error;
+  else if (res.message && !res.background) flash = res.message;
   if (res.celebrate) celebrate = true;
 
   return { screen, add, lastRev, state, render, flash, celebrate, closeFlow };
@@ -427,6 +447,7 @@ function buildSettings(state) {
   const autoSwitch = `<section class="set-sec"><span class="set-label">auto-switch</span>
     <div class="set-card">
       ${segBlock("when a seat runs out", strategyHint(strat), "set_strategy", strat, STRATEGY_OPTS)}
+      ${toggleRow("supervise_shell", "supervise terminal commands", "route codex/claude through the auto-switching launchers", s.supervise_shell !== false)}
       ${toggleRow("same_tool_only", "keep me on the same tool", "a Codex limit hops to your other Codex seat, never to Claude", s.same_tool_only)}
       ${toggleRow("notify", "tell me when it switches", "a gentle notification with who's on now", s.notify)}
       ${toggleRow("restart_app", "restart Codex after a swap", "Codex needs a fresh start · Claude picks it up live", s.restart_app)}
@@ -476,6 +497,7 @@ function buildHTML(state) {
       </span>
     </header>
     <div class="main-body">
+      ${supervisionBanner(state)}
       ${controlBar({ icon: REFRESH, title: "auto-switch", sub: "next ready seat · soonest-reset wins",
                      key: "auto_switch", on: s.auto_switch, accentClass: "ic-auto" })}
       ${moved}
@@ -655,6 +677,7 @@ document.addEventListener("click", (e) => {
     case "add-reveal": send("reveal"); break;   // native: reveal ~/.codex/auth.json in Finder
     case "settings": screen = "settings"; render(); break;
     case "settings-back": screen = "main"; render(); break;
+    case "supervision-on": send("toggle", { key: "supervise_shell", value: true }); break;
     case "set_theme": send("set_theme", { value }); break;
     case "set_strategy": send("set_strategy", { value }); break;
     case "quit": send("quit"); break;

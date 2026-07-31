@@ -1,8 +1,12 @@
 """Unit tests for the UI↔engine bridge dispatch (no pyobjc)."""
 import json
 
+import pytest
+
 from acctsw import accounts as acct
 from acctsw import bridge
+from acctsw import install as inst
+from acctsw.state import State
 from tests.conftest import make_claude_blob, make_codex_blob
 
 
@@ -54,6 +58,12 @@ def test_state_carries_app_version_and_build(ctx):
     assert app["build"] == "dev"           # source checkout → not a packaged build
 
 
+def test_snapshot_carries_supervision_status(ctx):
+    status = bridge.snapshot_state(ctx)["supervision"]
+    assert set(("wrappers", "block", "rc_path", "on_path", "active")) <= status.keys()
+    assert status["rc_path"] == str(inst.shell_rc_path())
+
+
 def test_build_number_reads_bundle_info_plist(tmp_path, monkeypatch):
     """From inside a packaged *.app, build_number() reads CFBundleVersion from Info.plist."""
     import plistlib
@@ -71,6 +81,64 @@ def test_toggle_setting_persists(ctx):
     r = bridge.handle(ctx, {"action": "toggle", "key": "auto_switch", "value": False})
     assert r["ok"] and r["state"]["settings"]["auto_switch"] is False
     assert ctx.load_state().settings()["auto_switch"] is False
+
+
+def test_toggle_supervision_off_removes_block_and_on_restores_it(ctx):
+    rc = inst.shell_rc_path()
+    inst.ensure_shell_setup(rc_path=rc)
+    assert inst.BLOCK_BEGIN in rc.read_text()
+
+    off = bridge.handle(ctx, {"action": "toggle", "key": "supervise_shell", "value": False})
+    assert off["ok"] is True and off["message"] == "terminal supervision is off"
+    assert ctx.load_state().settings()["supervise_shell"] is False
+    assert inst.BLOCK_BEGIN not in rc.read_text()
+
+    on = bridge.handle(ctx, {"action": "toggle", "key": "supervise_shell", "value": True})
+    assert on["ok"] is True and on["message"] == "terminal supervision is on"
+    assert ctx.load_state().settings()["supervise_shell"] is True
+    assert rc.read_text().count(inst.BLOCK_BEGIN) == 1
+    assert on["state"]["supervision"]["active"] is True  # missing wrappers were repaired too
+
+
+@pytest.mark.parametrize("value", [False, True], ids=["off", "on"])
+def test_toggle_supervision_write_failure_is_clear_and_does_not_change_state(
+    ctx, monkeypatch, value,
+):
+    state = ctx.load_state()
+    state.set_setting("supervise_shell", not value)
+    state.save()
+    operation = "remove_shell_setup" if value is False else "ensure_shell_setup"
+
+    def fail(*_args, **_kwargs):
+        raise PermissionError("rc is read-only")
+
+    monkeypatch.setattr(inst, operation, fail)
+    result = bridge.handle(ctx, {"action": "toggle", "key": "supervise_shell", "value": value})
+    assert result["ok"] is False
+    assert "terminal supervision" in result["error"] and "rc is read-only" in result["error"]
+    assert result["state"]["settings"]["supervise_shell"] is (not value)
+    assert ctx.load_state().settings()["supervise_shell"] is (not value)
+
+
+@pytest.mark.parametrize("value", [False, True], ids=["off", "on"])
+def test_toggle_supervision_state_save_failure_rolls_back_shell_setup(ctx, monkeypatch, value):
+    state = ctx.load_state()
+    state.set_setting("supervise_shell", not value)
+    state.save()
+    if not value:
+        inst.ensure_shell_setup()
+    else:
+        inst.remove_shell_setup()
+
+    def fail_save(_self):
+        raise OSError("state disk is full")
+
+    monkeypatch.setattr(State, "save", fail_save)
+    result = bridge.handle(ctx, {"action": "toggle", "key": "supervise_shell", "value": value})
+
+    assert result["ok"] is False and "state disk is full" in result["error"]
+    assert ctx.load_state().settings()["supervise_shell"] is (not value)
+    assert inst.supervision_status()["block"] is (not value)
 
 
 def test_switch_action(ctx):

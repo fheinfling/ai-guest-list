@@ -4,6 +4,8 @@ import os
 import stat
 import sys
 
+import pytest
+
 from acctsw import install as inst
 from acctsw.install import install, uninstall, _backup_account
 from tests.conftest import make_codex_blob, make_claude_blob
@@ -149,6 +151,60 @@ def test_ensure_shell_setup_adds_then_is_idempotent(tmp_path):
     assert rc.read_text().count(inst.BLOCK_BEGIN) == 1
 
 
+@pytest.mark.parametrize(
+    ("have_wrappers", "have_block", "path_live", "expected_active"),
+    [
+        (True, True, True, True),       # fully effective in this terminal
+        (True, False, False, False),    # maintainer's field failure: wrappers only
+        (False, True, False, False),    # rc block only
+        (False, False, False, False),   # neither half installed
+        (True, True, False, True),      # correctly wired; this terminal predates the rc edit
+    ],
+    ids=["wrappers-and-block", "wrappers-only", "block-only", "neither", "new-terminal-needed"],
+)
+def test_supervision_status_matrix(
+    tmp_path, monkeypatch, have_wrappers, have_block, path_live, expected_active,
+):
+    bindir = tmp_path / "bin"
+    rc = tmp_path / ".zshrc"
+    if have_wrappers:
+        bindir.mkdir()
+        for name in inst.BIN_NAMES:
+            wrapper = bindir / name
+            wrapper.write_text("#!/bin/sh\n")
+            wrapper.chmod(0o755)
+    if have_block:
+        inst.ensure_shell_setup(bindir, rc)
+    monkeypatch.setenv("PATH", f"{bindir}:/usr/bin" if path_live else "/usr/bin:/bin")
+
+    status = inst.supervision_status(bindir, rc)
+
+    assert status == {
+        "wrappers": have_wrappers,
+        "block": have_block,
+        "rc_path": str(rc),
+        "on_path": path_live,
+        "active": expected_active,
+    }
+
+
+def test_supervision_status_requires_executable_wrappers(tmp_path, monkeypatch):
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    for name in inst.BIN_NAMES:
+        wrapper = bindir / name
+        wrapper.write_text("#!/bin/sh\n")
+        wrapper.chmod(0o755)
+    (bindir / "cl").chmod(0o644)
+    rc = tmp_path / ".zshrc"
+    inst.ensure_shell_setup(bindir, rc)
+    monkeypatch.setenv("PATH", str(bindir))
+    status = inst.supervision_status(bindir, rc)
+    assert status["wrappers"] is False
+    assert status["block"] is True
+    assert status["active"] is False
+
+
 def test_ensure_shell_setup_rewrites_block_in_place(tmp_path):
     rc = tmp_path / ".zshrc"
     inst.ensure_shell_setup(tmp_path / "bin", rc, aliases=True)
@@ -210,6 +266,40 @@ def test_ensure_launchers_writes_wrappers_and_wires_rc(tmp_path, monkeypatch):
     # idempotent: nothing changes on a second call
     changed2, _ = inst.ensure_launchers(bin_dir=bindir)
     assert not changed2
+
+
+def test_ensure_launchers_rewires_deleted_block_once(tmp_path, monkeypatch):
+    """The exact field failure self-heals: intact wrappers + a missing managed block."""
+    rc = tmp_path / ".zshrc"
+    bindir = tmp_path / "bin"
+    monkeypatch.setattr(inst, "shell_rc_path", lambda: rc)
+    inst.ensure_launchers(bin_dir=bindir)
+    assert inst.remove_shell_setup(rc) is True
+    assert inst.supervision_status(bindir, rc)["block"] is False
+
+    changed, _ = inst.ensure_launchers(bin_dir=bindir)
+    assert changed is True
+    assert inst.supervision_status(bindir, rc)["active"] is True
+    assert rc.read_text().count(inst.BLOCK_BEGIN) == 1
+
+    changed_again, _ = inst.ensure_launchers(bin_dir=bindir)
+    assert changed_again is False
+    assert rc.read_text().count(inst.BLOCK_BEGIN) == 1
+
+
+def test_ensure_launchers_repairs_non_executable_wrapper(tmp_path):
+    bindir = tmp_path / "bin"
+    inst.ensure_launchers(bin_dir=bindir, wire_rc=False)
+    wrapper = bindir / "cl"
+    wrapper.chmod(0o644)
+    assert inst.supervision_status(bindir, tmp_path / ".zshrc")["wrappers"] is False
+
+    changed, messages = inst.ensure_launchers(bin_dir=bindir, wire_rc=False)
+
+    assert changed is True
+    assert any("made executable" in message for message in messages)
+    assert os.access(wrapper, os.X_OK)
+    assert inst.ensure_launchers(bin_dir=bindir, wire_rc=False)[0] is False
 
 
 def test_ensure_launchers_preserves_non_poisoned_wrapper(tmp_path, monkeypatch):
@@ -372,8 +462,7 @@ def test_uninstall_removes_only_our_block(ctx, tmp_path, monkeypatch):
 
 
 def test_uninstall_clears_bootstrap_sentinel(ctx, tmp_path, monkeypatch):
-    """Uninstall removes the wrappers/rc block, so it must also clear the .cli-bootstrapped sentinel —
-    otherwise reopening the app skips ensure_launchers() and never restores cx/cl."""
+    """A reinstall may show the one-time ready notification again; wiring never uses the sentinel."""
     _seed_live(ctx)
     monkeypatch.setattr(inst, "shell_rc_path", lambda: tmp_path / ".zshrc")
     sentinel = ctx.data_dir / ".cli-bootstrapped"

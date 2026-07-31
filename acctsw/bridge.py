@@ -11,6 +11,7 @@ from typing import Any
 from . import __version__, build_number
 from . import accounts as acct
 from . import identity as identity_mod
+from . import install as install_mod
 from . import paths as P
 from . import usage as usage_mod
 from .context import Context
@@ -21,7 +22,9 @@ from .util import now, iso, parse_iso
 from .web_dot import dot_for, door_for
 
 # Settings the UI may toggle (boolean only) — a whitelist so a stray key can't clobber e.g. theme.
-TOGGLE_KEYS = {"auto_switch", "notify", "restart_app", "celebrations", "same_tool_only"}
+TOGGLE_KEYS = {
+    "auto_switch", "notify", "restart_app", "celebrations", "same_tool_only", "supervise_shell",
+}
 
 # Actions handled entirely by the native shell (app quit / run the chosen login in Terminal).
 # Everything else goes through the bridge; the shell then acts on result fields (login/command).
@@ -61,6 +64,7 @@ def snapshot_state(ctx: Context) -> dict[str, Any]:
     data["dot"] = dot_for(data)  # single source of truth for the dot (JS + native both read this)
     data["door"] = door_for(data)  # shut/open door icon — same state feeds native glyph + web header
     data["app"] = {"version": __version__, "build": build_number()}  # shown in the settings sheet
+    data["supervision"] = install_mod.supervision_status()
     # the signed-in-but-not-added codex account (if any) → drives the one-tap import affordance
     data["codex_live_unregistered"] = _codex_live_unregistered(ctx, state)
     data["rev"] = int(state.data.get("rev", 0))  # monotonic; the UI drops a snapshot older than one it applied
@@ -98,9 +102,60 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
             val = bool(message["value"])
             with ctx.locked():
                 state = ctx.load_state()
+                previous = bool(state.settings().get(key, True))
+                if key == "supervise_shell":
+                    try:
+                        if val:
+                            # The popover's repair affordance uses this same toggle. Restore missing
+                            # wrappers too, while keeping the required rc operation explicit below.
+                            install_mod.ensure_launchers(wire_rc=False)
+                            install_mod.ensure_shell_setup()
+                        else:
+                            install_mod.remove_shell_setup()
+                    except Exception as exc:
+                        direction = "on" if val else "off"
+                        detail = str(exc).strip() or exc.__class__.__name__
+                        result = {
+                            "ok": False,
+                            "error": f"couldn't turn terminal supervision {direction}: {detail}",
+                        }
+                        try:
+                            result["state"] = snapshot_state(ctx)
+                        except Exception as status_exc:
+                            status_detail = str(status_exc).strip() or status_exc.__class__.__name__
+                            result["error"] += f"; couldn't refresh status: {status_detail}"
+                        return result
                 state.set_setting(key, val)
-                state.save()
-            return {"ok": True, "state": snapshot_state(ctx)}
+                try:
+                    state.save()
+                except Exception as exc:
+                    rollback_error = ""
+                    if key == "supervise_shell":
+                        # The state write failed after the rc edit. Restore the shell to the persisted
+                        # setting so the two user-facing sources of truth cannot silently disagree.
+                        try:
+                            if previous:
+                                install_mod.ensure_shell_setup()
+                            else:
+                                install_mod.remove_shell_setup()
+                        except Exception as rollback_exc:
+                            rollback_detail = str(rollback_exc).strip() or rollback_exc.__class__.__name__
+                            rollback_error = f"; shell rollback also failed: {rollback_detail}"
+                    detail = str(exc).strip() or exc.__class__.__name__
+                    result = {
+                        "ok": False,
+                        "error": f"couldn't save that setting: {detail}{rollback_error}",
+                    }
+                    try:
+                        result["state"] = snapshot_state(ctx)
+                    except Exception as status_exc:
+                        status_detail = str(status_exc).strip() or status_exc.__class__.__name__
+                        result["error"] += f"; couldn't refresh status: {status_detail}"
+                    return result
+            result = {"ok": True, "state": snapshot_state(ctx)}
+            if key == "supervise_shell":
+                result["message"] = f"terminal supervision is {'on' if val else 'off'}"
+            return result
 
         if action == "set_theme":
             val = message.get("value")

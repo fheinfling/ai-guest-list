@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   buildHTML, dotState, dotKey, doorKey, doorMark, creditLeft, pct, fmtCountdown, needsHello,
-  buildSettings, buildAddSeat, reduceReply,
+  buildSettings, buildAddSeat, reduceReply, supervisionBanner,
 } from "./render.mjs";
 
 const mkAdd = (over = {}) => ({ step: "provider", provider: null, name: "", method: "browser", token: "", ...over });
@@ -190,10 +190,48 @@ test("buildHTML default light theme for unknown", () => {
   assert.match(buildHTML(state({ settings: { theme: "evil" } })), /class="app theme-light"/);
 });
 
+test("inactive supervision shows a repair banner", () => {
+  const st = state({
+    supervision: { wrappers: true, block: false, on_path: false, active: false },
+  });
+  const banner = supervisionBanner(st);
+  assert.match(banner, /terminal supervision is off/);
+  assert.match(banner, /codex\/claude/);
+  assert.match(banner, /won't auto-switch/);
+  assert.match(banner, /data-action="supervision-on"/);
+  assert.match(buildHTML(st), /supervision-banner--error/);
+});
+
+test("wired supervision outside the current PATH asks for a new terminal", () => {
+  const st = state({
+    supervision: { wrappers: true, block: true, on_path: false, active: true },
+  });
+  const banner = supervisionBanner(st);
+  assert.match(banner, /open a new terminal to finish setup/);
+  assert.match(banner, /supervision-banner--info/);
+  assert.doesNotMatch(banner, /turn it on/);
+});
+
+test("supervision banner is absent when active or explicitly opted out", () => {
+  const active = state({
+    supervision: { wrappers: true, block: true, on_path: true, active: true },
+  });
+  assert.equal(supervisionBanner(active), "");
+  assert.doesNotMatch(buildHTML(active), /supervision-banner/);
+
+  const optedOut = state({
+    settings: { theme: "light", supervise_shell: false },
+    supervision: { wrappers: true, block: false, on_path: false, active: false },
+  });
+  assert.equal(supervisionBanner(optedOut), "");
+  assert.doesNotMatch(buildHTML(optedOut), /terminal supervision is off/);
+});
+
 test("settings wires its actions", () => {
   const set = buildSettings({ settings: { theme: "light", strategy: "soonest_back", notify: true } });
   assert.match(set, /data-action="set_strategy"[^>]*data-value="most_headroom"/);
   assert.match(set, /data-action="set_theme"[^>]*data-value="dark"/);
+  assert.match(set, /data-key="supervise_shell"/);
 });
 
 test("header ＋ opens the provider step (no hardcoded tool)", () => {

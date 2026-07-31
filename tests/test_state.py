@@ -9,6 +9,7 @@ def test_empty_state_defaults(tmp_path):
     assert s.active("codex") is None
     assert s.accounts("claude") == {}
     assert s.settings() == DEFAULT_SETTINGS
+    assert s.settings()["supervise_shell"] is True
 
 
 def test_no_retired_headroom_settings(tmp_path):
@@ -56,4 +57,5 @@ def test_load_merges_new_default_settings(tmp_path):
     # missing defaults filled in, explicit value preserved
     assert s.settings()["theme"] == "light"
     assert s.settings()["auto_switch"] is True
+    assert s.settings()["supervise_shell"] is True
     assert s.active("codex") is None  # tool scaffolding repaired
