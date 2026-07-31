@@ -28,6 +28,7 @@ from acctsw.context import Context, hydrate_path
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 USAGE_POLL_SECONDS = 180.0
+STATE_POLL_SECONDS = 3.0
 # The menu-bar mark is the door (icon handoff): open onto the disco when a model's free, shut when
 # every seat is resting. SF Symbols give a native, template (auto light/dark) glyph; emoji is the
 # fallback on older macOS where the symbol is missing (🪩 disco = open, 🚪 = shut).
@@ -47,6 +48,8 @@ if objc is not None:
             self.statusItem = None
             self.popover = None
             self.webview = None
+            self._state_timer = None
+            self._last_state_rev = -1
             self._acctWarned = set()              # shared-account warnings already toasted this session
             self._login_baseline = {}             # tool → (op, digest of live creds at that login launch)
             self._login_seq = 0                   # monotonic login op id (see the login handler)
@@ -126,6 +129,7 @@ if objc is not None:
             vc = NSViewController.alloc().init()
             vc.setView_(self.webview)
             self.popover = NSPopover.alloc().init()
+            self.popover.setDelegate_(self)
             self.popover.setContentViewController_(vc)
             self.popover.setContentSize_(NSMakeSize(376, 600))  # match the 376px popover width
             self.popover.setBehavior_(1)  # NSPopoverBehaviorTransient
@@ -139,11 +143,46 @@ if objc is not None:
         # --- actions ------------------------------------------------------------------------
         def togglePopover_(self, sender):
             if self.popover.isShown():
+                self._stopStateTimer()
+                self._setWebVisible(False)
                 self.popover.performClose_(sender)
             else:
                 btn = self.statusItem.button()
                 self.popover.showRelativeToRect_ofView_preferredEdge_(btn.bounds(), btn, 1)
+                self._setWebVisible(True)
+                self._startStateTimer()
                 self.pollUsage_(None)  # refresh usage each time the popover opens (cache-guarded)
+
+        def popoverDidClose_(self, _notification):
+            # Transient popovers also close when the user clicks elsewhere, bypassing togglePopover_.
+            self._stopStateTimer()
+            self._setWebVisible(False)
+
+        @objc.python_method
+        def _startStateTimer(self):
+            if self._state_timer is not None:
+                return
+            self._state_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                STATE_POLL_SECONDS, self, objc.selector(self.pollState_, signature=b"v@:@"), None, True)
+            self.pollState_(None)
+
+        @objc.python_method
+        def _stopStateTimer(self):
+            if self._state_timer is not None:
+                self._state_timer.invalidate()
+                self._state_timer = None
+
+        def pollState_(self, _timer):
+            """While open, notice state.json writes from supervised cx/cl sessions without networking."""
+            try:
+                rev = int(self.ctx.load_state().data.get("rev", 0))
+            except Exception:
+                return
+            if rev == self._last_state_rev:
+                return
+            result = dict(bridge.handle(self.ctx, {"action": "status"}))
+            result["background"] = True
+            self.applyResult_(result)
 
         def pollUsage_(self, _timer):
             # Run the network refresh OFF the main thread so the menubar UI never freezes.
@@ -323,9 +362,19 @@ if objc is not None:
         # --- helpers ------------------------------------------------------------------------
         @objc.python_method
         def _pushResult(self, result):
+            state = result.get("state")
+            if state is not None:
+                self._last_state_rev = max(self._last_state_rev, int(state.get("rev", 0)))
             if self.webview:
                 self.webview.evaluateJavaScript_completionHandler_(
                     f"window.AGL.result({json.dumps(result)});", None)
+
+        @objc.python_method
+        def _setWebVisible(self, visible):
+            if self.webview:
+                flag = "true" if visible else "false"
+                self.webview.evaluateJavaScript_completionHandler_(
+                    f"window.AGL && window.AGL.setVisible({flag});", None)
 
         @objc.python_method
         def _updateDot(self, state):
