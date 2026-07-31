@@ -7,6 +7,7 @@ import pytest
 from acctsw import accounts as acct
 from acctsw import bridge
 from acctsw.errors import MissingSnapshot
+from acctsw.identity import ClaudeLiveIdentity
 from acctsw.switch import switch, sync_back
 from tests.conftest import make_codex_blob, make_claude_blob
 
@@ -82,6 +83,22 @@ def test_sync_back_claude_unknown_identity_never_clobbers_old_seat(ctx, monkeypa
     monkeypatch.setattr(acct.identity, "claude_status_email", lambda _: "stranger@x.com")
 
     assert sync_back(ctx, state, "claude") is False
+    assert ctx.snapshot_get("claude", "a@x.com") == before
+
+
+def test_sync_back_claude_stale_blob_identity_is_noop(ctx):
+    """An identity answer for blob A must not authorize blob B after a login races the lock."""
+    blob_a = make_claude_blob("max")
+    blob_b = make_claude_blob("pro")
+    ctx.cred["claude"].set_live(blob_a)
+    state = ctx.load_state()
+    acct.add(ctx, state, "claude", email="a@x.com")
+    before = ctx.snapshot_get("claude", "a@x.com")
+    stale = ClaudeLiveIdentity(blob=blob_a, email="a@x.com")
+
+    ctx.cred["claude"].set_live(blob_b)
+
+    assert sync_back(ctx, state, "claude", live_identity=stale) is False
     assert ctx.snapshot_get("claude", "a@x.com") == before
 
 

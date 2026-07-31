@@ -492,13 +492,18 @@ def handle_exhausted(ctx: Context, state, tool: str, *, get=usage_mod._default_g
     summary = usage_mod.refresh(
         ctx, state, tool, only=active, force=True, get=get, user_agent=user_agent
     )
+    status = (summary.get(tool) or {}).get(active)
+    # A 403 is positive evidence that this seat is no longer entitled, not an inconclusive fetch
+    # and not a quota rest. Leave it through the dead-token path without inventing a reset time.
+    if status == "forbidden":
+        return handle_auth_dead(ctx, state, tool, exclude=exclude)
     until = parse_iso((state.get_seat(tool, active) or {}).get("limited_until"))
     out = until is not None and until > now()
     # A seat can be authoritatively out (limit_reached / a window at 100%) yet carry NO reset
     # timestamp, so usage stamps no ``limited_until``. Treat that "ok but not healthy" reading — the
     # same positive evidence handle_limit rests on — as out, and reactively rest it so choose() won't
     # re-pick it. Anything other than a clean "ok" fetch stays inconclusive → give_up.
-    if not out and (summary.get(tool) or {}).get(active) == "ok" \
+    if not out and status == "ok" \
             and not _seat_confirmed_healthy(state, tool, active, summary):
         state.set_limited_until(tool, active, iso(now() + DEFAULT_COOLDOWN), source="reactive")
         state.save()
@@ -753,8 +758,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
 
     # Claude's official identity command can stall for 30 seconds. Resolve it with NO state flock,
     # and memoise the answer only for the exact live Keychain blob: each distinct credential value
-    # gets its own answer, while initial selection, a hop, and exit cleanup cannot serially respawn
-    # the CLI for unchanged bytes. The reconcile write rechecks that the same blob is still live.
+    # gets its own answer, while later hops cannot serially respawn the CLI for unchanged bytes.
+    # The reconcile write rechecks that the same blob is still live.
     claude_identities: dict[str | None, identity_mod.ClaudeLiveIdentity] = {}
 
     def _claude_live_identity() -> identity_mod.ClaudeLiveIdentity | None:
@@ -785,7 +790,14 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         if email is None:
             return False
         hopped = False
-        live_identity = _claude_live_identity()  # slow Claude status happens before the flock
+        live_identity = None
+        if tool == "claude":
+            # The wait may return the seat that is already active. Check that cheaply first so the
+            # common no-switch path never pays for `claude auth status`; resolve only between locks.
+            with ctx.locked():
+                if email == ctx.load_state().active(tool):
+                    return True
+            live_identity = _claude_live_identity()  # slow Claude status happens before the flock
         with ctx.locked():
             state = ctx.load_state()
             if email != state.active(tool):
@@ -840,18 +852,31 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
 
     try:
         initial_resting: Decision | None = None
-        # Initial selection + switch, under the state lock (brief; never held across a spawn).
-        live_identity = _claude_live_identity()  # slow Claude status happens before the flock
+        # Initial selection is cheap. If Claude actually needs a switch, resolve its slow identity
+        # between two lock acquisitions and re-run selection before committing.
+        claude_switch_needed = False
         with ctx.locked():
             state = ctx.load_state()
             if tool == "codex":
                 from . import accounts as _acct
                 _acct.reconcile_codex(ctx, state)   # freshen home(s) from ~/.codex before using them
             sel = choose(state, tool)
-            if sel.email and sel.email != state.active(tool):
+            claude_switch_needed = (
+                tool == "claude"
+                and bool(sel.email)
+                and sel.email != state.active(tool)
+            )
+            if sel.email and sel.email != state.active(tool) and not claude_switch_needed:
                 switch(ctx, state, tool, sel.email, sync=(tool != "codex"),
-                       live_identity=live_identity)
+                       live_identity=None)
             _activate_codex_home(state.active(tool))
+        if claude_switch_needed:
+            live_identity = _claude_live_identity()  # subprocess — no state flock held
+            with ctx.locked():
+                state = ctx.load_state()
+                sel = choose(state, tool)  # selection may have changed while identity resolved
+                if sel.email and sel.email != state.active(tool):
+                    switch(ctx, state, tool, sel.email, live_identity=live_identity)
         if sel.all_limited:
             # The wait verifies against the live endpoint and recomputes targets from state, so it
             # does not need a pre-known unlock time (unlocks_at may be None for reactive marks).
@@ -882,6 +907,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             "unknown_notified": False,
             "limit_stay_notified": False,
             "auth_stay_notified": False,
+            "revoked_stay_notified": False,
             "budget_notified": False,
         }
 
@@ -1045,10 +1071,10 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                         scan["auth_stay_notified"] = True
                     return False
                 if decision_reason == "revoked":
-                    if not scan["auth_stay_notified"]:
+                    if not scan["revoked_stay_notified"]:
                         notify(f"{active} is no longer entitled and no other {tool} seat is ready "
                                f"— staying on this seat")
-                        scan["auth_stay_notified"] = True
+                        scan["revoked_stay_notified"] = True
                     return False
                 if not scan["limit_stay_notified"]:
                     label = "hit a hard billing limit" if hard else "hit its usage limit"
@@ -1071,18 +1097,25 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 # never second-guess it, and a user abort (Ctrl-C/kill) is not a limit — only a
                 # POSITIVE, non-abort failure code is worth a usage check. See handle_exhausted.
                 if status > 0 and status not in _ABORT_EXITS and switches < max_switches:
-                    live_identity = _claude_live_identity()  # before handle/commit's state flock
                     ua = (usage_mod.claude_user_agent(getattr(ctx, "claude_bin", None))
-                          if tool == "claude" else None)  # subprocess — still before the flock
+                          if tool == "claude" else None)  # subprocess — before the state flock
                     with ctx.locked():
                         state = ctx.load_state()
                         active = state.active(tool)
                         dec = handle_exhausted(
                             ctx, state, tool, get=get, exclude=auth_failed, user_agent=ua
                         )
-                        if dec.action == "switch":
-                            _commit_switch(state, dec.email, live_identity)
+                    switched = False
                     if dec.action == "switch":
+                        live_identity = _claude_live_identity()  # only for an approved seat hop
+                        with ctx.locked():
+                            state = ctx.load_state()
+                            landing = choose(state, tool, exclude=auth_failed)
+                            if (state.active(tool) == active and landing.available
+                                    and landing.email == dec.email):
+                                _commit_switch(state, dec.email, live_identity)
+                                switched = True
+                    if switched:
                         mark_session(ctx.data_dir, tool, dec.email)
                         notify(f"{active} hit its usage limit — hopping to {dec.email}, "
                                f"resuming your work ✨")
@@ -1128,16 +1161,34 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         #  - codex: it maintained its own home via CODEX_HOME → mirror the home into ~/.codex so
         #    plain codex / the GUI follow the active account.
         #  - claude: sync the live keychain item back into the account's snapshot.
+        # The Claude sync-back is NOT optional: Claude rotates refresh tokens mid-session, and the
+        # live copy is the freshest one (see switch.sync_back's module docstring). Deferring it to
+        # "whenever the next switch happens" loses those bytes outright if an out-of-band login
+        # replaces the live item first — the stored snapshot then holds a superseded refresh token
+        # and the seat silently stops working. What we DO skip is the cost: when the live blob is
+        # byte-identical to the stored snapshot there is nothing to preserve, so the common
+        # no-rotation launch never pays for `claude auth status`.
         try:
-            live_identity = _claude_live_identity()  # subprocess — never under the state flock
-            with ctx.locked():
-                st = ctx.load_state()
-                active = st.active(tool)
-                if tool == "codex" and active:
-                    blob = ctx.snapshot_get("codex", active)   # home = source of truth
-                    if blob:
-                        ctx.cred["codex"].set_live(blob)        # mirror → ~/.codex
-                elif sync_back(ctx, st, tool, live_identity=live_identity):
-                    st.save()
+            if tool == "codex":
+                with ctx.locked():
+                    st = ctx.load_state()
+                    active = st.active(tool)
+                    if active:
+                        blob = ctx.snapshot_get("codex", active)   # home = source of truth
+                        if blob:
+                            ctx.cred["codex"].set_live(blob)        # mirror → ~/.codex
+            else:
+                with ctx.locked():
+                    st = ctx.load_state()
+                    active = st.active(tool)
+                    # Cheap local keychain reads only — no CLI, no network, no identity probe.
+                    rotated = bool(active) and ctx.cred[tool].get_live() != ctx.snapshot_get(
+                        tool, active)
+                if rotated:
+                    live_identity = _claude_live_identity()  # subprocess — never under the flock
+                    with ctx.locked():
+                        st = ctx.load_state()
+                        if sync_back(ctx, st, tool, live_identity=live_identity):
+                            st.save()
         except Exception:
             pass

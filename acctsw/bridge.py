@@ -172,6 +172,10 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
             # an env-var inference credential that 403s on the OAuth endpoints and doesn't write the
             # Keychain login this app snapshots. Claude seats are added via browser sign-in only.)
             tool = message["tool"]
+            # Reject Claude explicitly before the lock: sync_back would otherwise need its slow
+            # identity subprocess, and the paste action has no supported Claude credential format.
+            if tool != "codex":
+                return {"ok": False, "error": "pasting credentials is codex-only"}
             blob = message["blob"]
             # VALIDATE BEFORE WRITING: never overwrite the canonical auth.json with an unparseable
             # paste — that would break stock `codex` (violates "stock keeps working").

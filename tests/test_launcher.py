@@ -417,6 +417,48 @@ def test_run_clean_exit_no_switch(ctx):
     assert ctx.load_state().active("codex") == "a@x.com"
 
 
+def test_run_claude_no_switch_skips_identity_cli(ctx, monkeypatch):
+    """An already-chosen Claude seat must launch without paying for `claude auth status`."""
+    ctx.cred["claude"].set_live(make_claude_blob())
+    acct.add(ctx, ctx.load_state(), "claude", email="solo@x.com")
+
+    def unexpected_identity(_ctx):
+        raise AssertionError("no-switch Claude launch resolved live identity")
+
+    monkeypatch.setattr(L.identity_mod, "claude_live_identity", unexpected_identity)
+    spawn = FakeSpawn([(b"all good, done\n", 0)])
+
+    assert run(ctx, "claude", [], spawn=spawn, get=fake_get({})) == 0
+    assert len(spawn.calls) == 1
+
+
+def test_run_claude_hop_resolves_identity_before_spawn(ctx, monkeypatch):
+    """A real Claude seat hop still resolves the outgoing blob's identity before switching."""
+    state = _two_claude(ctx)  # active c1
+    state.set_limited_until(
+        "claude", "c1@x.com", iso(now() + timedelta(hours=1)), source="usage"
+    )
+    state.save()
+    events = []
+
+    def resolve_identity(_ctx):
+        events.append("identity")
+        return L.identity_mod.ClaudeLiveIdentity(
+            blob=ctx.cred["claude"].get_live(), email="c1@x.com"
+        )
+
+    def spawn(argv, on_output):
+        events.append("spawn")
+        on_output(b"all good, done\n")
+        return 0
+
+    monkeypatch.setattr(L.identity_mod, "claude_live_identity", resolve_identity)
+
+    assert run(ctx, "claude", [], spawn=spawn, get=fake_get({})) == 0
+    assert events == ["identity", "spawn"]
+    assert ctx.load_state().active("claude") == "c2@x.com"
+
+
 def test_run_switches_and_resumes_on_limit(ctx):
     _two_codex(ctx)  # active a
     reset = iso(now() + timedelta(hours=3))
@@ -764,6 +806,27 @@ def test_run_leaves_child_alive_with_relogin_hint_when_only_seat_revoked(ctx):
     assert any("sign in again" in m for m in msgs)
 
 
+def test_run_auth_and_revoked_stay_notifications_are_independent(ctx, monkeypatch):
+    """Auth death and lost entitlement are different remedies, so one must not suppress the other."""
+    ctx.cred["codex"].set_live(make_codex_blob("solo@x.com"))
+    acct.add(ctx, ctx.load_state(), "codex", email="solo@x.com")
+    monkeypatch.setattr(L, "PROBE_COOLDOWN_S", 0.0)
+    replies = iter([(0, ""), (403, "")])
+
+    def get(url, headers, timeout):
+        return next(replies)
+
+    msgs = []
+    spawn = FakeSpawn([([
+        b"your refresh token was revoked\n",
+        b"usage limit reached\n",
+    ], 9)])
+
+    assert run(ctx, "codex", [], spawn=spawn, get=get, notify=msgs.append) == 9
+    assert any("sign in again" in msg for msg in msgs)
+    assert any("no longer entitled" in msg for msg in msgs)
+
+
 def test_run_budget_spent_does_not_stop_confirmed_limit(ctx, monkeypatch):
     _two_codex(ctx)
     reset = iso(now() + timedelta(hours=3))
@@ -808,6 +871,26 @@ def test_handle_exhausted_gives_up_when_endpoint_unreachable(ctx):
     state = _two_codex(ctx)  # active a
     dec = L.handle_exhausted(ctx, state, "codex", get=fake_get({P.CODEX_USAGE_URL: (0, "")}))
     assert dec.action == "give_up"
+
+
+def test_handle_exhausted_hops_off_forbidden_without_resting(ctx):
+    state = _two_codex(ctx)  # active a, healthy b
+    dec = L.handle_exhausted(
+        ctx, state, "codex", get=fake_get({P.CODEX_USAGE_URL: (403, "")})
+    )
+    assert dec.action == "switch" and dec.email == "b@x.com"
+    assert state.get_seat("codex", "a@x.com").get("limited_until") is None
+
+
+def test_handle_exhausted_forbidden_only_seat_gives_up_without_resting(ctx):
+    state = _two_codex(ctx)
+    state.remove_seat("codex", "b@x.com")
+    state.save()
+    dec = L.handle_exhausted(
+        ctx, state, "codex", get=fake_get({P.CODEX_USAGE_URL: (403, "")})
+    )
+    assert dec.action == "give_up"
+    assert state.get_seat("codex", "a@x.com").get("limited_until") is None
 
 
 def test_run_switches_on_silent_limit_exit(ctx):
@@ -1213,3 +1296,40 @@ def test_reset_terminal_noop_on_non_tty():
     finally:
         os.close(r)
         os.close(w)
+
+
+def test_run_claude_exit_syncs_back_rotated_creds(ctx, monkeypatch):
+    """Claude rotates refresh tokens mid-session and the LIVE copy is the freshest one. If exit
+    doesn't sync it into the seat's snapshot, an out-of-band login that replaces the live item next
+    loses those bytes outright — the snapshot keeps a superseded token and the seat quietly stops
+    working (switch.sync_back's module docstring is explicit about this)."""
+    ctx.cred["claude"].set_live(make_claude_blob())
+    acct.add(ctx, ctx.load_state(), "claude", email="solo@x.com")
+    rotated = make_claude_blob("max").replace('"accessToken": "x"', '"accessToken": "rotated"')
+
+    def rotate_mid_session(_argv, on_output):
+        ctx.cred["claude"].set_live(rotated)   # the child refreshed its token while running
+        on_output(b"done\n")
+        return 0
+
+    monkeypatch.setattr(
+        L.identity_mod, "claude_live_identity",
+        lambda _c: L.identity_mod.ClaudeLiveIdentity(blob=ctx.cred["claude"].get_live(),
+                                                     email="solo@x.com"))
+
+    assert run(ctx, "claude", [], spawn=rotate_mid_session, get=fake_get({})) == 0
+    assert ctx.snapshot_get("claude", "solo@x.com") == rotated
+
+
+def test_run_claude_exit_without_rotation_skips_identity_cli(ctx, monkeypatch):
+    """The sync-back is preserved, but its COST is not paid when there is nothing to preserve: an
+    unchanged live blob is byte-identical to the snapshot, so no `claude auth status` is spawned."""
+    ctx.cred["claude"].set_live(make_claude_blob())
+    acct.add(ctx, ctx.load_state(), "claude", email="solo@x.com")
+
+    def unexpected_identity(_ctx):
+        raise AssertionError("unrotated Claude exit resolved live identity")
+
+    monkeypatch.setattr(L.identity_mod, "claude_live_identity", unexpected_identity)
+
+    assert run(ctx, "claude", [], spawn=FakeSpawn([(b"done\n", 0)]), get=fake_get({})) == 0

@@ -3,7 +3,7 @@ import json
 
 from acctsw import accounts as acct
 from acctsw import bridge
-from tests.conftest import make_codex_blob
+from tests.conftest import make_claude_blob, make_codex_blob
 
 
 def _add(ctx, email):
@@ -212,6 +212,13 @@ def test_paste_installs_and_registers_codex(ctx):
     assert "pasted@x.com" in ctx.load_state().accounts("codex")
     import json
     assert json.loads(ctx.cred["codex"].get_live())  # live creds installed
+
+
+def test_paste_rejects_claude_explicitly(ctx):
+    r = bridge.handle(
+        ctx, {"action": "paste", "tool": "claude", "blob": make_claude_blob()}
+    )
+    assert r["ok"] is False and "codex-only" in r["error"]
 
 
 def test_is_native_routing():
