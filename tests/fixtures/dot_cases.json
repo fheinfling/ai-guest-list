@@ -11,5 +11,8 @@
   {"name": "switched", "expected": "switched",
    "state": {"recently_switched": true, "tools": {"codex": {"seats": [{"status": "active"}]}, "claude": {"seats": []}}}},
   {"name": "hello-beats-resting", "expected": "hello",
-   "state": {"tools": {"codex": {"seats": [{"status": "resting"}]}, "claude": {"seats": [{"status": "needs-login"}]}}}}
+   "state": {"tools": {"codex": {"seats": [{"status": "resting"}]}, "claude": {"seats": [{"status": "needs-login"}]}}}},
+  {"name": "hello-forbidden-parked-seat", "expected": "hello",
+   "state": {"tools": {"codex": {"seats": [{"status": "active"}]},
+                       "claude": {"seats": [{"status": "needs-login", "entitlement_revoked": true}]}}}}
 ]

@@ -14,5 +14,9 @@
    "state": {"tools": {"codex": {"seats": [{"status": "needs-login"}]}, "claude": {"seats": []}}}},
   {"name": "shut-resting-and-needs-login", "expected": "shut",
    "state": {"tools": {"codex": {"seats": [{"status": "resting"}]},
-                       "claude": {"seats": [{"status": "needs-login"}]}}}}
+                       "claude": {"seats": [{"status": "needs-login"}]}}}},
+  {"name": "shut-forbidden-only-seat", "expected": "shut",
+   "state": {"tools": {"codex": {"seats": [{"status": "needs-login",
+                                              "entitlement_revoked": true}]},
+                       "claude": {"seats": []}}}}
 ]

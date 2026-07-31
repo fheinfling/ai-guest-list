@@ -43,7 +43,7 @@ class Window:
 @dataclass
 class Usage:
     ok: bool = False
-    error: str | None = None  # "unauthorized" | "rate_limited" | "network" | "parse" | "no_token"
+    error: str | None = None  # "unauthorized" | "forbidden" | "rate_limited" | "network" | ...
     windows: dict[str, Window] = field(default_factory=dict)  # "5h" / "weekly"
     limit_reached: bool | None = None  # authoritative flag when the API provides one (Codex)
     fetched_at: str = ""
@@ -261,8 +261,10 @@ def codex_limit_reached(payload: dict) -> bool | None:
 def _classify(status: int) -> str | None:
     if status == 200:
         return None
-    if status == 401 or status == 403:
+    if status == 401:
         return "unauthorized"
+    if status == 403:
+        return "forbidden"
     if status == 429:
         return "rate_limited"
     if status == 0:
@@ -323,6 +325,12 @@ def fetch_claude(token: str | None, *, user_agent: str | None = None,
 # --- orchestration: refresh into state (cache + backoff + limit flagging) ----------------------
 
 LIMIT_PCT = 100.0  # a window at/above this means the seat is out of credit
+USAGE_MIN_REFRESH_SECONDS = P.USAGE_MIN_REFRESH_SECONDS
+
+# Last-good percentages are useful through a brief endpoint wobble, but after this age they are
+# context, not current fact. The seat view exposes that distinction so a terminated subscription
+# cannot keep painting frozen bars forever.
+MAX_TRUSTED_AGE_S = 900
 
 # Default cooldown when a limit is known but no authoritative reset is (shared with the launcher,
 # which re-exports it; defined here so usage's own limit-flagging can use it without a cycle).
@@ -353,37 +361,47 @@ def _fetch_for(tool: str, blob: str, get: HttpGet, ua: str | None) -> Usage:
 
 
 MAX_BACKOFF_SECONDS = 3600
+ACTIVE_MAX_BACKOFF_SECONDS = 300
 
 
-def _backoff_seconds(prev_usage: dict | None, base: int) -> float:
-    """Exponential backoff: each consecutive error doubles the wait, capped at 1h.
+def _backoff_seconds(prev_usage: dict | None, base: int, *, active: bool = False) -> float:
+    """Exponential backoff, capped at 1h for stored seats and 5m for the active seat.
 
     Claude's usage endpoint rate-limits hard; sustained 429s must not be retried every `base`s.
+    The seat actually on the floor gets the tighter cap so restored entitlement/network service is
+    re-validated promptly instead of remaining hidden behind an hour-long historical error streak.
     """
     streak = int((prev_usage or {}).get("error_streak", 0) or 0)
     if streak <= 0:
-        return base
-    return min(base * (2 ** streak), MAX_BACKOFF_SECONDS)
+        wait = base
+    else:
+        wait = min(base * (2 ** streak), MAX_BACKOFF_SECONDS)
+    return min(wait, ACTIVE_MAX_BACKOFF_SECONDS) if active else wait
 
 
-def _due(prev_usage: dict | None, at, base: int) -> bool:
+def _due(prev_usage: dict | None, at, base: int, *, active: bool = False) -> bool:
     from .util import parse_iso
-    prev = parse_iso((prev_usage or {}).get("fetched_at"))
+    # ``fetched_at`` is deliberately the LAST SUCCESS so the UI can age the preserved windows.
+    # Backoff needs the last ATTEMPT instead, otherwise a stale success would make every failed
+    # popover refresh immediately retry the endpoint.
+    prev = parse_iso((prev_usage or {}).get("last_attempted_at")
+                     or (prev_usage or {}).get("fetched_at"))
     if prev is None:
         return True
-    return (at - prev).total_seconds() >= _backoff_seconds(prev_usage, base)
+    return (at - prev).total_seconds() >= _backoff_seconds(prev_usage, base, active=active)
 
 
 def refresh(ctx, state, tool: str | None = None, *, only: str | None = None,
             force: bool = False, get: HttpGet = _default_get, post=_default_post,
-            min_seconds: int = P.USAGE_MIN_REFRESH_SECONDS,
+            min_seconds: int = USAGE_MIN_REFRESH_SECONDS,
             user_agent: str | None = None) -> dict[str, Any]:
     """Refresh cached usage for seats and flag limited seats. Persists state. Returns a summary.
 
     - Caching with EXPONENTIAL backoff: a seat is skipped if polled within its current backoff
       window (grows on consecutive errors), unless ``force``.
     - On error the last-known-good ``windows`` are PRESERVED (menubar keeps showing prior usage,
-      marked stale); only ``error``/``fetched_at``/``error_streak`` are updated.
+      marked stale); ``fetched_at`` remains the last success while ``last_attempted_at`` and the
+      error/backoff fields record the failed poll.
     """
     at = now()
     tools = [tool] if tool else ["codex", "claude"]
@@ -398,44 +416,73 @@ def refresh(ctx, state, tool: str | None = None, *, only: str | None = None,
                 continue
             seat = state.get_seat(t, email)
             prev_usage = seat.get("usage") or {}
-            if not force and not _due(prev_usage, at, min_seconds):
+            if not force and not _due(
+                    prev_usage, at, min_seconds, active=(state.active(t) == email)):
                 summary[t][email] = "cached"
                 continue
             blob = _seat_blob(ctx, state, t, email)
             if not blob:
                 summary[t][email] = "no_creds"
                 continue
-            fp = account_fingerprint(t, blob)   # cheap local decode; self-heals existing seats
-            if fp and seat.get("account_id") != fp:
-                seat["account_id"] = fp         # persisted by the state.save() below
             u = _fetch_for(t, blob, get, ua)
             # NOTE: we deliberately do NOT auto-refresh/rotate the token here. Codex's refresh
             # tokens are single-use; rotating one that codex itself owns (the active auth.json) can
             # invalidate codex's own session (reviewer KR-B2). For usage display we report
             # last-known/unauthorized instead. Per-account isolation (each account owning its home)
             # makes codex maintain its own tokens — refresh moves there.
-            summary[t][email] = store_fetch(state, t, email, u, at=at)
+            summary[t][email] = store_fetch(state, t, email, u, at=at, blob=blob)
     state.save()
     return summary
 
 
 def store_fetch(state, tool: str, email: str, u: Usage, at=None, *,
-                trust_reactive_lag: bool = True) -> str:
+                trust_reactive_lag: bool = True, blob: str | None = None) -> str:
     """Persist ONE fetch result onto a seat (windows, limit flags, error backoff) and return its
     summary status ("ok" or the error kind). Shared by refresh() and the launcher's inline probe,
     which must fetch WITHOUT the state lock held and only take it for this quick write. The caller
     saves state. ``trust_reactive_lag`` is threaded to _apply_limit (see there): default True keeps
-    in-session/poll behaviour; the launcher's cold-start sweep passes False."""
+    in-session/poll behaviour; the launcher's cold-start sweep passes False. A successful caller
+    should pass the exact fetched ``blob`` so plan/account identity are refreshed from the same
+    credentials that just authenticated."""
     at = at if at is not None else now()
     prev_usage = (state.get_seat(tool, email) or {}).get("usage") or {}
     d = u.to_dict()
     if u.ok:
+        d["fetched_at"] = u.fetched_at or iso(at)
+        d["last_attempted_at"] = d["fetched_at"]
+        d["stale"] = False
         d["error_streak"] = 0
+        if blob is not None:
+            # accounts imports this module for account_fingerprint, so keep the reverse dependency
+            # lazy. A successful poll is the proof that this exact current blob is meaningful.
+            from . import accounts
+            seat = state.get_seat(tool, email)
+            if seat is not None:
+                old_account_id = seat.get("account_id")
+                new_account_id = account_fingerprint(tool, blob)
+                seat["plan"] = accounts.plan_of(tool, blob)
+                seat["account_id"] = new_account_id
+                if old_account_id and new_account_id and old_account_id != new_account_id:
+                    # Same email, different provider account means cancellation/re-subscription or
+                    # a workspace move. Old rests and auth backoff belong to the old subscription.
+                    state.set_limited_until(tool, email, None)
+                    accounts._creds_refreshed(state, tool, email)
+                    state.data["moved_note"] = (
+                        f"new {tool} subscription detected for {email} — saved limits were reset"
+                    )
         state.set_usage(tool, email, d)
         _apply_limit(state, tool, email, u, at, trust_reactive_lag=trust_reactive_lag)
     else:
-        # preserve last-known-good windows; bump the error streak for backoff
+        # Preserve last-known-good windows AND their successful timestamp. The failed-attempt time is
+        # separate so backoff still works while the renderer can age the data actually on screen.
         d["windows"] = prev_usage.get("windows", d["windows"])
+        if prev_usage.get("stale") and "last_attempted_at" not in prev_usage:
+            # Pre-fix stale records used fetched_at for the failed attempt, not the retained windows;
+            # there is no honest success age to recover, so treat them as never successfully fetched.
+            d["fetched_at"] = None
+        else:
+            d["fetched_at"] = prev_usage.get("fetched_at") or None
+        d["last_attempted_at"] = u.fetched_at or iso(at)
         d["stale"] = True
         d["error_streak"] = int(prev_usage.get("error_streak", 0) or 0) + 1
         state.set_usage(tool, email, d)
