@@ -9,6 +9,11 @@ Rules (from the plan):
 a seat whose token just failed at runtime), WITHOUT persisting any "dead" flag — usage-poll auth
 errors are NOT a reliable health signal here (a non-active seat routinely shows ``unauthorized`` from
 a stale cached access token that is refreshed only when it becomes active).
+
+The one auth error that IS actionable is ``forbidden`` (403): the endpoint answered, and it answered
+"this account is not entitled" — a cancelled or terminated subscription. Unlike a 401 that a refresh
+would fix, switching onto such a seat can only fail, so it is not selectable. A 401 stays selectable,
+exactly as before.
 """
 from __future__ import annotations
 
@@ -38,7 +43,8 @@ def _limited_until(seat: dict, at: datetime) -> datetime | None:
 def choose(state: State, tool: str, at: datetime | None = None,
            exclude: frozenset | set | tuple = ()) -> Selection:
     at = at or now()
-    accounts = {e: s for e, s in state.accounts(tool).items() if e not in exclude}
+    accounts = {e: s for e, s in state.accounts(tool).items()
+                if e not in exclude and (s.get("usage") or {}).get("error") != "forbidden"}
     if not accounts:
         return Selection(email=None, available=False, unlocks_at=None, all_limited=False)
 

@@ -220,7 +220,10 @@ def _verify_capacity(ctx: Context, tool: str, get, *, at, force: bool,
             if email in exclude:
                 continue   # auth-dead this run: choose() skips it, so its fetch is a wasted 401
             prev = (state.get_seat(tool, email) or {}).get("usage") or {}
-            if not force and not usage_mod._due(prev, at, POLL_MIN_FETCH_S):
+            # The ACTIVE seat's error backoff is capped short (usage.ACTIVE_MAX_BACKOFF_SECONDS):
+            # the seat we're actually running on must re-validate promptly, not sit out the 1h cap.
+            if not force and not usage_mod._due(prev, at, POLL_MIN_FETCH_S,
+                                                active=(state.active(tool) == email)):
                 continue
             blob = usage_mod._seat_blob(ctx, state, tool, email)
             if blob:
@@ -228,16 +231,18 @@ def _verify_capacity(ctx: Context, tool: str, get, *, at, force: bool,
     results = []
     for email, blob in pending:   # network — no lock held
         try:
-            results.append((email, usage_mod._fetch_for(tool, blob, get, ua)))
+            # Carry the EXACT blob the fetch used into store_fetch: it re-derives plan/account_id
+            # from it, so a re-subscription is caught here too — not only on the menubar's poll.
+            results.append((email, blob, usage_mod._fetch_for(tool, blob, get, ua)))
         except Exception:
             pass  # a broken blob/transport must not kill the wait — the seat just isn't refreshed
     with ctx.locked():
         state = ctx.load_state()
         changed = False
-        for email, u in results:
+        for email, blob, u in results:
             if state.get_seat(tool, email) is not None:   # seat may have been removed mid-wait
                 usage_mod.store_fetch(state, tool, email, u, at=at,
-                                      trust_reactive_lag=trust_reactive_lag)
+                                      trust_reactive_lag=trust_reactive_lag, blob=blob)
                 changed = True
         # Trust the clock for markers the fetches did not re-stamp: clear EVERY seat whose rest has
         # expired by ``at`` (the old wait cleared only the one chosen seat, leaving stale siblings).
@@ -416,8 +421,9 @@ def handle_limit(ctx: Context, state, tool: str, *, get=usage_mod._default_get,
         # its windows show the seat maxed (else _seat_confirmed_healthy would have resumed above).
         # Anything else is inconclusive and must NOT burn a 5h rest — that false positive, cascaded
         # across every seat, is exactly what wrongly killed sessions with "all seats resting":
-        #   • network / unauthorized / cached / no_creds → we simply couldn't reach or read the endpoint
-        #     (network down, the Headroom proxy in front of it flapping, a stale snapshot token).
+        #   • network / unauthorized (401) / cached / no_creds → we simply couldn't reach or read the
+        #     endpoint (network down, the Headroom proxy in front of it flapping, a stale snapshot
+        #     token). A 401 is routine and inconclusive — it must never rest a seat.
         #   • rate_limited (429) is the USAGE ENDPOINT throttling us (it "rate-limits hard" — see
         #     usage._backoff_seconds), NOT the account's quota; a transient server 429 is not an out-
         #     of-quota banner (Claude Code even says "temporarily limiting requests (not your usage
@@ -428,6 +434,12 @@ def handle_limit(ctx: Context, state, tool: str, *, get=usage_mod._default_get,
         # — the account was removed mid-run — fall through to choose() a valid seat instead of
         # resuming a phantom, exactly as the pre-guard reactive path did.)
         status = (summary.get(tool) or {}).get(active)
+        # 403 is the one non-"ok" status that IS positive evidence: the endpoint answered, and it
+        # answered "this account is not entitled" — a cancelled/terminated subscription, not a
+        # quota. Resting it would advertise a reset that will never come, so treat it exactly like
+        # a dead token: leave this seat for an entitled one (or, with none, keep running and say so).
+        if status == "forbidden":
+            return handle_auth_dead(ctx, state, tool, exclude=exclude)
         if status != "ok" and state.get_seat(tool, active) is not None:
             return Decision("resume", active)
     seat = state.get_seat(tool, active) if active else None
@@ -871,7 +883,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 u = usage_mod._fetch_for(tool, blob, get, ua)  # network — no lock held
                 with ctx.locked():
                     st = ctx.load_state()
-                    status = usage_mod.store_fetch(st, tool, seat, u)
+                    status = usage_mod.store_fetch(st, tool, seat, u, blob=blob)
                     st.save()
                     if reason == "auth":
                         # the creds just authenticated a usage fetch → they aren't dead

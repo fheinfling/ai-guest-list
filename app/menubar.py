@@ -23,7 +23,7 @@ try:
 except ImportError:  # allows importing this module's pure helpers without pyobjc installed
     objc = None
 
-from acctsw import appalive, bridge
+from acctsw import TOOLS, appalive, bridge, session
 from acctsw.context import Context, hydrate_path
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
@@ -49,7 +49,7 @@ if objc is not None:
             self.popover = None
             self.webview = None
             self._state_timer = None
-            self._last_state_rev = -1
+            self._last_state_sig = None          # (state rev, session heartbeat mtimes)
             self._acctWarned = set()              # shared-account warnings already toasted this session
             self._login_baseline = {}             # tool → (op, digest of live creds at that login launch)
             self._login_seq = 0                   # monotonic login op id (see the login handler)
@@ -172,14 +172,37 @@ if objc is not None:
                 self._state_timer.invalidate()
                 self._state_timer = None
 
-        def pollState_(self, _timer):
-            """While open, notice state.json writes from supervised cx/cl sessions without networking."""
+        @objc.python_method
+        def _stateSignature(self):
+            """What "the state changed" means for the popover, cheaply (no network, no subprocess).
+
+            state.json's monotonic ``rev`` covers seat/usage/limit writes — but NOT a session
+            starting or ending: mark_session/clear_session write their own heartbeat file and a
+            launch on the already-active seat saves no state at all. Without the heartbeat mtimes
+            here, the live-session dot would lag by up to a full usage poll (180s), which is the
+            exact staleness this timer exists to remove.
+            """
             try:
                 rev = int(self.ctx.load_state().data.get("rev", 0))
             except Exception:
+                return None
+            beats = []
+            for tool in TOOLS:
+                try:
+                    beats.append(session.session_mtime_ns(self.ctx.data_dir, tool))
+                except Exception:
+                    beats.append(0)
+            return (rev, tuple(beats))
+
+        def pollState_(self, _timer):
+            """While open, notice state.json / session writes from supervised cx/cl sessions.
+
+            Deliberately network-free: the "status" action only re-reads local state, so the
+            engine's per-seat usage cache still governs every endpoint call."""
+            sig = self._stateSignature()
+            if sig is None or sig == self._last_state_sig:
                 return
-            if rev == self._last_state_rev:
-                return
+            self._last_state_sig = sig
             result = dict(bridge.handle(self.ctx, {"action": "status"}))
             result["background"] = True
             self.applyResult_(result)
@@ -362,9 +385,10 @@ if objc is not None:
         # --- helpers ------------------------------------------------------------------------
         @objc.python_method
         def _pushResult(self, result):
-            state = result.get("state")
-            if state is not None:
-                self._last_state_rev = max(self._last_state_rev, int(state.get("rev", 0)))
+            # Deliberately does NOT stamp _last_state_sig: this runs for pushes from other paths
+            # (the usage poll, a user action) whose state may already be older than what is on disk.
+            # Stamping here could swallow a change; the state timer records its OWN signature before
+            # it pushes, so the worst case is one redundant, network-free re-render.
             if self.webview:
                 self.webview.evaluateJavaScript_completionHandler_(
                     f"window.AGL.result({json.dumps(result)});", None)

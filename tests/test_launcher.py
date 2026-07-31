@@ -212,6 +212,40 @@ def test_handle_limit_resumes_when_usage_endpoint_throttled(ctx):
     assert state.get_seat("codex", "a@x.com").get("limited_until") is None
 
 
+def test_handle_limit_resumes_on_unauthorized_401(ctx):
+    """A 401 is routine and inconclusive — a cached access token expired, and a refresh fixes it
+    when the seat becomes active. It must never rest the seat or cost the running session: resume."""
+    state = _two_codex(ctx)  # active a
+    get = fake_get({P.CODEX_USAGE_URL: (401, "")})
+    dec = handle_limit(ctx, state, "codex", get=get)
+    assert dec.action == "resume" and dec.email == "a@x.com"
+    assert state.get_seat("codex", "a@x.com").get("limited_until") is None
+    assert state.active("codex") == "a@x.com"
+
+
+def test_handle_limit_hops_off_forbidden_403_without_resting_it(ctx):
+    """403 is the one auth error that IS evidence: the endpoint answered "not entitled" — the
+    subscription was cancelled or terminated. Resting it would advertise a reset that never comes,
+    so the seat is LEFT (not rested) for an entitled one, exactly like a dead token."""
+    state = _two_codex(ctx)  # active a, healthy b
+    get = fake_get({P.CODEX_USAGE_URL: (403, "")})
+    dec = handle_limit(ctx, state, "codex", get=get)
+    assert dec.action == "switch" and dec.email == "b@x.com"
+    assert state.get_seat("codex", "a@x.com").get("limited_until") is None  # never a phantom reset
+
+
+def test_handle_limit_forbidden_with_no_other_seat_gives_up_without_resting(ctx):
+    """A revoked-entitlement seat with nowhere to hop must still not be rested — and per the
+    supervisor's rule the caller keeps the session running rather than killing it."""
+    state = _two_codex(ctx)
+    state.remove_seat("codex", "b@x.com")
+    state.save()
+    get = fake_get({P.CODEX_USAGE_URL: (403, "")})
+    dec = handle_limit(ctx, state, "codex", get=get)
+    assert dec.action == "give_up"
+    assert state.get_seat("codex", "a@x.com").get("limited_until") is None
+
+
 def test_handle_limit_switches_off_stale_active_pointer(ctx):
     """If the active pointer is stale (its account was removed mid-run), an inconclusive probe must
     NOT resume the phantom seat — it falls through to choose() a real, available seat."""
@@ -898,10 +932,14 @@ def test_run_wait_polls_and_wakes_early_respecting_backoff(ctx):
     rc = run(ctx, "claude", [], spawn=spawn, get=get, notify=lambda m: None, sleep=sleeps.append)
 
     assert rc == 0
-    # chunked sleeps, never the full 30 min: poll at +300s is inside the 480s error backoff
-    # (0 fetches — no hammering), poll at +600s fetches, sees health, wakes 20 min early
-    assert sleeps == [L.POLL_INTERVAL_S, L.POLL_INTERVAL_S]
-    assert calls["n"] == 4                                # 2 entry + 2 at the second poll
+    # One chunked sleep, never the full 30 min. The ACTIVE seat's error backoff is capped at
+    # usage.ACTIVE_MAX_BACKOFF_SECONDS (300s) rather than the raw 480s the streak would give — the
+    # seat we're waiting to run ON must re-validate promptly — so the +300s poll fetches it, sees
+    # health and wakes 25 min early. Its resting sibling stays behind the full 480s (not fetched
+    # here), which is what keeps a flapping endpoint from being hammered.
+    assert sleeps == [L.POLL_INTERVAL_S]
+    assert calls["n"] == 3                                # 2 entry + 1 active-seat re-check
+    assert ctx.load_state().active("claude") == "c1@x.com"
     assert ctx.load_state().get_seat("claude", "c1@x.com")["limited_until"] is None
 
 

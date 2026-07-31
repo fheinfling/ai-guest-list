@@ -86,6 +86,25 @@ def test_unauthorized_seat_is_still_selectable(tmp_path):
     assert sel.email == "b@x" and sel.available is True
 
 
+def test_forbidden_seat_is_not_selectable(tmp_path):
+    # 403 is the ONE auth error that is real evidence: the endpoint answered "this account is not
+    # entitled" (cancelled/terminated subscription). Unlike a 401 a refresh would fix, switching
+    # onto it can only fail — the field bug was auto-switch hopping onto a dead subscription.
+    s = _state_with(tmp_path, [("a@x", None), ("b@x", None)])
+    s.get_seat("codex", "b@x")["usage"] = {"error": "forbidden"}
+    s.set_active("codex", "a@x")
+    sel = choose(s, "codex", exclude={"a@x"})
+    assert sel.email is None and sel.available is False
+
+
+def test_forbidden_seat_is_skipped_but_healthy_sibling_wins(tmp_path):
+    s = _state_with(tmp_path, [("a@x", None), ("b@x", None), ("c@x", None)])
+    s.get_seat("codex", "b@x")["usage"] = {"error": "forbidden"}
+    s.set_active("codex", "a@x")
+    sel = choose(s, "codex", exclude={"a@x"})
+    assert sel.email == "c@x" and sel.available is True
+
+
 def test_naive_reset_timestamp_does_not_crash(tmp_path):
     at = now()
     naive = (at + timedelta(hours=1)).replace(tzinfo=None).isoformat()  # no tz suffix

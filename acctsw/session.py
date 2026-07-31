@@ -85,6 +85,16 @@ def clear_session(data_dir: Path, tool: str) -> None:
         pass
 
 
+def session_mtime_ns(data_dir: Path, tool: str) -> int:
+    """The heartbeat file's mtime, or 0 when there is none. A cheap change-signal for the menubar:
+    a session starting or ending writes/removes this file WITHOUT touching state.json's ``rev``
+    (a launch on the already-active seat saves no state), so ``rev`` alone cannot see it."""
+    try:
+        return _session_file(data_dir, tool).stat().st_mtime_ns
+    except OSError:
+        return 0
+
+
 def active_session(data_dir: Path, tool: str) -> dict | None:
     """Return the live session's public fields, rejecting dead or recycled recorded PIDs."""
     try:
