@@ -23,6 +23,8 @@ def test_upsert_and_active(tmp_path):
     assert seat["limited_until"] is None
     s.set_active("codex", "a@x.com")
     assert s.active("codex") == "a@x.com"
+    s.set_last_on_floor("codex", "a@x.com", "2026-07-31T10:00:00+00:00")
+    assert seat["last_on_floor"] == "2026-07-31T10:00:00+00:00"
 
 
 def test_remove_seat_clears_active(tmp_path):

@@ -40,6 +40,9 @@ window.AGL = {
   },
   // legacy single-arg state push (kept for the poll path / older callers)
   update(next) { this.result({ state: typeof next === "string" ? JSON.parse(next) : next }); },
+  // Native popover lifecycle: tick cached countdowns only while this surface is actually visible.
+  // This never asks the bridge for data and never touches lastRev.
+  setVisible(visible) { setPopoverVisible(Boolean(visible)); },
   celebrate,
 };
 
@@ -59,6 +62,19 @@ let renderedScreen = null;  // what the last render() actually drew — gates sc
 // transient add-a-seat flow state; non-null only while screen === "add". Held here (not in `state`,
 // which the poll overwrites) so typed name/token survive a background re-render.
 let add = null;
+let clockTimer = null;
+
+function setPopoverVisible(visible) {
+  if (visible && clockTimer === null) {
+    clockTimer = setInterval(() => {
+      // Only the main screen has live countdowns. Never swap the add form under a focused input.
+      if (screen === "main") render();
+    }, 1000);
+  } else if (!visible && clockTimer !== null) {
+    clearInterval(clockTimer);
+    clockTimer = null;
+  }
+}
 
 function render() {
   // A background state push (the usage poll) re-renders whatever screen is up; carry the current
@@ -66,6 +82,10 @@ function render() {
   // Only when the screen is unchanged — navigating must start the new screen at the top.
   const prevBody = root.querySelector(".main-body, .set-body");
   const scrollTop = screen === renderedScreen && prevBody ? prevBody.scrollTop : 0;
+  // The one-second countdown paint must not collapse a seat the user is reading.
+  const expandedCards = screen === renderedScreen
+    ? [...root.querySelectorAll(".seat.expanded")].map((card) => [card.dataset.tool, card.dataset.email])
+    : [];
   root.innerHTML = screen === "settings" ? buildSettings(state)
     : screen === "add" ? buildAddSeat(state, add)
     : buildHTML(state);
@@ -73,6 +93,13 @@ function render() {
   if (scrollTop) {
     const nextBody = root.querySelector(".main-body, .set-body");
     if (nextBody) nextBody.scrollTop = scrollTop;
+  }
+  if (screen === "main" && expandedCards.length) {
+    for (const card of root.querySelectorAll(".seat")) {
+      if (expandedCards.some(([tool, email]) => tool === card.dataset.tool && email === card.dataset.email)) {
+        card.classList.add("expanded");
+      }
+    }
   }
   // mirror the theme onto <body> so overlays (siblings of #root) get the same CSS vars
   const theme = (state.settings && state.settings.theme === "dark") ? "dark" : "light";
@@ -178,6 +205,12 @@ document.addEventListener("keydown", (e) => {
   else if (screen === "add") addBack();
 });
 
+// WKWebView normally reflects popover visibility here; the native shell also calls setVisible()
+// explicitly so transient closes always clear the interval even on macOS versions that do not.
+document.addEventListener("visibilitychange", () => setPopoverVisible(!document.hidden));
+window.addEventListener("pagehide", () => setPopoverVisible(false));
+
 // initial paint + ask the native side for fresh state
 render();
 send("ready");
+if (!document.hidden && document.hasFocus()) setPopoverVisible(true);

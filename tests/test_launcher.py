@@ -4,6 +4,7 @@ No real PTY, no network: `spawn` is injected and `get` returns canned usage.
 """
 import json
 import os
+import threading
 
 import pytest
 
@@ -151,12 +152,14 @@ class FakeSpawn:
     def __init__(self, scripts):
         self.scripts = scripts
         self.calls = []
+        self.stops = 0
 
     def __call__(self, argv, on_output):
         out, status = self.scripts[len(self.calls)]
         self.calls.append(list(argv))
         for chunk in (out if isinstance(out, list) else [out]):
             if on_output(chunk):
+                self.stops += 1
                 break
         return status
 
@@ -206,6 +209,40 @@ def test_handle_limit_resumes_when_usage_endpoint_throttled(ctx):
     get = fake_get({P.CODEX_USAGE_URL: (429, "")})
     dec = handle_limit(ctx, state, "codex", get=get)
     assert dec.action == "resume" and dec.email == "a@x.com"
+    assert state.get_seat("codex", "a@x.com").get("limited_until") is None
+
+
+def test_handle_limit_resumes_on_unauthorized_401(ctx):
+    """A 401 is routine and inconclusive — a cached access token expired, and a refresh fixes it
+    when the seat becomes active. It must never rest the seat or cost the running session: resume."""
+    state = _two_codex(ctx)  # active a
+    get = fake_get({P.CODEX_USAGE_URL: (401, "")})
+    dec = handle_limit(ctx, state, "codex", get=get)
+    assert dec.action == "resume" and dec.email == "a@x.com"
+    assert state.get_seat("codex", "a@x.com").get("limited_until") is None
+    assert state.active("codex") == "a@x.com"
+
+
+def test_handle_limit_hops_off_forbidden_403_without_resting_it(ctx):
+    """403 is the one auth error that IS evidence: the endpoint answered "not entitled" — the
+    subscription was cancelled or terminated. Resting it would advertise a reset that never comes,
+    so the seat is LEFT (not rested) for an entitled one, exactly like a dead token."""
+    state = _two_codex(ctx)  # active a, healthy b
+    get = fake_get({P.CODEX_USAGE_URL: (403, "")})
+    dec = handle_limit(ctx, state, "codex", get=get)
+    assert dec.action == "switch" and dec.email == "b@x.com"
+    assert state.get_seat("codex", "a@x.com").get("limited_until") is None  # never a phantom reset
+
+
+def test_handle_limit_forbidden_with_no_other_seat_gives_up_without_resting(ctx):
+    """A revoked-entitlement seat with nowhere to hop must still not be rested — and per the
+    supervisor's rule the caller keeps the session running rather than killing it."""
+    state = _two_codex(ctx)
+    state.remove_seat("codex", "b@x.com")
+    state.save()
+    get = fake_get({P.CODEX_USAGE_URL: (403, "")})
+    dec = handle_limit(ctx, state, "codex", get=get)
+    assert dec.action == "give_up"
     assert state.get_seat("codex", "a@x.com").get("limited_until") is None
 
 
@@ -380,6 +417,48 @@ def test_run_clean_exit_no_switch(ctx):
     assert ctx.load_state().active("codex") == "a@x.com"
 
 
+def test_run_claude_no_switch_skips_identity_cli(ctx, monkeypatch):
+    """An already-chosen Claude seat must launch without paying for `claude auth status`."""
+    ctx.cred["claude"].set_live(make_claude_blob())
+    acct.add(ctx, ctx.load_state(), "claude", email="solo@x.com")
+
+    def unexpected_identity(_ctx):
+        raise AssertionError("no-switch Claude launch resolved live identity")
+
+    monkeypatch.setattr(L.identity_mod, "claude_live_identity", unexpected_identity)
+    spawn = FakeSpawn([(b"all good, done\n", 0)])
+
+    assert run(ctx, "claude", [], spawn=spawn, get=fake_get({})) == 0
+    assert len(spawn.calls) == 1
+
+
+def test_run_claude_hop_resolves_identity_before_spawn(ctx, monkeypatch):
+    """A real Claude seat hop still resolves the outgoing blob's identity before switching."""
+    state = _two_claude(ctx)  # active c1
+    state.set_limited_until(
+        "claude", "c1@x.com", iso(now() + timedelta(hours=1)), source="usage"
+    )
+    state.save()
+    events = []
+
+    def resolve_identity(_ctx):
+        events.append("identity")
+        return L.identity_mod.ClaudeLiveIdentity(
+            blob=ctx.cred["claude"].get_live(), email="c1@x.com"
+        )
+
+    def spawn(argv, on_output):
+        events.append("spawn")
+        on_output(b"all good, done\n")
+        return 0
+
+    monkeypatch.setattr(L.identity_mod, "claude_live_identity", resolve_identity)
+
+    assert run(ctx, "claude", [], spawn=spawn, get=fake_get({})) == 0
+    assert events == ["identity", "spawn"]
+    assert ctx.load_state().active("claude") == "c2@x.com"
+
+
 def test_run_switches_and_resumes_on_limit(ctx):
     _two_codex(ctx)  # active a
     reset = iso(now() + timedelta(hours=3))
@@ -394,8 +473,131 @@ def test_run_switches_and_resumes_on_limit(ctx):
     # first launch was the normal build_cmd, second was the resume command
     assert spawn.calls[0][-1] == "--foo"
     assert spawn.calls[1][-2:] == ["resume", "--last"]
+    assert spawn.stops == 1                                  # only the approved hop stopped a child
     assert ctx.load_state().active("codex") == "b@x.com"
     assert any("hopping to b@x.com" in m for m in msgs)
+
+
+def test_run_hops_off_forbidden_seat_without_resting_it(ctx):
+    """A live limit banner plus a 403 is positive proof that the subscription is gone. The
+    supervisor must treat that verdict like dead credentials, stop only after preflighting the
+    healthy sibling, and carry the work there without inventing a reset for the revoked seat."""
+    _two_codex(ctx)  # active a, healthy b
+    get = fake_get({P.CODEX_USAGE_URL: (403, "")})
+    spawn = FakeSpawn([
+        (b"usage limit reached\n", 1),
+        (b"resumed on entitled seat\n", 0),
+    ])
+
+    rc = run(ctx, "codex", ["--foo"], spawn=spawn, get=get, notify=lambda m: None)
+
+    assert rc == 0
+    assert len(spawn.calls) == 2 and spawn.stops == 1
+    assert spawn.calls[1][-2:] == ["resume", "--last"]
+    state = ctx.load_state()
+    assert state.active("codex") == "b@x.com"
+    assert state.get_seat("codex", "a@x.com").get("limited_until") is None
+
+
+def test_run_forbidden_only_seat_keeps_child_running_without_rest(ctx):
+    """A revoked subscription with no entitled landing seat is still positive evidence to leave,
+    but never permission to stop with nowhere to go. The one child owns its exit and no phantom
+    cooldown is persisted."""
+    ctx.cred["codex"].set_live(make_codex_blob("solo@x.com"))
+    acct.add(ctx, ctx.load_state(), "codex", email="solo@x.com")
+    get = fake_get({P.CODEX_USAGE_URL: (403, "")})
+    spawn = FakeSpawn([(b"usage limit reached\n", 17)])
+
+    rc = run(ctx, "codex", ["--foo"], spawn=spawn, get=get, notify=lambda m: None)
+
+    assert rc == 17 and rc != L.EXIT_GAVE_UP
+    assert len(spawn.calls) == 1 and spawn.stops == 0
+    seat = ctx.load_state().get_seat("codex", "solo@x.com")
+    assert seat.get("limited_until") is None
+
+
+def test_run_single_seat_confirmed_limit_does_not_stop_child(ctx):
+    """Positive confirmation is necessary but not sufficient: without another available seat the
+    callback leaves the only child alive and surfaces that child's own exit status."""
+    ctx.cred["codex"].set_live(make_codex_blob("solo@x.com"))
+    acct.add(ctx, ctx.load_state(), "codex", email="solo@x.com")
+    reset = iso(now() + timedelta(hours=3))
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=100.0,
+                                                            p_reset=reset))})
+    msgs = []
+    spawn = FakeSpawn([(b"usage limit reached\n", 12)])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=msgs.append)
+
+    assert rc == 12 and rc != L.EXIT_GAVE_UP
+    assert len(spawn.calls) == 1 and spawn.stops == 0
+    assert ctx.load_state().active("codex") == "solo@x.com"
+    assert any("staying on this seat" in m for m in msgs)
+
+
+def test_confirmed_limit_starts_one_advisory_seat_watcher(ctx, monkeypatch):
+    """When no hop is possible, one daemon watcher polls live capacity and notifies once. It does
+    not stop the child or switch seats; the child remains in charge of its own exit."""
+    state = _two_codex(ctx)  # active a
+    state.set_limited_until("codex", "b@x.com", iso(now() + timedelta(hours=2)),
+                            source="usage")
+    state.save()
+    reset = iso(now() + timedelta(hours=3))
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=100.0,
+                                                            p_reset=reset))})
+    watcher_calls = []
+    ready = threading.Event()
+    msgs = []
+
+    def verify(*args, **kwargs):
+        watcher_calls.append((args, kwargs))
+        return L.Selection("b@x.com", True, None, False)
+
+    def notify(msg):
+        msgs.append(msg)
+        if "available for codex now" in msg:
+            ready.set()
+
+    monkeypatch.setattr(L, "_verify_capacity", verify)
+    sleeps = []
+    calls = []
+
+    def spawn(argv, on_output):
+        calls.append(list(argv))
+        assert on_output(b"usage limit reached\n") is False
+        assert ready.wait(2), "seat watcher did not notify"
+        return 13
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=notify, sleep=sleeps.append)
+
+    assert rc == 13 and len(calls) == 1
+    assert sleeps == [L.POLL_INTERVAL_S]
+    assert len(watcher_calls) == 1
+    assert watcher_calls[0][1]["force"] is False
+    assert sum("available for codex now" in m for m in msgs) == 1
+    assert ctx.load_state().active("codex") == "a@x.com"
+
+
+def test_run_marks_each_launch_and_hop_then_clears_session(ctx, monkeypatch):
+    _two_codex(ctx)  # active a
+    reset = iso(now() + timedelta(hours=3))
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=100.0,
+                                                            p_reset=reset))})
+    marks = []
+    clears = []
+    monkeypatch.setattr(L, "mark_session",
+                        lambda data_dir, tool, email: marks.append((data_dir, tool, email)))
+    monkeypatch.setattr(L, "clear_session",
+                        lambda data_dir, tool: clears.append((data_dir, tool)))
+    spawn = FakeSpawn([
+        (b"usage limit reached\n", 1),
+        (b"resumed\n", 0),
+    ])
+
+    assert run(ctx, "codex", [], spawn=spawn, get=get, notify=lambda m: None) == 0
+
+    assert [email for _, _, email in marks] == ["a@x.com", "b@x.com", "b@x.com"]
+    assert clears == [(ctx.data_dir, "codex")]
 
 
 def test_run_switches_on_codex_workspace_out_of_credits_without_usage_confirmation(ctx):
@@ -420,6 +622,27 @@ def test_run_switches_on_codex_workspace_out_of_credits_without_usage_confirmati
     # ``hard`` source: healthy-looking usage windows must never clear a billing-banner rest early
     assert seat["limited_until"] is not None and seat["limit_source"] == "hard"
     assert any("primary+codex@example.test" in m for m in msgs)
+
+
+def test_run_hard_billing_banner_without_free_seat_does_not_stop_child(ctx):
+    """A hard billing banner supplies confirmation, not a landing seat. It still stamps a durable
+    hard rest, but the one live child is untouched when no alternative exists."""
+    ctx.cred["codex"].set_live(make_codex_blob("solo@x.com"))
+    state = ctx.load_state()
+    acct.add(ctx, state, "codex", email="solo@x.com")
+    spawn = FakeSpawn([
+        (b"\xe2\x96\xa0 Your workspace is out of credits. Add credits to continue.\n", 11),
+    ])
+
+    def no_usage_fetch(*_a, **_k):
+        raise AssertionError("hard banner must not probe usage")
+
+    rc = run(ctx, "codex", ["--foo"], spawn=spawn, get=no_usage_fetch, notify=lambda m: None)
+
+    assert rc == 11 and rc != L.EXIT_GAVE_UP
+    assert len(spawn.calls) == 1 and spawn.stops == 0
+    seat = ctx.load_state().get_seat("codex", "solo@x.com")
+    assert seat["limited_until"] is not None and seat["limit_source"] == "hard"
 
 
 def test_hard_banner_overrides_existing_soft_flag(ctx):
@@ -453,22 +676,53 @@ def test_hard_codex_workspace_credit_banner_bypasses_disabled_generic_scan(ctx, 
     assert ctx.load_state().active("codex") == "b@x.com"
 
 
-def test_run_unverifiable_limit_never_gives_up(ctx):
+@pytest.mark.parametrize("transport_status", [0, 429])
+def test_run_unverifiable_limit_never_gives_up(ctx, monkeypatch, transport_status):
     """End-to-end guard against the false 'all seats resting' kill: every usage probe fails to
-    connect (e.g. the Headroom proxy in front of the endpoint is flapping), so a limit line can
-    never be corroborated. The supervisor must keep the session alive on the same seat and return
-    the child's own exit code — never EXIT_GAVE_UP, never a 5h rest."""
+    connect or is throttled, so a limit line can never be corroborated. The supervisor must leave
+    that SAME child running with the user's original argv and return its own exit code — never
+    EXIT_GAVE_UP, never a same-seat resume, never a 5h rest."""
     _two_codex(ctx)  # active a
-    get = fake_get({P.CODEX_USAGE_URL: (0, "")})   # endpoint unreachable on every probe
-    spawn = FakeSpawn([
-        (b"... you've hit your usage limit ...\n", 1),  # kill-path: probe can't confirm → resume
-        (b"resumed, all good\n", 0),                    # same seat, carried on to a clean finish
-    ])
-    rc = run(ctx, "codex", ["--foo"], spawn=spawn, get=get, notify=lambda m: None)
-    assert rc == 0 and rc != L.EXIT_GAVE_UP
-    assert spawn.calls[1][-2:] == ["resume", "--last"]       # resumed the SAME seat's work
+    monkeypatch.setattr(L, "PROBE_COOLDOWN_S", 0.0)
+    get = fake_get({P.CODEX_USAGE_URL: (transport_status, "")})
+    msgs = []
+    spawn = FakeSpawn([(b"... you've hit your usage limit ...\n", 7)])
+    rc = run(ctx, "codex", ["--foo"], spawn=spawn, get=get, notify=msgs.append)
+    assert rc == 7 and rc != L.EXIT_GAVE_UP                   # child's own exit, not supervisor give-up
+    assert spawn.calls == [build_cmd(ctx, "codex", ["--foo"])]  # false alarm never flips `resuming`
+    assert spawn.stops == 0                                  # callback left the live child alone
     assert ctx.load_state().active("codex") == "a@x.com"     # never switched away
     assert ctx.load_state().get_seat("codex", "a@x.com").get("limited_until") is None  # never rested
+    assert sum("couldn't verify" in m for m in msgs) == 1
+
+
+def test_run_unknown_probes_never_disable_later_limit_detection(ctx, monkeypatch):
+    """Endpoint noise is not proof that stdout is untrustworthy. More than the false-alarm bound
+    worth of inconclusive probes must leave scanning alive so a later confirmed limit still hops."""
+    _two_codex(ctx)  # active a, healthy b
+    monkeypatch.setattr(L, "PROBE_COOLDOWN_S", 0.0)
+    unknowns = L.MAX_FALSE_ALARMS + 2
+    probes = {"n": 0}
+    reset = iso(now() + timedelta(hours=3))
+
+    def get(url, headers, timeout):
+        probes["n"] += 1
+        if probes["n"] <= unknowns:
+            return 0, ""
+        return 200, codex_ok_body(primary=100.0, p_reset=reset)
+
+    chunks = [b"... you've hit your usage limit ...\n"] * (unknowns + 1)
+    spawn = FakeSpawn([
+        (chunks, 1),
+        (b"resumed after the endpoint recovered\n", 0),
+    ])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=lambda m: None)
+
+    assert rc == 0
+    assert probes["n"] == unknowns + 1
+    assert len(spawn.calls) == 2 and spawn.stops == 1
+    assert ctx.load_state().active("codex") == "b@x.com"
 
 
 @pytest.mark.parametrize("text", [
@@ -541,26 +795,50 @@ def test_run_auth_prose_dismissed_when_token_provably_works(ctx):
     assert ctx.load_state().active("codex") == "a@x.com"  # no hop
 
 
-def test_run_gives_up_with_relogin_hint_when_only_seat_revoked(ctx):
+def test_run_leaves_child_alive_with_relogin_hint_when_only_seat_revoked(ctx):
     ctx.cred["codex"].set_live(make_codex_blob("solo@x.com"))
     acct.add(ctx, ctx.load_state(), "codex", email="solo@x.com")
     msgs = []
-    spawn = FakeSpawn([(b"refresh token was revoked\n", 1)])
+    spawn = FakeSpawn([(b"refresh token was revoked\n", 9)])
     rc = run(ctx, "codex", [], spawn=spawn, get=fake_get({}), notify=msgs.append)
-    assert rc == L.EXIT_GAVE_UP
+    assert rc == 9 and rc != L.EXIT_GAVE_UP
+    assert len(spawn.calls) == 1 and spawn.stops == 0
     assert any("sign in again" in m for m in msgs)
 
 
-def test_run_respects_max_switches(ctx, monkeypatch):
+def test_run_auth_and_revoked_stay_notifications_are_independent(ctx, monkeypatch):
+    """Auth death and lost entitlement are different remedies, so one must not suppress the other."""
+    ctx.cred["codex"].set_live(make_codex_blob("solo@x.com"))
+    acct.add(ctx, ctx.load_state(), "codex", email="solo@x.com")
+    monkeypatch.setattr(L, "PROBE_COOLDOWN_S", 0.0)
+    replies = iter([(0, ""), (403, "")])
+
+    def get(url, headers, timeout):
+        return next(replies)
+
+    msgs = []
+    spawn = FakeSpawn([([
+        b"your refresh token was revoked\n",
+        b"usage limit reached\n",
+    ], 9)])
+
+    assert run(ctx, "codex", [], spawn=spawn, get=get, notify=msgs.append) == 9
+    assert any("sign in again" in msg for msg in msgs)
+    assert any("no longer entitled" in msg for msg in msgs)
+
+
+def test_run_budget_spent_does_not_stop_confirmed_limit(ctx, monkeypatch):
     _two_codex(ctx)
     reset = iso(now() + timedelta(hours=3))
     get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=100.0, p_reset=reset))})  # genuinely maxed
     monkeypatch.setenv(L.WAIT_ON_ALL_RESTING_ENV, "0")
-    # every launch hits a real limit; with max_switches=1 we get: launch, switch, launch(limit)->stop
-    spawn = FakeSpawn([(b"usage limit reached\n", 1)] * 5)
-    rc = run(ctx, "codex", [], spawn=spawn, get=get, max_switches=1, notify=lambda m: None)
-    assert len(spawn.calls) == 2  # initial + one resume, then bail
-    assert rc == L.EXIT_GAVE_UP
+    # A different seat is ready, but switches==max_switches at launch. The budget is part of the
+    # pre-flight, so the child keeps its terminal and its own exit code is surfaced.
+    spawn = FakeSpawn([(b"usage limit reached\n", 8)])
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, max_switches=0, notify=lambda m: None)
+    assert len(spawn.calls) == 1 and spawn.stops == 0
+    assert rc == 8 and rc != L.EXIT_GAVE_UP
+    assert ctx.load_state().active("codex") == "a@x.com"
 
 
 def test_run_propagates_nonzero_clean_exit(ctx):
@@ -593,6 +871,26 @@ def test_handle_exhausted_gives_up_when_endpoint_unreachable(ctx):
     state = _two_codex(ctx)  # active a
     dec = L.handle_exhausted(ctx, state, "codex", get=fake_get({P.CODEX_USAGE_URL: (0, "")}))
     assert dec.action == "give_up"
+
+
+def test_handle_exhausted_hops_off_forbidden_without_resting(ctx):
+    state = _two_codex(ctx)  # active a, healthy b
+    dec = L.handle_exhausted(
+        ctx, state, "codex", get=fake_get({P.CODEX_USAGE_URL: (403, "")})
+    )
+    assert dec.action == "switch" and dec.email == "b@x.com"
+    assert state.get_seat("codex", "a@x.com").get("limited_until") is None
+
+
+def test_handle_exhausted_forbidden_only_seat_gives_up_without_resting(ctx):
+    state = _two_codex(ctx)
+    state.remove_seat("codex", "b@x.com")
+    state.save()
+    dec = L.handle_exhausted(
+        ctx, state, "codex", get=fake_get({P.CODEX_USAGE_URL: (403, "")})
+    )
+    assert dec.action == "give_up"
+    assert state.get_seat("codex", "a@x.com").get("limited_until") is None
 
 
 def test_run_switches_on_silent_limit_exit(ctx):
@@ -675,7 +973,9 @@ def test_run_claude_resume_uses_continue(ctx):
         acct.add(ctx, st, "claude", email=em)
     from acctsw.switch import switch
     switch(ctx, ctx.load_state(), "claude", "c1@x.com")
-    get = fake_get({P.CLAUDE_USAGE_URL: (429, "")})
+    reset = iso(now() + timedelta(hours=3))
+    get = fake_get({P.CLAUDE_USAGE_URL: (200, claude_ok_body(five=100.0,
+                                                             five_reset=reset))})
     spawn = FakeSpawn([(b"usage limit reached\n", 1), (b"resumed\n", 0)])
     rc = run(ctx, "claude", [], spawn=spawn, get=get, notify=lambda m: None)
     assert rc == 0
@@ -704,28 +1004,21 @@ def test_run_claude_waits_and_resumes_when_all_seats_resting(ctx):
     assert ctx.load_state().get_seat("claude", "c1@x.com").get("limited_until") is None
 
 
-def test_run_claude_wait_activates_soonest_unlocked_seat(ctx):
+def test_run_confirmed_limit_with_all_other_seats_resting_keeps_child(ctx):
     state = _two_claude(ctx)  # active c1
     c1_reset = iso(now() + timedelta(seconds=60))
     c2_reset = iso(now() + timedelta(seconds=30))
     state.set_limited_until("claude", "c2@x.com", c2_reset, source="usage")
     state.save()
-    # First fetch (the mid-session probe on c1) confirms it maxed until c1_reset; every later fetch
-    # (the wait loop's verify sweeps) errors, so each seat KEEPS its own distinct rest timestamp.
-    calls = {"n": 0}
-    def get(url, headers, timeout):
-        calls["n"] += 1
-        return (200, claude_ok_body(five=100.0, five_reset=c1_reset)) if calls["n"] == 1 else (429, "")
-    sleeps = []
-    spawn = FakeSpawn([(b"usage limit reached\n", 1), (b"resumed\n", 0)])
+    get = fake_get({P.CLAUDE_USAGE_URL:
+                    (200, claude_ok_body(five=100.0, five_reset=c1_reset))})
+    spawn = FakeSpawn([(b"usage limit reached\n", 6)])
 
-    rc = run(ctx, "claude", [], spawn=spawn, get=get, notify=lambda m: None,
-             sleep=sleeps.append)
+    rc = run(ctx, "claude", [], spawn=spawn, get=get, notify=lambda m: None)
 
-    assert rc == 0
-    assert len(sleeps) == 1
-    assert spawn.calls[1][-1] == "--continue"
-    assert ctx.load_state().active("claude") == "c2@x.com"
+    assert rc == 6 and rc != L.EXIT_GAVE_UP
+    assert len(spawn.calls) == 1 and spawn.stops == 0
+    assert ctx.load_state().active("claude") == "c1@x.com"
 
 
 def test_run_claude_all_resting_opt_out_exits_without_spawn(ctx, monkeypatch):
@@ -789,10 +1082,14 @@ def test_run_wait_polls_and_wakes_early_respecting_backoff(ctx):
     rc = run(ctx, "claude", [], spawn=spawn, get=get, notify=lambda m: None, sleep=sleeps.append)
 
     assert rc == 0
-    # chunked sleeps, never the full 30 min: poll at +300s is inside the 480s error backoff
-    # (0 fetches — no hammering), poll at +600s fetches, sees health, wakes 20 min early
-    assert sleeps == [L.POLL_INTERVAL_S, L.POLL_INTERVAL_S]
-    assert calls["n"] == 4                                # 2 entry + 2 at the second poll
+    # One chunked sleep, never the full 30 min. The ACTIVE seat's error backoff is capped at
+    # usage.ACTIVE_MAX_BACKOFF_SECONDS (300s) rather than the raw 480s the streak would give — the
+    # seat we're waiting to run ON must re-validate promptly — so the +300s poll fetches it, sees
+    # health and wakes 25 min early. Its resting sibling stays behind the full 480s (not fetched
+    # here), which is what keeps a flapping endpoint from being hammered.
+    assert sleeps == [L.POLL_INTERVAL_S]
+    assert calls["n"] == 3                                # 2 entry + 1 active-seat re-check
+    assert ctx.load_state().active("claude") == "c1@x.com"
     assert ctx.load_state().get_seat("claude", "c1@x.com")["limited_until"] is None
 
 
@@ -945,6 +1242,26 @@ def test_pty_spawn_stop_path_terminates_without_error():
     assert rc != 0
 
 
+def test_terminate_gives_sigterm_five_seconds_before_sigkill(monkeypatch):
+    """The legitimate hop path gives a TUI 100×50ms to flush its resume file before SIGKILL."""
+    signals = []
+    waits = {"n": 0}
+    sleeps = []
+    monkeypatch.setattr(L.os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(L.os, "killpg", lambda pgid, sig: signals.append(sig))
+
+    def waitpid(pid, options):
+        waits["n"] += 1
+        return (0, 0) if waits["n"] <= 100 else (pid, 0)
+
+    monkeypatch.setattr(L.os, "waitpid", waitpid)
+    monkeypatch.setattr(L.time, "sleep", sleeps.append)
+
+    assert L._terminate(4242) == 0
+    assert signals == [L.signal.SIGTERM, L.signal.SIGKILL]
+    assert sleeps == [0.05] * 100
+
+
 def test_pty_spawn_nonzero_exit_propagates():
     rc = L.pty_spawn(["/bin/sh", "-c", "exit 7"], lambda c: False)
     assert rc == 7
@@ -979,3 +1296,58 @@ def test_reset_terminal_noop_on_non_tty():
     finally:
         os.close(r)
         os.close(w)
+
+
+def test_run_claude_exit_syncs_back_rotated_creds(ctx, monkeypatch):
+    """Claude rotates refresh tokens mid-session and the LIVE copy is the freshest one. If exit
+    doesn't sync it into the seat's snapshot, an out-of-band login that replaces the live item next
+    loses those bytes outright — the snapshot keeps a superseded token and the seat quietly stops
+    working (switch.sync_back's module docstring is explicit about this)."""
+    ctx.cred["claude"].set_live(make_claude_blob())
+    acct.add(ctx, ctx.load_state(), "claude", email="solo@x.com")
+    rotated = make_claude_blob("max").replace('"accessToken": "x"', '"accessToken": "rotated"')
+
+    def rotate_mid_session(_argv, on_output):
+        ctx.cred["claude"].set_live(rotated)   # the child refreshed its token while running
+        on_output(b"done\n")
+        return 0
+
+    monkeypatch.setattr(
+        L.identity_mod, "claude_live_identity",
+        lambda _c: L.identity_mod.ClaudeLiveIdentity(blob=ctx.cred["claude"].get_live(),
+                                                     email="solo@x.com"))
+
+    assert run(ctx, "claude", [], spawn=rotate_mid_session, get=fake_get({})) == 0
+    assert ctx.snapshot_get("claude", "solo@x.com") == rotated
+
+
+def test_run_claude_exit_without_rotation_skips_identity_cli(ctx, monkeypatch):
+    """The sync-back is preserved, but its COST is not paid when there is nothing to preserve: an
+    unchanged live blob is byte-identical to the snapshot, so no `claude auth status` is spawned."""
+    ctx.cred["claude"].set_live(make_claude_blob())
+    acct.add(ctx, ctx.load_state(), "claude", email="solo@x.com")
+
+    def unexpected_identity(_ctx):
+        raise AssertionError("unrotated Claude exit resolved live identity")
+
+    monkeypatch.setattr(L.identity_mod, "claude_live_identity", unexpected_identity)
+
+    assert run(ctx, "claude", [], spawn=FakeSpawn([(b"done\n", 0)]), get=fake_get({})) == 0
+
+
+def test_run_exit_hop_off_revoked_seat_says_entitlement_not_limit(ctx):
+    """The post-exit safety net can now hop for TWO reasons. Telling a user whose subscription was
+    cancelled that they "hit their usage limit" promises a reset that will never arrive — the exit
+    path must name the real cause, exactly as the mid-session path already does."""
+    _two_codex(ctx)  # active a, healthy b
+    get = fake_get({P.CODEX_USAGE_URL: (403, "")})
+    msgs = []
+    # No banner on stdout: the child just dies, so ONLY the exit-time safety net can react.
+    spawn = FakeSpawn([(b"boom\n", 3), (b"carried on\n", 0)])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=msgs.append)
+
+    assert rc == 0
+    assert ctx.load_state().active("codex") == "b@x.com"     # it did hop
+    assert any("no longer entitled" in m for m in msgs)
+    assert not any("hit its usage limit" in m for m in msgs)

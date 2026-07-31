@@ -3,7 +3,7 @@ import json
 
 from acctsw import accounts as acct
 from acctsw import bridge
-from tests.conftest import make_codex_blob
+from tests.conftest import make_claude_blob, make_codex_blob
 
 
 def _add(ctx, email):
@@ -29,6 +29,21 @@ def test_shared_account_warning_rides_the_nested_state(ctx):
     r = bridge.handle(ctx, {"action": "usage"})
     assert "warnings" not in r                      # NOT at the top level (the bug we fixed)
     assert len(r["state"]["warnings"]) == 1 and "same account" in r["state"]["warnings"][0]
+
+
+def test_usage_reconciles_both_provider_identities_before_poll(ctx, monkeypatch):
+    """A popover usage poll must capture Claude out-of-band login identity just like Codex."""
+    seen = []
+    monkeypatch.setattr(acct, "reconcile_codex", lambda _ctx, _state: seen.append("codex"))
+    monkeypatch.setattr(
+        acct, "reconcile_claude",
+        lambda _ctx, _state, **_kwargs: seen.append("claude"),
+    )
+    monkeypatch.setattr(bridge.usage_mod, "refresh",
+                        lambda _ctx, _state, _tool=None, **_kwargs: {"codex": {}, "claude": {}})
+    result = bridge.handle(ctx, {"action": "usage"})
+    assert result["ok"] is True
+    assert seen == ["codex", "claude"]
 
 
 def test_state_carries_app_version_and_build(ctx):
@@ -186,6 +201,8 @@ def test_switch_sets_recently_switched_dot(ctx):
     r = bridge.handle(ctx, {"action": "switch", "tool": "codex", "email": "a@x.com"})
     assert r["state"]["recently_switched"] is True
     assert r["state"]["dot"] == "switched"
+    seat = next(s for s in r["state"]["tools"]["codex"]["seats"] if s["email"] == "a@x.com")
+    assert seat["last_on_floor"] is not None
 
 
 def test_paste_installs_and_registers_codex(ctx):
@@ -195,6 +212,13 @@ def test_paste_installs_and_registers_codex(ctx):
     assert "pasted@x.com" in ctx.load_state().accounts("codex")
     import json
     assert json.loads(ctx.cred["codex"].get_live())  # live creds installed
+
+
+def test_paste_rejects_claude_explicitly(ctx):
+    r = bridge.handle(
+        ctx, {"action": "paste", "tool": "claude", "blob": make_claude_blob()}
+    )
+    assert r["ok"] is False and "codex-only" in r["error"]
 
 
 def test_is_native_routing():

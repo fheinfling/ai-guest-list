@@ -115,6 +115,11 @@ class State:
     def set_active(self, tool: str, email: str | None) -> None:
         self._tool(tool)["active"] = email
 
+    def set_last_on_floor(self, tool: str, email: str, at_iso: str) -> None:
+        seat = self.get_seat(tool, email)
+        if seat is not None:
+            seat["last_on_floor"] = at_iso
+
     def get_seat(self, tool: str, email: str) -> dict[str, Any] | None:
         return self.accounts(tool).get(email)
 

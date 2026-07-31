@@ -13,17 +13,28 @@ from __future__ import annotations
 
 from .context import Context
 from .errors import MissingSnapshot, UnknownSeat
+from .identity import ClaudeLiveIdentity
 from .state import State
+from .util import iso, now
 
 
-def sync_back(ctx: Context, state: State, tool: str) -> bool:
+def sync_back(ctx: Context, state: State, tool: str, *,
+              live_identity: ClaudeLiveIdentity | None = None) -> bool:
     """Persist the live creds of the currently-active seat into its snapshot. Returns True if done.
 
-    Guard: if the live creds clearly belong to a *different* account than ``state.active`` (e.g.
-    the user ran stock ``codex login`` or switched in the GUI — an in-scope scenario), we skip the
-    sync-back instead of corrupting the active seat's snapshot with foreign creds. Detectable for
-    Codex (email is in the JWT); best-effort for Claude (no email in the blob → proceed).
+    Guard: if the live creds belong to a *different* account than ``state.active`` (e.g. the user ran
+    a stock login or switched in the GUI), capture/adopt a known identity or skip the sync-back
+    instead of corrupting the old seat's snapshot with foreign bytes. Codex identifies from its JWT;
+    Claude must reconcile through ``claude auth status --json`` because its blob has no email.
+    Lock-owning Claude callers must resolve and pass ``live_identity`` before taking the flock.
     """
+    if tool == "claude":
+        # Lazy import avoids accounts -> usage/state imports becoming a module cycle. An unknown or
+        # unreadable CLI identity is deliberately a no-op: proceeding was the permanent guard bypass
+        # that let account B's Keychain bytes overwrite active seat A.
+        from .accounts import reconcile_claude
+        if reconcile_claude(ctx, state, live_identity=live_identity) is None:
+            return False
     active = state.active(tool)
     if not active:
         return False
@@ -37,7 +48,8 @@ def sync_back(ctx: Context, state: State, tool: str) -> bool:
     return True
 
 
-def switch(ctx: Context, state: State, tool: str, email: str, *, sync: bool = True) -> None:
+def switch(ctx: Context, state: State, tool: str, email: str, *, sync: bool = True,
+           live_identity: ClaudeLiveIdentity | None = None) -> None:
     """Make ``email`` the active seat for ``tool``.
 
     ``sync=False`` skips the sync-back-from-mirror — used by the launcher for codex, where codex
@@ -48,7 +60,7 @@ def switch(ctx: Context, state: State, tool: str, email: str, *, sync: bool = Tr
 
     # 1. sync-back outgoing (no-op if switching to the same / no active seat)
     if sync:
-        sync_back(ctx, state, tool)
+        sync_back(ctx, state, tool, live_identity=live_identity)
 
     # 2. install chosen account's stored creds into the canonical location (the active mirror)
     blob = ctx.snapshot_get(tool, email)
@@ -58,4 +70,5 @@ def switch(ctx: Context, state: State, tool: str, email: str, *, sync: bool = Tr
 
     # 3. record active
     state.set_active(tool, email)
+    state.set_last_on_floor(tool, email, iso(now()))
     state.save()

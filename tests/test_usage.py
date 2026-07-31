@@ -107,10 +107,69 @@ def test_refresh_backfills_account_id(ctx):
     assert ctx.load_state().get_seat("codex", "a@x.com")["account_id"] == "ACCT7"
 
 
+def test_successful_poll_rereads_claude_plan(ctx):
+    """A Max→Pro subscription change must not stay frozen at the add-time plan."""
+    ctx.cred["claude"].set_live(make_claude_blob("max"))
+    state = ctx.load_state()
+    acct.add(ctx, state, "claude", email="c@x.com")
+    assert state.get_seat("claude", "c@x.com")["plan"] == "Max"
+
+    ctx.cred["claude"].set_live(make_claude_blob("pro"))
+    U.refresh(ctx, state, "claude", force=True, user_agent="claude-code/x",
+              get=fake_get({P.CLAUDE_USAGE_URL: (200, claude_ok_body())}))
+    assert state.get_seat("claude", "c@x.com")["plan"] == "Pro"
+
+
+def test_successful_poll_detects_new_subscription_under_same_email(ctx):
+    """A changed provider account id under one email is a new subscription: the old hard rest and
+    auth backoff must be cleared, and the snapshot notice must tell the UI what happened."""
+    ctx.cred["codex"].set_live(make_codex_blob("a@x.com", account_id="old-sub"))
+    state = ctx.load_state()
+    acct.add(ctx, state, "codex", email="a@x.com")
+    state.set_limited_until("codex", "a@x.com", iso(now() + timedelta(hours=5)), source="hard")
+    state.get_seat("codex", "a@x.com")["usage"] = {
+        "error": "forbidden", "error_streak": 12, "stale": True,
+        "fetched_at": None, "last_attempted_at": iso(now()),
+    }
+    ctx.cred["codex"].set_live(make_codex_blob("a@x.com", account_id="new-sub"))
+
+    U.refresh(ctx, state, "codex", force=True,
+              get=fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=5, secondary=5))}))
+    seat = state.get_seat("codex", "a@x.com")
+    assert seat["account_id"] == "new-sub"
+    assert seat["limited_until"] is None and seat["limit_source"] is None
+    assert seat["usage"]["error"] is None and seat["usage"]["error_streak"] == 0
+    assert "new codex subscription" in state.data["moved_note"]
+    from acctsw.bridge import snapshot_state
+    assert "new codex subscription" in snapshot_state(ctx)["moved_note"]
+
+
+def test_new_subscription_success_does_not_touch_discarded_usage(ctx, monkeypatch):
+    """The fresh successful usage dict already clears error/streak. Account-change handling must
+    not mutate the old usage object that `set_usage` immediately replaces wholesale."""
+    ctx.cred["codex"].set_live(make_codex_blob("a@x.com", account_id="old-sub"))
+    state = ctx.load_state()
+    acct.add(ctx, state, "codex", email="a@x.com")
+    state.get_seat("codex", "a@x.com")["usage"] = {
+        "error": "forbidden", "error_streak": 4, "stale": True,
+    }
+    ctx.cred["codex"].set_live(make_codex_blob("a@x.com", account_id="new-sub"))
+
+    def dead_write(*_args, **_kwargs):
+        raise AssertionError("old usage is discarded; refreshing it here is a dead write")
+
+    monkeypatch.setattr(acct, "_creds_refreshed", dead_write)
+    U.refresh(ctx, state, "codex", force=True,
+              get=fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=5, secondary=5))}))
+
+    usage = state.get_seat("codex", "a@x.com")["usage"]
+    assert usage["error"] is None and usage["error_streak"] == 0
+
+
 # --- error classification ---------------------------------------------------------------------
 
 @pytest.mark.parametrize("status,err", [(200, None), (401, "unauthorized"),
-                                        (403, "unauthorized"), (429, "rate_limited"),
+                                        (403, "forbidden"), (429, "rate_limited"),
                                         (0, "network"), (500, "http_500")])
 def test_classify(status, err):
     assert U._classify(status) == err
@@ -120,6 +179,13 @@ def test_fetch_claude_unauthorized_sets_error():
     u = U.fetch_claude("tok", user_agent="claude-code/x",
                        get=fake_get({P.CLAUDE_USAGE_URL: (401, "")}))
     assert u.ok is False and u.error == "unauthorized"
+
+
+def test_fetch_claude_forbidden_marks_lost_entitlement():
+    """A 403 is a revoked/downgraded subscription, not routine parked-seat token expiry."""
+    u = U.fetch_claude("tok", user_agent="claude-code/x",
+                       get=fake_get({P.CLAUDE_USAGE_URL: (403, "")}))
+    assert u.ok is False and u.error == "forbidden"
 
 
 def test_fetch_claude_no_token():
@@ -375,6 +441,28 @@ def test_error_preserves_last_known_windows(ctx):
     assert usage["error_streak"] == 1
 
 
+def test_error_preserves_last_success_time_for_honest_usage_age(ctx):
+    """A failed fetch must not timestamp frozen windows as freshly fetched; their age starts at the
+    last successful response while a separate attempt time continues driving retry backoff."""
+    state = _seed_two_codex(ctx)
+    success_at = now() - timedelta(minutes=20)
+    good = U.Usage(ok=True, fetched_at=iso(success_at),
+                   windows={"5h": U.Window(used_pct=42.0)})
+    U.store_fetch(state, "codex", "a@x.com", good, at=success_at,
+                  blob=ctx.cred["codex"].get_live())
+    failed_at = now()
+    failed = U.Usage(ok=False, error="network", fetched_at=iso(failed_at))
+    U.store_fetch(state, "codex", "a@x.com", failed, at=failed_at)
+
+    usage = state.get_seat("codex", "a@x.com")["usage"]
+    assert usage["fetched_at"] == iso(success_at)
+    assert usage["last_attempted_at"] == iso(failed_at)
+    view = acct.list_seats(state, "codex", at=failed_at)[0]
+    assert view["usage_fetched_at"] == iso(success_at)
+    assert 1199 <= view["usage_age_s"] <= 1201
+    assert view["usage_stale"] is True and view["usage_unknown"] is True
+
+
 def test_exponential_backoff_skips_retry_after_error(ctx):
     state = _seed_two_codex(ctx)
     # an error sets streak=1 → backoff = base*2; a non-forced refresh within that window is skipped
@@ -382,6 +470,13 @@ def test_exponential_backoff_skips_retry_after_error(ctx):
     summary = U.refresh(ctx, state, "codex", force=False, min_seconds=10,
                         get=fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body())}))
     assert summary["codex"]["a@x.com"] == "cached"
+
+
+def test_active_seat_error_backoff_is_capped_for_prompt_recovery():
+    """A recovering on-floor seat must revalidate within five minutes, not wait out the 1h cap."""
+    usage = {"error_streak": 20}
+    assert U._backoff_seconds(usage, 150) == U.MAX_BACKOFF_SECONDS
+    assert U._backoff_seconds(usage, 150, active=True) == U.ACTIVE_MAX_BACKOFF_SECONDS == 300
 
 
 def test_seat_blob_prefers_live_for_active(ctx):

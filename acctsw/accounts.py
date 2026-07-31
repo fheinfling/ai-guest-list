@@ -1,17 +1,18 @@
 """Seat management: add (snapshot the live account), remove, list, status."""
 from __future__ import annotations
 
+import json
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
+from . import identity, session
 from .context import Context
 from .errors import CannotIdentify, NoLiveCreds
-from .identity import live_email
 from .selection import choose
 from .state import State
-from .usage import account_fingerprint
+from .usage import MAX_TRUSTED_AGE_S, account_fingerprint
 from .util import now, parse_iso, jwt_payload
-import json
 
 # raw plan code -> display label (spec §4: Business|Team|Pro|Max|Free)
 _PLAN_LABELS = {"business": "Business", "team": "Team", "enterprise": "Enterprise",
@@ -50,7 +51,7 @@ def add(ctx: Context, state: State, tool: str, *, name: str | None = None,
     live = blob if blob is not None else ctx.cred[tool].get_live()
     if not live:
         raise NoLiveCreds(f"no live {tool} credentials — sign in with the official tool first")
-    em = email or live_email(ctx, tool)
+    em = email or identity.live_email(ctx, tool)
     if not em:
         raise CannotIdentify(f"could not determine the account email for {tool}")
     ctx.snapshot_set(tool, em, live)
@@ -83,7 +84,10 @@ def _creds_refreshed(state: State, tool: str, em: str) -> None:
     u["error"] = None
     u["error_streak"] = 0
     u["stale"] = False
-    u["fetched_at"] = None      # force the next refresh to actually run (not skipped as "cached")
+    # Both timestamps participate in cache/backoff decisions. Clearing only fetched_at stopped
+    # working once failed-attempt time became separate from last-success time.
+    u["fetched_at"] = None
+    u["last_attempted_at"] = None  # force the next refresh to run (not skipped as "cached")
 
 
 def reconcile_codex(ctx: Context, state: State) -> str | None:
@@ -115,6 +119,46 @@ def reconcile_codex(ctx: Context, state: State) -> str | None:
     return em
 
 
+def reconcile_claude(
+        ctx: Context, state: State,
+        *, live_identity: identity.ClaudeLiveIdentity | None = None) -> str | None:
+    """Capture a fresh/out-of-band Claude Keychain login into the matching seat snapshot.
+
+    Claude's credential blob has no email, so comparing it with ``state.active`` cannot identify its
+    owner. The official ``claude auth status --json`` identity is the guard: a known out-of-band
+    login is adopted and captured under its real seat, while an unknown/inconclusive identity is
+    never written over the old active seat's snapshot. Lock-owning callers resolve and pass
+    ``live_identity`` before taking the flock; direct callers may omit it when no lock is held.
+    The blob/email pair is revalidated here so a login racing between those phases is also a no-op.
+    """
+    if not state.accounts("claude"):
+        return None
+    resolved = live_identity or identity.claude_live_identity(ctx)
+    live = resolved.blob
+    if not live:
+        return None
+    # The identity answer belongs only to the exact bytes observed before the subprocess. If an
+    # official login replaced the Keychain item while the caller waited for the flock, writing the
+    # new bytes under the old answer would recreate the cross-account snapshot corruption guard.
+    if ctx.cred["claude"].get_live() != live:
+        return None
+    em = resolved.email
+    if not em or em not in state.accounts("claude"):
+        return None
+    changed = ctx.snapshot_get("claude", em) != live
+    ctx.snapshot_set("claude", em, live)
+    dirty = False
+    if changed:
+        _creds_refreshed(state, "claude", em)
+        dirty = True
+    if state.active("claude") != em:
+        state.set_active("claude", em)
+        dirty = True
+    if dirty:
+        state.save()
+    return em
+
+
 def remove(ctx: Context, state: State, tool: str, email: str) -> bool:
     """Remove a seat: delete its keychain snapshot and its state entry. Returns True if it existed."""
     ctx.snapshot_delete(tool, email)
@@ -128,10 +172,15 @@ def _usage_pct(seat: dict, win: str):
     return w.get("used_pct")
 
 
-def _seat_view(seat: dict, *, active: bool, at: datetime) -> dict[str, Any]:
+def _seat_view(seat: dict, *, active: bool, at: datetime,
+               active_session: dict | None = None) -> dict[str, Any]:
     until = parse_iso(seat.get("limited_until"))
     limited = until is not None and until > at
     usage = seat.get("usage") or {}
+    fetched_at = parse_iso(usage.get("fetched_at"))
+    usage_age_s = max(0.0, (at - fetched_at).total_seconds()) if fetched_at else None
+    in_session = bool(active_session and active_session.get("email") == seat["email"])
+    error = usage.get("error")
     return {
         "email": seat["email"],
         "name": seat.get("name") or seat["email"].split("@")[0],
@@ -139,10 +188,16 @@ def _seat_view(seat: dict, *, active: bool, at: datetime) -> dict[str, Any]:
         "active": active,
         "limited": limited,
         "limited_until": seat.get("limited_until") if limited else None,
-        # needs-login only when the ACTIVE seat's LIVE creds fail. A non-active seat's cached access
-        # token expiring (401) is normal — its refresh token still works when switched to — so we
-        # don't cry "logged out"; it shows as ready with last-known usage.
-        "needs_login": active and usage.get("error") == "unauthorized",
+        # A 401 is actionable only for the active seat: cached access-token expiry on a parked seat
+        # is routine. A 403 means the entitlement itself is gone and is actionable on every seat.
+        "needs_login": (active and error == "unauthorized") or error == "forbidden",
+        "entitlement_revoked": error == "forbidden",
+        "in_session": in_session,
+        "session_started_at": active_session.get("started_at") if in_session else None,
+        "usage_fetched_at": usage.get("fetched_at") if fetched_at else None,
+        "usage_stale": bool(usage.get("stale")),
+        "usage_age_s": usage_age_s,
+        "usage_unknown": usage_age_s is not None and usage_age_s > MAX_TRUSTED_AGE_S,
         "usage5h": _usage_pct(seat, "5h"),
         "usageWeek": _usage_pct(seat, "weekly"),
         "usage": usage or None,
@@ -197,11 +252,18 @@ def _assign_statuses(seats: list[dict[str, Any]]) -> None:
             s["status"] = "ready"
 
 
-def list_seats(state: State, tool: str, at: datetime | None = None) -> list[dict[str, Any]]:
+def list_seats(state: State, tool: str, at: datetime | None = None,
+               data_dir: Path | None = None) -> list[dict[str, Any]]:
+    """Return renderer-ready seats.
+
+    ``data_dir`` is optional for CLI/backward compatibility. The menubar passes it so the read side
+    can attach the verified supervised-session heartbeat to the one matching seat.
+    """
     at = at or now()
     active = state.active(tool)
+    running = session.active_session(data_dir, tool) if data_dir is not None else None
     seats = [
-        _seat_view(seat, active=(email == active), at=at)
+        _seat_view(seat, active=(email == active), at=at, active_session=running)
         for email, seat in state.accounts(tool).items()
     ]
     _assign_statuses(seats)
@@ -236,7 +298,7 @@ def status(ctx: Context, state: State, at: datetime | None = None) -> dict[str, 
     tools_seats: dict[str, list[dict[str, Any]]] = {}
     for tool in ("codex", "claude"):
         sel = choose(state, tool, at)
-        seats = list_seats(state, tool, at)
+        seats = list_seats(state, tool, at, data_dir=ctx.data_dir)
         tools_seats[tool] = seats
         n_rest += sum(1 for s in seats if s["status"] in ("resting", "queued"))
         n_ready += sum(1 for s in seats if s["status"] in ("ready", "active"))

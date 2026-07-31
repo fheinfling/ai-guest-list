@@ -11,6 +11,7 @@ import sys
 
 from . import APP_NAME, TOOLS, __version__
 from . import accounts as acct
+from . import paths as P
 from .context import Context
 from .errors import AcctswError
 from .switch import switch as do_switch
@@ -129,9 +130,17 @@ def _cmd_switch(ctx: Context, ns) -> int:
 
 def _cmd_usage(ctx: Context, ns) -> int:
     from . import usage as usage_mod
+    requested = getattr(ns, "tool", None)
+    before = ctx.load_state()
+    if requested in (None, "claude") and before.accounts("claude"):
+        # `claude --version` may stall for 10 seconds. Resolve the User-Agent before the state flock;
+        # refresh receives an explicit value and therefore cannot spawn the CLI while locked.
+        claude_ua = usage_mod.claude_user_agent(ctx.claude_bin)
+    else:
+        claude_ua = P.CLAUDE_USER_AGENT_FALLBACK
     with ctx.locked():  # refresh writes creds on the 401 path — must hold the cross-process lock
         state = ctx.load_state()
-        summary = usage_mod.refresh(ctx, state, tool=getattr(ns, "tool", None))
+        summary = usage_mod.refresh(ctx, state, tool=requested, user_agent=claude_ua)
     if getattr(ns, "json", False):
         out = {"refresh": summary, "status": acct.status(ctx, state)}
         print(json.dumps(out, indent=2))
