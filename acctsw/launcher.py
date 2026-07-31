@@ -1105,6 +1105,12 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                         dec = handle_exhausted(
                             ctx, state, tool, get=get, exclude=auth_failed, user_agent=ua
                         )
+                        # handle_exhausted can now hop for TWO different reasons: a real usage limit,
+                        # or a 403 (entitlement gone). Decision carries no reason, so read the status
+                        # the refresh just persisted — telling a user with a cancelled subscription
+                        # that they "hit their usage limit" promises a reset that will never arrive.
+                        exit_revoked = ((state.get_seat(tool, active) or {}).get("usage") or {}
+                                        ).get("error") == "forbidden" if active else False
                     switched = False
                     if dec.action == "switch":
                         live_identity = _claude_live_identity()  # only for an approved seat hop
@@ -1117,7 +1123,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                                 switched = True
                     if switched:
                         mark_session(ctx.data_dir, tool, dec.email)
-                        notify(f"{active} hit its usage limit — hopping to {dec.email}, "
+                        why = ("is no longer entitled" if exit_revoked else "hit its usage limit")
+                        notify(f"{active} {why} — hopping to {dec.email}, "
                                f"resuming your work ✨")
                         switches += 1
                         resuming = True
@@ -1128,7 +1135,11 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                         if _wait_and_activate():
                             resuming = True
                             continue
-                        notify(f"all {tool} seats are resting"
+                        # A revoked active seat is not "resting" — saying so implies waiting will fix
+                        # it. Name the real problem so the user knows to sign in / re-subscribe.
+                        lead = (f"{active} is no longer entitled and every other {tool} seat is "
+                                f"resting" if exit_revoked else f"all {tool} seats are resting")
+                        notify(lead
                                + (f"; soonest unlocks at {dec.unlocks_at}" if dec.unlocks_at else ""))
                         return EXIT_GAVE_UP
                 return status  # clean exit, or a plain failure — child's real exit code

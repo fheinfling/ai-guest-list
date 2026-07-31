@@ -1333,3 +1333,21 @@ def test_run_claude_exit_without_rotation_skips_identity_cli(ctx, monkeypatch):
     monkeypatch.setattr(L.identity_mod, "claude_live_identity", unexpected_identity)
 
     assert run(ctx, "claude", [], spawn=FakeSpawn([(b"done\n", 0)]), get=fake_get({})) == 0
+
+
+def test_run_exit_hop_off_revoked_seat_says_entitlement_not_limit(ctx):
+    """The post-exit safety net can now hop for TWO reasons. Telling a user whose subscription was
+    cancelled that they "hit their usage limit" promises a reset that will never arrive — the exit
+    path must name the real cause, exactly as the mid-session path already does."""
+    _two_codex(ctx)  # active a, healthy b
+    get = fake_get({P.CODEX_USAGE_URL: (403, "")})
+    msgs = []
+    # No banner on stdout: the child just dies, so ONLY the exit-time safety net can react.
+    spawn = FakeSpawn([(b"boom\n", 3), (b"carried on\n", 0)])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=msgs.append)
+
+    assert rc == 0
+    assert ctx.load_state().active("codex") == "b@x.com"     # it did hop
+    assert any("no longer entitled" in m for m in msgs)
+    assert not any("hit its usage limit" in m for m in msgs)
