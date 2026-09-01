@@ -35,17 +35,20 @@ acctsw (engine, Python 3, stdlib + `security` CLI)        ← all credential/usa
    └── used by both the CLI wrappers and the menubar app
 menubar app (lean, minimal, fun)                          ← thin UI over the engine
 shared store:
-   Keychain service "acct-switcher": codex:<email> / claude:<email>  → credential blobs
+   ~/.account-switcher/codex-homes/<email>/auth.json → private Codex seat snapshots
+   Keychain service "acct-switcher"                    → Claude snapshots + factory images
    ~/.account-switcher/state.json   → non-secret: active acct + cached usage + limited_until
    ~/.account-switcher/backups/     → factory image of original creds (for clean restore)
+   ~/.account-switcher/codex-runners/ → flock-backed supervised-session coordination
 ```
 
 ### Engine `acctsw` (the source of truth)
 Subcommands (also the menubar's backend, callable with `--json`):
 - `install` / `uninstall [--purge] [--dry-run]` — see Install/Uninstall below.
-- `add <tool>` — run the official login, snapshot resulting creds → keychain `<tool>:<email>`
+- `add <tool>` — run the official login, snapshot resulting creds → private Codex auth store or
+  Claude keychain item
   (identity from Codex JWT email / `claude auth status`).
-- `remove <tool> <email>` — delete that keychain snapshot (and live creds if it's active).
+- `remove <tool> <email>` — delete that seat snapshot.
 - `list` / `status [--json]` — accounts, active one, cached usage %, reset countdowns.
 - `usage refresh [--tool] [--json]` — fetch live usage (cached, backoff-aware) for the menubar.
 - `switch <tool> <email>` — the swap primitive (below). Used by menubar + auto-switch.
@@ -62,10 +65,13 @@ Subcommands (also the menubar's backend, callable with `--json`):
 
 ### Swap primitive (`switch`)
 1. **Sync-back first** (longevity-critical — Codex/Claude rotate refresh tokens): copy the
-   *current live* creds of the outgoing account back into its keychain snapshot.
+   *current live* creds of the outgoing account back into its private seat snapshot.
 2. Install chosen blob into the canonical location **atomically** (temp + `rename()`, preserve `0600`):
    - Codex → `~/.codex/auth.json`; Claude → `security add-generic-password -U -s "Claude Code-credentials"`.
 3. Update `state.json.active`.
+4. For Codex, perform steps 1–3 only when no supervised Codex child is running. Multiple children
+   may share one active seat; automatic hops wait interruptibly, while manual hops return a clear
+   busy error. Codex always uses its canonical home — only `auth.json` changes.
 
 ### Account selection logic (used by `run` and at launch)
 Available = `limited_until` null/past. Prefer current active if available; else first available.
@@ -73,14 +79,13 @@ If **all limited** → pick **min(reset)** and report `"all limited; <email> unl
 launch anyway (works the moment it resets). "Unlock soonest" uses cached usage reset timestamps.
 
 ### Supervised launcher (`run`, the core auto-switch + continuity)
-1. Select account, swap creds.
+1. Select account, swap creds, and register a running-child lease for Codex.
 2. Spawn the tool under a **PTY** (stdlib `pty`) so the TUI stays interactive while we tee output.
-3. Track session id (Codex: newest `~/.codex/sessions/**/rollout-*.jsonl` after spawn; Claude:
-   `--continue`/session id).
-4. **On limit** (regex match on the tee'd limit message → also captures reset time, or a 429 in the
+3. **On limit** (regex match on the tee'd limit message → also captures reset time, or a 429 in the
    usage poll): set `limited_until`, swap to next/soonest account, **relaunch with resume**
-   (`codex resume <uuid>` / `claude --resume <id>`) so the work continues. Loop.
-5. On exit: sync-back refreshed creds, persist state.
+   (`codex resume --last` / `claude --continue`) so the work continues. Loop. If another Codex child
+   is still running, wait for it to stop before changing the canonical login.
+4. On exit: sync-back refreshed creds, persist state, release the runtime lease.
    *(For Claude, optionally install Claude Code hooks `Stop`/`PostToolUseFailure` for cleaner triggers.)*
 
 ---
@@ -180,7 +185,8 @@ seats** + **reset** to simulate limits, and **"or peek at the list i've got"** t
 - **Menubar app "ai guest list"**: `pyobjc` `NSStatusItem` + `WKWebView` popover loading the
   cleaned-up `ai guest list` HTML/CSS (Hanken Grotesk + Space Mono bundled), JS↔Python bridge to
   `acctsw`. Packaged to a `.app` (e.g. `py2app`). Source under `~/.account-switcher/app/`.
-- `~/.account-switcher/` (state + backups) at install; keychain items at `add`.
+- `~/.account-switcher/` (state, Codex auth snapshots, runtime leases, backups) at install; Claude
+  snapshots and factory images use Keychain items.
 - Headroom is an external dependency installed on demand (`pip`/`npm`), not vendored.
 - No existing file modified except, at switch time, the two canonical credential locations the
   official tools already own.
@@ -191,7 +197,10 @@ seats** + **reset** to simulate limits, and **"or peek at the list i've got"** t
   reactive-only detection if throttled. **Don't assume 7d** — use the returned reset timestamp.
 - **Limit message format unknown until first hit** → regex in a top config block; capture the real
   strings during verification and lock them in. Launch-time selection works regardless.
-- **auth.json race during refresh** → atomic swap only between child runs.
+- **auth.json race during refresh** → atomic swap only while no supervised Codex child is running;
+  stopped/waiting supervisors do not count, preventing two simultaneous limit exits from deadlocking.
+- **Codex runtime database drift** → never redirect or synthesize a `CODEX_HOME`; legacy per-seat
+  SQLite/symlink entries are ignored and never auto-deleted.
 - **GUI apps** → menubar `switch` swaps the same creds the apps read; they may need a restart (app
   reads creds at launch). Auto-detection stays CLI-driven (best-effort GUI, as agreed).
 

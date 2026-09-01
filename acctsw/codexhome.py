@@ -1,18 +1,19 @@
-"""Per-account Codex homes (isolation, spec §4).
+"""Per-account Codex credential snapshots.
 
-Each Codex account gets its own ``CODEX_HOME`` directory under ~/.account-switcher/codex-homes/<id>/
-containing that account's REAL ``auth.json`` plus symlinks to everything else in the user's real
-``~/.codex`` (config.toml, sessions, plugins, sqlite, …). codex run with that ``CODEX_HOME`` reads
-and refreshes the account's own auth.json in place — so using/rotating one account NEVER touches
-another (the cross-invalidation that the shared-auth.json swap model suffered). Sessions/config are
-shared via the symlinks, so cross-account `codex resume` still works.
+Each Codex account keeps one real ``auth.json`` under
+``~/.account-switcher/codex-homes/<id>/``.  These directories used to be complete ``CODEX_HOME``
+overlays with symlinks into ``~/.codex``.  That became unsafe when Codex added top-level SQLite/WAL
+families: a database could be created locally while its later ``-wal``/``-shm`` files were linked to
+the canonical home, producing SQLite error 14 at startup.
 
-This keeps the user's real ~/.codex as the shared source of truth (we never relocate it); only
-auth.json is per-account. Fully reversible: delete the codex-homes dir.
+The directories are now auth-only stores.  Codex itself always runs against its canonical home so
+all configuration, session history, and runtime databases stay together.  Legacy non-auth entries
+are deliberately left untouched and ignored; deleting a seat still removes its whole old directory.
 """
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 
 from . import paths as P
@@ -36,27 +37,14 @@ def auth_path(email: str, root: Path | None = None) -> Path:
 
 
 def ensure_home(email: str, *, codex_home: Path | None = None, root: Path | None = None) -> Path:
-    """Create the account's home: real auth.json lives here; everything else symlinks to ~/.codex.
+    """Create the account's auth store without touching legacy non-auth contents.
 
-    Idempotent. Re-links any new shared entries that appeared in ~/.codex since last time.
+    ``codex_home`` remains as a compatibility-only keyword for existing callers; it is intentionally
+    ignored so no canonical Codex entry is ever linked into the seat store again.
     """
-    real = codex_home or P.CODEX_HOME
     home = home_dir(email, root)
     home.mkdir(parents=True, exist_ok=True)
     os.chmod(home, 0o700)
-    if real.exists():
-        for entry in real.iterdir():
-            if entry.name == "auth.json":
-                continue  # auth is per-account (a real file in the home)
-            link = home / entry.name
-            if link.is_symlink():
-                if link.resolve() != entry.resolve():
-                    link.unlink(); link.symlink_to(entry)
-            elif not link.exists():
-                try:
-                    link.symlink_to(entry)
-                except OSError:
-                    pass
     return home
 
 
@@ -74,16 +62,12 @@ def load(email: str, *, root: Path | None = None) -> str | None:
 
 def delete(email: str, *, root: Path | None = None) -> bool:
     home = home_dir(email, root)
+    if home.is_symlink():
+        home.unlink()  # never traverse a replaced/malformed seat root
+        return True
     if not home.exists():
         return False
-    # unlink symlinks (don't follow into ~/.codex), remove the real auth.json, then the dir
-    for entry in home.iterdir():
-        try:
-            entry.unlink()
-        except OSError:
-            pass
-    try:
-        home.rmdir()
-    except OSError:
-        pass
+    # shutil.rmtree unlinks directory symlinks rather than following them, so this safely removes
+    # auth-only stores as well as legacy homes that contain real runtime directories/databases.
+    shutil.rmtree(home)
     return True

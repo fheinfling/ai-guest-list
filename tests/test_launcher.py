@@ -653,10 +653,9 @@ def test_handle_exhausted_confirms_out_on_limit_reached_without_reset(ctx):
     assert seat["limited_until"] is not None and seat["limit_source"] == "usage"
 
 
-def test_run_codex_home_preserved_on_exception(ctx):
-    """Codex isolation: a crash must not corrupt/lose the active account's per-account home
-    (the source of truth codex maintains); the finally mirrors home → ~/.codex."""
-    state = _two_codex(ctx)  # active a, home(a) populated
+def test_run_codex_auth_synced_on_exception(ctx):
+    """A launcher crash must preserve canonical Codex creds in the active auth snapshot."""
+    state = _two_codex(ctx)  # active a, auth store populated
     before = ctx.snapshot_get("codex", "a@x.com")
 
     def boom(argv, on_output):
@@ -664,8 +663,107 @@ def test_run_codex_home_preserved_on_exception(ctx):
 
     with pytest.raises(RuntimeError):
         run(ctx, "codex", [], spawn=boom, get=fake_get({}))
-    assert ctx.snapshot_get("codex", "a@x.com") == before        # home intact
-    assert ctx.cred["codex"].get_live() == before                # mirrored home → live
+    assert ctx.snapshot_get("codex", "a@x.com") == before
+    assert ctx.cred["codex"].get_live() == before
+
+
+def test_run_codex_never_redirects_codex_home(ctx, monkeypatch):
+    """Regression: account stores are auth-only; runtime SQLite must remain in canonical CODEX_HOME."""
+    _two_codex(ctx)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    seen = []
+
+    def spawn(argv, on_output):
+        seen.append(os.environ.get("CODEX_HOME"))
+        return 0
+
+    assert run(ctx, "codex", [], spawn=spawn, get=fake_get({})) == 0
+    assert seen == [None]
+
+
+def test_run_codex_syncs_rotated_canonical_auth_back_to_seat(ctx):
+    _two_codex(ctx)
+    rotated = make_codex_blob("a@x.com").replace('"refresh_token": "r"',
+                                                   '"refresh_token": "ROTATED"')
+
+    def spawn(argv, on_output):
+        ctx.cred["codex"].set_live(rotated)
+        return 0
+
+    assert run(ctx, "codex", [], spawn=spawn, get=fake_get({})) == 0
+    assert json.loads(ctx.snapshot_get("codex", "a@x.com"))["tokens"]["refresh_token"] == "ROTATED"
+
+
+def test_run_codex_waits_for_other_child_before_initial_seat_change(ctx):
+    """Concurrent sessions may share a seat; changing seats waits until every running child stops."""
+    from acctsw import codexruntime
+
+    state = _two_codex(ctx)  # active a
+    state.set_limited_until("codex", "a@x.com", iso(now() + timedelta(hours=1)), source="usage")
+    state.save()
+    other = codexruntime.SupervisorLease(ctx.data_dir)
+    other.mark_running("a@x.com")
+    sleeps, msgs = [], []
+
+    def release_other(seconds):
+        sleeps.append(seconds)
+        other.mark_stopped()
+
+    try:
+        rc = run(ctx, "codex", [], spawn=FakeSpawn([(b"ok\n", 0)]), get=fake_get({}),
+                 notify=msgs.append, sleep=release_other)
+    finally:
+        other.close()
+
+    assert rc == 0
+    assert sleeps == [L.CODEX_BUSY_POLL_S]
+    assert ctx.load_state().active("codex") == "b@x.com"
+    assert any("waiting to switch seats safely" in m for m in msgs)
+
+
+def test_run_codex_allows_concurrent_child_on_same_active_seat(ctx):
+    from acctsw import codexruntime
+
+    _two_codex(ctx)
+    other = codexruntime.SupervisorLease(ctx.data_dir)
+    other.mark_running("a@x.com")
+    sleeps = []
+    try:
+        rc = run(ctx, "codex", [], spawn=FakeSpawn([(b"ok\n", 0)]), get=fake_get({}),
+                 sleep=sleeps.append)
+    finally:
+        other.close()
+    assert rc == 0
+    assert sleeps == []
+
+
+def test_run_codex_limit_hop_waits_for_concurrent_child_then_resumes(ctx):
+    from acctsw import codexruntime
+
+    _two_codex(ctx)
+    other = codexruntime.SupervisorLease(ctx.data_dir)
+    other.mark_running("a@x.com")
+    sleeps, msgs = [], []
+    spawn = FakeSpawn([
+        (b"\xe2\x96\xa0 Your workspace is out of credits. Add credits to continue.\n", 1),
+        (b"resumed on b\n", 0),
+    ])
+
+    def release_other(seconds):
+        sleeps.append(seconds)
+        other.mark_stopped()
+
+    try:
+        rc = run(ctx, "codex", [], spawn=spawn, get=fake_get({}), notify=msgs.append,
+                 sleep=release_other)
+    finally:
+        other.close()
+
+    assert rc == 0
+    assert sleeps == [L.CODEX_BUSY_POLL_S]
+    assert spawn.calls[1][-2:] == ["resume", "--last"]
+    assert ctx.load_state().active("codex") == "b@x.com"
+    assert any("waiting to switch seats safely" in m for m in msgs)
 
 
 def test_run_claude_resume_uses_continue(ctx):

@@ -32,7 +32,7 @@ from typing import Callable
 
 from . import usage as usage_mod
 from .context import Context
-from .errors import AcctswError
+from .errors import AcctswError, CodexBusy
 from .headroom import harden_env
 from .selection import Selection, choose
 from .switch import switch, sync_back
@@ -58,6 +58,7 @@ PROBE_COOLDOWN_S = 30.0  # after a dismissed match, skip re-probing usage for th
 FALSE_ALARM_MAX_PCT = usage_mod.FALSE_ALARM_MAX_PCT
 EXIT_GAVE_UP = 75     # EX_TEMPFAIL: distinguishes "we gave up / all limited" from a child failure
 WAIT_ON_ALL_RESTING_ENV = "ACCTSW_WAIT_ON_ALL_RESTING"
+CODEX_BUSY_POLL_S = 1.0  # interruptible wait between checks for other running Codex children
 _ENV_FALSE = frozenset({"0", "false", "no", "off"})
 # A usage-limit exit is an ordinary POSITIVE failure code; a user abort is not. Signal deaths come
 # back NEGATIVE (os.waitstatus_to_exitcode), and a tool that catches the signal exits 128+N — so the
@@ -712,45 +713,89 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
     except Exception:
         pass
 
-    def _activate_codex_home(email):
-        """Point codex at the account's own home so it maintains that account's tokens in place."""
-        if tool == "codex" and email:
-            from . import codexhome
-            codexhome.ensure_home(email, codex_home=ctx._codex_real, root=ctx._homes_root)
-            os.environ["CODEX_HOME"] = str(ctx.codex_home(email))
-
     def _commit_switch(state, email):
-        """Persist a seat hop: switch creds, repoint codex's home, stamp the switch time. Caller holds
-        ctx.locked() and owns the surrounding notify/budget bookkeeping."""
-        switch(ctx, state, tool, email, sync=(tool != "codex"))
-        _activate_codex_home(email)
+        """Persist a seat hop. Caller holds ctx.locked(); Codex's runtime guard may reject while a
+        different supervised child can still read/refresh the canonical auth.json."""
+        switch(ctx, state, tool, email)
         state.data["last_switch_at"] = iso(now())
         state.save()
 
     auth_failed: set = set()   # seats whose token died THIS run — skip them for the rest of it
 
+    def _activate_after_codex_idle(*, exclude=frozenset()) -> str | None:
+        """Wait interruptibly for running Codex children, then atomically choose/install a ready seat.
+
+        Recompute selection after every race: another stopped supervisor may win the hop while this
+        one waits, in which case we simply join the newly-active seat and resume there.
+        """
+        if tool != "codex":
+            return None
+        from . import codexruntime
+        announced = False
+        while True:
+            while codexruntime.running_count(ctx.data_dir):
+                if not announced:
+                    notify("another Codex session is still running — waiting to switch seats safely")
+                    announced = True
+                sleep(CODEX_BUSY_POLL_S)
+            raced = False
+            with ctx.locked():
+                state = ctx.load_state()
+                sel = choose(state, tool, exclude=exclude)
+                if not sel.email or not sel.available:
+                    return None
+                if sel.email != state.active(tool):
+                    try:
+                        _commit_switch(state, sel.email)
+                    except CodexBusy:
+                        raced = True
+                if not raced:
+                    return state.active(tool)
+
     def _wait_and_activate() -> bool:
         email = _wait_for_unlock(ctx, tool, notify, sleep, get, exclude=auth_failed)
         if email is None:
             return False
+        busy = False
         with ctx.locked():
             state = ctx.load_state()
             if email != state.active(tool):
-                _commit_switch(state, email)
-        return True
+                try:
+                    _commit_switch(state, email)
+                except CodexBusy:
+                    busy = True
+        return bool(_activate_after_codex_idle(exclude=auth_failed)) if busy else True
+
+    codex_lease = None
+    if tool == "codex":
+        from . import codexruntime
+        codex_lease = codexruntime.SupervisorLease(ctx.data_dir)
 
     try:
         initial_resting: Decision | None = None
         # Initial selection + switch, under the state lock (brief; never held across a spawn).
-        with ctx.locked():
-            state = ctx.load_state()
-            if tool == "codex":
-                from . import accounts as _acct
-                _acct.reconcile_codex(ctx, state)   # freshen home(s) from ~/.codex before using them
-            sel = choose(state, tool)
-            if sel.email and sel.email != state.active(tool):
-                switch(ctx, state, tool, sel.email, sync=(tool != "codex"))
-            _activate_codex_home(state.active(tool))
+        while True:
+            busy = False
+            with ctx.locked():
+                state = ctx.load_state()
+                if tool == "codex":
+                    from . import accounts as _acct
+                    # Canonical auth.json is the freshest copy for the currently-live identity.
+                    _acct.reconcile_codex(ctx, state)
+                sel = choose(state, tool)
+                if sel.email and sel.email != state.active(tool):
+                    try:
+                        _commit_switch(state, sel.email)
+                    except CodexBusy:
+                        busy = True
+            if not busy:
+                break
+            if _activate_after_codex_idle() is None:
+                # Capacity may have changed while another child was finishing. Do not keep the stale
+                # pre-wait selection: reload so the all-resting path below makes the final decision.
+                with ctx.locked():
+                    sel = choose(ctx.load_state(), tool)
+                break
         if sel.all_limited:
             # The wait verifies against the live endpoint and recomputes targets from state, so it
             # does not need a pre-known unlock time (unlocks_at may be None for reactive marks).
@@ -845,7 +890,14 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 hit["corroborated"] = verdict == "confirmed"
                 return True
 
-            status = spawn(argv, on_output)  # NO lock held during the session
+            # Register the child while holding the state lock. Every app/manual switch takes that
+            # same lock before consulting the runtime gate, so no credential change can slip between
+            # selecting this active seat and marking the child as running.
+            if codex_lease is not None:
+                with ctx.locked():
+                    child_state = ctx.load_state()
+                    codex_lease.mark_running(child_state.active("codex") or "")
+            status = spawn(argv, on_output)  # NO state lock held during the session
 
             if hit["reason"] is None:
                 # No stdout limit banner was caught — but a NON-ZERO exit can be a real limit codex
@@ -856,14 +908,24 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 # never second-guess it, and a user abort (Ctrl-C/kill) is not a limit — only a
                 # POSITIVE, non-abort failure code is worth a usage check. See handle_exhausted.
                 if status > 0 and status not in _ABORT_EXITS and switches < max_switches:
+                    busy = False
                     with ctx.locked():
                         state = ctx.load_state()
                         active = state.active(tool)
                         dec = handle_exhausted(ctx, state, tool, get=get, exclude=auth_failed)
+                        if codex_lease is not None:
+                            codex_lease.mark_stopped()
                         if dec.action == "switch":
-                            _commit_switch(state, dec.email)
+                            try:
+                                _commit_switch(state, dec.email)
+                            except CodexBusy:
+                                busy = True
                     if dec.action == "switch":
-                        notify(f"{active} hit its usage limit — hopping to {dec.email}, "
+                        target = (_activate_after_codex_idle(exclude=auth_failed) if busy
+                                  else dec.email)
+                        if target is None:
+                            return EXIT_GAVE_UP
+                        notify(f"{active} hit its usage limit — hopping to {target}, "
                                f"resuming your work ✨")
                         switches += 1
                         resuming = True
@@ -877,8 +939,11 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                         notify(f"all {tool} seats are resting"
                                + (f"; soonest unlocks at {dec.unlocks_at}" if dec.unlocks_at else ""))
                         return EXIT_GAVE_UP
+                if codex_lease is not None:
+                    codex_lease.mark_stopped()
                 return status  # clean exit, or a plain failure — child's real exit code
 
+            busy = False
             with ctx.locked():
                 state = ctx.load_state()
                 active = state.active(tool)
@@ -894,15 +959,25 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 # because earlier genuine switches used up the budget — that would kill a healthy
                 # session, the very bug this supervisor is meant to avoid.
                 hop_capped = dec.action == "switch" and switches >= max_switches
+                if codex_lease is not None:
+                    # The child is gone and its event has been classified against the seat it ran on.
+                    # It no longer blocks a hop; another stopped supervisor may race us and win it.
+                    codex_lease.mark_stopped()
                 if dec.action == "switch" and not hop_capped:
-                    _commit_switch(state, dec.email)
+                    try:
+                        _commit_switch(state, dec.email)
+                    except CodexBusy:
+                        busy = True
             if hop_capped:
                 notify(f"hit the switch limit ({max_switches}); stopping")
                 return EXIT_GAVE_UP
             if dec.action == "switch":
+                target = (_activate_after_codex_idle(exclude=auth_failed) if busy else dec.email)
+                if target is None:
+                    return EXIT_GAVE_UP
                 reason_msg = ("needs you to sign in again 🔑" if hit["reason"] == "auth"
                               else "needs a rest 💤")
-                notify(f"{active} {reason_msg} — hopping to {dec.email}, "
+                notify(f"{active} {reason_msg} — hopping to {target}, "
                        f"your work's coming with you ✨")
                 switches += 1
                 resuming = True
@@ -932,19 +1007,17 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                    + (f"; soonest unlocks at {dec.unlocks_at}" if dec.unlocks_at else ""))
             return EXIT_GAVE_UP
     finally:
-        # On exit, reconcile the active account's creds (the just-run seat may carry a rotated token).
-        #  - codex: it maintained its own home via CODEX_HOME → mirror the home into ~/.codex so
-        #    plain codex / the GUI follow the active account.
-        #  - claude: sync the live keychain item back into the account's snapshot.
+        # On exit, reconcile the active account's canonical creds (the just-run tool may carry a
+        # rotated token) into that seat's snapshot. Codex deliberately remains on its canonical home.
         try:
+            if codex_lease is not None:
+                codex_lease.mark_stopped()
             with ctx.locked():
                 st = ctx.load_state()
-                active = st.active(tool)
-                if tool == "codex" and active:
-                    blob = ctx.snapshot_get("codex", active)   # home = source of truth
-                    if blob:
-                        ctx.cred["codex"].set_live(blob)        # mirror → ~/.codex
-                elif sync_back(ctx, st, tool):
+                if sync_back(ctx, st, tool):
                     st.save()
         except Exception:
             pass
+        finally:
+            if codex_lease is not None:
+                codex_lease.close()

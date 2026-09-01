@@ -276,6 +276,23 @@ def test_switch_sets_recently_switched_dot(ctx):
     assert r["state"]["dot"] == "switched"
 
 
+def test_manual_codex_switch_rejected_while_supervised_child_runs(ctx):
+    from acctsw import codexruntime
+
+    _add(ctx, "a@x.com")
+    _add(ctx, "b@x.com")
+    lease = codexruntime.SupervisorLease(ctx.data_dir)
+    lease.mark_running("b@x.com")
+    try:
+        r = bridge.handle(ctx, {"action": "switch", "tool": "codex", "email": "a@x.com"})
+    finally:
+        lease.close()
+
+    assert r["ok"] is False
+    assert "sessions are active" in r["error"]
+    assert ctx.load_state().active("codex") == "b@x.com"
+
+
 def test_paste_installs_and_registers_codex(ctx):
     blob = make_codex_blob("pasted@x.com")
     r = bridge.handle(ctx, {"action": "paste", "tool": "codex", "blob": blob})

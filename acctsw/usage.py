@@ -334,7 +334,7 @@ FALSE_ALARM_MAX_PCT = 90.0
 
 
 def _seat_blob(ctx, state, tool: str, email: str) -> str | None:
-    """Freshest creds for a seat: live blob if it's active, else the keychain snapshot."""
+    """Freshest creds for a seat: live blob if active, otherwise its private snapshot."""
     if state.active(tool) == email:
         live = ctx.cred[tool].get_live()
         if live:

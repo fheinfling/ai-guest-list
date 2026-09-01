@@ -15,8 +15,8 @@ STATE_FILE = DATA_DIR / "state.json"
 BACKUP_DIR = DATA_DIR / "backups"
 BACKUP_MANIFEST = BACKUP_DIR / "manifest.json"
 APP_SRC_DIR = DATA_DIR / "app"
-# Per-account Codex homes (each a CODEX_HOME with its own auth.json; shared state symlinked to the
-# real ~/.codex). Isolation so codex maintains each account's token lifecycle independently.
+# Per-account Codex auth stores. Codex itself stays on the canonical home; redirecting the whole home
+# is unsafe for its SQLite/WAL files. The historical directory name is retained for compatibility.
 CODEX_HOMES = DATA_DIR / "codex-homes"
 
 # Keychain service that holds our per-account credential snapshots.

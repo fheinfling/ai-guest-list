@@ -98,7 +98,7 @@ def test_remove_path(isolated, capsys):
 def test_keychain_error_is_friendly(isolated, monkeypatch, capsys):
     """A keychain failure surfaces as a friendly stderr line, not a traceback.
 
-    (Claude still uses the keychain for its snapshots; codex uses on-disk homes.)
+    (Claude still uses the keychain for its snapshots; Codex uses on-disk auth stores.)
     """
     from acctsw.keychain import KeychainError
     from tests.conftest import make_claude_blob

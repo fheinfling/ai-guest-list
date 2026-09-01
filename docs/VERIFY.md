@@ -40,6 +40,11 @@ cx                             # supervised codex; on a real usage limit it auto
 ```
 - Continuity dry-run (no real limit): start `cx`, do one turn, Ctrl-C, `acctsw switch codex <other>`,
   then `codex resume --last` → same conversation continues under the other seat.
+- Database regression: with the app open, `codex doctor --summary` uses canonical `~/.codex` and
+  reports no account-home SQLite error. Existing legacy files below
+  `~/.account-switcher/codex-homes` are ignored.
+- Concurrency: two `cx` sessions may run on the current seat. A manual seat change reports a busy
+  error; an automatic limit hop waits until the other running child stops, then resumes.
 
 ## Menubar app
 ```sh
@@ -64,8 +69,8 @@ acctsw uninstall --purge       # also deletes the store + all our keychain items
 ## Known gaps to confirm live (tracked)
 - Real limit-message strings: `launcher.LIMIT_PATTERNS` is conservative; confirm/extend against the
   actual Codex/Claude limit output on a real cap.
-- Resume-by-id: currently `codex resume --last` / `claude --continue` (MVP); capture the session id
-  at spawn to resume by id if you run multiple concurrent sessions.
+- Resume-by-id: currently `codex resume --last` / `claude --continue` (MVP). Concurrent Codex sessions
+  share canonical history, so a future enhancement should capture the exact session id at spawn.
 - We deliberately do NOT use `headroom install apply/remove/status` — its macOS launchd deploy is
   broken. Global app-managed mode instead runs the proxy ourselves (`headroom proxy`, detached +
   PID-tracked) and hand-writes provider routing. Live

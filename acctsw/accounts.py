@@ -82,10 +82,10 @@ def _creds_refreshed(state: State, tool: str, em: str) -> None:
 
 
 def reconcile_codex(ctx: Context, state: State) -> str | None:
-    """Capture a fresh/out-of-band ~/.codex into the matching account's home (ISO-B1).
+    """Capture a fresh/out-of-band ~/.codex into the matching account's auth store (ISO-B1).
 
-    Plain `codex`/the GUI rotate ~/.codex in place; before we use or switch homes we capture those
-    fresh creds into the owning account's home (it's the freshest copy), and adopt them as active if
+    Plain `codex`/the GUI rotate ~/.codex in place; before selecting or switching seats we capture
+    fresh creds into the owning account's store (it's the freshest copy), and adopt them as active if
     the user signed into a different known seat out-of-band. Unknown identities are left untouched.
     Returns the reconciled email, or None.
     """
@@ -96,7 +96,7 @@ def reconcile_codex(ctx: Context, state: State) -> str | None:
     if not em or em not in state.accounts("codex"):
         return None
     changed = ctx.snapshot_get("codex", em) != live
-    ctx.snapshot_set("codex", em, live)            # ~/.codex is the freshest copy for `em`
+    ctx.snapshot_set("codex", em, live)            # canonical auth is the freshest copy for `em`
     dirty = False
     if changed:
         # creds rotated/re-logged out-of-band → clear any stale auth error so the app auto-recovers.
@@ -111,7 +111,14 @@ def reconcile_codex(ctx: Context, state: State) -> str | None:
 
 
 def remove(ctx: Context, state: State, tool: str, email: str) -> bool:
-    """Remove a seat: delete its keychain snapshot and its state entry. Returns True if it existed."""
+    """Remove a seat snapshot and state entry. Returns True if it existed."""
+    if tool == "codex" and email == state.active(tool):
+        from . import codexruntime
+        if codexruntime.running_count(ctx.data_dir):
+            from .errors import CodexBusy
+            raise CodexBusy(
+                "can't remove the active Codex seat while supervised Codex sessions are active"
+            )
     ctx.snapshot_delete(tool, email)
     existed = state.remove_seat(tool, email)
     state.save()

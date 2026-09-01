@@ -35,9 +35,9 @@ It's two thin pieces over your stock tools:
 - a **menubar app** showing live usage + a one-glance status, and
 - supervised `cx` / `cl` launchers that wrap stock `codex` / `claude` and do the hop for you.
 
-Your stock `codex` / `claude` and their desktop apps keep working **untouched**. Credentials never
-leave the **macOS Keychain** and the locations the official tools already read — nothing is uploaded
-anywhere.
+Your stock `codex` / `claude` and their desktop apps keep working **untouched**. Credentials stay on
+your Mac: Claude seats and factory backups use the **macOS Keychain**, while Codex seat snapshots are
+private `auth.json` files under `~/.account-switcher`. Nothing is uploaded anywhere.
 
 <p align="center">
   <img src="docs/assets/screenshot.png" width="340" alt="The ai guest list popover: Codex and Claude seats with live 5-hour usage bars, an active 'on the floor' seat and a resting one, auto-switch and Headroom save-credit toggles." />
@@ -127,9 +127,11 @@ Build the app locally with `pip install -e ".[build]" && python setup.py py2app`
 
 ## Safety & security
 
-Credentials are only ever moved between the Keychain and the locations the official tools already read
-— nothing is proxied off-device or committed to git. Writes are atomic and `0o600`; the Headroom proxy
-binds loopback only and is identity-checked before any traffic is routed through it. See
+Credentials are only ever moved between the app's private local store, the Keychain, and the locations
+the official tools already read — nothing is proxied off-device or committed to git. Codex always keeps
+its canonical home, so its SQLite databases and session history are never split across account overlays;
+only `auth.json` is swapped. Writes are atomic and `0o600`; the Headroom proxy binds loopback only and
+is identity-checked before any traffic is routed through it. See
 [`docs/SECURITY-headroom.md`](docs/SECURITY-headroom.md) for the save-credit threat model.
 
 ## License

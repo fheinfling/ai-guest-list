@@ -58,7 +58,7 @@ class Context:
     cred: dict[str, CredLocation]  # tool -> canonical location
     claude_bin: str | None = None  # path to the official `claude` CLI (for identity/usage)
     codex_bin: str | None = None   # path to the official `codex` CLI (for the launcher)
-    homes_root: Path | None = None  # per-account Codex homes root (None → P.CODEX_HOMES)
+    homes_root: Path | None = None  # per-account Codex auth-store root (None → P.CODEX_HOMES)
     codex_real: Path | None = None  # the real shared ~/.codex (None → P.CODEX_HOME)
 
     @property
@@ -141,9 +141,9 @@ class Context:
         """Keychain account name for our snapshot of a seat: ``<tool>:<email>``."""
         return f"{tool}:{email}"
 
-    # --- per-seat credential store (codex → on-disk per-account home; claude → keychain) -------
+    # --- per-seat credential store (codex → on-disk auth store; claude → keychain) --------------
     def codex_home(self, email: str) -> Path:
-        """The CODEX_HOME directory for a codex seat (used by the launcher)."""
+        """The legacy-named directory holding a Codex seat's auth.json snapshot."""
         from . import codexhome
         return codexhome.home_dir(email, self._homes_root)
 

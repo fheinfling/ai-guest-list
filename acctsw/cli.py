@@ -81,8 +81,9 @@ def _cmd_add(ctx: Context, ns) -> int:
 
 
 def _cmd_remove(ctx: Context, ns) -> int:
-    state = ctx.load_state()
-    existed = acct.remove(ctx, state, ns.tool, ns.email)
+    with ctx.locked():
+        state = ctx.load_state()
+        existed = acct.remove(ctx, state, ns.tool, ns.email)
     print(f"✓ waved goodbye to {ns.tool}:{ns.email}" if existed
           else f"(no seat {ns.tool}:{ns.email})")
     return EXIT_OK
@@ -121,8 +122,9 @@ def _cmd_status(ctx: Context, ns) -> int:
 
 
 def _cmd_switch(ctx: Context, ns) -> int:
-    state = ctx.load_state()
-    do_switch(ctx, state, ns.tool, ns.email)
+    with ctx.locked():
+        state = ctx.load_state()
+        do_switch(ctx, state, ns.tool, ns.email)
     print(f"✓ {ns.tool} is now on {ns.email}")
     return EXIT_OK
 

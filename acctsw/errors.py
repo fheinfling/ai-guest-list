@@ -19,4 +19,8 @@ class UnknownSeat(AcctswError):
 
 
 class MissingSnapshot(AcctswError):
-    """A seat is registered but its credential snapshot is missing from the keychain."""
+    """A seat is registered but its credential snapshot is missing from its private store."""
+
+
+class CodexBusy(AcctswError):
+    """Changing the canonical Codex login would disrupt one or more running Codex children."""
