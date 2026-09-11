@@ -46,6 +46,13 @@ class Usage:
     error: str | None = None  # "unauthorized" | "forbidden" | "rate_limited" | "network" | ...
     windows: dict[str, Window] = field(default_factory=dict)  # "5h" / "weekly"
     limit_reached: bool | None = None  # authoritative flag when the API provides one (Codex)
+    # Authoritative NON-percentage signals (codex). In the credits-depleted case the windows come
+    # back null, so percentages prove nothing and only these say whether the seat can be used.
+    plan_type: str | None = None            # "team" / "plus" / ... (display + triage)
+    allowed: bool | None = None             # rate_limit.allowed: false ⇒ the API refuses work
+    reached_type: str | None = None         # e.g. "workspace_member_credits_depleted"
+    spend_control_reached: bool | None = None
+    has_credits: bool | None = None         # DISPLAY ONLY — false on healthy subscriptions
     fetched_at: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -53,6 +60,11 @@ class Usage:
             "ok": self.ok,
             "error": self.error,
             "limit_reached": self.limit_reached,
+            "plan_type": self.plan_type,
+            "allowed": self.allowed,
+            "reached_type": self.reached_type,
+            "spend_control_reached": self.spend_control_reached,
+            "has_credits": self.has_credits,
             "fetched_at": self.fetched_at,
             "windows": {k: {"used_pct": w.used_pct, "resets_at": w.resets_at}
                         for k, w in self.windows.items()},
@@ -233,6 +245,34 @@ def parse_claude(payload: dict) -> dict[str, Window]:
     }
 
 
+def _bool(obj: Any, key: str) -> bool | None:
+    """A STRICTLY boolean field, else None. Truthiness is refused on purpose: this payload uses
+    ``null`` for "unknown", and coercing null to False would invent an answer the API never gave."""
+    if not isinstance(obj, dict):
+        return None
+    v = obj.get(key)
+    return v if isinstance(v, bool) else None
+
+
+def _codex_rate_src(payload: Any) -> dict:
+    """The container holding the rate-limit fields, tolerating the documented key variants."""
+    src = payload if isinstance(payload, dict) else {}
+    for k in ("rate_limit", "rate_limits", "usage"):
+        v = src.get(k)
+        if isinstance(v, dict) and v:
+            return v
+    return src
+
+
+def _codex_window_objs(src: dict) -> tuple[dict, dict]:
+    primary = (src.get("primary_window") or src.get("primary") or src.get("five_hour")
+               or src.get("5h") or src.get("hourly") or {})
+    secondary = (src.get("secondary_window") or src.get("secondary") or src.get("weekly")
+                 or src.get("seven_day") or src.get("week") or {})
+    return (primary if isinstance(primary, dict) else {},
+            secondary if isinstance(secondary, dict) else {})
+
+
 def parse_codex(payload: dict) -> dict[str, Window]:
     """Parse the real ChatGPT ``wham/usage`` shape (and tolerate minor variations).
 
@@ -241,12 +281,7 @@ def parse_codex(payload: dict) -> dict[str, Window]:
         {"rate_limit": {"primary_window":   {"used_percent": int, "reset_at": <epoch>},
                         "secondary_window": {"used_percent": int, "reset_at": <epoch>}}}
     """
-    src = (payload.get("rate_limit") or payload.get("rate_limits")
-           or payload.get("usage") or payload)
-    primary = (src.get("primary_window") or src.get("primary") or src.get("five_hour")
-               or src.get("5h") or src.get("hourly") or {})
-    secondary = (src.get("secondary_window") or src.get("secondary") or src.get("weekly")
-                 or src.get("seven_day") or src.get("week") or {})
+    primary, secondary = _codex_window_objs(_codex_rate_src(payload))
     return {"5h": _window_from(primary), "weekly": _window_from(secondary)}
 
 
@@ -254,6 +289,41 @@ def codex_limit_reached(payload: dict) -> bool | None:
     src = payload.get("rate_limit") or payload.get("rate_limits") or {}
     v = src.get("limit_reached")
     return v if isinstance(v, bool) else None
+
+
+def parse_codex_flags(payload: dict) -> dict[str, Any]:
+    """The AUTHORITATIVE non-percentage signals of the codex ``wham/usage`` payload.
+
+    Percentages are BLIND in the credits-depleted case: both windows come back ``null`` while the
+    only evidence is ``rate_limit.allowed: false`` plus ``rate_limit_reached_type``
+    (e.g. "workspace_member_credits_depleted"). ``credits.has_credits`` is carried for DISPLAY only —
+    it is false on perfectly healthy subscription accounts, so treating it as a limit signal would
+    rest every seat we own.
+
+    ``reset_after_seconds`` is the window's RELATIVE unlock, present even when ``reset_at`` is not.
+
+    Never raises: every field is type-checked, so garbage or missing input yields Nones.
+    """
+    p = payload if isinstance(payload, dict) else {}
+    rl = _codex_rate_src(p)
+    reached = p.get("rate_limit_reached_type")
+    if not (isinstance(reached, str) and reached):
+        reached = rl.get("rate_limit_reached_type")
+    primary, secondary = _codex_window_objs(rl)
+
+    def _secs(w: dict) -> int | None:
+        n = _num(w, "reset_after_seconds")
+        return int(n) if n is not None else None
+
+    plan = p.get("plan_type")
+    return {
+        "plan_type": plan if isinstance(plan, str) else None,
+        "allowed": _bool(rl, "allowed"),
+        "reached_type": reached if (isinstance(reached, str) and reached) else None,
+        "spend_control_reached": _bool(p.get("spend_control"), "reached"),
+        "has_credits": _bool(p.get("credits"), "has_credits"),
+        "reset_after_seconds": {"5h": _secs(primary), "weekly": _secs(secondary)},
+    }
 
 
 # --- fetchers ---------------------------------------------------------------------------------
@@ -290,6 +360,19 @@ def fetch_codex(token: str | None, account_id: str | None, *,
         payload = json.loads(body)
         u.windows = parse_codex(payload)
         u.limit_reached = codex_limit_reached(payload)
+        flags = parse_codex_flags(payload)
+        u.plan_type = flags["plan_type"]
+        u.allowed = flags["allowed"]
+        u.reached_type = flags["reached_type"]
+        u.spend_control_reached = flags["spend_control_reached"]
+        u.has_credits = flags["has_credits"]
+        # A window can carry only its RELATIVE unlock ("in 320961s") and no absolute stamp. Turn it
+        # into one here so a limited seat rests until its real reset instead of a blind estimate.
+        at = now()
+        for key, secs in flags["reset_after_seconds"].items():
+            w = u.windows.get(key)
+            if w is not None and secs is not None and not w.resets_at:
+                w.resets_at = iso(at + timedelta(seconds=secs))
         u.ok = True
     except (json.JSONDecodeError, AttributeError, TypeError):
         u.error = "parse"
@@ -491,12 +574,22 @@ def store_fetch(state, tool: str, email: str, u: Usage, at=None, *,
 
 
 def _is_limited(u: Usage) -> bool:
-    """True when THIS fetch shows the seat out: a window at/above LIMIT_PCT, or the authoritative
-    API flag. A limited seat must ALWAYS end up rested even when the payload carries no reset
+    """True when THIS fetch shows the seat out: a window at/above LIMIT_PCT, the authoritative
+    ``limit_reached`` flag, or one of the other authoritative signals — ``allowed: false``, a
+    non-empty ``rate_limit_reached_type``, or a reached spend control.
+
+    Those three matter because the credits-depleted payload ("workspace_member_credits_depleted")
+    reports NULL windows: there is no percentage to read, so percent-based logic is blind and only
+    the flags can tell that the seat cannot be used. ``has_credits`` is deliberately NOT consulted —
+    it is false on perfectly healthy accounts and would rest everything.
+
+    A limited seat must ALWAYS end up rested even when the payload carries no reset
     timestamp (e.g. a codex workspace out of credits) — otherwise the seat reads "available" while
     the display shows 100% and the launcher picks a maxed seat."""
-    return bool(u.limit_reached) or any(
-        w.used_pct is not None and w.used_pct >= LIMIT_PCT for w in u.windows.values())
+    return (bool(u.limit_reached) or u.allowed is False or bool(u.reached_type)
+            or u.spend_control_reached is True
+            or any(w.used_pct is not None and w.used_pct >= LIMIT_PCT
+                   for w in u.windows.values()))
 
 
 def _limit_reset(u: Usage) -> str | None:
@@ -506,6 +599,10 @@ def _limit_reset(u: Usage) -> str | None:
     LATER reset, so we take ``max()`` over maxed windows (using ``min()`` would mark the seat
     available too early and the launcher would switch back to a still-capped seat). With no reset
     on the maxed window(s), the latest known reset across all windows is the best estimate.
+
+    A window that only reported ``reset_after_seconds`` already had its ``resets_at`` synthesised in
+    ``fetch_codex`` (now + n seconds), so relative-only payloads land here as ordinary resets and
+    the caller never falls back to the blind DEFAULT_COOLDOWN estimate for them.
     """
     maxed = [w for w in u.windows.values() if w.used_pct is not None and w.used_pct >= LIMIT_PCT]
     resets = [w.resets_at for w in maxed if w.resets_at]
@@ -519,11 +616,30 @@ def _confirmed_healthy(u: Usage) -> bool:
     """True only when THIS fresh fetch proves the seat has clear headroom (mirror of the launcher's
     ``_seat_confirmed_healthy``, for a Usage object in hand rather than persisted state): ok, no
     authoritative limit flag, and the busiest window well under the false-alarm bar. A lagging
-    endpoint on a truly-maxed seat reads ~95-100% — above the bar — so lag can never look healthy."""
+    endpoint on a truly-maxed seat reads ~95-100% — above the bar — so lag can never look healthy.
+
+    An authoritative "out" (``allowed: false`` / a reached type / spend control) vetoes health even
+    when the windows look fine or are absent entirely: those are exactly the credits-depleted
+    payloads whose percentages say nothing."""
     if not u.ok or u.limit_reached:
+        return False
+    if u.allowed is False or bool(u.reached_type) or u.spend_control_reached is True:
         return False
     pcts = [w.used_pct for w in u.windows.values() if w.used_pct is not None]
     return bool(pcts) and max(pcts) < FALSE_ALARM_MAX_PCT
+
+
+def snapshot_says_out(u_dict: dict) -> bool:
+    """The persisted-state mirror of ``_is_limited``'s flag half: True when a seat's stored ``usage``
+    dict carries an authoritative out signal (``limit_reached``, ``allowed`` false, a non-empty
+    ``reached_type`` or a reached spend control). Callers that hold state rather than a fresh
+    ``Usage`` — the launcher — need the credits-depleted verdict too, and that case has NO
+    percentages to inspect. Snapshots written before these fields existed simply lack the keys, so
+    every lookup is a ``.get`` and an old state degrades to the ``limit_reached`` answer it had.
+    ``has_credits`` is NOT consulted: it is false on perfectly healthy accounts."""
+    d = u_dict if isinstance(u_dict, dict) else {}
+    return (bool(d.get("limit_reached")) or d.get("allowed") is False
+            or bool(d.get("reached_type")) or d.get("spend_control_reached") is True)
 
 
 def _apply_limit(state, tool: str, email: str, u: Usage, at, *,

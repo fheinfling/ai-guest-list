@@ -30,17 +30,60 @@ def claude_ok_body(five=10.0, week=50.0, five_reset=None, week_reset=None):
     })
 
 
-def codex_ok_body(primary=20.0, secondary=70.0, p_reset=None, s_reset=None):
-    """Real ChatGPT wham/usage shape: rate_limit.{primary,secondary}_window, reset_at epoch."""
+def codex_ok_body(primary=20.0, secondary=70.0, p_reset=None, s_reset=None, *,
+                  allowed=None, plan_type=None, has_credits=None, spend_control_reached=None,
+                  reached_type=None, reset_after_seconds=None, omit_reset_at=False):
+    """Real ChatGPT wham/usage shape: rate_limit.{primary,secondary}_window, reset_at epoch.
+
+    The keyword-only extras mirror the rest of the live payload (plan_type, rate_limit.allowed,
+    credits.has_credits, spend_control.reached, rate_limit_reached_type and the windows' RELATIVE
+    reset_after_seconds as a (primary, secondary) pair). Each is emitted only when given, so every
+    pre-existing caller still gets exactly the old body.
+    """
     import calendar
     def to_epoch(iso_s):
         from datetime import datetime
         return calendar.timegm(datetime.fromisoformat(iso_s).utctimetuple())
-    return json.dumps({"rate_limit": {
-        "limit_reached": primary >= 100 or secondary >= 100,
-        "primary_window": {"used_percent": primary, "reset_at": to_epoch(p_reset or iso(now()))},
-        "secondary_window": {"used_percent": secondary, "reset_at": to_epoch(s_reset or iso(now()))},
-    }})
+    pw = {"used_percent": primary}
+    sw = {"used_percent": secondary}
+    if not omit_reset_at:
+        pw["reset_at"] = to_epoch(p_reset or iso(now()))
+        sw["reset_at"] = to_epoch(s_reset or iso(now()))
+    if reset_after_seconds is not None:
+        pw["reset_after_seconds"], sw["reset_after_seconds"] = reset_after_seconds
+    rate = {"limit_reached": primary >= 100 or secondary >= 100,
+            "primary_window": pw, "secondary_window": sw}
+    if allowed is not None:
+        rate["allowed"] = allowed
+    body = {"rate_limit": rate}
+    if plan_type is not None:
+        body["plan_type"] = plan_type
+    if reached_type is not None:
+        body["rate_limit_reached_type"] = reached_type
+    if has_credits is not None:
+        body["credits"] = {"has_credits": has_credits, "unlimited": False, "balance": None}
+    if spend_control_reached is not None:
+        body["spend_control"] = {"reached": spend_control_reached, "individual_limit": None}
+    return json.dumps(body)
+
+
+def codex_credits_depleted_body(*, plan_type="team",
+                                reached_type="workspace_member_credits_depleted",
+                                allowed=False, windows_null=True):
+    """The credits-depleted payload (verified live): the windows are NULL, so there is no percentage
+    to read and only allowed/rate_limit_reached_type reveal that the seat cannot be used."""
+    return json.dumps({
+        "plan_type": plan_type,
+        "rate_limit": {
+            "allowed": allowed, "limit_reached": False,
+            "primary_window": None if windows_null else {"used_percent": 0},
+            "secondary_window": None if windows_null else {"used_percent": 0},
+        },
+        "rate_limit_reached_type": reached_type,
+        "credits": {"has_credits": False, "unlimited": False, "overage_limit_reached": False,
+                    "balance": None},
+        "spend_control": {"reached": False, "individual_limit": None},
+    })
 
 
 # --- parsers ----------------------------------------------------------------------------------
@@ -71,6 +114,15 @@ def test_parse_codex_alt_layout_and_epoch_reset():
 def test_parse_missing_windows_are_empty():
     w = U.parse_claude({})
     assert w["5h"].used_pct is None and w["5h"].resets_at is None
+
+
+@pytest.mark.parametrize("payload", [{}, {"rate_limit": "nope"}, {"credits": []}])
+def test_parse_codex_flags_tolerates_garbage(payload):
+    """The flag parser must never raise on an unexpected shape — it degrades to all-unknown."""
+    f = U.parse_codex_flags(payload)
+    assert f["plan_type"] is None and f["allowed"] is None and f["reached_type"] is None
+    assert f["spend_control_reached"] is None and f["has_credits"] is None
+    assert f["reset_after_seconds"] == {"5h": None, "weekly": None}
 
 
 # --- token extraction -------------------------------------------------------------------------
@@ -425,6 +477,118 @@ def test_maxed_usage_poll_does_not_downgrade_hard_limit(ctx):
     U.refresh(ctx, state, "codex", only="a@x.com", force=True, get=get)
     seat = state.get_seat("codex", "a@x.com")
     assert seat["limit_source"] == "hard" and seat["limited_until"] == hard_until
+
+
+# --- authoritative non-percentage flags (credits-depleted case) --------------------------------
+
+def _codex_usage(body):
+    return U.fetch_codex("tok", "acc", get=fake_get({P.CODEX_USAGE_URL: (200, body)}))
+
+
+def test_codex_allowed_false_is_limited(ctx):
+    """rate_limit.allowed=false with NULL windows: percentages are absent, so this flag is the ONLY
+    evidence the seat is out. With no reset in the payload the rest is the default cooldown."""
+    u = _codex_usage(codex_credits_depleted_body(reached_type=None))
+    assert u.ok and u.allowed is False and u.reached_type is None
+    assert U._is_limited(u) is True
+
+    state = _seed_two_codex(ctx)
+    at = now()
+    U.store_fetch(state, "codex", "a@x.com", u, at=at)
+    seat = state.get_seat("codex", "a@x.com")
+    assert seat["limit_source"] == "usage"
+    assert abs((parse_iso(seat["limited_until"]) - (at + U.DEFAULT_COOLDOWN)).total_seconds()) < 5
+
+
+def test_codex_reached_type_is_limited_and_not_healthy():
+    """rate_limit_reached_type alone (allowed still true, windows null) rests the seat and can never
+    be read as confirmed-healthy — there is no window to prove headroom with."""
+    u = _codex_usage(codex_credits_depleted_body(allowed=True))
+    assert u.reached_type == "workspace_member_credits_depleted"
+    assert U._is_limited(u) is True
+    assert U._confirmed_healthy(u) is False
+
+
+def test_codex_spend_control_reached_is_limited():
+    """A reached spend control blocks work even while both windows look perfectly healthy."""
+    u = _codex_usage(codex_ok_body(primary=5.0, secondary=5.0, allowed=True,
+                                   spend_control_reached=True))
+    assert u.spend_control_reached is True
+    assert U._is_limited(u) is True
+    assert U._confirmed_healthy(u) is False
+
+
+def test_codex_has_credits_false_alone_is_not_limited(ctx):
+    """THE regression that matters: credits.has_credits is false on perfectly healthy subscription
+    accounts (real payload: allowed true, 0% / 57% used). It must never rest a seat."""
+    u = _codex_usage(codex_ok_body(primary=0, secondary=57, allowed=True, plan_type="team",
+                                   has_credits=False))
+    assert u.has_credits is False and u.plan_type == "team" and u.allowed is True
+    assert U._is_limited(u) is False
+    assert U._confirmed_healthy(u) is True
+
+    state = _seed_two_codex(ctx)
+    U.store_fetch(state, "codex", "a@x.com", u, at=now())
+    assert state.get_seat("codex", "a@x.com")["limited_until"] is None
+
+
+def test_codex_reset_after_seconds_used_when_reset_at_missing():
+    """A window may carry only its RELATIVE unlock; it is turned into an absolute stamp so a maxed
+    seat rests until its real reset instead of a blind DEFAULT_COOLDOWN estimate."""
+    at = now()
+    u = _codex_usage(codex_ok_body(primary=100.0, secondary=57.0, omit_reset_at=True,
+                                   reset_after_seconds=(1800, 320961)))
+    five = parse_iso(u.windows["5h"].resets_at)
+    assert abs((five - (at + timedelta(seconds=1800))).total_seconds()) < 5
+    assert parse_iso(u.windows["weekly"].resets_at) > five
+    assert U._limit_reset(u) == u.windows["5h"].resets_at   # the maxed window's own reset
+
+
+def test_usage_snapshot_carries_plan_type_and_reached_type(ctx):
+    """The new flags must round-trip into the persisted seat so state-only callers can see them."""
+    assert set(U.Usage().to_dict()) >= {"plan_type", "allowed", "reached_type",
+                                        "spend_control_reached", "has_credits"}
+    state = _seed_two_codex(ctx)
+    U.refresh(ctx, state, "codex", only="a@x.com", force=True,
+              get=fake_get({P.CODEX_USAGE_URL: (200, codex_credits_depleted_body())}))
+    usage = state.get_seat("codex", "a@x.com")["usage"]
+    assert usage["plan_type"] == "team"
+    assert usage["reached_type"] == "workspace_member_credits_depleted"
+    assert usage["allowed"] is False and usage["has_credits"] is False
+    assert U.snapshot_says_out(usage) is True
+
+
+def test_store_fetch_tolerates_snapshot_without_new_fields(ctx):
+    """A seat persisted before these fields existed has none of the keys — nothing may KeyError."""
+    state = _seed_two_codex(ctx)
+    state.get_seat("codex", "a@x.com")["usage"] = {
+        "ok": True, "error": None, "limit_reached": False, "fetched_at": iso(now()),
+        "windows": {"5h": {"used_pct": 10.0, "resets_at": None}},
+    }
+    old = state.get_seat("codex", "a@x.com")["usage"]
+    assert U.snapshot_says_out(old) is False
+
+    u = _codex_usage(codex_ok_body(primary=5.0, secondary=5.0))
+    assert U.store_fetch(state, "codex", "a@x.com", u, at=now()) == "ok"
+    usage = state.get_seat("codex", "a@x.com")["usage"]
+    assert usage["plan_type"] is None and usage["allowed"] is None
+    assert state.get_seat("codex", "a@x.com")["limited_until"] is None
+
+    failed = U.Usage(ok=False, error="network", fetched_at=iso(now()))
+    assert U.store_fetch(state, "codex", "a@x.com", failed, at=now()) == "network"
+
+
+def test_snapshot_says_out_flags():
+    assert U.snapshot_says_out({}) is False
+    assert U.snapshot_says_out({"limit_reached": True}) is True
+    assert U.snapshot_says_out({"allowed": False}) is True
+    assert U.snapshot_says_out({"allowed": True}) is False
+    assert U.snapshot_says_out({"reached_type": "workspace_member_credits_depleted"}) is True
+    assert U.snapshot_says_out({"reached_type": ""}) is False
+    assert U.snapshot_says_out({"spend_control_reached": True}) is True
+    assert U.snapshot_says_out({"spend_control_reached": False}) is False
+    # has_credits is false on healthy accounts — it is not an out-signal
+    assert U.snapshot_says_out({"allowed": True, "has_credits": False}) is False
 
 
 def test_error_preserves_last_known_windows(ctx):
