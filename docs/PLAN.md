@@ -212,6 +212,10 @@ migration path: [`SECURITY-headroom.md`](SECURITY-headroom.md).
 - **Limit message wording changes** (Codex CLI 0.153.4 reworded the out-of-credits banner) → the
   regexes are a hint/fallback only; the trusted signals are the rollout events and the usage flags.
   Launch-time selection works regardless.
+- **Two seats, one account** → seats are fingerprinted by the ChatGPT *user* id, so one person
+  signed in twice (Gmail `+alias`) is warned as one quota, while Team/Business members of one
+  workspace stay separate seats with their own 5h/weekly windows (only credits pool there, and
+  the launcher's hard-limit landing pre-flight already proves the landing seat).
 - **auth.json race during refresh** → atomic swap only between child runs.
 - **GUI apps** → menubar `switch` swaps the same creds the apps read; they may need a restart (app
   reads creds at launch). Auto-detection stays CLI-driven (best-effort GUI, as agreed).

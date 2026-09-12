@@ -159,10 +159,42 @@ def codex_token_account(blob: str) -> tuple[str | None, str | None]:
 
 
 def account_fingerprint(tool: str, blob: str | None) -> str | None:
-    """The underlying provider-account id for a credential blob. Two seats that share a fingerprint
-    are the SAME billing account — one quota pool, so they can't cover each other when limited (a
-    Gmail '+alias' codex login still maps to one ChatGPT account). Codex: the ChatGPT account id;
-    Claude: none exposed today → None (claude seats are distinct Anthropic accounts by email)."""
+    """The PERSON behind a credential blob — the identity whose rate-limit windows a seat spends.
+    Two seats that share a fingerprint are the same human on one subscription: one quota pool, so
+    they can't cover each other when limited (a Gmail '+alias' codex login is still one ChatGPT
+    user). Codex: ``chatgpt_user_id``/``user_id`` from the id/access token.
+
+    NOT the ChatGPT account id: on Team/Business that id is the WORKSPACE every member shares, while
+    each member keeps their OWN 5h/weekly windows (verified live — two members of one workspace read
+    100% and 0% at the same moment, and hopping between them worked). Fingerprinting the workspace
+    mis-flagged colleagues as one quota. Only workspace CREDITS are pooled, and the launcher's
+    hard-limit landing pre-flight already proves the landing seat before it hops.
+
+    Falls back to the workspace id (``account_workspace``) when no user claim is present — old
+    blobs, API-key auth — which is the pre-user-id behaviour. Claude exposes no such id today →
+    None (claude seats are distinct Anthropic accounts by email)."""
+    if not blob or tool != "codex":
+        return None
+    from .util import jwt_payload
+    try:
+        data = json.loads(blob)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    tokens = data.get("tokens") or {}
+    for tok in (tokens.get("id_token"), tokens.get("access_token")):
+        auth = (jwt_payload(tok or "") or {}).get("https://api.openai.com/auth") or {}
+        uid = auth.get("chatgpt_user_id") or auth.get("user_id")
+        if uid:
+            return uid
+    return account_workspace(tool, blob)
+
+
+def account_workspace(tool: str, blob: str | None) -> str | None:
+    """The provider ACCOUNT id behind a credential blob (codex: ``chatgpt_account_id``). For a
+    personal login that is the account itself; on Team/Business it is the workspace every member
+    shares — so it names the SUBSCRIPTION, not the person (that's ``account_fingerprint``). It is
+    what changes on a cancel/re-subscribe or a workspace move, which is why the poll uses it to
+    decide that a seat's saved limits belong to a subscription that no longer exists."""
     if not blob or tool != "codex":
         return None
     from .util import jwt_payload
@@ -541,11 +573,17 @@ def store_fetch(state, tool: str, email: str, u: Usage, at=None, *,
             from . import accounts
             seat = state.get_seat(tool, email)
             if seat is not None:
-                old_account_id = seat.get("account_id")
-                new_account_id = account_fingerprint(tool, blob)
+                # Two ids, two jobs: ``account_id`` is the PERSON (shared-quota detection) and
+                # ``workspace_id`` the subscription. The re-subscription check must compare the
+                # SUBSCRIPTION — a workspace move keeps the person but not their windows, and the
+                # person is stable across a re-login. Seats stamped before workspace_id existed
+                # carry None and simply adopt it on this poll (no phantom re-subscription).
+                old_workspace = seat.get("workspace_id")
+                new_workspace = account_workspace(tool, blob)
                 seat["plan"] = accounts.plan_of(tool, blob)
-                seat["account_id"] = new_account_id
-                if old_account_id and new_account_id and old_account_id != new_account_id:
+                seat["account_id"] = account_fingerprint(tool, blob)
+                seat["workspace_id"] = new_workspace
+                if old_workspace and new_workspace and old_workspace != new_workspace:
                     # Same email, different provider account means cancellation/re-subscription or
                     # a workspace move. Old rests and auth backoff belong to the old subscription.
                     state.set_limited_until(tool, email, None)
