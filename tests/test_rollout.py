@@ -383,3 +383,239 @@ def test_watcher_keeps_its_cwd_match_when_a_rival_session_appears(tmp_path):
 
     assert watcher.poll() == []          # the rival's limit never reaches us
     assert watcher.attached == mine
+
+
+# --- discovery: the defensive edges -------------------------------------------------------------
+
+def test_sessions_roots_skips_a_root_that_cannot_be_resolved(ctx, monkeypatch):
+    """A per-account CODEX_HOME whose ``sessions`` entry is a broken symlink loop raises on resolve.
+    One unusable home must not cost us the OTHER root — the real ~/.codex is where a symlinked home
+    points anyway, so dropping the whole list would blind the watcher for the entire session."""
+    doomed = Path(ctx.codex_home("a@x.com")) / "sessions"
+    real_resolve = Path.resolve
+
+    def flaky(self, *a, **kw):
+        if self == doomed:
+            raise OSError("ELOOP: too many levels of symbolic links")
+        return real_resolve(self, *a, **kw)
+
+    monkeypatch.setattr(rollout.Path, "resolve", flaky)
+    assert rollout.sessions_roots(ctx, "a@x.com") == [real_resolve(ctx._codex_real / "sessions")]
+
+
+def test_scan_rollouts_visits_a_repeated_root_once(tmp_path):
+    """A per-account home usually SYMLINKS its sessions dir to the shared one, so the two roots can
+    collapse to the same real directory. Walking it twice would double every stat for nothing."""
+    root = tmp_path / "sessions"
+    path = write_rollout(root)
+    _touch(path, BASE)
+    once = rollout.scan_rollouts([root])
+    assert once == {path: int(BASE * 1_000_000_000)}
+    assert rollout.scan_rollouts([root, root, root / "." ]) == once
+
+
+class _RaisingEntry:
+    """A scandir entry whose metadata calls fail — a file deleted between listing and stat, or one
+    inside a directory we may list but not read."""
+
+    def __init__(self, entry, fail):
+        self._entry, self._fail = entry, fail
+        self.name, self.path = entry.name, entry.path
+
+    def is_dir(self, follow_symlinks=True):
+        if self._fail == "is_dir":
+            raise OSError("ENOENT: vanished between listing and stat")
+        return self._entry.is_dir(follow_symlinks=follow_symlinks)
+
+    def stat(self, follow_symlinks=True):
+        if self._fail == "stat":
+            raise OSError("ENOENT: vanished between listing and stat")
+        return self._entry.stat(follow_symlinks=follow_symlinks)
+
+
+def test_scan_rollouts_skips_entries_whose_metadata_raises(tmp_path, monkeypatch):
+    """The sessions tree is written by another process: a file can disappear between the directory
+    listing and the stat that follows it. That entry is simply absent from the result — a scan that
+    raised would take down the watcher, and with it the whole supervisor."""
+    root = tmp_path / "sessions"
+    good = write_rollout(root, thread="good")
+    gone = write_rollout(root, thread="gone")
+    doomed_dir = write_rollout(root, thread="x", ts="2026-09-06T09:00:00").parent
+    _touch(good, BASE)
+
+    real_scandir = os.scandir
+
+    class _Fake:
+        def __init__(self, d):
+            self._it = real_scandir(d)
+
+        def __enter__(self):
+            return [_RaisingEntry(e, "stat" if e.path == str(gone) else
+                                 ("is_dir" if e.path == str(doomed_dir) else None))
+                    for e in self._it]
+
+        def __exit__(self, *exc):
+            self._it.close()
+            return False
+
+    monkeypatch.setattr(rollout.os, "scandir", _Fake)
+    found = rollout.scan_rollouts([root])
+    assert list(found) == [good]          # the unreadable file and the unreadable dir are just absent
+
+
+def test_session_meta_returns_none_for_anything_that_is_not_a_header(tmp_path):
+    """Line 1 is read blind: the file may be empty, half-written, not a rollout at all, or not even
+    a file. Every one of those is "we don't know whose session this is", never an exception."""
+    empty = tmp_path / "rollout-empty.jsonl"
+    empty.write_text("")
+    not_a_dict = tmp_path / "rollout-list.jsonl"
+    not_a_dict.write_text("[1, 2, 3]\n")
+    wrong_type = tmp_path / "rollout-other.jsonl"
+    wrong_type.write_text(rollout_line("token_count", rate_limits=None, info={}) + "\n")
+    bad_payload = tmp_path / "rollout-payload.jsonl"
+    bad_payload.write_text(json.dumps({"type": "session_meta", "payload": "just a string"}) + "\n")
+
+    for path in (tmp_path, empty, not_a_dict, wrong_type, bad_payload):
+        assert rollout.session_meta(path) is None
+
+    header = write_rollout(tmp_path / "sessions", cwd="/work/x")
+    assert rollout.session_meta(header)["cwd"] == "/work/x"
+
+
+def test_find_session_file_skips_a_file_that_has_not_moved_since_the_snapshot(tmp_path):
+    """Discovery is snapshot-then-diff: a session in OUR cwd that was already idle when we spawned
+    is not our child, however recent its mtime. Only files that actually MOVED are candidates."""
+    root = tmp_path / "sessions"
+    idle = write_rollout(root, thread="idle", cwd="/work/x")
+    _touch(idle, BASE + 10)                       # newer than the spawn floor...
+    before = rollout.scan_rollouts([root])        # ...but recorded, and it never advances again
+    assert rollout.find_session_file([root], before=before, cwd="/work/x",
+                                     since_ns=int((BASE + 5) * 1e9)) == (None, False)
+
+
+# --- classification: malformed windows ----------------------------------------------------------
+
+def test_classify_ignores_a_used_percent_that_is_not_a_number():
+    """``used_percent: true`` would read as 1.0 under a bare int check (bool IS an int in Python),
+    and a string would raise on compare. Neither says anything about the window, so neither may
+    produce a verdict — "uninformative" is not "healthy" and certainly not "limited"."""
+    for junk in (True, False, "12", "100", None, {"pct": 100}):
+        line = token_count_line(primary={"used_percent": junk, "window_minutes": 300,
+                                         "resets_at": RESET_5H})
+        assert rollout.classify(_obj(line)) is None
+
+
+def test_classify_passes_a_string_resets_at_through_untouched():
+    """Rollouts write ``resets_at`` as epoch seconds, but the schema is undocumented and a build
+    that switches to ISO must keep working — a string is already what the caller wants. An EMPTY
+    string is not a time, though, and must not be stamped on a seat as its unlock moment."""
+    iso_reset = rollout.classify(_obj(token_count_line(
+        primary=window(78.0, resets_at="2026-09-12T00:00:00Z"),
+        reached_type="workspace_member_credits_depleted")))
+    assert iso_reset.reset_at == "2026-09-12T00:00:00Z"
+
+    blank = rollout.classify(_obj(token_count_line(
+        primary=window(78.0, resets_at=""), reached_type="workspace_member_credits_depleted")))
+    assert blank.kind == "limit" and blank.reset_at is None
+
+
+def test_classify_drops_an_out_of_range_resets_at():
+    """An epoch the platform cannot turn into a datetime (a garbled or millisecond-scaled field)
+    must leave the limit standing WITHOUT a reset time, not raise inside the watcher."""
+    for junk in (1e20, -1e20, 1_789_000_000_000):
+        sig = rollout.classify(_obj(token_count_line(
+            primary=window(100.0, resets_at=junk), secondary=None)))
+        assert sig.kind == "limit" and sig.hard is False
+        assert sig.reset_at is None
+
+
+def test_classify_task_complete_without_a_limit_error_says_nothing():
+    """Most turns finish fine, and the ones that fail usually fail for reasons that are none of our
+    business (a tool error, a cancelled turn). Only the server's own limit codes are a signal."""
+    ignored = [
+        rollout_line("task_complete", turn_id="t1", last_agent_message="done", error=None),
+        rollout_line("task_complete", turn_id="t1", error={"message": "boom",
+                                                           "codex_error_info": "other"}),
+        rollout_line("task_complete", turn_id="t1", error="not even a dict"),
+        task_complete_error_line(code="internal_server_error"),
+    ]
+    assert [rollout.classify(_obj(line)) for line in ignored] == [None] * len(ignored)
+
+
+# --- watcher: attaching to a file already in flight ---------------------------------------------
+
+def test_watcher_upgrades_confidence_on_the_same_file_without_replaying_it(tmp_path):
+    """A provisional attachment that later proves unique must only flip the FLAG. Two sessions share
+    this directory, so we attach ambiguously; when the rival's log is gone the next scan names the
+    same file, now unique. Re-seeking there would replay the tail and hand the caller a limit it has
+    already acted on — a second, unearned hop on one event."""
+    root = tmp_path / "sessions"
+    started = now()
+    ts = iso(started + timedelta(seconds=1))
+    rival = write_rollout(root, thread="rival", cwd="/work/x")
+    mine = write_rollout(root, thread="ours", cwd="/work/x",
+                         lines=[task_complete_error_line(timestamp=ts)])
+    _touch(rival, time.time() + 5)
+    _touch(mine, time.time() + 10)       # newest wins the first, ambiguous attach
+
+    watcher = _watcher(root, started_at=started)
+    assert [s.kind for s in watcher.poll()] == ["limit"]
+    assert watcher.attached == mine and watcher.unambiguous is False
+
+    rival.unlink()                       # the other session's log is pruned away
+
+    assert watcher.poll() == []          # the limit is NOT delivered a second time...
+    assert watcher.attached == mine
+    assert watcher.unambiguous is True   # ...but we now know the file is ours
+
+
+def _pad(line, size):
+    """``line`` padded with trailing spaces to exactly ``size`` bytes including its newline (JSON
+    ignores the padding), so a test can place a known byte layout under the tail window."""
+    fill = size - len(line.encode()) - 1
+    assert fill >= 0
+    return line + " " * fill
+
+
+def test_watcher_attach_reads_only_the_tail_of_a_long_running_session(tmp_path, monkeypatch):
+    """A resumed thread keeps appending to its ORIGINAL file, which can be megabytes — and still
+    holds the limit that ended the previous run. Attach re-reads only the last TAIL_BYTES, cut
+    FORWARD to the next line boundary so the partial line the window starts in is never parsed."""
+    monkeypatch.setattr(rollout, "TAIL_BYTES", 4096)
+    root = tmp_path / "sessions"
+    started = now()
+    ts = iso(started + timedelta(seconds=1))
+    buried = task_complete_error_line(timestamp=ts)   # inside this session, but far from the end
+    filler = [_pad(token_count_line(primary=window(4.0), timestamp=ts), 1024) for _ in range(20)]
+    path = write_rollout(root, lines=[buried, *filler])
+    assert path.stat().st_size > 4096 * 4
+
+    watcher = _watcher(root, started_at=started)
+    # The 4096-byte window covers four 1024-byte lines; the first is the one we land inside, so it
+    # is skipped and exactly three whole lines are read. The buried limit is far outside it.
+    assert [s.kind for s in watcher.poll()] == ["healthy"] * 3
+
+    _append(path, task_complete_error_line(timestamp=ts) + "\n")
+    assert [s.kind for s in watcher.poll()] == ["limit"]   # and it tails normally from there
+
+
+def test_watcher_poll_swallows_an_error_that_is_not_an_oserror(tmp_path, monkeypatch):
+    """``poll`` is called from the supervisor's heartbeat, so ANY exception escaping it would take
+    down the session it is meant to protect. The inner reads guard OSError; this is the outer net
+    for everything else a filesystem layer or a schema change can throw."""
+    root = tmp_path / "sessions"
+    started = now()
+    ts = iso(started + timedelta(seconds=1))
+    path = write_rollout(root, lines=[task_complete_error_line(timestamp=ts)])
+    watcher = _watcher(root, started_at=started)
+    assert [s.kind for s in watcher.poll()] == ["limit"]
+
+    real_stat = os.stat
+
+    def boom(target, *a, **kw):
+        if not isinstance(target, int) and str(target) == str(path):
+            raise RuntimeError("not an OSError, and still not worth killing a session over")
+        return real_stat(target, *a, **kw)
+
+    monkeypatch.setattr(rollout.os, "stat", boom)
+    assert watcher.poll() == []

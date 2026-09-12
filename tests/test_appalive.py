@@ -120,6 +120,34 @@ def test_proc_start_is_locale_independent_for_a_real_process(monkeypatch):
     assert baseline.split()[0] in {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}
 
 
+def test_proc_start_rejects_a_pid_that_cannot_name_a_process():
+    """`ps -p 0` asks about the kernel's own scheduler slot, and a negative pid is a process GROUP.
+    Neither can ever be our menubar app, so both read as "not running" without spawning anything."""
+    assert procenv.proc_start(0) == ""
+    assert procenv.proc_start(-1) == ""
+    assert procenv.proc_start(-os.getpid()) == ""
+
+
+def test_proc_start_returns_none_when_ps_itself_cannot_run(monkeypatch):
+    """No `ps` on PATH (a stripped container, a mangled PATH) is NOT evidence the process is gone.
+    Returning "" there would read as a recycled PID and silently disable supervision for everyone;
+    None is the distinct "couldn't ask", which sends the caller back to bare liveness."""
+    def no_such_binary(*a, **kw):
+        raise FileNotFoundError("[Errno 2] No such file or directory: 'ps'")
+
+    monkeypatch.setattr(procenv.subprocess, "run", no_such_binary)
+    assert procenv.proc_start(os.getpid()) is None
+
+
+def test_app_running_survives_a_missing_ps(ctx, monkeypatch):
+    """The same "couldn't ask" case reaching the heartbeat: a live PID with a recorded start-time
+    must still read as running when `ps` is unavailable, rather than closing the app's own gate."""
+    monkeypatch.setattr(procenv.subprocess, "run",
+                        lambda *a, **kw: (_ for _ in ()).throw(FileNotFoundError("ps")))
+    (ctx.data_dir / "app.pid").write_text(f"{os.getpid()}\nSat Aug 29 16:36:54 2026")
+    assert appalive.app_running(ctx.data_dir) is True
+
+
 def test_app_running_accepts_a_heartbeat_written_in_another_locale(ctx, monkeypatch):
     """Upgrade path: an app started before the fix still holds a German-formatted start-time until
     it restarts. Same instant, different spelling → still the app, NOT a recycled PID."""

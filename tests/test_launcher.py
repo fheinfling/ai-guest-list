@@ -2078,3 +2078,196 @@ def test_hard_banner_acts_when_attachment_is_ambiguous(ctx, monkeypatch, tmp_pat
     state = ctx.load_state()
     assert state.active("codex") == "b@x.com"
     assert state.get_seat("codex", "a@x.com")["limit_source"] == "hard"
+
+
+# --- the edges of the decision tail ------------------------------------------------------------
+
+def test_handle_limit_never_shortens_a_rest_we_already_believe_in(ctx):
+    """A structured signal can carry an EARLIER unlock than the one already on the seat: the 5-hour
+    window reopens long before the weekly one that is actually blocking us. Re-anchoring to the
+    nearer time would send the launcher back to a still-capped seat the moment it passes."""
+    state = _two_codex(ctx)  # active a
+    later = iso(now() + timedelta(hours=3))
+    state.set_limited_until("codex", "a@x.com", later, source="usage")
+    state.save()
+
+    dec = handle_limit(ctx, state, "codex", get=fake_get({}), corroborated=True, hard=False,
+                       reset_at=iso(now() + timedelta(hours=1)), source="usage")
+
+    seat = state.get_seat("codex", "a@x.com")
+    assert L.parse_iso(seat["limited_until"]) == L.parse_iso(later)
+    assert dec.action == "switch" and dec.email == "b@x.com"
+
+
+def test_run_auth_death_names_the_resting_sibling_instead_of_a_relogin(ctx):
+    """Dead credentials while the only other seat is asleep. Both walls block the hop, but the
+    remedies differ: telling this user to re-add a seat would send them to fix the wrong thing —
+    the seat exists, it is merely resting. Say when it comes back, and leave the child running."""
+    state = _two_codex(ctx)  # active a
+    unlocks = iso(now() + timedelta(hours=2))
+    state.set_limited_until("codex", "b@x.com", unlocks, source="usage")
+    state.save()
+    get = fake_get({P.CODEX_USAGE_URL: (401, "")})  # inconclusive: it must not dismiss the banner
+    msgs = []
+    spawn = FakeSpawn([(b"... your refresh token was revoked ...\n", 7)])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=msgs.append)
+
+    assert rc == 7 and rc != L.EXIT_GAVE_UP
+    assert spawn.stops == 0 and len(spawn.calls) == 1
+    assert ctx.load_state().active("codex") == "a@x.com"
+    hints = [m for m in msgs if "sign in again" in m]
+    assert len(hints) == 1
+    assert "is resting until" in hints[0]
+    assert "acctsw add" not in hints[0]   # the seat is already there; re-adding it fixes nothing
+
+
+def test_tick_survives_a_state_file_that_disappears(ctx):
+    """The store is written atomically, but nothing stops the data dir being taken away mid-session
+    (a restore, a stray rm, an uninstall losing a race). The heartbeat reads it every two seconds;
+    raising there would kill a child that is running perfectly well over pure bookkeeping."""
+    _two_codex(ctx)
+
+    def wipe_the_store():
+        ctx.state_file.unlink()
+
+    msgs = []
+    spawn = FakeSpawn([(None, 0, [wipe_the_store, None, None])])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=fake_get({}), notify=msgs.append)
+
+    assert rc == 0 and spawn.stops == 0 and len(spawn.calls) == 1
+    assert msgs == []
+
+
+def test_tick_treats_a_touched_state_file_as_unchanged(ctx, monkeypatch):
+    """The mtime is only a cheap pre-filter: anything that rewrites or touches the file moves it.
+    The REVISION is what says the data moved. Without that second gate, a seat already judged would
+    be re-decided — and re-notified — every time some other process breathed on the store."""
+    ctx.cred["codex"].set_live(make_codex_blob("solo@x.com"))
+    acct.add(ctx, ctx.load_state(), "codex", email="solo@x.com")
+    calls = {"n": 0}
+    real_handle = L.handle_limit
+    monkeypatch.setattr(L, "handle_limit",
+                        lambda *a, **k: (calls.__setitem__("n", calls["n"] + 1),
+                                         real_handle(*a, **k))[1])
+
+    def poll_rests_it():
+        with ctx.locked():
+            st = ctx.load_state()
+            st.set_limited_until("codex", "solo@x.com", iso(now() + timedelta(hours=3)),
+                                 source="usage")
+            st.save()
+
+    def touch_without_writing():
+        stamp = ctx.state_file.stat().st_mtime_ns + 1_000_000_000
+        os.utime(ctx.state_file, ns=(stamp, stamp))
+
+    msgs = []
+    spawn = FakeSpawn([(None, 3, [poll_rests_it] + [touch_without_writing] * 5)])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=fake_get({}), notify=msgs.append)
+
+    assert rc == 3 and spawn.stops == 0
+    assert calls["n"] == 1                                  # one real change, five bare touches
+    assert sum("staying on this seat" in m for m in msgs) == 1
+
+
+def test_tick_recovery_respects_a_switch_budget_that_is_already_spent(ctx, monkeypatch):
+    """The clock-driven re-check exists to rescue a session stuck on a rested seat. It must not
+    become a way around the switch bound: with the budget spent there is no hop to make, however
+    healthy the sibling looks, so the re-check has to fall silent instead of re-deciding forever."""
+    clock = _frozen_clock(monkeypatch)
+    _two_codex(ctx)  # active a, healthy b
+
+    def menubar_rests_a():
+        with ctx.locked():
+            st = ctx.load_state()
+            st.set_limited_until("codex", "a@x.com", iso(clock["t"] + timedelta(hours=3)),
+                                 source="usage")
+            st.save()
+
+    def time_passes():
+        clock["advance"](L.TICK_BLOCK_S + 10)   # the re-check window opens, with nothing written
+
+    msgs = []
+    spawn = FakeSpawn([(None, 4, [menubar_rests_a, None, time_passes, None, None])])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=fake_get({}), notify=msgs.append,
+             max_switches=0)
+
+    assert rc == 4 and spawn.stops == 0 and len(spawn.calls) == 1
+    assert ctx.load_state().active("codex") == "a@x.com"    # the budget held; no hop happened
+    assert sum("switch limit" in m for m in msgs) == 1      # ...and it was said exactly once
+
+
+def test_tick_recovery_stays_quiet_while_no_seat_has_freed(ctx, monkeypatch):
+    """Blocked on the only seat there is. The re-check runs on the CLOCK, so it fires again and
+    again with nothing to find; each round must end in silence rather than a second notification or
+    another decision, and the child has to keep its terminal throughout."""
+    clock = _frozen_clock(monkeypatch)
+    ctx.cred["codex"].set_live(make_codex_blob("solo@x.com"))
+    acct.add(ctx, ctx.load_state(), "codex", email="solo@x.com")
+    calls = {"n": 0}
+    real_handle = L.handle_limit
+    monkeypatch.setattr(L, "handle_limit",
+                        lambda *a, **k: (calls.__setitem__("n", calls["n"] + 1),
+                                         real_handle(*a, **k))[1])
+
+    def poll_rests_it():
+        with ctx.locked():
+            st = ctx.load_state()
+            st.set_limited_until("codex", "solo@x.com", iso(clock["t"] + timedelta(hours=3)),
+                                 source="usage")
+            st.save()
+
+    def time_passes():
+        clock["advance"](L.TICK_BLOCK_S + 10)
+
+    msgs = []
+    sleeps = []
+    spawn = FakeSpawn([(None, 6, [poll_rests_it, None, time_passes, None, time_passes, None])])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=fake_get({}), notify=msgs.append,
+             sleep=sleeps.append)
+
+    assert rc == 6 and spawn.stops == 0 and len(spawn.calls) == 1
+    assert calls["n"] == 1
+    assert sum("staying on this seat" in m for m in msgs) == 1
+    assert not any("hopping to" in m for m in msgs)
+
+
+def test_tick_ambiguous_limit_lines_share_one_probe_cooldown(ctx, monkeypatch, tmp_path):
+    """Two sessions in one directory, so every limit line needs the endpoint to agree before it may
+    touch a live child. A maxed seat writes one such line PER TURN and a user can keep pressing
+    continue — without the shared cooldown each of them would re-hit the endpoint that just told us
+    nothing, which is the hammering the stdout path already guards against."""
+    monkeypatch.chdir(tmp_path)
+    cwd = os.getcwd()
+    _two_codex(ctx)  # active a
+    other = _rollout_session(ctx, cwd, thread="01aaaaaa")
+    mine = _rollout_session(ctx, cwd, thread="01bbbbbb")
+    gets = []
+
+    def get(url, headers, timeout):
+        gets.append(url)
+        return 429, ""   # throttled: it can corroborate nothing, now or on any retry
+
+    def first_turn():
+        _appender(other, token_count_line(primary=window(3.0), timestamp=_soon()), bump=3.0)()
+        _appender(mine, task_complete_error_line(timestamp=_soon()), bump=6.0)()
+
+    def another_turn():
+        _appender(mine, task_complete_error_line(timestamp=_soon()), bump=9.0)()
+
+    msgs = []
+    spawn = FakeSpawn([(None, 0, [first_turn, another_turn, another_turn, another_turn])])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=msgs.append)
+
+    assert rc == 0 and spawn.stops == 0 and len(spawn.calls) == 1
+    assert gets == [P.CODEX_USAGE_URL]                      # four limit lines, one probe
+    state = ctx.load_state()
+    assert state.active("codex") == "a@x.com"
+    assert state.get_seat("codex", "a@x.com").get("limited_until") is None
+    assert msgs == []
