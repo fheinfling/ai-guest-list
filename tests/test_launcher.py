@@ -1977,3 +1977,104 @@ def test_hard_preflight_failure_restores_the_users_active_seat(ctx, monkeypatch,
     assert state.active("codex") == "b@x.com"                # the user's choice survived untouched
     assert state.get_seat("codex", "a@x.com")["limit_source"] == "hard"   # ...and a was still rested
     assert sum("workspace" in m and "staying on this seat" in m for m in msgs) == 1
+
+
+def test_probe_judges_the_launch_seat_not_active(ctx, monkeypatch, tmp_path):
+    """The verify-before-kill probe must judge the seat this child was SPAWNED with. CODEX_HOME is
+    process-global, so the credentials behind the fetch are that seat's — if another process moved
+    ``active`` first, filing the answer under the sibling's name rests a healthy seat and rewrites
+    its account_id, which reads as a re-subscription."""
+    monkeypatch.chdir(tmp_path)
+    _two_codex(ctx)  # active a, and a is the launch seat
+    before_b = dict(ctx.load_state().get_seat("codex", "b@x.com"))
+    reset = iso(now() + timedelta(hours=3))
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=100.0, p_reset=reset))})
+
+    def gui_switch():
+        with ctx.locked():
+            st = ctx.load_state()
+            st.set_active("codex", "b@x.com")
+            st.save()
+
+    spawn = FakeSpawn([
+        ([b"booting\n", b"... you've hit your usage limit ...\n"], 1, [gui_switch]),
+        (b"resumed\n", 0),
+    ])
+
+    rc = run(ctx, "codex", ["--foo"], spawn=spawn, get=get, notify=lambda m: None)
+
+    assert rc == 0 and spawn.stops == 1
+    assert spawn.calls[1][-2:] == ["resume", "--last"]
+    state = ctx.load_state()
+    seat_a, seat_b = state.get_seat("codex", "a@x.com"), state.get_seat("codex", "b@x.com")
+    assert (seat_a.get("usage") or {}).get("windows")      # the fetch landed on the launch seat
+    assert seat_a["limited_until"] is not None
+    assert seat_b.get("usage") == before_b.get("usage")    # ...and never touched the sibling
+    assert seat_b.get("account_id") == before_b.get("account_id")
+    assert seat_b.get("limited_until") is None
+    assert "moved_note" not in state.data                  # no phantom re-subscription
+    assert state.active("codex") == "b@x.com"              # the hop still went where it should
+
+
+def test_tick_limit_signals_do_not_refetch_while_blocked(ctx, monkeypatch, tmp_path):
+    """A user pressing "continue" on a maxed seat writes a fresh usage_limit_exceeded per turn. Once
+    we have decided and found nowhere to land, every later line must be recorded and ignored — not
+    pay for another forced landing pre-flight."""
+    monkeypatch.chdir(tmp_path)
+    cwd = os.getcwd()
+    _two_codex(ctx)  # active a
+    path = _rollout_session(ctx, cwd)
+    gets = []
+
+    def get(url, headers, timeout):
+        gets.append(url)
+        return 200, codex_credits_depleted_body()   # the sibling is out too: nowhere to land
+
+    calls = {"n": 0}
+    real_handle = L.handle_limit
+    monkeypatch.setattr(L, "handle_limit",
+                        lambda *a, **k: (calls.__setitem__("n", calls["n"] + 1),
+                                         real_handle(*a, **k))[1])
+    limit = _appender(path, task_complete_error_line(timestamp=_soon()))
+    seen = {}
+    spawn = FakeSpawn([(None, 4, [limit, limit, limit,
+                                  lambda: seen.__setitem__("in_session", calls["n"])])])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=lambda m: None)
+
+    assert rc == 4 and spawn.stops == 0
+    assert seen["in_session"] == 1   # decided once for three identical limit events...
+    assert len(gets) == 1            # ...and paid for exactly one landing pre-flight
+    assert calls["n"] == 2           # (the second is the exit-time decision, on the same evidence)
+
+
+def test_hard_banner_acts_when_attachment_is_ambiguous(ctx, monkeypatch, tmp_path):
+    """The banner is only vetoed by a rollout we KNOW is this child's. With two sessions sharing the
+    directory the attachment is a guess, so the fallback has to stay live — otherwise a wrong guess
+    silences the structured source and the banner at the same time, and nothing ever hops."""
+    monkeypatch.chdir(tmp_path)
+    cwd = os.getcwd()
+    _two_codex(ctx)  # active a
+    first = _rollout_session(ctx, cwd, thread="01aaaaaa")
+    second = _rollout_session(ctx, cwd, thread="01bbbbbb")
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=10.0, secondary=10.0))})
+
+    def both_move():
+        # Neither line says anything about limits (a fresh session reports no windows yet), so the
+        # attachment is ambiguous without any structured verdict to lean on either way.
+        quiet = token_count_line(primary=None, secondary=None, timestamp=_soon())
+        _appender(first, quiet, bump=3.0)()
+        _appender(second, quiet, bump=6.0)()
+
+    spawn = FakeSpawn([
+        ([b"booting\n", (REFILL_BANNER + "\n").encode()], 1, [both_move]),
+        (b"resumed\n", 0),
+    ])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=lambda m: None)
+
+    assert rc == 0 and spawn.stops == 1
+    assert spawn.calls[1][-2:] == ["resume", "--last"]
+    state = ctx.load_state()
+    assert state.active("codex") == "b@x.com"
+    assert state.get_seat("codex", "a@x.com")["limit_source"] == "hard"

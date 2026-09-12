@@ -44,11 +44,17 @@ def harden_env(env: dict | None = None) -> dict:
 _TIME_RE = re.compile(r"\d{1,2}:\d{2}:\d{2}")
 
 
+# Every env var that can steer how a child formats dates/messages. LC_ALL outranks the rest, but we
+# drop them all so nothing is left to argue with — including LANGUAGE, which gettext honours ahead of
+# LANG on glibc systems.
+_LOCALE_ENV_STRIP = ("LANG", "LANGUAGE")
+
+
 def _c_locale_env() -> dict:
     """os.environ with every locale override removed and the C locale forced, so `ps` formats dates
-    the same way for every user. LC_ALL alone is not enough to *set* — a stray LC_TIME in the
-    inherited env is outranked by LC_ALL, but dropping the whole LC_* family keeps this obvious."""
-    e = {k: v for k, v in os.environ.items() if not k.startswith("LC_") and k != "LANG"}
+    the same way for every user."""
+    e = {k: v for k, v in os.environ.items()
+         if not k.startswith("LC_") and k not in _LOCALE_ENV_STRIP}
     e["LC_ALL"] = "C"
     e["LANG"] = "C"
     return e

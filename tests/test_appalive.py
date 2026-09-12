@@ -97,12 +97,14 @@ def test_proc_start_forces_the_c_locale(monkeypatch):
     monkeypatch.setenv("LC_ALL", "de_DE.UTF-8")
     monkeypatch.setenv("LC_TIME", "fr_FR.UTF-8")
     monkeypatch.setenv("LANG", "de_DE.UTF-8")
+    monkeypatch.setenv("LANGUAGE", "de_DE:de")
     monkeypatch.setattr(procenv.subprocess, "run", fake_run)
     assert procenv.proc_start(1234) == "Sat Aug 29 16:36:54 2026"
     assert captured["argv"] == ["ps", "-o", "lstart=", "-p", "1234"]
     env = captured["env"]
     assert env["LC_ALL"] == "C" and env["LANG"] == "C"
     assert [k for k in env if k.startswith("LC_")] == ["LC_ALL"]  # no LC_TIME to outrank it
+    assert "LANGUAGE" not in env   # gettext prefers LANGUAGE over LANG on glibc
 
 
 def test_proc_start_is_locale_independent_for_a_real_process(monkeypatch):

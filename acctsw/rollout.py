@@ -271,6 +271,14 @@ class RolloutWatcher:
 
     # --- attach ---------------------------------------------------------------------------------
     def _try_attach(self) -> None:
+        """Find our child's rollout — and keep looking while the answer is only a guess.
+
+        An ambiguous attachment (two sessions in one directory, or the single-foreign-candidate
+        fallback taken because our child had not written yet) is provisional: the file may not be
+        ours at all. Since the caller treats an attachment as authority — it stops trusting the
+        stdout banner — a wrong guess must be correctable, so discovery keeps running at the same
+        rate limit until a file we can actually claim shows up.
+        """
         now_t = self._clock()
         if self._next_scan is not None and now_t < self._next_scan:
             return
@@ -279,6 +287,14 @@ class RolloutWatcher:
                                               since_ns=self._since_ns)
         if path is None:
             return
+        if path == self.attached:
+            # Same file as before: only the confidence can have changed (the rival session went
+            # quiet). Never re-seek — that would replay the tail and re-deliver signals we handled.
+            self.unambiguous = unambiguous
+            return
+        if (self.attached is not None and not unambiguous
+                and self.meta.get("cwd") == self._cwd):
+            return  # we already hold a cwd match; another equally ambiguous guess is no improvement
         self.attached = path
         self.unambiguous = unambiguous
         self.meta = session_meta(path) or {}
@@ -323,8 +339,8 @@ class RolloutWatcher:
     def poll(self) -> list[RolloutSignal]:
         """Signals from bytes appended since the previous poll (never raises; [] when unattached)."""
         try:
-            if self.attached is None:
-                self._try_attach()
+            if self.attached is None or not self.unambiguous:
+                self._try_attach()   # unattached, or attached only provisionally — keep looking
             if self.attached is None:
                 return []
             return self._read()

@@ -7,6 +7,7 @@ The line-building helpers are exported for the launcher tests that drive a fake 
 import itertools
 import json
 import os
+import time
 from datetime import timedelta
 from pathlib import Path
 
@@ -335,3 +336,50 @@ def test_watcher_poll_never_raises_on_garbage_lines(tmp_path):
     assert watcher.poll() == []
     _append(path, task_complete_error_line(timestamp=ts) + "\n")
     assert [s.kind for s in watcher.poll()] == ["limit"]
+
+
+def test_watcher_reattaches_to_cwd_match_after_foreign_attach(tmp_path):
+    """A provisional attachment must be correctable. With only a stranger's session moving, the
+    single-foreign-candidate fallback attaches to it — and the caller then stops trusting the stdout
+    banner. So the moment OUR child writes its first line, discovery has to notice and switch, or a
+    wrong guess would silence both sources for the rest of the session."""
+    root = tmp_path / "sessions"
+    started = now()
+    ts = iso(started + timedelta(seconds=1))
+    foreign = write_rollout(root, thread="stranger", cwd="/somewhere/else")
+    watcher = _watcher(root, started_at=started)
+
+    assert watcher.poll() == []          # nothing said yet, but it is all that is moving...
+    assert watcher.attached == foreign   # ...so the fallback holds it, provisionally
+    assert watcher.unambiguous is False
+
+    mine = write_rollout(root, thread="ours", cwd="/work/x",
+                         lines=[task_complete_error_line(timestamp=ts)])
+    signals = watcher.poll()
+
+    assert watcher.attached == mine
+    assert watcher.unambiguous is True
+    assert [s.kind for s in signals] == ["limit"]
+
+
+def test_watcher_keeps_its_cwd_match_when_a_rival_session_appears(tmp_path):
+    """The re-scan may only ever IMPROVE the guess. Two sessions share this directory, so our
+    attachment stays ambiguous and discovery keeps running — but swapping between two equally
+    plausible cwd matches would replay each new file's tail and re-deliver limits that were already
+    judged. Holding a cwd match, an equally ambiguous rival is no improvement."""
+    root = tmp_path / "sessions"
+    started = now()
+    ts = iso(started + timedelta(seconds=1))
+    rival = write_rollout(root, thread="rival", cwd="/work/x")
+    mine = write_rollout(root, thread="ours", cwd="/work/x")
+    _touch(rival, time.time() + 5)
+    _touch(mine, time.time() + 10)       # newest wins the first, ambiguous attach
+    watcher = _watcher(root, started_at=started)
+    assert watcher.poll() == []
+    assert watcher.attached == mine and watcher.unambiguous is False
+
+    _append(rival, task_complete_error_line(timestamp=ts) + "\n")
+    _touch(rival, time.time() + 30)      # now the newest, so max(mtime) alone would prefer it
+
+    assert watcher.poll() == []          # the rival's limit never reaches us
+    assert watcher.attached == mine

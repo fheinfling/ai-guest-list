@@ -995,7 +995,14 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             try:
                 with ctx.locked():
                     st = ctx.load_state()
-                    seat = st.active(tool)
+                    # ALWAYS the seat this child was SPAWNED with — CODEX_HOME is process-global, so
+                    # the credentials behind this fetch are that seat's no matter where ``active``
+                    # points now. Judging st.active() instead would fetch with the running seat's
+                    # creds and file the answer (windows, limit flags, account_id) under a sibling's
+                    # name — resting a healthy seat and tripping the re-subscription branch.
+                    seat = (launch_email
+                            if launch_email and st.get_seat(tool, launch_email) is not None
+                            else st.active(tool))
                     blob = usage_mod._seat_blob(ctx, st, tool, seat) if seat else None
                 if not seat or not blob:
                     return "unknown"
@@ -1277,12 +1284,22 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     if sig.kind == "healthy":
                         tick["healthy_at"] = time.monotonic()
                         continue
-                    tick["last_structured"] = sig
-                    if not rollout_source.unambiguous and _probe("limit") != "confirmed":
+                    tick["last_structured"] = sig   # recorded even when we don't act (post-exit)
+                    if time.monotonic() < tick["blocked_until"]:
+                        # Already decided this and could not act. A user pressing "continue" on a
+                        # maxed seat writes a fresh usage_limit_exceeded per turn, and each one
+                        # would otherwise cost a forced fetch (the hard landing pre-flight).
+                        continue
+                    if not rollout_source.unambiguous:
                         # Two sessions share this cwd, so the file may not be ours. A wrong
                         # attachment must never kill a healthy session on its own — require the
-                        # endpoint to agree before acting.
-                        continue
+                        # endpoint to agree before acting, on the SAME cooldown stdout probes use
+                        # so a burst of lines cannot hammer the endpoint.
+                        if time.monotonic() < scan["next_probe"]:
+                            continue
+                        if _probe("limit") != "confirmed":
+                            scan["next_probe"] = time.monotonic() + PROBE_COOLDOWN_S
+                            continue
                     if _tick_decide(reason="limit", hard=sig.hard, reset_at=sig.reset_at,
                                     source=("hard" if sig.hard else "usage"), detail=sig.detail):
                         return True
@@ -1314,10 +1331,13 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     _dismissed()
                     return False
                 if hard:
-                    if rollout_source is not None and rollout_source.attached is not None:
-                        # We are tailing this child's own session log: the banner is a hint, the
+                    if (rollout_source is not None and rollout_source.attached is not None
+                            and rollout_source.unambiguous):
+                        # We are tailing THIS child's own session log: the banner is a hint, the
                         # JSONL is the fact. Wait for the structured event instead of killing on a
-                        # string whose wording changes between releases.
+                        # string whose wording changes between releases. Only a file we know is
+                        # ours earns that veto — an ambiguous or provisional attachment must not
+                        # silence the fallback, or a wrong guess would disable the banner outright.
                         buf.clear()
                         return False
                     verdict = "confirmed"   # nothing better to consult: the banner is the fallback
