@@ -4,7 +4,7 @@ The engine is intentionally stdlib-only so it can be vendored as a single direct
 without a virtualenv. The menubar app (``app/``) is a thin UI layer on top of this package.
 """
 
-__version__ = "0.8.1"     # marketing version — the SINGLE source of truth (setup.py reads this,
+__version__ = "0.8.2"     # marketing version — the SINGLE source of truth (setup.py reads this,
                           # pyproject mirrors it, and tests/test_smoke.py pins them together)
 APP_NAME = "ai guest list"
 
