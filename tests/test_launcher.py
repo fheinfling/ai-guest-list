@@ -998,6 +998,32 @@ def test_run_codex_home_preserved_on_exception(ctx):
     assert ctx.cred["codex"].get_live() == before                # mirrored home → live
 
 
+def test_activate_codex_home_promotes_only_without_a_live_session(ctx, monkeypatch):
+    """Promotion MOVES shared files, so it is asked for only when no supervised codex session could
+    have them open — otherwise the home is merely relinked and the heal waits for the next launch."""
+    from acctsw import codexhome
+
+    seen = []
+    real_ensure = codexhome.ensure_home
+
+    def spy(email, **kw):
+        if "promote" in kw:   # ignore the credential-snapshot calls, which never promote
+            seen.append(kw["promote"])
+        return real_ensure(email, **kw)
+
+    _two_codex(ctx)
+    monkeypatch.setattr(codexhome, "ensure_home", spy)
+    monkeypatch.setattr(L, "active_session", lambda data_dir, tool: {"email": "b@x.com", "pid": 1,
+                                                                     "started_at": "x"})
+    run(ctx, "codex", [], spawn=FakeSpawn([(b"", 0)]), get=fake_get({}))
+    assert seen and seen[0] is False
+
+    seen.clear()
+    monkeypatch.setattr(L, "active_session", lambda data_dir, tool: None)
+    run(ctx, "codex", [], spawn=FakeSpawn([(b"", 0)]), get=fake_get({}))
+    assert seen and seen[0] is True
+
+
 def test_run_claude_resume_uses_continue(ctx):
     for em in ("c1@x.com", "c2@x.com"):
         ctx.cred["claude"].set_live(__import__("tests.conftest", fromlist=["make_claude_blob"]).make_claude_blob())

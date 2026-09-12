@@ -247,6 +247,14 @@ migration path: [`SECURITY-headroom.md`](SECURITY-headroom.md).
   *after* login and cannot recover them.
 - **Unattended switching (M4 launcher) uses the Codex live-vs-active guard** in `switch.sync_back`
   (skip sync-back when live creds belong to a different account than `state.active`).
+- **Per-account Codex homes hold exactly one real file, `auth.json`.** Everything else in
+  `~/.account-switcher/codex-homes/<seat>/` is a symlink into the shared `~/.codex`, which stays the
+  source of truth for config and sessions. **SQLite sidecars (`-wal`/`-shm`/`-journal`) are never
+  linked** — SQLite resolves a symlinked database and writes them beside the real file, while a real
+  database next to linked sidecars fails every open with error 14. Real files a supervised child
+  created in a home are **promoted** into `~/.codex` on the next launch with no live codex session
+  (moving files under a running child is not worth the risk); a copy whose name `~/.codex` already
+  has is **parked** as `<name>.orphaned-<stamp>` — never deleted, never linked again.
 - **All timestamps are tz-aware** (`parse_iso` coerces naive→UTC) so selection comparisons never
   raise.
 - **Real usage shapes (verified live):** Claude `oauth/usage` → `five_hour`/`seven_day`

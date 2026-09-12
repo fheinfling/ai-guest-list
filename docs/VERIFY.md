@@ -131,6 +131,10 @@ acctsw uninstall --purge       # also deletes the store + all our keychain items
   out-of-credits banner and the old trusted match stopped firing; that is why the banners were
   demoted.) Claude has no structured source yet, so its patterns still carry weight — confirm/extend
   them against the actual Claude limit output on a real cap.
+- Codex SQLite error 14 ("unable to open database file") from a mixed database/sidecar family is
+  now healed automatically on the next `cx` launch with no other supervised codex session running:
+  `ls -la ~/.account-switcher/codex-homes/<seat>/` must show `auth.json` as the ONLY real file and
+  no `*-wal` / `*-shm` links (a `*.orphaned-<stamp>` copy parked there is expected and inert).
 - Resume-by-id: currently `codex resume --last` / `claude --continue` (MVP); capture the session id
   at spawn to resume by id if you run multiple concurrent sessions.
 - The Headroom "save credit" proxy is gone; only the one-time `cleanup_legacy` migration remains

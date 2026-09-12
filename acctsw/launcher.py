@@ -52,7 +52,7 @@ from .context import Context
 from .errors import AcctswError
 from .procenv import harden_env
 from .selection import Selection, choose
-from .session import clear_session, mark_session
+from .session import active_session, clear_session, mark_session
 from .switch import switch, sync_back
 from .util import iso, now, parse_iso
 
@@ -808,7 +808,13 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         """Point codex at the account's own home so it maintains that account's tokens in place."""
         if tool == "codex" and email:
             from . import codexhome
-            codexhome.ensure_home(email, codex_home=ctx._codex_real, root=ctx._homes_root)
+            # Promotion MOVES shared files (incl. live SQLite databases) out of the home into
+            # ~/.codex, so ask for it only when no supervised codex session is alive to have them
+            # open — ours included, once this run has marked itself. Skipping costs nothing: the
+            # heal happens at the next launch that finds the coast clear.
+            promote = active_session(ctx.data_dir, "codex") is None
+            codexhome.ensure_home(email, codex_home=ctx._codex_real, root=ctx._homes_root,
+                                  promote=promote)
             os.environ["CODEX_HOME"] = str(ctx.codex_home(email))
 
     # Claude's official identity command can stall for 30 seconds. Resolve it with NO state flock,
