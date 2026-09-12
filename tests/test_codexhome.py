@@ -3,8 +3,10 @@
 A home that mixes a REAL database with symlinked ``-wal``/``-shm`` files makes SQLite fail every open
 with error 14 ("unable to open database file") — the regression these tests pin down.
 """
+import errno
 import shutil
 import sqlite3
+from datetime import datetime
 
 import pytest
 
@@ -46,6 +48,19 @@ def _sidecars(path):
 
 def _parked(d):
     return sorted(p.name for p in d.iterdir() if codexhome.ORPHAN_MARK in p.name)
+
+
+FROZEN_STAMP = "20260101T000000"
+
+
+def _freeze_clock(monkeypatch):
+    """``_park`` stamps to the second, so two heals inside one second collide by construction."""
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 1, 1, 0, 0, 0)
+
+    monkeypatch.setattr(codexhome, "datetime", _Frozen)
 
 
 # --- rule 1: sidecars are never linked ----------------------------------------------------------
@@ -105,6 +120,59 @@ def test_promote_parks_a_divergent_copy_when_the_real_home_already_has_it(ctx):
     assert any(n.startswith("logs_2.sqlite-wal" + codexhome.ORPHAN_MARK) for n in parked)
     assert (home / "logs_2.sqlite").is_symlink()
     assert (home / "logs_2.sqlite").resolve() == canonical.resolve()
+
+
+def test_relocate_falls_back_to_copy_when_rename_crosses_filesystems(ctx, monkeypatch):
+    """A home on another volume than ~/.codex cannot be renamed across the boundary. Promotion must
+    still move the database and its sidecars, byte for byte, and link the base name back."""
+    home = _ensure(ctx)
+    _sidecars(_make_db(home / "logs_2.sqlite", rows=(7,)))
+    payload = (home / "logs_2.sqlite").read_bytes()
+    attempted = []
+
+    def _cross_device(src, dst):
+        attempted.append(str(src))
+        raise OSError(errno.EXDEV, "Cross-device link")
+
+    monkeypatch.setattr(codexhome.os, "replace", _cross_device)
+    _ensure(ctx, promote=True)
+
+    moved = ctx._codex_real / "logs_2.sqlite"
+    assert attempted                                          # the rename really was tried first
+    assert moved.is_file() and not moved.is_symlink()
+    assert moved.read_bytes() == payload
+    assert (ctx._codex_real / "logs_2.sqlite-wal").exists()    # the real sidecars travelled along
+    assert (home / "logs_2.sqlite").is_symlink()
+    assert (home / "logs_2.sqlite").resolve() == moved.resolve()
+    assert not (home / "logs_2.sqlite-wal").exists()           # nothing left behind in the home
+    assert _parked(home) == []
+    conn = sqlite3.connect(moved)
+    assert conn.execute("SELECT x FROM t").fetchall() == [(7,)]
+    conn.close()
+
+
+def test_park_never_clobbers_an_existing_parked_copy(ctx, monkeypatch):
+    """Two heals in the same second land on the same stamp. Each divergent copy gets its own
+    ``-2`` / ``-3`` suffix instead of overwriting the copy parked a moment earlier."""
+    canonical = _make_db(ctx._codex_real / "logs_2.sqlite", rows=(1,))
+    canonical_bytes = canonical.read_bytes()
+    home = _ensure(ctx)
+    _freeze_clock(monkeypatch)
+    base = f"logs_2.sqlite{codexhome.ORPHAN_MARK}{FROZEN_STAMP}"
+    (home / base).write_bytes(b"parked-earlier")
+
+    for n, rows in ((2, (99,)), (3, (98,))):
+        (home / "logs_2.sqlite").unlink()          # drop the link; the child writes its own copy
+        _make_db(home / "logs_2.sqlite", rows=rows)
+        divergent = (home / "logs_2.sqlite").read_bytes()
+        _ensure(ctx, promote=True)
+        assert (home / f"{base}-{n}").read_bytes() == divergent
+        assert (home / base).read_bytes() == b"parked-earlier"   # the earlier copy is untouched
+        assert canonical.read_bytes() == canonical_bytes         # canonical still wins
+        assert (home / "logs_2.sqlite").is_symlink()
+        assert (home / "logs_2.sqlite").resolve() == canonical.resolve()
+
+    assert _parked(home) == [base, f"{base}-2", f"{base}-3"]
 
 
 def test_promote_false_leaves_real_files_alone(ctx):
