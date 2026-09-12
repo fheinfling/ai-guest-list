@@ -1,5 +1,6 @@
 """Unit tests for the UI↔engine bridge dispatch (no pyobjc)."""
 import json
+import os
 
 import pytest
 
@@ -139,6 +140,109 @@ def test_toggle_supervision_state_save_failure_rolls_back_shell_setup(ctx, monke
     assert result["ok"] is False and "state disk is full" in result["error"]
     assert ctx.load_state().settings()["supervise_shell"] is (not value)
     assert inst.supervision_status()["block"] is (not value)
+
+
+def _raiser(exc):
+    """A stand-in that always fails with ``exc`` — for the failure-on-top-of-failure paths below."""
+    def fail(*_args, **_kwargs):
+        raise exc
+    return fail
+
+
+@pytest.mark.parametrize("value", [False, True], ids=["off", "on"])
+def test_toggle_supervision_failure_reports_an_unrefreshable_status(ctx, monkeypatch, value):
+    """Worst case: the rc edit fails AND the status snapshot that would explain it fails too.
+    The user must be told both halves, and must not be handed a half-built result to render."""
+    state = ctx.load_state()
+    state.set_setting("supervise_shell", not value)
+    state.save()
+    operation = "remove_shell_setup" if value is False else "ensure_shell_setup"
+    monkeypatch.setattr(inst, operation, _raiser(PermissionError("rc is read-only")))
+    monkeypatch.setattr(bridge, "snapshot_state", _raiser(OSError("the store is gone")))
+
+    result = bridge.handle(ctx, {"action": "toggle", "key": "supervise_shell", "value": value})
+
+    direction = "on" if value else "off"
+    assert result == {
+        "ok": False,
+        "error": (f"couldn't turn terminal supervision {direction}: rc is read-only"
+                  "; couldn't refresh status: the store is gone"),
+    }
+    assert "state" not in result                 # never a partial snapshot the UI would apply
+    assert ctx.load_state().settings()["supervise_shell"] is (not value)
+
+
+def test_toggle_supervision_failure_names_a_wordless_exception(ctx, monkeypatch):
+    """An exception with no message — or only whitespace — must still name something reportable,
+    so the sheet never shows a bare 'couldn't turn terminal supervision on:' with nothing after it."""
+    monkeypatch.setattr(inst, "ensure_shell_setup", _raiser(RuntimeError()))
+    monkeypatch.setattr(bridge, "snapshot_state", _raiser(TimeoutError("   ")))
+
+    result = bridge.handle(ctx, {"action": "toggle", "key": "supervise_shell", "value": True})
+
+    assert result == {
+        "ok": False,
+        "error": ("couldn't turn terminal supervision on: RuntimeError"
+                  "; couldn't refresh status: TimeoutError"),
+    }
+
+
+@pytest.mark.parametrize("value", [False, True], ids=["off", "on"])
+def test_toggle_supervision_save_failure_reports_a_failed_rollback(ctx, monkeypatch, value):
+    """The rc edit landed, the state write failed, and the rollback that would have re-aligned the
+    two sources of truth ALSO failed. The shell and the setting now genuinely disagree, so the
+    message has to admit it rather than blaming the save alone."""
+    state = ctx.load_state()
+    state.set_setting("supervise_shell", not value)
+    state.save()
+    # previous == (not value), so the rollback attempts that direction — break exactly that call
+    # and leave the forward toggle working.
+    rollback_op = "ensure_shell_setup" if not value else "remove_shell_setup"
+    monkeypatch.setattr(inst, rollback_op, _raiser(PermissionError("rc is read-only")))
+    monkeypatch.setattr(State, "save", _raiser(OSError("state disk is full")))
+
+    result = bridge.handle(ctx, {"action": "toggle", "key": "supervise_shell", "value": value})
+
+    assert result["ok"] is False
+    assert result["error"] == ("couldn't save that setting: state disk is full"
+                               "; shell rollback also failed: rc is read-only")
+    assert result["state"]["settings"]["supervise_shell"] is (not value)
+    assert ctx.load_state().settings()["supervise_shell"] is (not value)
+
+
+@pytest.mark.parametrize("key", ["auto_switch", "supervise_shell"])
+def test_toggle_save_failure_reports_an_unrefreshable_status(ctx, monkeypatch, key):
+    """Save failed and the follow-up snapshot failed too — for a plain toggle as well as the
+    supervision one, which additionally rolled the shell back successfully (no rollback clause)."""
+    monkeypatch.setattr(State, "save", _raiser(OSError("state disk is full")))
+    monkeypatch.setattr(bridge, "snapshot_state", _raiser(RuntimeError()))
+
+    result = bridge.handle(ctx, {"action": "toggle", "key": key, "value": False})
+
+    assert result == {
+        "ok": False,
+        "error": ("couldn't save that setting: state disk is full"
+                  "; couldn't refresh status: RuntimeError"),
+    }
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses file permissions")
+def test_snapshot_surfaces_an_unreadable_rc_to_the_ui(ctx):
+    """The install-layer read failure has to travel all the way into the popover payload — and only
+    that one field: an rc we cannot read must not take the rest of the snapshot down with it."""
+    rc = inst.shell_rc_path()
+    inst.ensure_shell_setup(rc_path=rc)
+    rc.chmod(0o000)
+    try:
+        state = bridge.snapshot_state(ctx)
+    finally:
+        rc.chmod(0o600)
+
+    supervision = state["supervision"]
+    assert supervision["error"].startswith(f"couldn't read {rc}: ")
+    assert "Permission denied" in supervision["error"]
+    assert supervision["block"] is False and supervision["active"] is False
+    assert state["dot"] and "tools" in state          # the rest of the payload is intact
 
 
 def test_switch_action(ctx):

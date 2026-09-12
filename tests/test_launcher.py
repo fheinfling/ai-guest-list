@@ -5,6 +5,7 @@ No real PTY, no network: `spawn` is injected and `get` returns canned usage.
 import json
 import os
 import threading
+import time
 
 import pytest
 
@@ -15,7 +16,10 @@ from acctsw.launcher import (NoSeats, build_cmd, resume_cmd, detect_limit, detec
 from acctsw.util import now, iso
 from datetime import timedelta
 from tests.conftest import make_claude_blob, make_codex_blob
-from tests.test_usage import fake_get, claude_ok_body, codex_ok_body
+from tests.test_rollout import (OUT_OF_CREDITS, task_complete_error_line, token_count_line,
+                                window, write_rollout)
+from tests.test_usage import (fake_get, claude_ok_body, codex_credits_depleted_body,
+                              codex_ok_body)
 from acctsw import paths as P
 
 
@@ -145,23 +149,51 @@ def _two_claude(ctx):
 
 
 class FakeSpawn:
-    """Returns scripted (output, status) per call; records argv of each launch. ``output`` may be
-    a list of chunks to exercise repeated on_output calls within ONE child session; like the real
-    pty_spawn, the child "dies" (remaining chunks dropped) once on_output asks for a stop."""
+    """Returns scripted ``(output, status)`` — or ``(output, status, ticks)`` — per call; records
+    argv of each launch. ``output`` may be a list of chunks to exercise repeated on_output calls
+    within ONE child session (None for a silent child); like the real pty_spawn, the child "dies"
+    (remaining chunks dropped) once the supervisor asks for a stop.
+
+    ``ticks`` scripts the supervisor's heartbeat: one entry per tick, each either None or a callable
+    run just before that tick — the hook stands in for whatever happened outside this process (the
+    child appending to its rollout log, the menubar resting a seat in state.json). One tick fires
+    after each output chunk, then any remaining scripted ticks run with no further output, so a
+    silent child is scripted as ``(None, status, [hook, None, None])``.
+    """
 
     def __init__(self, scripts):
         self.scripts = scripts
         self.calls = []
         self.stops = 0
+        self.ticks = 0
 
-    def __call__(self, argv, on_output):
-        out, status = self.scripts[len(self.calls)]
+    def __call__(self, argv, on_output, on_tick=None):
+        script = self.scripts[len(self.calls)]
+        out, status = script[0], script[1]
+        hooks = list(script[2]) if len(script) > 2 else []
         self.calls.append(list(argv))
-        for chunk in (out if isinstance(out, list) else [out]):
+        chunks = out if isinstance(out, list) else ([] if out is None else [out])
+        for chunk in chunks:
             if on_output(chunk):
                 self.stops += 1
-                break
+                return status
+            if self._tick(on_tick, hooks):
+                self.stops += 1
+                return status
+        while hooks:
+            if self._tick(on_tick, hooks):
+                self.stops += 1
+                return status
         return status
+
+    def _tick(self, on_tick, hooks) -> bool:
+        if on_tick is None or not hooks:
+            return False
+        hook = hooks.pop(0)
+        if callable(hook):
+            hook()
+        self.ticks += 1
+        return bool(on_tick())
 
 
 # --- handle_limit -----------------------------------------------------------------------------
@@ -447,7 +479,7 @@ def test_run_claude_hop_resolves_identity_before_spawn(ctx, monkeypatch):
             blob=ctx.cred["claude"].get_live(), email="c1@x.com"
         )
 
-    def spawn(argv, on_output):
+    def spawn(argv, on_output, on_tick=None):
         events.append("spawn")
         on_output(b"all good, done\n")
         return 0
@@ -562,7 +594,7 @@ def test_confirmed_limit_starts_one_advisory_seat_watcher(ctx, monkeypatch):
     sleeps = []
     calls = []
 
-    def spawn(argv, on_output):
+    def spawn(argv, on_output, on_tick=None):
         calls.append(list(argv))
         assert on_output(b"usage limit reached\n") is False
         assert ready.wait(2), "seat watcher did not notify"
@@ -957,7 +989,7 @@ def test_run_codex_home_preserved_on_exception(ctx):
     state = _two_codex(ctx)  # active a, home(a) populated
     before = ctx.snapshot_get("codex", "a@x.com")
 
-    def boom(argv, on_output):
+    def boom(argv, on_output, on_tick=None):
         raise RuntimeError("pty exploded")
 
     with pytest.raises(RuntimeError):
@@ -1307,7 +1339,7 @@ def test_run_claude_exit_syncs_back_rotated_creds(ctx, monkeypatch):
     acct.add(ctx, ctx.load_state(), "claude", email="solo@x.com")
     rotated = make_claude_blob("max").replace('"accessToken": "x"', '"accessToken": "rotated"')
 
-    def rotate_mid_session(_argv, on_output):
+    def rotate_mid_session(_argv, on_output, on_tick=None):
         ctx.cred["claude"].set_live(rotated)   # the child refreshed its token while running
         on_output(b"done\n")
         return 0
@@ -1351,3 +1383,891 @@ def test_run_exit_hop_off_revoked_seat_says_entitlement_not_limit(ctx):
     assert ctx.load_state().active("codex") == "b@x.com"     # it did hop
     assert any("no longer entitled" in m for m in msgs)
     assert not any("hit its usage limit" in m for m in msgs)
+
+
+# --- structured signals: the supervisor's tick -------------------------------------------------
+# Field failure (2026-09-11, codex 0.153.4): the banner wording changed AND the menubar poll rested
+# the running seat in state.json, yet the live child never hopped. These drive the two structured
+# sources that now decide — the child's own rollout JSONL and the engine state file — through the
+# heartbeat, with stdout demoted to a hint.
+
+def _codex_sessions(ctx):
+    d = ctx._codex_real / "sessions"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _rollout_session(ctx, cwd, *, thread="01a0abcd"):
+    """A rollout file holding only its session_meta header, as it looks the moment codex starts.
+
+    Pre-created so the cwd match can succeed, but discovery is snapshot-then-diff on mtime: the
+    watcher attaches only once a tick hook APPENDS to it, exactly like a real child writing its
+    first event.
+    """
+    return write_rollout(_codex_sessions(ctx), thread=thread, cwd=cwd)
+
+
+def _appender(path, *lines, bump=5.0):
+    """A tick hook: the child appends ``lines`` to its rollout and the file's mtime moves."""
+    def _hook():
+        with open(path, "a") as f:
+            for line in lines:
+                f.write(line + "\n")
+        stamp = time.time() + bump
+        os.utime(path, (stamp, stamp))
+    return _hook
+
+
+def _soon(seconds=5):
+    """A rollout line timestamp inside THIS session (the watcher drops replayed older lines)."""
+    return iso(now() + timedelta(seconds=seconds))
+
+
+def _reset_epoch(hours=3):
+    return int(time.time() + hours * 3600)
+
+
+REFILL_BANNER = ("■ Your workspace is out of credits. "
+                 "Ask your workspace owner to refill in order to continue.")
+
+
+def test_tick_hops_on_rollout_credits_depleted(ctx, monkeypatch, tmp_path):
+    """The child's own log says the turn failed with usage_limit_exceeded — a fact, not prose. The
+    tick reads it while the child is alive, rests the seat as "hard" with the server's own message,
+    and hops. The only usage fetch in the whole run is the hard landing pre-flight."""
+    monkeypatch.chdir(tmp_path)
+    cwd = os.getcwd()
+    _two_codex(ctx)  # active a
+    path = _rollout_session(ctx, cwd)
+    gets = []
+
+    def get(url, headers, timeout):
+        gets.append(url)
+        return 200, codex_ok_body(primary=10.0, secondary=10.0)   # the landing seat is fine
+
+    spawn = FakeSpawn([
+        (None, 1, [_appender(path, task_complete_error_line(timestamp=_soon()))]),
+        (b"resumed\n", 0),
+    ])
+
+    rc = run(ctx, "codex", ["--foo"], spawn=spawn, get=get, notify=lambda m: None)
+
+    assert rc == 0
+    assert spawn.stops == 1
+    assert spawn.calls[1][-2:] == ["resume", "--last"]
+    state = ctx.load_state()
+    assert state.active("codex") == "b@x.com"
+    seat = state.get_seat("codex", "a@x.com")
+    assert seat["limited_until"] is not None and seat["limit_source"] == "hard"
+    assert seat["limit_detail"] == OUT_OF_CREDITS
+    assert gets == [P.CODEX_USAGE_URL]   # pre-flight only: no corroboration probe, no exit fetch
+
+
+def test_tick_rollout_limit_without_landing_seat_keeps_child(ctx, monkeypatch, tmp_path):
+    """Confirmed by the rollout, but the only seat IS the running one: the child lives on, the hard
+    rest is still persisted, the user is told once, and the advisory watcher takes over."""
+    monkeypatch.chdir(tmp_path)
+    cwd = os.getcwd()
+    ctx.cred["codex"].set_live(make_codex_blob("solo@x.com"))
+    acct.add(ctx, ctx.load_state(), "codex", email="solo@x.com")
+    path = _rollout_session(ctx, cwd)
+    monkeypatch.setattr(L, "_verify_capacity",
+                        lambda *a, **k: L.Selection("solo@x.com", True, None, False))
+    msgs = []
+    sleeps = []
+    spawn = FakeSpawn([(None, 11, [_appender(path, task_complete_error_line(timestamp=_soon()))])])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=fake_get({}), notify=msgs.append,
+             sleep=sleeps.append)
+
+    assert rc == 11 and rc != L.EXIT_GAVE_UP
+    assert spawn.stops == 0 and len(spawn.calls) == 1
+    seat = ctx.load_state().get_seat("codex", "solo@x.com")
+    assert seat["limited_until"] is not None and seat["limit_source"] == "hard"
+    assert seat["limit_detail"] == OUT_OF_CREDITS
+    assert sum("staying on this seat" in m for m in msgs) == 1
+    assert sleeps == [L.POLL_INTERVAL_S]                      # the capacity watcher did start
+    assert sum("available for codex now" in m for m in msgs) == 1
+
+
+def test_tick_hops_when_another_process_rests_the_running_seat(ctx):
+    """THE FIELD REGRESSION. The menubar's usage poll rested the exhausted seat and pointed
+    ``active`` at the sibling — and the running supervised child never noticed, because nothing fed
+    a seat rested by ANOTHER process back into a live launcher. No rollout, no banner, no network:
+    the state file alone must be enough to hop and resume."""
+    _two_codex(ctx)  # active a
+
+    def menubar_poll():
+        with ctx.locked():
+            st = ctx.load_state()
+            st.set_limited_until("codex", "a@x.com", iso(now() + timedelta(hours=3)),
+                                 source="usage")
+            st.set_active("codex", "b@x.com")   # ...and it moves the pointer, as in the field
+            st.save()
+
+    def get(*_a, **_k):
+        raise AssertionError("a seat rested by another process needs no usage fetch")
+
+    spawn = FakeSpawn([(None, 1, [menubar_poll]), (b"resumed\n", 0)])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=lambda m: None)
+
+    assert rc == 0
+    assert spawn.stops == 1
+    assert spawn.calls[1][-2:] == ["resume", "--last"]
+    assert ctx.load_state().active("codex") == "b@x.com"
+
+
+def test_tick_does_not_kill_healthy_session_when_user_switches_active_seat(ctx):
+    """The contract that must survive all of this: a seat the user re-pointed in the GUI is NOT a
+    limit. The healthy child keeps running (and owns its exit code); the new seat applies next time."""
+    _two_codex(ctx)  # active a
+
+    def gui_switch():
+        with ctx.locked():
+            st = ctx.load_state()
+            st.set_active("codex", "b@x.com")
+            st.save()
+
+    msgs = []
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=20.0, secondary=30.0))})
+    spawn = FakeSpawn([(None, 5, [gui_switch, None, None])])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=msgs.append)
+
+    assert rc == 5
+    assert spawn.stops == 0 and len(spawn.calls) == 1
+    assert sum("still running on a@x.com" in m for m in msgs) == 1
+    assert ctx.load_state().active("codex") == "b@x.com"   # the user's choice stands untouched
+
+
+def test_tick_ignores_our_own_reactive_stamp(ctx):
+    """"reactive" is OUR weakest guess (a stdout match we could not disprove). Reading it back as if
+    another process had confirmed it would turn a false positive into a hop."""
+    _two_codex(ctx)  # active a
+
+    def our_own_guess():
+        with ctx.locked():
+            st = ctx.load_state()
+            st.set_limited_until("codex", "a@x.com", iso(now() + timedelta(hours=3)),
+                                 source="reactive")
+            st.save()
+
+    msgs = []
+    spawn = FakeSpawn([(None, 0, [our_own_guess, None])])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=fake_get({}), notify=msgs.append)
+
+    assert rc == 0
+    assert spawn.stops == 0 and len(spawn.calls) == 1
+    assert ctx.load_state().active("codex") == "a@x.com"
+    assert msgs == []
+
+
+def test_tick_rollout_healthy_dismisses_stdout_hint_without_network(ctx, monkeypatch, tmp_path):
+    """Authority order: a token_count the child JUST wrote showing 2% used disproves any limit prose
+    on screen. The dismissal is free — no usage fetch at all — and still spends the false-alarm
+    budget, so persistent prose turns scanning off exactly as before."""
+    monkeypatch.chdir(tmp_path)
+    cwd = os.getcwd()
+    _two_codex(ctx)  # active a
+    path = _rollout_session(ctx, cwd)
+
+    def get(*_a, **_k):
+        raise AssertionError("structured healthy evidence must dismiss prose without a fetch")
+
+    prose = b"... you've hit your usage limit ...\n"
+    chunks = [b"working\n", *([prose] * (L.MAX_FALSE_ALARMS + 1))]
+    hooks = [_appender(path, token_count_line(primary=window(2.0), timestamp=_soon()))]
+    msgs = []
+    spawn = FakeSpawn([(chunks, 0, hooks)])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=msgs.append)
+
+    assert rc == 0
+    assert spawn.stops == 0 and len(spawn.calls) == 1
+    assert any("ignoring limit" in m for m in msgs)          # the dismissals were counted
+    assert ctx.load_state().get_seat("codex", "a@x.com").get("limited_until") is None
+
+
+def test_tick_hard_signal_stays_when_landing_preflight_fails(ctx, monkeypatch, tmp_path):
+    """Both seats can share ONE creditless workspace. Before committing a hard hop the landing seat
+    is proven against the live endpoint; when it is out too, the fetch rests it, the child is left
+    alone and the user is told the workspace — not the seat — is the problem. No ping-pong."""
+    monkeypatch.chdir(tmp_path)
+    cwd = os.getcwd()
+    _two_codex(ctx)  # active a
+    path = _rollout_session(ctx, cwd)
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_credits_depleted_body())})
+    msgs = []
+    spawn = FakeSpawn([(None, 9, [_appender(path, task_complete_error_line(timestamp=_soon()))])])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=msgs.append)
+
+    assert rc == 9 and rc != L.EXIT_GAVE_UP
+    assert spawn.stops == 0 and len(spawn.calls) == 1
+    state = ctx.load_state()
+    assert state.active("codex") == "a@x.com"
+    assert state.get_seat("codex", "a@x.com")["limit_source"] == "hard"
+    assert state.get_seat("codex", "b@x.com")["limited_until"] is not None   # sibling rested too
+    assert sum("workspace" in m and "staying on this seat" in m for m in msgs) == 1
+
+
+@pytest.mark.parametrize("corroborated", [False, True])
+def test_tick_ambiguous_attachment_requires_usage_corroboration(ctx, monkeypatch, tmp_path,
+                                                                corroborated):
+    """Two sessions in ONE directory: the rollout we attached to may not be ours, so a limit line in
+    it is not permission to kill a healthy session. With the endpoint throttled the child lives; with
+    the endpoint agreeing the seat is maxed, the hop proceeds."""
+    monkeypatch.chdir(tmp_path)
+    cwd = os.getcwd()
+    _two_codex(ctx)  # active a
+    other = _rollout_session(ctx, cwd, thread="01aaaaaa")
+    mine = _rollout_session(ctx, cwd, thread="01bbbbbb")
+    get = fake_get({P.CODEX_USAGE_URL: (
+        (200, codex_ok_body(primary=100.0, p_reset=iso(now() + timedelta(hours=3))))
+        if corroborated else (429, ""))})
+
+    def advance_both():
+        _appender(other, token_count_line(primary=window(3.0), timestamp=_soon()), bump=3.0)()
+        _appender(mine, token_count_line(primary=window(100.0, resets_at=_reset_epoch()),
+                                         timestamp=_soon()), bump=6.0)()
+
+    scripts = [(None, 1 if corroborated else 0, [advance_both])]
+    if corroborated:
+        scripts.append((b"resumed\n", 0))
+    spawn = FakeSpawn(scripts)
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=lambda m: None)
+
+    if corroborated:
+        assert rc == 0 and spawn.stops == 1
+        assert spawn.calls[1][-2:] == ["resume", "--last"]
+        assert ctx.load_state().active("codex") == "b@x.com"
+    else:
+        assert rc == 0 and spawn.stops == 0 and len(spawn.calls) == 1
+        assert ctx.load_state().active("codex") == "a@x.com"
+        assert ctx.load_state().get_seat("codex", "a@x.com").get("limited_until") is None
+
+
+def test_hard_banner_still_acts_when_no_rollout_attached(ctx):
+    """With no rollout to consult, the banner is all we have and it still acts — now with the 0.153.4
+    "ask your workspace owner to refill" wording. The one fetch it costs is the landing pre-flight,
+    never a corroboration probe."""
+    _two_codex(ctx)  # active a
+    gets = []
+
+    def get(url, headers, timeout):
+        gets.append(url)
+        return 200, codex_ok_body(primary=10.0, secondary=10.0)
+
+    spawn = FakeSpawn([((REFILL_BANNER + "\n").encode(), 1), (b"resumed\n", 0)])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=lambda m: None)
+
+    assert rc == 0 and spawn.stops == 1
+    assert spawn.calls[1][-2:] == ["resume", "--last"]
+    state = ctx.load_state()
+    assert state.active("codex") == "b@x.com"
+    assert state.get_seat("codex", "a@x.com")["limit_source"] == "hard"
+    assert gets == [P.CODEX_USAGE_URL]
+
+
+def test_hard_banner_waits_for_structured_event_when_rollout_attached(ctx, monkeypatch, tmp_path):
+    """When we ARE tailing this child's log, the banner is demoted to a hint: killing a session on a
+    string whose wording changes between releases is exactly what we are getting away from. Without
+    a structured event the live child is untouched."""
+    monkeypatch.chdir(tmp_path)
+    cwd = os.getcwd()
+    _two_codex(ctx)  # active a
+    path = _rollout_session(ctx, cwd)
+
+    def get(*_a, **_k):
+        raise AssertionError("a deferred banner must not probe usage either")
+
+    quiet = token_count_line(primary=None, secondary=None, timestamp=_soon())
+    spawn = FakeSpawn([([b"booting\n", (REFILL_BANNER + "\n").encode()], 0, [_appender(path, quiet)])])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=lambda m: None)
+
+    assert rc == 0
+    assert spawn.stops == 0 and len(spawn.calls) == 1
+    assert ctx.load_state().active("codex") == "a@x.com"
+    assert ctx.load_state().get_seat("codex", "a@x.com").get("limited_until") is None
+
+
+def test_detect_hard_limit_matches_refill_wording():
+    """The exact 0.153.4 line that no longer matched — and the narration that still must not."""
+    assert detect_hard_limit("codex", REFILL_BANNER)
+    assert detect_hard_limit("codex", "■ Your workspace is out of credits. Add credits to continue.")
+    assert not detect_hard_limit("claude", REFILL_BANNER)
+    for benign in (
+        "the routed Codex workspace is out of credits",
+        "the routed Codex workspace is out of credits. Add credits to continue",
+        "Codex printed: Your workspace is out of credits. Add credits to continue.",
+    ):
+        assert not detect_hard_limit("codex", benign)
+
+
+def test_pty_spawn_calls_on_tick_when_idle_and_under_output():
+    """The heartbeat must fire on a SILENT child (nothing to select on) and must be able to stop it —
+    the structured sources decide, and a child that prints nothing still has to be supervised."""
+    ticks = {"n": 0}
+
+    rc = L.pty_spawn(["/bin/sh", "-c", "sleep 1.2; echo hi"], lambda c: False,
+                     on_tick=lambda: bool(ticks.__setitem__("n", ticks["n"] + 1)) or False,
+                     tick_interval=0.2)
+    assert rc == 0
+    assert ticks["n"] >= 1                      # ticked while the child was idle
+
+    stops = {"n": 0}
+
+    def stopper():
+        stops["n"] += 1
+        return stops["n"] >= 2
+
+    started = time.monotonic()
+    rc = L.pty_spawn(["/bin/sh", "-c", "sleep 30"], lambda c: False,
+                     on_tick=stopper, tick_interval=0.2)
+    assert time.monotonic() - started < 10      # the tick terminated it instead of waiting 30s
+    assert rc != 0
+
+
+def test_tick_costs_one_stat_when_nothing_changed(ctx, monkeypatch):
+    """The heartbeat runs every 2s for a whole session, so it has to stay cheap: one stat per tick,
+    and the state file is only PARSED when its mtime actually moved."""
+    _two_codex(ctx)
+    loads = {"n": 0}
+    real_load = L.Context.load_state
+    monkeypatch.setattr(L.Context, "load_state",
+                        lambda self: (loads.__setitem__("n", loads["n"] + 1), real_load(self))[1])
+    stats = {"n": 0}
+    real_stat = os.stat
+
+    def counting_stat(path, *a, **k):
+        if not isinstance(path, int) and str(path) == str(ctx.state_file):
+            stats["n"] += 1
+        return real_stat(path, *a, **k)
+
+    monkeypatch.setattr(L.os, "stat", counting_stat)
+    seen = {}
+
+    def spawn(argv, on_output, on_tick=None):
+        before = loads["n"]
+        stats["n"] = 0
+        for _ in range(50):
+            assert on_tick() is False
+        seen["loads"] = loads["n"] - before
+        seen["stats"] = stats["n"]
+        return 0
+
+    assert run(ctx, "codex", [], spawn=spawn, get=fake_get({})) == 0
+    assert seen["loads"] <= 1    # only the first tick reads state; the rest stop at the stat
+    assert seen["stats"] >= 50   # ...and every tick does pay that stat
+
+
+def test_tick_blocked_decision_is_suppressed_then_retried(ctx, monkeypatch):
+    """A seat rested for the next five hours with nowhere to land must not re-run the whole decision
+    (and re-notify) every two seconds, even though the poll that rested it keeps rewriting state."""
+    ctx.cred["codex"].set_live(make_codex_blob("solo@x.com"))
+    acct.add(ctx, ctx.load_state(), "codex", email="solo@x.com")
+    calls = {"n": 0}
+    real_handle = L.handle_limit
+    monkeypatch.setattr(L, "handle_limit",
+                        lambda *a, **k: (calls.__setitem__("n", calls["n"] + 1),
+                                         real_handle(*a, **k))[1])
+
+    def poll_rests_it():
+        with ctx.locked():
+            st = ctx.load_state()
+            st.set_limited_until("codex", "solo@x.com", iso(now() + timedelta(hours=3)),
+                                 source="usage")
+            st.save()   # every tick sees a NEW revision, as a live menubar poll would produce
+
+    msgs = []
+    spawn = FakeSpawn([(None, 3, [poll_rests_it] * 12)])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=fake_get({}), notify=msgs.append)
+
+    assert rc == 3 and spawn.stops == 0
+    assert calls["n"] == 1                                     # decided once, then suppressed
+    assert sum("staying on this seat" in m for m in msgs) == 1
+
+
+def test_exit_after_structured_limit_hops_even_if_endpoint_unreachable(ctx, monkeypatch, tmp_path):
+    """Codex often just ends the turn with usage_limit_exceeded and quits. That log line is positive
+    evidence in hand, so the hop happens on exit even though the usage endpoint is unreachable and
+    the ambiguous attachment kept us from acting mid-session."""
+    monkeypatch.chdir(tmp_path)
+    cwd = os.getcwd()
+    _two_codex(ctx)  # active a
+    other = _rollout_session(ctx, cwd, thread="01aaaaaa")
+    mine = _rollout_session(ctx, cwd, thread="01bbbbbb")
+    get = fake_get({P.CODEX_USAGE_URL: (0, "")})   # endpoint down: nothing can corroborate anything
+
+    def advance_both():
+        _appender(other, token_count_line(primary=window(3.0), timestamp=_soon()), bump=3.0)()
+        _appender(mine, task_complete_error_line(timestamp=_soon()), bump=6.0)()
+
+    spawn = FakeSpawn([(None, 1, [advance_both]), (b"resumed\n", 0)])
+    msgs = []
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=msgs.append)
+
+    assert rc == 0
+    assert spawn.stops == 0                                 # the child ended on its own
+    assert spawn.calls[1][-2:] == ["resume", "--last"]
+    state = ctx.load_state()
+    assert state.active("codex") == "b@x.com"
+    seat = state.get_seat("codex", "a@x.com")
+    assert seat["limit_source"] == "hard" and seat["limit_detail"] == OUT_OF_CREDITS
+    assert any("hopping to b@x.com" in m for m in msgs)
+
+
+def test_exit_after_structured_limit_preflights_the_landing_seat(ctx, monkeypatch, tmp_path):
+    """The post-exit hop takes the SAME decision tail as a live one, so a hard signal still has to
+    prove the landing seat. With the whole workspace out of credits there is nowhere to go: no hop,
+    both seats rested, and the resumed session never ping-pongs between two creditless siblings."""
+    monkeypatch.chdir(tmp_path)
+    cwd = os.getcwd()
+    _two_codex(ctx)  # active a
+    other = _rollout_session(ctx, cwd, thread="01aaaaaa")
+    mine = _rollout_session(ctx, cwd, thread="01bbbbbb")
+    gets = []
+
+    def get(url, headers, timeout):
+        gets.append(url)
+        if len(gets) == 1:
+            return 429, ""   # the mid-session probe can't corroborate → the child is left alone
+        return 200, codex_credits_depleted_body()   # the pre-flight: the sibling is out too
+
+    def advance_both():
+        _appender(other, token_count_line(primary=window(3.0), timestamp=_soon()), bump=3.0)()
+        _appender(mine, task_complete_error_line(timestamp=_soon()), bump=6.0)()
+
+    msgs = []
+    spawn = FakeSpawn([(None, 1, [advance_both])])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=msgs.append)
+
+    assert rc == 1 and rc != L.EXIT_GAVE_UP
+    assert len(spawn.calls) == 1 and spawn.stops == 0        # no hop, no relaunch
+    assert len(gets) == 2                                    # probe, then the landing pre-flight
+    state = ctx.load_state()
+    assert state.active("codex") == "a@x.com"
+    assert state.get_seat("codex", "a@x.com")["limit_source"] == "hard"
+    assert state.get_seat("codex", "b@x.com")["limited_until"] is not None
+    assert sum("workspace" in m and "staying on this seat" in m for m in msgs) == 1
+
+
+def _frozen_clock(monkeypatch):
+    """Freeze BOTH clocks the supervisor reads: wall time (launcher + selection) and the monotonic
+    one its cooldowns run on. Time then only moves when a test says so, which is what lets a rest
+    expire with NO state write at all — exactly how a rest usually ends, and the case a change gate
+    built on the state file's mtime can never see.
+    """
+    from acctsw import selection as SEL
+    clock = {"t": now(), "mono": 1000.0}
+    monkeypatch.setattr(L, "now", lambda: clock["t"])
+    monkeypatch.setattr(SEL, "now", lambda: clock["t"])
+    monkeypatch.setattr(L.time, "monotonic", lambda: clock["mono"])
+
+    def advance(seconds):
+        clock["t"] = clock["t"] + timedelta(seconds=seconds)
+        clock["mono"] += seconds
+
+    clock["advance"] = advance
+    return clock
+
+
+def test_tick_recovers_when_a_seat_frees_while_blocked(ctx, monkeypatch, tmp_path):
+    """Blocked on a confirmed limit with every sibling resting, the session used to sit on the dead
+    seat forever while the watcher merely announced that a seat had freed. When b's rest expires —
+    by the clock, with nothing writing state — the next tick must carry the work over to it."""
+    monkeypatch.chdir(tmp_path)
+    cwd = os.getcwd()
+    clock = _frozen_clock(monkeypatch)
+    state = _two_codex(ctx)  # active a
+    state.set_limited_until("codex", "b@x.com", iso(clock["t"] + timedelta(seconds=1)),
+                            source="usage")
+    state.save()
+    path = _rollout_session(ctx, cwd)
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=10.0, secondary=10.0))})
+
+    def time_passes():
+        # b's rest expires and the re-check window passes. NOTHING writes state.json, so only a
+        # clock-driven re-check can notice — the child would otherwise finish on the dead seat.
+        clock["advance"](L.TICK_BLOCK_S + 10)
+
+    msgs = []
+    spawn = FakeSpawn([
+        # exit 0: if the tick does not hop, this child simply completes and there is no second launch
+        (None, 0, [_appender(path, task_complete_error_line(timestamp=_soon())), time_passes]),
+        (b"resumed\n", 0),
+    ])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=msgs.append)
+
+    assert rc == 0
+    assert spawn.stops == 1                                  # it really did stop and hop, eventually
+    assert spawn.calls[1][-2:] == ["resume", "--last"]
+    assert ctx.load_state().active("codex") == "b@x.com"
+    assert any("staying on this seat" in m for m in msgs)    # ...after first being blocked
+    assert any("hopping to b@x.com" in m for m in msgs)
+
+
+def test_tick_recovery_never_fires_for_a_healthy_launch_seat(ctx, monkeypatch, tmp_path):
+    """The recovery re-check may only rescue a session that is genuinely stuck. Once the seat we are
+    running on is no longer rested (a poll proved it healthy again), a freed sibling is just another
+    available seat — killing the live child for it would be the false-positive class all over again."""
+    monkeypatch.chdir(tmp_path)
+    cwd = os.getcwd()
+    clock = _frozen_clock(monkeypatch)
+    state = _two_codex(ctx)  # active a
+    state.set_limited_until("codex", "b@x.com", iso(clock["t"] + timedelta(seconds=1)),
+                            source="usage")
+    state.save()
+    path = _rollout_session(ctx, cwd)
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=10.0, secondary=10.0))})
+
+    def poll_clears_the_running_seat():
+        clock["advance"](L.TICK_BLOCK_S + 10)                # b frees, the re-check window passes...
+        with ctx.locked():
+            st = ctx.load_state()
+            st.set_limited_until("codex", "a@x.com", None)   # ...and a is proven healthy again
+            st.save()
+
+    msgs = []
+    spawn = FakeSpawn([(None, 0, [_appender(path, task_complete_error_line(timestamp=_soon())),
+                                  poll_clears_the_running_seat, None, None])])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=msgs.append)
+
+    assert rc == 0
+    assert spawn.stops == 0 and len(spawn.calls) == 1        # the healthy child was left alone
+    assert ctx.load_state().active("codex") == "a@x.com"
+    assert not any("hopping to" in m for m in msgs)
+
+
+def test_hard_preflight_failure_restores_the_users_active_seat(ctx, monkeypatch, tmp_path):
+    """The tail borrows ``active`` to name the seat this child actually runs on. When the hard
+    landing pre-flight then refuses, that borrow must be given back: no hop happened, so a seat the
+    user picked in the GUI still has to apply to their next session."""
+    monkeypatch.chdir(tmp_path)
+    cwd = os.getcwd()
+    _two_codex(ctx)  # active a, and a is the launch seat
+    path = _rollout_session(ctx, cwd, thread="01bbbbbb")
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_credits_depleted_body())})  # b is out too
+
+    def gui_switch_then_limit():
+        with ctx.locked():
+            st = ctx.load_state()
+            st.set_active("codex", "b@x.com")   # the user re-points the seat, mid-session
+            st.save()
+        _appender(path, task_complete_error_line(timestamp=_soon()), bump=6.0)()
+
+    msgs = []
+    spawn = FakeSpawn([(None, 3, [gui_switch_then_limit, None])])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=msgs.append)
+
+    assert rc == 3
+    assert spawn.stops == 0 and len(spawn.calls) == 1        # nowhere to land: the child lives on
+    state = ctx.load_state()
+    assert state.active("codex") == "b@x.com"                # the user's choice survived untouched
+    assert state.get_seat("codex", "a@x.com")["limit_source"] == "hard"   # ...and a was still rested
+    assert sum("workspace" in m and "staying on this seat" in m for m in msgs) == 1
+
+
+def test_probe_judges_the_launch_seat_not_active(ctx, monkeypatch, tmp_path):
+    """The verify-before-kill probe must judge the seat this child was SPAWNED with. CODEX_HOME is
+    process-global, so the credentials behind the fetch are that seat's — if another process moved
+    ``active`` first, filing the answer under the sibling's name rests a healthy seat and rewrites
+    its account_id, which reads as a re-subscription."""
+    monkeypatch.chdir(tmp_path)
+    _two_codex(ctx)  # active a, and a is the launch seat
+    before_b = dict(ctx.load_state().get_seat("codex", "b@x.com"))
+    reset = iso(now() + timedelta(hours=3))
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=100.0, p_reset=reset))})
+
+    def gui_switch():
+        with ctx.locked():
+            st = ctx.load_state()
+            st.set_active("codex", "b@x.com")
+            st.save()
+
+    spawn = FakeSpawn([
+        ([b"booting\n", b"... you've hit your usage limit ...\n"], 1, [gui_switch]),
+        (b"resumed\n", 0),
+    ])
+
+    rc = run(ctx, "codex", ["--foo"], spawn=spawn, get=get, notify=lambda m: None)
+
+    assert rc == 0 and spawn.stops == 1
+    assert spawn.calls[1][-2:] == ["resume", "--last"]
+    state = ctx.load_state()
+    seat_a, seat_b = state.get_seat("codex", "a@x.com"), state.get_seat("codex", "b@x.com")
+    assert (seat_a.get("usage") or {}).get("windows")      # the fetch landed on the launch seat
+    assert seat_a["limited_until"] is not None
+    assert seat_b.get("usage") == before_b.get("usage")    # ...and never touched the sibling
+    assert seat_b.get("account_id") == before_b.get("account_id")
+    assert seat_b.get("limited_until") is None
+    assert "moved_note" not in state.data                  # no phantom re-subscription
+    assert state.active("codex") == "b@x.com"              # the hop still went where it should
+
+
+def test_tick_limit_signals_do_not_refetch_while_blocked(ctx, monkeypatch, tmp_path):
+    """A user pressing "continue" on a maxed seat writes a fresh usage_limit_exceeded per turn. Once
+    we have decided and found nowhere to land, every later line must be recorded and ignored — not
+    pay for another forced landing pre-flight."""
+    monkeypatch.chdir(tmp_path)
+    cwd = os.getcwd()
+    _two_codex(ctx)  # active a
+    path = _rollout_session(ctx, cwd)
+    gets = []
+
+    def get(url, headers, timeout):
+        gets.append(url)
+        return 200, codex_credits_depleted_body()   # the sibling is out too: nowhere to land
+
+    calls = {"n": 0}
+    real_handle = L.handle_limit
+    monkeypatch.setattr(L, "handle_limit",
+                        lambda *a, **k: (calls.__setitem__("n", calls["n"] + 1),
+                                         real_handle(*a, **k))[1])
+    limit = _appender(path, task_complete_error_line(timestamp=_soon()))
+    seen = {}
+    spawn = FakeSpawn([(None, 4, [limit, limit, limit,
+                                  lambda: seen.__setitem__("in_session", calls["n"])])])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=lambda m: None)
+
+    assert rc == 4 and spawn.stops == 0
+    assert seen["in_session"] == 1   # decided once for three identical limit events...
+    assert len(gets) == 1            # ...and paid for exactly one landing pre-flight
+    assert calls["n"] == 2           # (the second is the exit-time decision, on the same evidence)
+
+
+def test_hard_banner_acts_when_attachment_is_ambiguous(ctx, monkeypatch, tmp_path):
+    """The banner is only vetoed by a rollout we KNOW is this child's. With two sessions sharing the
+    directory the attachment is a guess, so the fallback has to stay live — otherwise a wrong guess
+    silences the structured source and the banner at the same time, and nothing ever hops."""
+    monkeypatch.chdir(tmp_path)
+    cwd = os.getcwd()
+    _two_codex(ctx)  # active a
+    first = _rollout_session(ctx, cwd, thread="01aaaaaa")
+    second = _rollout_session(ctx, cwd, thread="01bbbbbb")
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=10.0, secondary=10.0))})
+
+    def both_move():
+        # Neither line says anything about limits (a fresh session reports no windows yet), so the
+        # attachment is ambiguous without any structured verdict to lean on either way.
+        quiet = token_count_line(primary=None, secondary=None, timestamp=_soon())
+        _appender(first, quiet, bump=3.0)()
+        _appender(second, quiet, bump=6.0)()
+
+    spawn = FakeSpawn([
+        ([b"booting\n", (REFILL_BANNER + "\n").encode()], 1, [both_move]),
+        (b"resumed\n", 0),
+    ])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=lambda m: None)
+
+    assert rc == 0 and spawn.stops == 1
+    assert spawn.calls[1][-2:] == ["resume", "--last"]
+    state = ctx.load_state()
+    assert state.active("codex") == "b@x.com"
+    assert state.get_seat("codex", "a@x.com")["limit_source"] == "hard"
+
+
+# --- the edges of the decision tail ------------------------------------------------------------
+
+def test_handle_limit_never_shortens_a_rest_we_already_believe_in(ctx):
+    """A structured signal can carry an EARLIER unlock than the one already on the seat: the 5-hour
+    window reopens long before the weekly one that is actually blocking us. Re-anchoring to the
+    nearer time would send the launcher back to a still-capped seat the moment it passes."""
+    state = _two_codex(ctx)  # active a
+    later = iso(now() + timedelta(hours=3))
+    state.set_limited_until("codex", "a@x.com", later, source="usage")
+    state.save()
+
+    dec = handle_limit(ctx, state, "codex", get=fake_get({}), corroborated=True, hard=False,
+                       reset_at=iso(now() + timedelta(hours=1)), source="usage")
+
+    seat = state.get_seat("codex", "a@x.com")
+    assert L.parse_iso(seat["limited_until"]) == L.parse_iso(later)
+    assert dec.action == "switch" and dec.email == "b@x.com"
+
+
+def test_run_auth_death_names_the_resting_sibling_instead_of_a_relogin(ctx):
+    """Dead credentials while the only other seat is asleep. Both walls block the hop, but the
+    remedies differ: telling this user to re-add a seat would send them to fix the wrong thing —
+    the seat exists, it is merely resting. Say when it comes back, and leave the child running."""
+    state = _two_codex(ctx)  # active a
+    unlocks = iso(now() + timedelta(hours=2))
+    state.set_limited_until("codex", "b@x.com", unlocks, source="usage")
+    state.save()
+    get = fake_get({P.CODEX_USAGE_URL: (401, "")})  # inconclusive: it must not dismiss the banner
+    msgs = []
+    spawn = FakeSpawn([(b"... your refresh token was revoked ...\n", 7)])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=msgs.append)
+
+    assert rc == 7 and rc != L.EXIT_GAVE_UP
+    assert spawn.stops == 0 and len(spawn.calls) == 1
+    assert ctx.load_state().active("codex") == "a@x.com"
+    hints = [m for m in msgs if "sign in again" in m]
+    assert len(hints) == 1
+    assert "is resting until" in hints[0]
+    assert "acctsw add" not in hints[0]   # the seat is already there; re-adding it fixes nothing
+
+
+def test_tick_survives_a_state_file_that_disappears(ctx):
+    """The store is written atomically, but nothing stops the data dir being taken away mid-session
+    (a restore, a stray rm, an uninstall losing a race). The heartbeat reads it every two seconds;
+    raising there would kill a child that is running perfectly well over pure bookkeeping."""
+    _two_codex(ctx)
+
+    def wipe_the_store():
+        ctx.state_file.unlink()
+
+    msgs = []
+    spawn = FakeSpawn([(None, 0, [wipe_the_store, None, None])])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=fake_get({}), notify=msgs.append)
+
+    assert rc == 0 and spawn.stops == 0 and len(spawn.calls) == 1
+    assert msgs == []
+
+
+def test_tick_treats_a_touched_state_file_as_unchanged(ctx, monkeypatch):
+    """The mtime is only a cheap pre-filter: anything that rewrites or touches the file moves it.
+    The REVISION is what says the data moved. Without that second gate, a seat already judged would
+    be re-decided — and re-notified — every time some other process breathed on the store."""
+    ctx.cred["codex"].set_live(make_codex_blob("solo@x.com"))
+    acct.add(ctx, ctx.load_state(), "codex", email="solo@x.com")
+    calls = {"n": 0}
+    real_handle = L.handle_limit
+    monkeypatch.setattr(L, "handle_limit",
+                        lambda *a, **k: (calls.__setitem__("n", calls["n"] + 1),
+                                         real_handle(*a, **k))[1])
+
+    def poll_rests_it():
+        with ctx.locked():
+            st = ctx.load_state()
+            st.set_limited_until("codex", "solo@x.com", iso(now() + timedelta(hours=3)),
+                                 source="usage")
+            st.save()
+
+    def touch_without_writing():
+        stamp = ctx.state_file.stat().st_mtime_ns + 1_000_000_000
+        os.utime(ctx.state_file, ns=(stamp, stamp))
+
+    msgs = []
+    spawn = FakeSpawn([(None, 3, [poll_rests_it] + [touch_without_writing] * 5)])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=fake_get({}), notify=msgs.append)
+
+    assert rc == 3 and spawn.stops == 0
+    assert calls["n"] == 1                                  # one real change, five bare touches
+    assert sum("staying on this seat" in m for m in msgs) == 1
+
+
+def test_tick_recovery_respects_a_switch_budget_that_is_already_spent(ctx, monkeypatch):
+    """The clock-driven re-check exists to rescue a session stuck on a rested seat. It must not
+    become a way around the switch bound: with the budget spent there is no hop to make, however
+    healthy the sibling looks, so the re-check has to fall silent instead of re-deciding forever."""
+    clock = _frozen_clock(monkeypatch)
+    _two_codex(ctx)  # active a, healthy b
+
+    def menubar_rests_a():
+        with ctx.locked():
+            st = ctx.load_state()
+            st.set_limited_until("codex", "a@x.com", iso(clock["t"] + timedelta(hours=3)),
+                                 source="usage")
+            st.save()
+
+    def time_passes():
+        clock["advance"](L.TICK_BLOCK_S + 10)   # the re-check window opens, with nothing written
+
+    msgs = []
+    spawn = FakeSpawn([(None, 4, [menubar_rests_a, None, time_passes, None, None])])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=fake_get({}), notify=msgs.append,
+             max_switches=0)
+
+    assert rc == 4 and spawn.stops == 0 and len(spawn.calls) == 1
+    assert ctx.load_state().active("codex") == "a@x.com"    # the budget held; no hop happened
+    assert sum("switch limit" in m for m in msgs) == 1      # ...and it was said exactly once
+
+
+def test_tick_recovery_stays_quiet_while_no_seat_has_freed(ctx, monkeypatch):
+    """Blocked on the only seat there is. The re-check runs on the CLOCK, so it fires again and
+    again with nothing to find; each round must end in silence rather than a second notification or
+    another decision, and the child has to keep its terminal throughout."""
+    clock = _frozen_clock(monkeypatch)
+    ctx.cred["codex"].set_live(make_codex_blob("solo@x.com"))
+    acct.add(ctx, ctx.load_state(), "codex", email="solo@x.com")
+    calls = {"n": 0}
+    real_handle = L.handle_limit
+    monkeypatch.setattr(L, "handle_limit",
+                        lambda *a, **k: (calls.__setitem__("n", calls["n"] + 1),
+                                         real_handle(*a, **k))[1])
+
+    def poll_rests_it():
+        with ctx.locked():
+            st = ctx.load_state()
+            st.set_limited_until("codex", "solo@x.com", iso(clock["t"] + timedelta(hours=3)),
+                                 source="usage")
+            st.save()
+
+    def time_passes():
+        clock["advance"](L.TICK_BLOCK_S + 10)
+
+    msgs = []
+    sleeps = []
+    spawn = FakeSpawn([(None, 6, [poll_rests_it, None, time_passes, None, time_passes, None])])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=fake_get({}), notify=msgs.append,
+             sleep=sleeps.append)
+
+    assert rc == 6 and spawn.stops == 0 and len(spawn.calls) == 1
+    assert calls["n"] == 1
+    assert sum("staying on this seat" in m for m in msgs) == 1
+    assert not any("hopping to" in m for m in msgs)
+
+
+def test_tick_ambiguous_limit_lines_share_one_probe_cooldown(ctx, monkeypatch, tmp_path):
+    """Two sessions in one directory, so every limit line needs the endpoint to agree before it may
+    touch a live child. A maxed seat writes one such line PER TURN and a user can keep pressing
+    continue — without the shared cooldown each of them would re-hit the endpoint that just told us
+    nothing, which is the hammering the stdout path already guards against."""
+    monkeypatch.chdir(tmp_path)
+    cwd = os.getcwd()
+    _two_codex(ctx)  # active a
+    other = _rollout_session(ctx, cwd, thread="01aaaaaa")
+    mine = _rollout_session(ctx, cwd, thread="01bbbbbb")
+    gets = []
+
+    def get(url, headers, timeout):
+        gets.append(url)
+        return 429, ""   # throttled: it can corroborate nothing, now or on any retry
+
+    def first_turn():
+        _appender(other, token_count_line(primary=window(3.0), timestamp=_soon()), bump=3.0)()
+        _appender(mine, task_complete_error_line(timestamp=_soon()), bump=6.0)()
+
+    def another_turn():
+        _appender(mine, task_complete_error_line(timestamp=_soon()), bump=9.0)()
+
+    msgs = []
+    spawn = FakeSpawn([(None, 0, [first_turn, another_turn, another_turn, another_turn])])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=msgs.append)
+
+    assert rc == 0 and spawn.stops == 0 and len(spawn.calls) == 1
+    assert gets == [P.CODEX_USAGE_URL]                      # four limit lines, one probe
+    state = ctx.load_state()
+    assert state.active("codex") == "a@x.com"
+    assert state.get_seat("codex", "a@x.com").get("limited_until") is None
+    assert msgs == []

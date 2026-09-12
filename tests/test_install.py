@@ -205,6 +205,58 @@ def test_supervision_status_requires_executable_wrappers(tmp_path, monkeypatch):
     assert status["active"] is False
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses file permissions")
+def test_supervision_status_survives_an_unreadable_rc(tmp_path, monkeypatch):
+    """An rc we are not allowed to read must degrade, not explode: the caller still gets a status
+    dict, `block` falls back to False, and the reason travels with it so the UI can say it."""
+    bindir = tmp_path / "bin"
+    inst.ensure_launchers(bin_dir=bindir, wire_rc=False)
+    rc = tmp_path / ".zshrc"
+    inst.ensure_shell_setup(bindir, rc)          # the block IS there — we simply cannot look
+    rc.chmod(0o000)
+    monkeypatch.setenv("PATH", str(bindir))
+    try:
+        status = inst.supervision_status(bindir, rc)
+    finally:
+        rc.chmod(0o600)                          # keep tmp_path teardown clean
+
+    assert status["error"].startswith(f"couldn't read {rc}: ")
+    assert "Permission denied" in status["error"]
+    assert status["block"] is False and status["active"] is False
+    assert status["wrappers"] is True            # the half we could check is still reported
+    assert status["rc_path"] == str(rc)
+    assert status["on_path"] is True
+
+
+def test_supervision_status_survives_an_undecodable_rc(tmp_path, monkeypatch):
+    """A readable rc holding non-UTF-8 bytes (a stray latin-1 line) hits the same guard."""
+    bindir = tmp_path / "bin"
+    rc = tmp_path / ".zshrc"
+    rc.write_bytes(b"export EDITOR=vi\n# caf\xe9 au lait (latin-1, not utf-8)\n")
+    monkeypatch.setenv("PATH", "/usr/bin")
+
+    status = inst.supervision_status(bindir, rc)
+
+    assert status == {
+        "wrappers": False,
+        "block": False,
+        "rc_path": str(rc),
+        "on_path": False,
+        "active": False,
+        "error": status["error"],
+    }
+    assert status["error"].startswith(f"couldn't read {rc}: ")
+    assert "utf-8" in status["error"]
+
+
+def test_supervision_status_omits_error_when_the_rc_reads_fine(tmp_path, monkeypatch):
+    """The error key is the exception, not the rule — a healthy probe must not carry one."""
+    rc = tmp_path / ".zshrc"
+    rc.write_text("alias ll='ls -la'\n")
+    monkeypatch.setenv("PATH", "/usr/bin")
+    assert "error" not in inst.supervision_status(tmp_path / "bin", rc)
+
+
 def test_ensure_shell_setup_rewrites_block_in_place(tmp_path):
     rc = tmp_path / ".zshrc"
     inst.ensure_shell_setup(tmp_path / "bin", rc, aliases=True)

@@ -54,8 +54,11 @@ anywhere.
 
 ## Features
 
-- **Auto-switch on limit _or_ dead token** — rate-limited, or signed-out/revoked: it hops to a healthy
-  same-tool seat and resumes your work; clear "sign in again" message when none is ready.
+- **Auto-switch on limit _or_ dead token** — rate-limited, out of credits, or signed-out/revoked: it
+  hops to a healthy same-tool seat and resumes your work; clear "sign in again" message when none is
+  ready. Limits are read from Codex's own session events and the usage API's own flags — not from
+  screen text — so a reworded banner can't fool it. And if a seat is put to rest while you're working
+  on it (the menubar's usage poll notices first), the *running* session hops too.
 - **Live limits in the bar** — 5-hour + weekly usage and reset timers, read from the official usage
   endpoints (cached, gently polled).
 - **Zero-touch setup** — installing the app wires `codex` / `claude` to the supervised launchers; when
@@ -100,8 +103,9 @@ Then a plain `codex` / `claude` is supervised whenever the app is running.
 
 ## How it works
 
-- `acctsw/` — the engine (Python, stdlib + the `security` CLI): credential swap, usage reading, seat
-  selection, the supervised PTY launcher, install/uninstall.
+- `acctsw/` — the engine (Python, stdlib + the `security` CLI): credential swap, usage reading,
+  limit signals from Codex's own session log (`acctsw/rollout.py`), seat selection, the supervised
+  PTY launcher, install/uninstall.
 - `app/` — the menubar app (`pyobjc` `NSStatusItem` + a `WKWebView` popover) — a thin UI over the engine.
 - `cx` / `cl` — supervised launchers for `codex` / `claude`. **Stock binaries are never renamed or
   shadowed**; the app is the master switch — closed app ⇒ `cx`/`cl` run the real tool.

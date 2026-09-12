@@ -3,7 +3,7 @@ import os
 import stat
 import subprocess
 
-from acctsw import session
+from acctsw import procenv, session
 from acctsw.util import write_json
 
 
@@ -68,6 +68,38 @@ def test_recycled_pid_reads_as_no_session(ctx, monkeypatch):
         "email": "stale@x.com",
         "pid": os.getpid(),
         "process_start": "Not The Real Start Time",
+        "started_at": "2026-01-01T00:00:00+00:00",
+    })
+    assert session.active_session(ctx.data_dir, "codex") is None
+
+
+def test_session_shares_the_locale_normalized_proc_start(ctx):
+    """Both heartbeats must read start-times through ONE implementation, or they drift apart again
+    and only one of them survives a non-English locale."""
+    assert session._proc_start is procenv.proc_start
+
+
+def test_active_session_accepts_a_heartbeat_written_in_another_locale(ctx, monkeypatch):
+    """Upgrade path: a supervisor started before the fix still holds a German-formatted start-time.
+    Same instant, different spelling → still this session, NOT a recycled PID."""
+    monkeypatch.setattr(session, "_proc_start", lambda pid: "Sat Aug 29 16:36:54 2026")
+    write_json(_path(ctx), {
+        "email": "a@x.com",
+        "pid": os.getpid(),
+        "process_start": "Sa. 29 Aug. 16:36:54 2026",
+        "started_at": "2026-01-01T00:00:00+00:00",
+    })
+    active = session.active_session(ctx.data_dir, "codex")
+    assert active is not None and active["email"] == "a@x.com"
+
+
+def test_active_session_rejects_a_different_start_time_across_locales(ctx, monkeypatch):
+    """The tolerant compare must not blunt the PID-reuse guard."""
+    monkeypatch.setattr(session, "_proc_start", lambda pid: "Sat Aug 30 09:00:00 2026")
+    write_json(_path(ctx), {
+        "email": "stale@x.com",
+        "pid": os.getpid(),
+        "process_start": "Sat Aug 29 16:36:54 2026",
         "started_at": "2026-01-01T00:00:00+00:00",
     })
     assert session.active_session(ctx.data_dir, "codex") is None

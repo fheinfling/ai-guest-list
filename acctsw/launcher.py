@@ -6,12 +6,26 @@ with a scripted fake child (no real PTY, no network).
 
 Flow:
   1. pick a seat (prefer active; else available; else soonest-unlock + report) and switch to it
-  2. spawn the agent under a PTY, teeing output while scanning for the limit signal
-  3. on a stdout limit-signal: DECIDE BEFORE KILLING — while the child is still running, positively
-     verify the limit (or trust a hard billing banner), choose a different seat, and check the switch
-     budget. Only when all three pass do we stop, commit that exact hop, and relaunch with RESUME;
-     unverifiable signals and confirmed limits with nowhere to land leave the live session alone
+  2. spawn the agent under a PTY, teeing output while a TICK_INTERVAL_S heartbeat polls the
+     STRUCTURED signals beside it — the child's own rollout JSONL (codex writes its rate-limit
+     windows and the server's error code there) and the engine state file (another process, e.g.
+     the menubar's usage poll, can rest the seat we are running on while we hold no lock)
+  3. on any confirmed signal: DECIDE BEFORE KILLING — while the child is still running, stamp the
+     seat, choose a different seat, and check the switch budget. Only when all three pass do we
+     stop, commit that exact hop, and relaunch with RESUME; unverifiable signals and confirmed
+     limits with nowhere to land leave the live session alone
   4. on normal exit: sync-back the (refreshed) creds and return the child's exit status
+
+Authority order for "this seat is out" (highest first) — banner strings are the WEAKEST evidence
+and never decide anything on their own when something better is available:
+  1. the child's rollout JSONL (``rollout.RolloutWatcher``): the tool's own structured record,
+     carrying the server's error code and the real reset time
+  2. the usage endpoint's authoritative flags (``usage.snapshot_says_out`` / ``_is_limited``):
+     ``allowed:false``, ``rate_limit_reached_type``, spend control, a window at 100%
+  3. engine state: a seat rested by ANOTHER process with ``limit_source`` "usage"/"hard" (never our
+     own weakest "reactive" guess) means hop now, mid-session
+  4. stdout regexes: a HINT that triggers a probe, and a fallback only when nothing better exists
+     (no rollout attached). A fresh structured "healthy" reading dismisses limit prose outright.
 """
 from __future__ import annotations
 
@@ -32,6 +46,7 @@ from datetime import timedelta
 from typing import Callable
 
 from . import identity as identity_mod
+from . import rollout
 from . import usage as usage_mod
 from .context import Context
 from .errors import AcctswError
@@ -41,15 +56,23 @@ from .session import clear_session, mark_session
 from .switch import switch, sync_back
 from .util import iso, now, parse_iso
 
-# A spawn function: (argv, on_output) -> exit_status.
+# A spawn function: (argv, on_output, on_tick=None) -> exit_status.
 #   on_output(chunk: bytes) -> bool ; returning True asks the supervisor to stop the child.
-SpawnFn = Callable[[list, Callable[[bytes], bool]], int]
+#   on_tick() -> bool           ; called about every TICK_INTERVAL_S, INDEPENDENTLY of output (a
+#                                 silent child still has to be supervised); True also stops it.
+SpawnFn = Callable[..., int]
 Notifier = Callable[[str], None]
 
 # Default cooldown when a limit is caught but no authoritative reset is known (owned by usage so
 # its limit-flagging can share it; re-exported here for the handlers and existing callers/tests).
 DEFAULT_COOLDOWN = usage_mod.DEFAULT_COOLDOWN
 MAX_SWITCHES = 6      # safety bound on auto-relaunches within one `run`
+TICK_INTERVAL_S = 2.0   # heartbeat for the structured signals (rollout JSONL + state file). Cheap
+                        # by construction: one incremental read of an already-open path and one
+                        # os.stat, so a silent child is still supervised without polling the network.
+TICK_BLOCK_S = 60.0     # after a tick decision that could NOT stop the child (no landing seat), wait
+                        # this long before re-deciding — a permanently rested seat must not re-run
+                        # the whole decision (and its notifications) every TICK_INTERVAL_S.
 MAX_FALSE_ALARMS = 3  # dismissed stdout matches per run before stdout scanning is switched OFF
                       # (supervision continues — only the untrustworthy signal is dropped)
 PROBE_COOLDOWN_S = 30.0  # after a dismissed or inconclusive match, skip re-probing usage for this
@@ -127,14 +150,17 @@ AUTH_DEAD_PATTERNS = {
 _LIMIT_RE = {t: [re.compile(p, re.IGNORECASE) for p in pats] for t, pats in LIMIT_PATTERNS.items()}
 _AUTH_RE = {t: [re.compile(p, re.IGNORECASE) for p in pats] for t, pats in AUTH_DEAD_PATTERNS.items()}
 
-# Codex can emit this hard billing banner when the ChatGPT workspace has no credits left. It is not
-# always reflected as a normal usage-window reset, so waiting for usage API corroboration can trap the
-# launcher in a same-seat resume loop. Keep this deliberately narrower than generic "out of credits"
-# prose, which is still guarded by the usage probe.
+# Codex's hard billing banner (the ChatGPT workspace has no credits left). This is a HINT and a
+# FALLBACK, never the primary evidence: the decision belongs to the structured signals (the rollout
+# JSONL's own error code / reached-type, and the usage endpoint's flags), and when we are tailing
+# this child's rollout we WAIT for that fact instead of acting on prose. The old pattern also pinned
+# the trailing sentence ("Add credits to continue"), and codex 0.153.4 shipped different wording
+# ("Ask your workspace owner to refill in order to continue") — so the whole hop silently stopped
+# working. Only the line anchor and the leading-glyph allowance remain, which is what keeps the
+# model's own narration about credits (mid-sentence, never at a line start) out.
 HARD_LIMIT_PATTERNS = {
     "codex": [
-        r"(?m)^[^\w\n]{0,8}\s*your\s+workspace\s+is\s+out\s+of\s+credits?\.?"
-        r"\s+add\s+credits\s+to\s+continue\.?\s*$",
+        r"(?m)^[^\w\n]{0,8}\s*your\s+workspace\s+is\s+out\s+of\s+credits?\b",
     ],
     "claude": [],
 }
@@ -380,8 +406,11 @@ def _seat_confirmed_healthy(state, tool: str, email: str, summary: dict) -> bool
     if (summary.get(tool) or {}).get(email) != "ok":
         return False  # cached / unauthorized / rate_limited / network / no_creds → can't tell
     u = (state.get_seat(tool, email) or {}).get("usage") or {}
-    if u.get("limit_reached"):
-        return False  # authoritative API flag says the seat really is out
+    if usage_mod.snapshot_says_out(u):
+        # Authoritative API flags say the seat really is out. NOT just ``limit_reached``: the
+        # credits-depleted payload reports NULL windows and says so only via allowed/reached_type,
+        # so a percentage-only reading would call a creditless seat "healthy" and dismiss a real hit.
+        return False
     pcts = [w.get("used_pct") for w in (u.get("windows") or {}).values()
             if isinstance(w, dict) and w.get("used_pct") is not None]
     return bool(pcts) and max(pcts) < FALSE_ALARM_MAX_PCT
@@ -400,14 +429,20 @@ def _hop_or_give_up(state, tool: str, *, exclude, active) -> Decision:
 
 def handle_limit(ctx: Context, state, tool: str, *, get=usage_mod._default_get,
                  exclude: set | frozenset = frozenset(), corroborated: bool = False,
-                 hard: bool = False) -> Decision:
+                 hard: bool = False, reset_at: str | None = None, source: str | None = None,
+                 detail: str | None = None) -> Decision:
     """A limit was caught for the active seat. Flag it, then choose the next seat. ``exclude`` carries
     seats that already failed auth this run, so a limit never re-selects a known-dead-token seat.
     ``corroborated``: the verify-before-kill probe force-refreshed usage moments ago and it confirmed
     the limit — don't refetch (state already carries the fresh snapshot) or second-guess it here.
-    ``hard``: the signal was a trusted tool-side BILLING banner (e.g. codex "workspace out of
-    credits") — the usage windows can look healthy while the seat is unusable, so the rest is
-    stamped ``source="hard"`` and usage polls must not clear it before it expires."""
+    ``hard``: the signal was a trusted tool-side BILLING/entitlement stop (the rollout's own error
+    code or reached-type, or the banner as a fallback) — the usage windows can look healthy while
+    the seat is unusable, so the rest is stamped ``source="hard"`` and usage polls must not clear it
+    before it expires.
+    ``reset_at``/``source``/``detail``: what a STRUCTURED signal knew and a stdout match never
+    could — the server's own unlock time, which evidence class stamped it, and the human phrase to
+    keep on the seat. Omitted by every pre-existing caller, which therefore behaves exactly as
+    before (reactive guess, blind DEFAULT_COOLDOWN)."""
     active = state.active(tool)
     # Authoritative reset from the usage endpoint for the seat that just hit the limit (only the
     # active seat — others keep their known state; their stale snapshot tokens would 401 anyway).
@@ -450,16 +485,17 @@ def handle_limit(ctx: Context, state, tool: str, *, get=usage_mod._default_get,
     # ...else a reactive fallback so we don't immediately re-pick the maxed seat.
     if seat is not None:
         existing = parse_iso(seat.get("limited_until"))
-        if hard:
-            # A billing banner must ALWAYS land as source="hard" — even over an existing softer
-            # flag (e.g. a menubar poll's short "usage" stamp), which a later healthy-looking
-            # fetch would clear, re-picking the creditless seat. Keep the later unlock time.
-            until = now() + DEFAULT_COOLDOWN
+        src = source or ("hard" if hard else "reactive")
+        # Re-stamp when the signal is authoritative (hard), when it brought a real reset time, or
+        # when nothing is stamped yet. A soft signal that knows no more than an existing flag does
+        # must NOT re-anchor it to now() — that would make the wait target recede on every poll.
+        if hard or reset_at or existing is None:
+            until = parse_iso(reset_at) or (now() + DEFAULT_COOLDOWN)
             if existing is not None and existing > until:
-                until = existing
-            state.set_limited_until(tool, active, iso(until), source="hard")
-        elif existing is None:
-            state.set_limited_until(tool, active, iso(now() + DEFAULT_COOLDOWN), source="reactive")
+                until = existing   # never shorten a rest we already believed in
+            state.set_limited_until(tool, active, iso(until), source=src)
+            if detail:
+                seat["limit_detail"] = detail   # the server's own phrase, for the UI/notifications
     state.save()
     return _hop_or_give_up(state, tool, exclude=exclude, active=active)
 
@@ -561,11 +597,20 @@ def _exitcode(raw_status: int) -> int:
             if hasattr(os, "waitstatus_to_exitcode") else raw_status)
 
 
-def pty_spawn(argv: list, on_output: Callable[[bytes], bool]) -> int:
+def pty_spawn(argv: list, on_output: Callable[[bytes], bool],
+              on_tick: Callable[[], bool] | None = None,
+              tick_interval: float = TICK_INTERVAL_S) -> int:
     """Run ``argv`` in a PTY, copying I/O to the real terminal and teeing output to ``on_output``.
 
     If ``on_output`` returns True, the child is terminated (SIGTERM→SIGKILL) so the caller can
     relaunch. Returns the child's exit status. The child is reaped exactly once.
+
+    ``on_tick`` is the supervisor's heartbeat, called about every ``tick_interval`` seconds and
+    independently of output: the structured signals (the child's rollout log, the engine state) are
+    the ones that actually decide, and a child can sit silent for minutes — or flood the terminal so
+    fast that select() never times out. It is therefore driven from BOTH ends of the loop: a timeout
+    when there is nothing to copy, and an elapsed-time check after each copy. True stops the child
+    exactly like ``on_output`` does.
     """
     # Resolve real fds up front; under test capture / non-tty these may be missing — guard them
     # so we never pass an object with a raising fileno() into select() (which would busy-loop).
@@ -627,9 +672,11 @@ def pty_spawn(argv: list, on_output: Callable[[bytes], bool]) -> int:
         except (ValueError, OSError):
             pass
 
+        next_tick = time.monotonic() + tick_interval
         while True:
+            timeout = None if on_tick is None else max(0.0, next_tick - time.monotonic())
             try:
-                rlist, _, _ = select.select(watch, [], [])
+                rlist, _, _ = select.select(watch, [], [], timeout)
             except InterruptedError:
                 continue
             except OSError:
@@ -654,6 +701,14 @@ def pty_spawn(argv: list, on_output: Callable[[bytes], bool]) -> int:
                     os.write(master_fd, inp)
                 else:
                     watch.remove(stdin_fd)  # stdin EOF → stop watching (avoid busy-loop)
+            # Checked on EVERY iteration, not only on a select timeout: a chatty TUI keeps the
+            # master fd readable forever, so a timeout-only tick would never fire on the one child
+            # that most needs supervising.
+            if on_tick is not None and time.monotonic() >= next_tick:
+                next_tick = time.monotonic() + tick_interval
+                if on_tick():
+                    stop_requested = True
+                    break
     finally:
         # Re-assert the terminal's default private modes the child TUI may have left set (mouse
         # tracking especially) — on the kill path the child never got to do this itself.
@@ -940,7 +995,14 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             try:
                 with ctx.locked():
                     st = ctx.load_state()
-                    seat = st.active(tool)
+                    # ALWAYS the seat this child was SPAWNED with — CODEX_HOME is process-global, so
+                    # the credentials behind this fetch are that seat's no matter where ``active``
+                    # points now. Judging st.active() instead would fetch with the running seat's
+                    # creds and file the answer (windows, limit flags, account_id) under a sibling's
+                    # name — resting a healthy seat and tripping the re-subscription branch.
+                    seat = (launch_email
+                            if launch_email and st.get_seat(tool, launch_email) is not None
+                            else st.active(tool))
                     blob = usage_mod._seat_blob(ctx, st, tool, seat) if seat else None
                 if not seat or not blob:
                     return "unknown"
@@ -962,6 +1024,135 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             except Exception:
                 return "unknown"
 
+        def _decide_and_maybe_stop(*, reason: str, hard: bool = False,
+                                   reset_at: str | None = None, source: str | None = None,
+                                   detail: str | None = None,
+                                   clear: Callable[[], None] = lambda: None) -> bool:
+            """The ONE decision tail every confirmed signal goes through — stdout, the rollout
+            JSONL, or a seat another process rested. Stamp the seat, choose the exact landing seat,
+            check the switch budget; return True (with ``hit`` filled in) only when all of them
+            pass, else leave the live child alone and say why exactly once.
+
+            DECIDE BEFORE KILLING: nothing here kills anything. It reports whether a stop is
+            justified while the child is still running, so an unverifiable signal or a confirmed
+            limit with nowhere to land costs nothing but a brief stall.
+            """
+            # ``hit`` is rebound per loop iteration; the closure reads the current one.
+            hit["handled"] = True   # recognized — the exit-time net must not re-derive this signal
+            with ctx.locked():
+                state = ctx.load_state()
+                active = state.active(tool)
+                prev_active = active
+                # Another process (the menubar's usage poll) may already have moved ``active`` off
+                # the seat this child is running on — that is exactly the field failure this whole
+                # tick exists for. CODEX_HOME was pointed at ``launch_email`` before the spawn and
+                # is process-global, so the seat to rest and leave is ALWAYS launch_email.
+                realigned = (reason == "limit" and bool(launch_email) and active != launch_email
+                             and state.get_seat(tool, launch_email) is not None)
+                if realigned:
+                    state.set_active(tool, launch_email)
+                    active = launch_email
+                if reason in ("auth", "revoked"):
+                    if active:
+                        auth_failed.add(active)
+                    dec = handle_auth_dead(ctx, state, tool, exclude=auth_failed)
+                else:
+                    dec = handle_limit(ctx, state, tool, get=get, exclude=auth_failed,
+                                       corroborated=True, hard=hard, reset_at=reset_at,
+                                       source=source, detail=detail)
+                approved = dec.action == "switch" and switches < max_switches
+                if realigned and not approved:
+                    # Not hopping after all: put the pointer back so a seat the user picked in the
+                    # GUI still applies to their next session.
+                    state.set_active(tool, prev_active)
+                    state.save()
+
+            def _undo_realign() -> None:
+                """Same promise as above for the paths that give up AFTER the lock was released:
+                we only borrowed ``active`` to name the seat this child runs on, so a decision that
+                ends in no hop must not leave the user's own choice overwritten. Re-read under a
+                fresh lock and only undo what is still ours — another process may have moved on."""
+                if not realigned:
+                    return
+                with ctx.locked():
+                    st = ctx.load_state()
+                    if st.active(tool) == launch_email:
+                        st.set_active(tool, prev_active)
+                        st.save()
+
+            if approved:
+                landing = dec.email
+                if hard:
+                    # HARD means billing/entitlement, and two codex seats routinely share ONE
+                    # workspace — a depleted workspace would ping-pong the session between siblings
+                    # until MAX_SWITCHES is gone. So prove the landing seat against the live
+                    # endpoint first (no lock held — locked()'s contract). The fetch also RESTS a
+                    # sibling that is out, so the next signal won't re-pick it either. Shared
+                    # account_id is deliberately NOT a veto: the field report had both seats on one
+                    # workspace and the sibling member was still usable.
+                    skip = set(auth_failed) | ({launch_email} if launch_email else set())
+                    sel = _verify_capacity(ctx, tool, get, at=now(), force=True, exclude=skip,
+                                           ua=None)
+                    if sel.email and sel.available and sel.email != launch_email:
+                        landing = sel.email   # the fresh sweep may name a different seat than choose
+                    else:
+                        _undo_realign()   # the pre-flight refused: this is a no-hop after all
+                        if not scan["limit_stay_notified"]:
+                            notify(f"{active} hit a hard billing limit and no other {tool} seat is "
+                                   f"usable right now (the whole workspace may be out of credits) "
+                                   f"— staying on this seat")
+                            scan["limit_stay_notified"] = True
+                        _start_capacity_watcher(active)
+                        clear()
+                        scan["next_probe"] = time.monotonic() + PROBE_COOLDOWN_S
+                        return False
+                hit.update({
+                    "reason": reason,
+                    "email": landing,
+                    "active": active,
+                    "hard": hard,
+                })
+                return True
+
+            # No approved landing means no stop. Clear the rolling match so subsequent ordinary
+            # output is not mistaken for a fresh banner; the child keeps its terminal and argv.
+            clear()
+            scan["next_probe"] = time.monotonic() + PROBE_COOLDOWN_S
+            if dec.action == "switch":  # a seat exists, but the budget is already spent
+                if not scan["budget_notified"]:
+                    suffix = (
+                        f"; {active} needs you to sign in again" if reason == "auth"
+                        else (f"; {active} is no longer entitled"
+                              if reason == "revoked" else "")
+                    )
+                    notify(f"hit the switch limit ({max_switches}){suffix} — staying on this seat")
+                    scan["budget_notified"] = True
+                return False
+            if reason == "auth":
+                if not scan["auth_stay_notified"]:
+                    if dec.unlocks_at:
+                        notify(f"{active} needs you to sign in again 🔑 — the only other {tool} "
+                               f"seat is resting until {dec.unlocks_at}; staying on this seat")
+                    else:
+                        notify(f"{active} needs you to sign in again (token revoked) and no "
+                               f"other {tool} seat is ready — re-add it via the app or "
+                               f"`acctsw add {tool}`; staying on this seat")
+                    scan["auth_stay_notified"] = True
+                return False
+            if reason == "revoked":
+                if not scan["revoked_stay_notified"]:
+                    notify(f"{active} is no longer entitled and no other {tool} seat is ready "
+                           f"— staying on this seat")
+                    scan["revoked_stay_notified"] = True
+                return False
+            if not scan["limit_stay_notified"]:
+                label = "hit a hard billing limit" if hard else "hit its usage limit"
+                notify(f"{active} {label}, but no other {tool} seat is ready — staying on this "
+                       f"seat")
+                scan["limit_stay_notified"] = True
+            _start_capacity_watcher(active)
+            return False
+
         while True:
             argv = resume_cmd(ctx, tool) if resuming else build_cmd(ctx, tool, args)
             with ctx.locked():
@@ -980,6 +1171,142 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             }
             buf.clear()
 
+            # --- structured signals beside this child -------------------------------------------
+            # Snapshot the sessions tree BEFORE the spawn so the child's own rollout file is
+            # identified by what moves afterwards (a RESUMED thread keeps appending to its original
+            # dated file, so the date in the path proves nothing). Aware datetimes only — the
+            # watcher gates every replayed line on its timestamp.
+            launch_cwd = os.getcwd()
+            spawn_at = now()
+            rollout_source = None
+            if tool == "codex":
+                roots = rollout.sessions_roots(ctx, launch_email)
+                rollout_source = rollout.RolloutWatcher(roots, cwd=launch_cwd,
+                                                        started_at=spawn_at,
+                                                        before=rollout.scan_rollouts(roots))
+            tick = {
+                "state_mtime": 0,             # last seen st_mtime_ns of state.json (cheap change gate)
+                "seen_rev": None,             # last seen state revision (mtime can move without data)
+                "blocked": False,             # a confirmed limit could not be acted on (yet)
+                "blocked_until": 0.0,         # monotonic: suppress re-deciding an unlandable limit
+                "gui_switch_notified": False,
+                "healthy_at": None,           # monotonic of the last structured "still has headroom"
+                "last_structured": None,      # last structured limit signal (post-exit evidence)
+            }
+
+            def _tick_state() -> bool:
+                """Engine state as a signal: another process may have rested the seat we run on.
+
+                This is the field regression — the menubar's usage poll rested the exhausted seat
+                and made the sibling active, but the live child never hopped because nothing fed
+                that back in. One os.stat per tick, a lock-free read only when it changed (state
+                writes are atomic temp+os.replace, so a reader never sees a torn file).
+                """
+                try:
+                    m = os.stat(ctx.state_file).st_mtime_ns
+                except OSError:
+                    return False
+                if m == tick["state_mtime"]:
+                    return False
+                tick["state_mtime"] = m
+                snap = ctx.load_state()
+                if snap.data.get("rev") == tick["seen_rev"]:
+                    return False   # touched but unchanged (e.g. an idle poll's rewrite)
+                tick["seen_rev"] = snap.data.get("rev")
+                # ALWAYS the seat this child was spawned with: CODEX_HOME is process-global and
+                # ``active`` may already point somewhere else.
+                seat = snap.get_seat(tool, launch_email) or {}
+                until = parse_iso(seat.get("limited_until"))
+                # "reactive" is our OWN weakest guess (a stdout match); it must never be read back
+                # as if it were someone else's evidence, or a false positive becomes a hop.
+                rested_by_other = (until is not None and until > now()
+                                   and seat.get("limit_source") in ("usage", "hard"))
+                if rested_by_other:
+                    if time.monotonic() >= tick["blocked_until"]:
+                        return _tick_decide(reason="limit",
+                                            hard=(seat.get("limit_source") == "hard"),
+                                            reset_at=seat.get("limited_until"),
+                                            source=seat.get("limit_source"),
+                                            detail=seat.get("limit_detail"))
+                elif snap.active(tool) != launch_email and not tick["gui_switch_notified"]:
+                    # A healthy seat the user simply re-pointed in the GUI. Never kill for that.
+                    tick["gui_switch_notified"] = True
+                    notify(f"{tool} is still running on {launch_email}; your new seat applies to "
+                           f"the next session")
+                return False
+
+            def _tick_decide(**kw) -> bool:
+                if _decide_and_maybe_stop(**kw):
+                    return True
+                # Nowhere to land (or no budget): don't re-decide — and re-notify — every 2s.
+                tick["blocked"] = True
+                tick["blocked_until"] = time.monotonic() + TICK_BLOCK_S
+                return False
+
+            def _tick_recover() -> bool:
+                """Stuck on a rested seat — has a sibling come back yet?
+
+                A confirmed limit with nowhere to land leaves the child running, and until now the
+                only thing that ever changed afterwards was the advisory watcher PRINTING that a
+                seat had freed. The session stayed on the dead seat. The missing half is this: a
+                rest usually expires by the CLOCK, with nobody writing state.json at all, so the
+                mtime gate in _tick_state can never notice it. Hence a time-driven re-check, but
+                only once we are actually blocked and only every TICK_BLOCK_S — otherwise a healthy
+                session would parse state on every tick for nothing.
+
+                Same contract as every other path: the seat we run on must still be credibly rested
+                (never our own "reactive" guess), there must be a real landing seat, and the switch
+                budget must allow it — the decision tail re-checks all three anyway.
+                """
+                if not tick["blocked"] or time.monotonic() < tick["blocked_until"]:
+                    return False
+                tick["blocked_until"] = time.monotonic() + TICK_BLOCK_S
+                snap = ctx.load_state()
+                seat = snap.get_seat(tool, launch_email) or {}
+                until = parse_iso(seat.get("limited_until"))
+                if (until is None or until <= now()
+                        or seat.get("limit_source") not in ("usage", "hard")):
+                    return False   # the seat we are on is not (credibly) out — nothing to recover
+                if switches >= max_switches:
+                    return False
+                sel = choose(snap, tool,
+                             exclude=set(auth_failed) | ({launch_email} if launch_email else set()))
+                if not (sel.email and sel.available):
+                    return False   # still nowhere to go; try again after the next TICK_BLOCK_S
+                return _tick_decide(reason="limit",
+                                    hard=(seat.get("limit_source") == "hard"),
+                                    reset_at=seat.get("limited_until"),
+                                    source=seat.get("limit_source"),
+                                    detail=seat.get("limit_detail"))
+
+            def _tick() -> bool:
+                for sig in (rollout_source.poll() if rollout_source is not None else ()):
+                    if sig.kind == "healthy":
+                        tick["healthy_at"] = time.monotonic()
+                        continue
+                    tick["last_structured"] = sig   # recorded even when we don't act (post-exit)
+                    if time.monotonic() < tick["blocked_until"]:
+                        # Already decided this and could not act. A user pressing "continue" on a
+                        # maxed seat writes a fresh usage_limit_exceeded per turn, and each one
+                        # would otherwise cost a forced fetch (the hard landing pre-flight).
+                        continue
+                    if not rollout_source.unambiguous:
+                        # Two sessions share this cwd, so the file may not be ours. A wrong
+                        # attachment must never kill a healthy session on its own — require the
+                        # endpoint to agree before acting, on the SAME cooldown stdout probes use
+                        # so a burst of lines cannot hammer the endpoint.
+                        if time.monotonic() < scan["next_probe"]:
+                            continue
+                        if _probe("limit") != "confirmed":
+                            scan["next_probe"] = time.monotonic() + PROBE_COOLDOWN_S
+                            continue
+                    if _tick_decide(reason="limit", hard=sig.hard, reset_at=sig.reset_at,
+                                    source=("hard" if sig.hard else "usage"), detail=sig.detail):
+                        return True
+                # (c) engine state, then (d) the clock: a seat that frees while we are stuck must
+                # actually carry the session over, not merely be announced.
+                return _tick_state() or _tick_recover()
+
             def on_output(chunk: bytes) -> bool:
                 buf.extend(chunk)
                 del buf[:-4096]  # keep a rolling tail
@@ -987,7 +1314,6 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 hard = detect_hard_limit(tool, text)
                 if hard:
                     reason = "limit"
-                    verdict = "confirmed"  # trusted tool-side billing stop; no usage probe needed
                 else:
                     if not scan["on"]:
                         return False
@@ -995,14 +1321,33 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     if reason is None:
                         return False
                     hit["handled"] = True
+                if reason == "limit" and tick["healthy_at"] is not None \
+                        and time.monotonic() - tick["healthy_at"] < PROBE_COOLDOWN_S:
+                    # The child ITSELF just recorded near-empty windows in its rollout. Structured
+                    # evidence outranks prose, so the text is a false positive — and dismissing it
+                    # here costs no network call at all.
+                    hit["handled"] = True
+                    buf.clear()
+                    _dismissed()
+                    return False
+                if hard:
+                    if (rollout_source is not None and rollout_source.attached is not None
+                            and rollout_source.unambiguous):
+                        # We are tailing THIS child's own session log: the banner is a hint, the
+                        # JSONL is the fact. Wait for the structured event instead of killing on a
+                        # string whose wording changes between releases. Only a file we know is
+                        # ours earns that veto — an ambiguous or provisional attachment must not
+                        # silence the fallback, or a wrong guess would disable the banner outright.
+                        buf.clear()
+                        return False
+                    verdict = "confirmed"   # nothing better to consult: the banner is the fallback
+                else:
                     if time.monotonic() < scan["next_probe"]:
                         # Same banner/prose redrawn inside the cooldown. It has already been handled,
                         # so neither re-probe nor the exit-time fallback gets a second bite at it.
                         buf.clear()
                         return False
                     verdict = _probe(reason)
-                if reason is None:
-                    return False
                 hit["handled"] = True
                 if verdict == "dismiss":
                     buf.clear()  # don't re-trip on the text still sitting in the rolling tail
@@ -1018,73 +1363,31 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     buf.clear()
                     _unknown()
                     return False
-
-                # Confirmation alone is insufficient. While the child is alive, stamp the failed
-                # seat and choose the exact different landing seat we would use. Auth banners remain
-                # a separate trusted signal: a successful usage call dismissed them above; otherwise
-                # the token-dead seat is excluded for every later decision in this run. A 403 reached
-                # through a limit banner is the same leave-this-seat decision, but it is never rested.
+                # Confirmation alone is insufficient — the shared tail decides. Auth banners remain a
+                # separate trusted signal: a successful usage call dismissed them above; otherwise the
+                # token-dead seat is excluded for every later decision in this run. A 403 reached
+                # through a limit banner is the same leave-this-seat decision, but never a rest.
                 decision_reason = "revoked" if verdict == "revoked" else reason
-                with ctx.locked():
-                    state = ctx.load_state()
-                    active = state.active(tool)
-                    if decision_reason in ("auth", "revoked"):
-                        if active:
-                            auth_failed.add(active)
-                        dec = handle_auth_dead(ctx, state, tool, exclude=auth_failed)
-                    else:
-                        dec = handle_limit(ctx, state, tool, get=get, exclude=auth_failed,
-                                           corroborated=True, hard=hard)
+                return _decide_and_maybe_stop(reason=decision_reason, hard=hard, clear=buf.clear)
 
-                if dec.action == "switch" and switches < max_switches:
-                    hit.update({
-                        "reason": decision_reason,
-                        "email": dec.email,
-                        "active": active,
-                        "hard": hard,
-                    })
-                    return True
+            status = spawn(argv, on_output, on_tick=_tick)  # NO lock held here
+            if rollout_source is not None:
+                rollout_source.close()
 
-                # No approved landing means no stop. Clear the rolling match so subsequent ordinary
-                # output is not mistaken for a fresh banner; the child keeps its terminal and argv.
-                buf.clear()
-                scan["next_probe"] = time.monotonic() + PROBE_COOLDOWN_S
-                if dec.action == "switch":  # a seat exists, but the budget is already spent
-                    if not scan["budget_notified"]:
-                        suffix = (
-                            f"; {active} needs you to sign in again" if decision_reason == "auth"
-                            else (f"; {active} is no longer entitled"
-                                  if decision_reason == "revoked" else "")
-                        )
-                        notify(f"hit the switch limit ({max_switches}){suffix} — staying on this seat")
-                        scan["budget_notified"] = True
-                    return False
-                if decision_reason == "auth":
-                    if not scan["auth_stay_notified"]:
-                        if dec.unlocks_at:
-                            notify(f"{active} needs you to sign in again 🔑 — the only other {tool} "
-                                   f"seat is resting until {dec.unlocks_at}; staying on this seat")
-                        else:
-                            notify(f"{active} needs you to sign in again (token revoked) and no "
-                                   f"other {tool} seat is ready — re-add it via the app or "
-                                   f"`acctsw add {tool}`; staying on this seat")
-                        scan["auth_stay_notified"] = True
-                    return False
-                if decision_reason == "revoked":
-                    if not scan["revoked_stay_notified"]:
-                        notify(f"{active} is no longer entitled and no other {tool} seat is ready "
-                               f"— staying on this seat")
-                        scan["revoked_stay_notified"] = True
-                    return False
-                if not scan["limit_stay_notified"]:
-                    label = "hit a hard billing limit" if hard else "hit its usage limit"
-                    notify(f"{active} {label}, but no other {tool} seat is ready — staying on this "
-                           f"seat")
-                    scan["limit_stay_notified"] = True
-                _start_capacity_watcher(active)
-                return False
-
-            status = spawn(argv, on_output)  # NO lock held during the session
+            # The child exited right after its OWN log recorded a limit (codex often just ends the
+            # turn with `usage_limit_exceeded` and quits). That is positive, structured evidence in
+            # hand — it does not need the usage endpoint to agree, which is the difference that
+            # matters when the endpoint is 401/429/unreachable. It goes through the SAME decision
+            # tail as every live signal, so it realigns the active pointer, pre-flights the landing
+            # seat and respects the switch budget exactly like a mid-session hop; when it approves,
+            # ``hit`` is filled and the shared commit below carries the work over. Same guards as
+            # the safety net: a clean exit is a real completion and an abort is not a limit, so
+            # neither is ever second-guessed.
+            sig = tick["last_structured"]
+            if (hit["reason"] is None and sig is not None and sig.kind == "limit"
+                    and status > 0 and status not in _ABORT_EXITS):
+                _decide_and_maybe_stop(reason="limit", hard=sig.hard, reset_at=sig.reset_at,
+                                       source=("hard" if sig.hard else "usage"), detail=sig.detail)
 
             if hit["reason"] is None:
                 if hit["handled"]:
