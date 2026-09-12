@@ -12,11 +12,19 @@ from acctsw import install as install_mod
 from acctsw.context import Context
 
 
-def make_codex_blob(email: str, account_id: str | None = None) -> str:
-    """A minimal auth.json whose id_token JWT carries the given email. ``account_id`` is the
-    underlying ChatGPT account (two seats sharing it are the same account); it DEFAULTS to a distinct
-    per-email id so separate seats model separate accounts — pass the SAME id to model a duplicate."""
-    payload = base64.urlsafe_b64encode(json.dumps({"email": email}).encode()).decode().rstrip("=")
+def make_codex_blob(email: str, account_id: str | None = None, *,
+                    user_id: str | None = None) -> str:
+    """A minimal auth.json whose id_token JWT carries the given email. ``account_id`` is the ChatGPT
+    account/workspace; it DEFAULTS to a distinct per-email id so separate seats model separate
+    subscriptions — pass the SAME id to model one subscription. ``user_id`` is the PERSON inside it
+    (what the fingerprint keys on): two seats with one account_id and DIFFERENT user ids model
+    Team/Business colleagues, the same user_id models one login twice. Omitting it reproduces a
+    pre-user-id blob, where the fingerprint falls back to the account id."""
+    claims: dict = {"email": email}
+    if user_id is not None:
+        claims["https://api.openai.com/auth"] = {"chatgpt_account_id": account_id,
+                                                 "chatgpt_user_id": user_id}
+    payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
     id_token = f"header.{payload}.sig"
     return json.dumps({"auth_mode": "ChatGPT", "tokens": {"id_token": id_token, "access_token": "a",
                        "refresh_token": "r", "account_id": account_id or f"acct:{email}"}})

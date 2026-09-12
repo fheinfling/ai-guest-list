@@ -39,6 +39,40 @@ def test_shared_account_seats_are_flagged_and_warned(ctx):
     assert "a@x.com" in warnings[0] and "a+codex@x.com" in warnings[0]
 
 
+def test_plus_alias_same_user_is_still_flagged_as_shared(ctx):
+    """The real duplicate: ONE person, one subscription, two logins (Gmail '+alias'). Same user id
+    AND same account id → one quota, so both seats are flagged and the warning still fires."""
+    ctx.cred["codex"].set_live(make_codex_blob("a@x.com", account_id="same", user_id="user-a"))
+    acct.add(ctx, ctx.load_state(), "codex", email="a@x.com")
+    ctx.cred["codex"].set_live(make_codex_blob("a+codex@x.com", account_id="same", user_id="user-a"))
+    acct.add(ctx, ctx.load_state(), "codex", email="a+codex@x.com")
+    state = ctx.load_state()
+    seats = acct.list_seats(state, "codex")
+    assert all(s["shared_account"] for s in seats)
+    a = next(s for s in seats if s["email"] == "a@x.com")
+    assert a["shared_account_with"] == ["a+codex@x.com"]
+    assert a["shared_workspace_with"] == []          # already said as shared_account, not twice
+    assert len(acct.status(ctx, state)["warnings"]) == 1
+
+
+def test_team_members_are_not_flagged_as_shared(ctx):
+    """Two members of ONE Team/Business workspace share the account id but NOT the person: each has
+    their own 5h/weekly windows, so they are real headroom — no flag, no warning, just a note that
+    they sit in the same workspace."""
+    ctx.cred["codex"].set_live(make_codex_blob("me@corp.com", account_id="ws-1", user_id="user-me"))
+    acct.add(ctx, ctx.load_state(), "codex", email="me@corp.com")
+    ctx.cred["codex"].set_live(make_codex_blob("you@corp.com", account_id="ws-1", user_id="user-you"))
+    acct.add(ctx, ctx.load_state(), "codex", email="you@corp.com")
+    state = ctx.load_state()
+    seats = acct.list_seats(state, "codex")
+    assert not any(s["shared_account"] for s in seats)
+    assert all(s["shared_account_with"] == [] for s in seats)
+    me = next(s for s in seats if s["email"] == "me@corp.com")
+    assert me["account_id"] == "user-me" and me["workspace_id"] == "ws-1"
+    assert me["shared_workspace_with"] == ["you@corp.com"]
+    assert acct.status(ctx, state)["warnings"] == []
+
+
 def test_distinct_account_seats_are_not_flagged(ctx):
     """Genuinely separate accounts (distinct account_id) give real headroom → no flag, no warning."""
     ctx.cred["codex"].set_live(make_codex_blob("a@x.com", account_id="acct-a"))

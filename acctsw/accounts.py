@@ -11,7 +11,7 @@ from .context import Context
 from .errors import CannotIdentify, NoLiveCreds
 from .selection import choose
 from .state import State
-from .usage import MAX_TRUSTED_AGE_S, account_fingerprint
+from .usage import MAX_TRUSTED_AGE_S, account_fingerprint, account_workspace
 from .util import now, parse_iso, jwt_payload
 
 # raw plan code -> display label (spec §4: Business|Team|Pro|Max|Free)
@@ -56,13 +56,17 @@ def add(ctx: Context, state: State, tool: str, *, name: str | None = None,
         raise CannotIdentify(f"could not determine the account email for {tool}")
     ctx.snapshot_set(tool, em, live)
     seat = state.upsert_seat(tool, em, name=name, plan=plan_of(tool, live))
-    # Fingerprint the underlying provider account so we can warn when two seats are secretly the same
-    # account (shared quota — they can't cover each other). Stamped now so the warning shows the
-    # moment a duplicate is added, before any usage poll.
-    fp = account_fingerprint(tool, live)
-    if fp:
+    # Fingerprint the PERSON behind the creds so we can warn when two seats are secretly the same
+    # login (shared quota — they can't cover each other), and record the workspace/subscription id
+    # beside it (colleagues share that one, yet each has their own windows). Stamped now so the
+    # warning shows the moment a duplicate is added, before any usage poll.
+    fp, ws = account_fingerprint(tool, live), account_workspace(tool, live)
+    if fp or ws:
         seat = state.get_seat(tool, em)
-        seat["account_id"] = fp
+        if fp:
+            seat["account_id"] = fp
+        if ws:
+            seat["workspace_id"] = ws
     state.set_active(tool, em)  # the freshly signed-in account is what's live now
     _creds_refreshed(state, tool, em)
     state.save()
@@ -203,17 +207,23 @@ def _seat_view(seat: dict, *, active: bool, at: datetime,
         "usage": usage or None,
         "added_at": seat.get("added_at"),
         "last_on_floor": seat.get("last_on_floor"),
-        # underlying provider-account id; two seats sharing it are one account (filled by _mark_shared)
+        # the PERSON behind the creds; two seats sharing it are one login on one quota
         "account_id": seat.get("account_id"),
-        "shared_account": False,
+        # the subscription/workspace; colleagues share it but each has their own windows
+        "workspace_id": seat.get("workspace_id"),
+        "shared_account": False,       # filled by _mark_shared_accounts
         "shared_account_with": [],
+        "shared_workspace_with": [],   # informational only — same workspace, different people
     }
 
 
 def _mark_shared_accounts(seats: list[dict[str, Any]]) -> None:
-    """Flag seats that share ONE underlying provider account (same account_id) — they draw on the
-    same quota, so when one is limited they all are; auto-switch can never find headroom between
-    them. Seats with no known account_id yet (never polled) are left unflagged."""
+    """Flag seats that are ONE PERSON signed in twice (same account_id fingerprint) — they draw on
+    the same quota, so when one is limited they all are; auto-switch can never find headroom between
+    them. Seats that only share a WORKSPACE (Team/Business colleagues: one workspace id, different
+    people) are real headroom — each member has their own 5h/weekly windows — so they get the
+    informational ``shared_workspace_with`` list and no flag, no warning. Seats with no known ids yet
+    (never polled) are left unmarked."""
     groups: dict[str, list[dict[str, Any]]] = {}
     for s in seats:
         if s.get("account_id"):
@@ -224,6 +234,16 @@ def _mark_shared_accounts(seats: list[dict[str, Any]]) -> None:
             for m in members:
                 m["shared_account"] = True
                 m["shared_account_with"] = [e for e in emails if e != m["email"]]
+    spaces: dict[str, list[dict[str, Any]]] = {}
+    for s in seats:
+        if s.get("workspace_id"):
+            spaces.setdefault(s["workspace_id"], []).append(s)
+    for members in spaces.values():
+        for m in members:
+            # Same-person siblings are already reported as shared_account; don't say it twice.
+            m["shared_workspace_with"] = [x["email"] for x in members
+                                          if x["email"] != m["email"]
+                                          and x["email"] not in m["shared_account_with"]]
 
 
 def _assign_statuses(seats: list[dict[str, Any]]) -> None:
@@ -272,7 +292,9 @@ def list_seats(state: State, tool: str, at: datetime | None = None,
 
 
 def _shared_account_warnings(tools_seats: dict[str, list[dict[str, Any]]]) -> list[str]:
-    """One human-readable warning per group of seats that are secretly the same provider account."""
+    """One human-readable warning per group of seats that are secretly the same person's login.
+    Workspace colleagues never reach here: they hold separate windows, so there is nothing to warn
+    about (only their credits pool, which the launcher's landing pre-flight handles at hop time)."""
     warnings: list[str] = []
     for tool, seats in tools_seats.items():
         seen: set[str] = set()
@@ -282,9 +304,9 @@ def _shared_account_warnings(tools_seats: dict[str, list[dict[str, Any]]]) -> li
             group = sorted([s["email"], *s["shared_account_with"]])
             seen.update(group)
             warnings.append(
-                f"{len(group)} {tool} seats are the same account ({', '.join(group)}) — they share "
-                f"one quota, so switching between them can't help when it's limited. Add a separate "
-                f"{tool} account for real headroom."
+                f"{len(group)} {tool} seats are the same account ({', '.join(group)}) — the same "
+                f"login, so they share one quota and switching between them can't help when it's "
+                f"limited. Add a separate {tool} account for real headroom."
             )
     return warnings
 

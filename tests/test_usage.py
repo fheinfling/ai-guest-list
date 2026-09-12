@@ -141,6 +141,27 @@ def test_account_fingerprint():
     assert U.account_fingerprint("codex", "not json") is None
 
 
+def test_fingerprint_is_the_user_not_the_workspace():
+    """Team/Business colleagues share ONE chatgpt_account_id but hold separate rate-limit windows,
+    so the fingerprint must be the person — otherwise two real seats read as one quota."""
+    mine = make_codex_blob("me@corp.com", account_id="ws-1", user_id="user-me")
+    yours = make_codex_blob("you@corp.com", account_id="ws-1", user_id="user-you")
+    assert U.account_fingerprint("codex", mine) == "user-me"
+    assert U.account_fingerprint("codex", mine) != U.account_fingerprint("codex", yours)
+    # the workspace id is still available to whoever needs the subscription, not the person
+    assert U.account_workspace("codex", mine) == U.account_workspace("codex", yours) == "ws-1"
+    assert U.account_workspace("claude", make_claude_blob()) is None
+    assert U.account_workspace("codex", "not json") is None
+
+
+def test_fingerprint_falls_back_to_account_id_without_user_claim():
+    """Old blobs and API-key auth carry no user id: keep the pre-user-id behaviour there."""
+    assert U.account_fingerprint("codex", make_codex_blob("a@x.com", account_id="X9")) == "X9"
+    # one person signed in twice still collapses to one fingerprint, via the shared account id
+    assert U.account_fingerprint("codex", make_codex_blob("a@x.com", account_id="Z")) == \
+           U.account_fingerprint("codex", make_codex_blob("a+alias@x.com", account_id="Z"))
+
+
 def test_claude_token():
     assert U.claude_token(make_claude_blob()) == "x"
     assert U.claude_token("not json") is None
@@ -157,6 +178,28 @@ def test_refresh_backfills_account_id(ctx):
     U.refresh(ctx, state, "codex", force=True,
               get=fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body())}))
     assert ctx.load_state().get_seat("codex", "a@x.com")["account_id"] == "ACCT7"
+
+
+def test_poll_restamps_a_pre_upgrade_workspace_fingerprint_without_a_phantom_move(ctx):
+    """Seats added before the fingerprint became the user id hold the WORKSPACE id in account_id and
+    no workspace_id at all. The first poll must adopt both ids quietly — reading that swap as a
+    re-subscription would wipe every existing seat's rest on upgrade."""
+    ctx.cred["codex"].set_live(make_codex_blob("me@corp.com", account_id="ws-1", user_id="user-me"))
+    acct.add(ctx, ctx.load_state(), "codex", email="me@corp.com")
+    state = ctx.load_state()
+    seat = state.get_seat("codex", "me@corp.com")
+    seat["account_id"] = "ws-1"            # what the old fingerprint stamped
+    seat.pop("workspace_id", None)         # ...and it knew no workspace id
+    state.save()
+
+    state = ctx.load_state()
+    state.set_limited_until("codex", "me@corp.com", iso(now() + timedelta(hours=4)), source="hard")
+    U.refresh(ctx, state, "codex", force=True,
+              get=fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=5, secondary=5))}))
+    seat = state.get_seat("codex", "me@corp.com")
+    assert seat["account_id"] == "user-me" and seat["workspace_id"] == "ws-1"
+    assert seat["limited_until"] is not None      # the rest survived
+    assert "moved_note" not in state.data
 
 
 def test_successful_poll_rereads_claude_plan(ctx):
