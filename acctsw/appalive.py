@@ -16,9 +16,10 @@ location and tests stay isolated to their temp dir.
 from __future__ import annotations
 
 import os
-import subprocess
 import threading
 from pathlib import Path
+
+from .procenv import proc_start, same_proc_start
 
 
 def _pidfile(data_dir: Path) -> Path:
@@ -40,17 +41,10 @@ def _alive(pid: int) -> bool:
     return True
 
 
-def _proc_start(pid: int) -> str | None:
-    """The process's absolute start-time string (a stable per-process identity that survives PID
-    reuse), via ``ps``. Returns "" if no such process, or None if ``ps`` itself couldn't run."""
-    if pid <= 0:
-        return ""
-    try:
-        r = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
-                           capture_output=True, text=True, timeout=2)
-    except Exception:
-        return None  # ps unavailable → caller falls back to bare liveness
-    return r.stdout.strip()  # empty when the PID is not running
+# Shared with ``session`` (one implementation, so the two heartbeats can't drift): reads the
+# start-time in the C locale and compares tolerantly. Aliased as a module global so tests can
+# monkeypatch the ``ps`` call on this module.
+_proc_start = proc_start
 
 
 _START_CACHE: dict[int, str] = {}
@@ -103,4 +97,6 @@ def app_running(data_dir: Path) -> bool:
         return True
     if not start:                   # raced: process exited between the checks → closed
         return False
-    return stored_start is None or start == stored_start  # identity match when we recorded one
+    # Identity match when we recorded one. Tolerant compare: a heartbeat written by a pre-fix
+    # build carries the writer's locale formatting until the app restarts (see same_proc_start).
+    return stored_start is None or same_proc_start(stored_start, start)

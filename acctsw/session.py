@@ -14,9 +14,9 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 from pathlib import Path
 
+from .procenv import proc_start, same_proc_start
 from .util import iso, now, write_json
 
 
@@ -39,16 +39,10 @@ def _alive(pid: int) -> bool:
     return True
 
 
-def _proc_start(pid: int) -> str | None:
-    """The process's stable absolute start-time, or None when ``ps`` itself is unavailable."""
-    if pid <= 0:
-        return ""
-    try:
-        r = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
-                           capture_output=True, text=True, timeout=2)
-    except Exception:
-        return None
-    return r.stdout.strip()
+# Shared with ``appalive`` (one implementation, so the two heartbeats can't drift): reads the
+# start-time in the C locale and compares tolerantly. Aliased as a module global so tests can
+# monkeypatch the ``ps`` call on this module.
+_proc_start = proc_start
 
 
 _START_CACHE: dict[int, str] = {}
@@ -114,6 +108,8 @@ def active_session(data_dir: Path, tool: str) -> dict | None:
         pass  # ps unavailable → bare liveness already confirmed the process exists
     elif not start:
         return None  # process exited between the cheap liveness check and ps
-    elif stored_start and start != stored_start:
+    elif stored_start and not same_proc_start(stored_start, start):
+        # Tolerant compare: a heartbeat written by a pre-fix build carries the writer's locale
+        # formatting until that supervisor exits, so raw inequality is not proof of PID reuse.
         return None
     return {"email": email, "pid": pid, "started_at": started_at}
