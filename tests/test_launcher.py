@@ -1858,3 +1858,122 @@ def test_exit_after_structured_limit_preflights_the_landing_seat(ctx, monkeypatc
     assert state.get_seat("codex", "a@x.com")["limit_source"] == "hard"
     assert state.get_seat("codex", "b@x.com")["limited_until"] is not None
     assert sum("workspace" in m and "staying on this seat" in m for m in msgs) == 1
+
+
+def _frozen_clock(monkeypatch):
+    """Freeze BOTH clocks the supervisor reads: wall time (launcher + selection) and the monotonic
+    one its cooldowns run on. Time then only moves when a test says so, which is what lets a rest
+    expire with NO state write at all — exactly how a rest usually ends, and the case a change gate
+    built on the state file's mtime can never see.
+    """
+    from acctsw import selection as SEL
+    clock = {"t": now(), "mono": 1000.0}
+    monkeypatch.setattr(L, "now", lambda: clock["t"])
+    monkeypatch.setattr(SEL, "now", lambda: clock["t"])
+    monkeypatch.setattr(L.time, "monotonic", lambda: clock["mono"])
+
+    def advance(seconds):
+        clock["t"] = clock["t"] + timedelta(seconds=seconds)
+        clock["mono"] += seconds
+
+    clock["advance"] = advance
+    return clock
+
+
+def test_tick_recovers_when_a_seat_frees_while_blocked(ctx, monkeypatch, tmp_path):
+    """Blocked on a confirmed limit with every sibling resting, the session used to sit on the dead
+    seat forever while the watcher merely announced that a seat had freed. When b's rest expires —
+    by the clock, with nothing writing state — the next tick must carry the work over to it."""
+    monkeypatch.chdir(tmp_path)
+    cwd = os.getcwd()
+    clock = _frozen_clock(monkeypatch)
+    state = _two_codex(ctx)  # active a
+    state.set_limited_until("codex", "b@x.com", iso(clock["t"] + timedelta(seconds=1)),
+                            source="usage")
+    state.save()
+    path = _rollout_session(ctx, cwd)
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=10.0, secondary=10.0))})
+
+    def time_passes():
+        # b's rest expires and the re-check window passes. NOTHING writes state.json, so only a
+        # clock-driven re-check can notice — the child would otherwise finish on the dead seat.
+        clock["advance"](L.TICK_BLOCK_S + 10)
+
+    msgs = []
+    spawn = FakeSpawn([
+        # exit 0: if the tick does not hop, this child simply completes and there is no second launch
+        (None, 0, [_appender(path, task_complete_error_line(timestamp=_soon())), time_passes]),
+        (b"resumed\n", 0),
+    ])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=msgs.append)
+
+    assert rc == 0
+    assert spawn.stops == 1                                  # it really did stop and hop, eventually
+    assert spawn.calls[1][-2:] == ["resume", "--last"]
+    assert ctx.load_state().active("codex") == "b@x.com"
+    assert any("staying on this seat" in m for m in msgs)    # ...after first being blocked
+    assert any("hopping to b@x.com" in m for m in msgs)
+
+
+def test_tick_recovery_never_fires_for_a_healthy_launch_seat(ctx, monkeypatch, tmp_path):
+    """The recovery re-check may only rescue a session that is genuinely stuck. Once the seat we are
+    running on is no longer rested (a poll proved it healthy again), a freed sibling is just another
+    available seat — killing the live child for it would be the false-positive class all over again."""
+    monkeypatch.chdir(tmp_path)
+    cwd = os.getcwd()
+    clock = _frozen_clock(monkeypatch)
+    state = _two_codex(ctx)  # active a
+    state.set_limited_until("codex", "b@x.com", iso(clock["t"] + timedelta(seconds=1)),
+                            source="usage")
+    state.save()
+    path = _rollout_session(ctx, cwd)
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=10.0, secondary=10.0))})
+
+    def poll_clears_the_running_seat():
+        clock["advance"](L.TICK_BLOCK_S + 10)                # b frees, the re-check window passes...
+        with ctx.locked():
+            st = ctx.load_state()
+            st.set_limited_until("codex", "a@x.com", None)   # ...and a is proven healthy again
+            st.save()
+
+    msgs = []
+    spawn = FakeSpawn([(None, 0, [_appender(path, task_complete_error_line(timestamp=_soon())),
+                                  poll_clears_the_running_seat, None, None])])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=msgs.append)
+
+    assert rc == 0
+    assert spawn.stops == 0 and len(spawn.calls) == 1        # the healthy child was left alone
+    assert ctx.load_state().active("codex") == "a@x.com"
+    assert not any("hopping to" in m for m in msgs)
+
+
+def test_hard_preflight_failure_restores_the_users_active_seat(ctx, monkeypatch, tmp_path):
+    """The tail borrows ``active`` to name the seat this child actually runs on. When the hard
+    landing pre-flight then refuses, that borrow must be given back: no hop happened, so a seat the
+    user picked in the GUI still has to apply to their next session."""
+    monkeypatch.chdir(tmp_path)
+    cwd = os.getcwd()
+    _two_codex(ctx)  # active a, and a is the launch seat
+    path = _rollout_session(ctx, cwd, thread="01bbbbbb")
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_credits_depleted_body())})  # b is out too
+
+    def gui_switch_then_limit():
+        with ctx.locked():
+            st = ctx.load_state()
+            st.set_active("codex", "b@x.com")   # the user re-points the seat, mid-session
+            st.save()
+        _appender(path, task_complete_error_line(timestamp=_soon()), bump=6.0)()
+
+    msgs = []
+    spawn = FakeSpawn([(None, 3, [gui_switch_then_limit, None])])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=msgs.append)
+
+    assert rc == 3
+    assert spawn.stops == 0 and len(spawn.calls) == 1        # nowhere to land: the child lives on
+    state = ctx.load_state()
+    assert state.active("codex") == "b@x.com"                # the user's choice survived untouched
+    assert state.get_seat("codex", "a@x.com")["limit_source"] == "hard"   # ...and a was still rested
+    assert sum("workspace" in m and "staying on this seat" in m for m in msgs) == 1

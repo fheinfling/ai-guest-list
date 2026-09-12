@@ -1060,6 +1060,19 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     state.set_active(tool, prev_active)
                     state.save()
 
+            def _undo_realign() -> None:
+                """Same promise as above for the paths that give up AFTER the lock was released:
+                we only borrowed ``active`` to name the seat this child runs on, so a decision that
+                ends in no hop must not leave the user's own choice overwritten. Re-read under a
+                fresh lock and only undo what is still ours — another process may have moved on."""
+                if not realigned:
+                    return
+                with ctx.locked():
+                    st = ctx.load_state()
+                    if st.active(tool) == launch_email:
+                        st.set_active(tool, prev_active)
+                        st.save()
+
             if approved:
                 landing = dec.email
                 if hard:
@@ -1076,6 +1089,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     if sel.email and sel.available and sel.email != launch_email:
                         landing = sel.email   # the fresh sweep may name a different seat than choose
                     else:
+                        _undo_realign()   # the pre-flight refused: this is a no-hop after all
                         if not scan["limit_stay_notified"]:
                             notify(f"{active} hit a hard billing limit and no other {tool} seat is "
                                    f"usable right now (the whole workspace may be out of credits) "
@@ -1166,6 +1180,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             tick = {
                 "state_mtime": 0,             # last seen st_mtime_ns of state.json (cheap change gate)
                 "seen_rev": None,             # last seen state revision (mtime can move without data)
+                "blocked": False,             # a confirmed limit could not be acted on (yet)
                 "blocked_until": 0.0,         # monotonic: suppress re-deciding an unlandable limit
                 "gui_switch_notified": False,
                 "healthy_at": None,           # monotonic of the last structured "still has headroom"
@@ -1217,8 +1232,45 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 if _decide_and_maybe_stop(**kw):
                     return True
                 # Nowhere to land (or no budget): don't re-decide — and re-notify — every 2s.
+                tick["blocked"] = True
                 tick["blocked_until"] = time.monotonic() + TICK_BLOCK_S
                 return False
+
+            def _tick_recover() -> bool:
+                """Stuck on a rested seat — has a sibling come back yet?
+
+                A confirmed limit with nowhere to land leaves the child running, and until now the
+                only thing that ever changed afterwards was the advisory watcher PRINTING that a
+                seat had freed. The session stayed on the dead seat. The missing half is this: a
+                rest usually expires by the CLOCK, with nobody writing state.json at all, so the
+                mtime gate in _tick_state can never notice it. Hence a time-driven re-check, but
+                only once we are actually blocked and only every TICK_BLOCK_S — otherwise a healthy
+                session would parse state on every tick for nothing.
+
+                Same contract as every other path: the seat we run on must still be credibly rested
+                (never our own "reactive" guess), there must be a real landing seat, and the switch
+                budget must allow it — the decision tail re-checks all three anyway.
+                """
+                if not tick["blocked"] or time.monotonic() < tick["blocked_until"]:
+                    return False
+                tick["blocked_until"] = time.monotonic() + TICK_BLOCK_S
+                snap = ctx.load_state()
+                seat = snap.get_seat(tool, launch_email) or {}
+                until = parse_iso(seat.get("limited_until"))
+                if (until is None or until <= now()
+                        or seat.get("limit_source") not in ("usage", "hard")):
+                    return False   # the seat we are on is not (credibly) out — nothing to recover
+                if switches >= max_switches:
+                    return False
+                sel = choose(snap, tool,
+                             exclude=set(auth_failed) | ({launch_email} if launch_email else set()))
+                if not (sel.email and sel.available):
+                    return False   # still nowhere to go; try again after the next TICK_BLOCK_S
+                return _tick_decide(reason="limit",
+                                    hard=(seat.get("limit_source") == "hard"),
+                                    reset_at=seat.get("limited_until"),
+                                    source=seat.get("limit_source"),
+                                    detail=seat.get("limit_detail"))
 
             def _tick() -> bool:
                 for sig in (rollout_source.poll() if rollout_source is not None else ()):
@@ -1234,7 +1286,9 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     if _tick_decide(reason="limit", hard=sig.hard, reset_at=sig.reset_at,
                                     source=("hard" if sig.hard else "usage"), detail=sig.detail):
                         return True
-                return _tick_state()
+                # (c) engine state, then (d) the clock: a seat that frees while we are stuck must
+                # actually carry the session over, not merely be announced.
+                return _tick_state() or _tick_recover()
 
             def on_output(chunk: bytes) -> bool:
                 buf.extend(chunk)
