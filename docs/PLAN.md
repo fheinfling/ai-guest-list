@@ -76,12 +76,35 @@ launch anyway (works the moment it resets). "Unlock soonest" uses cached usage r
 ### Supervised launcher (`run`, the core auto-switch + continuity)
 1. Select account, swap creds.
 2. Spawn the tool under a **PTY** (stdlib `pty`) so the TUI stays interactive while we tee output.
-3. Track session id (Codex: newest `~/.codex/sessions/**/rollout-*.jsonl` after spawn; Claude:
-   `--continue`/session id).
-4. **On limit** (regex match on the tee'd limit message → also captures reset time, or a 429 in the
-   usage poll): set `limited_until`, swap to next/soonest account, **relaunch with resume**
-   (`codex resume <uuid>` / `claude --resume <id>`) so the work continues. Loop.
+3. **Attach to Codex's own session log** (`acctsw/rollout.py`): mtime-snapshot
+   `<CODEX_HOME>/sessions/**/rollout-*.jsonl` before spawn, diff after, confirm the match via
+   `session_meta.cwd` — a *resumed* thread keeps appending to its **original** dated file, so never
+   trust the date in the path. (Claude: `--continue`/session id; no structured source yet.)
+4. **Tick every ~2 s while the child runs** (cheap, no network) and decide on **structured** signals,
+   in this authority order:
+   1. **Rollout events** — `task_complete` with `error.codex_error_info == "usage_limit_exceeded"`;
+      `token_count` with `rate_limits.rate_limit_reached_type` set (e.g.
+      `workspace_member_credits_depleted`), `spend_control_reached`, or a window at 100%.
+      `credits.has_credits:false` is **not** a signal — healthy seats report it.
+   2. **Usage-endpoint flags** (`acctsw/usage.py`) — `rate_limit.allowed`, `rate_limit_reached_type`,
+      `spend_control.reached`, `plan_type`, `reset_after_seconds`: authoritative where percentages
+      are blind (credits-depleted returns *null* windows).
+   3. **Engine state** — a seat rested by **any** process (menubar poll, another launcher;
+      `limit_source` `usage`/`hard`, never our own weak `reactive` guess) makes the **running**
+      session hop and resume.
+   4. **stdout banners — hint/fallback only** — a match merely *triggers* a usage check, a fresh
+      structured "healthy" reading dismisses it, and the hard banner acts alone only when no session
+      log is attached.
+
+   Then: set `limited_until`, swap, **relaunch with resume** (`codex resume --last` /
+   `claude --resume`). Before a **hard** (credits/spend) hop the landing seat is pre-flighted with a
+   fresh usage fetch, so a workspace-wide outage can't ping-pong. Unchanged invariant: never abort a
+   live session without a confirmed limit **and** a free landing seat **and** switch budget; a manual
+   GUI switch of the active seat never kills a healthy run (one notice: *"still running on `<seat>`;
+   your new seat applies to the next session"*).
 5. On exit: sync-back refreshed creds, persist state.
+   *(Claude has no structured log to read yet — it relies on banners + the usage endpoint — but the
+   tick's state check (c) applies to it just the same.)*
    *(For Claude, optionally install Claude Code hooks `Stop`/`PostToolUseFailure` for cleaner triggers.)*
 
 ---
@@ -186,8 +209,9 @@ migration path: [`SECURITY-headroom.md`](SECURITY-headroom.md).
 - **Refresh-token rotation** → mandatory sync-back before every swap and on exit.
 - **Claude usage endpoint 429s** → cache, sparse polling, exponential backoff; degrade to
   reactive-only detection if throttled. **Don't assume 7d** — use the returned reset timestamp.
-- **Limit message format unknown until first hit** → regex in a top config block; capture the real
-  strings during verification and lock them in. Launch-time selection works regardless.
+- **Limit message wording changes** (Codex CLI 0.153.4 reworded the out-of-credits banner) → the
+  regexes are a hint/fallback only; the trusted signals are the rollout events and the usage flags.
+  Launch-time selection works regardless.
 - **auth.json race during refresh** → atomic swap only between child runs.
 - **GUI apps** → menubar `switch` swaps the same creds the apps read; they may need a restart (app
   reads creds at launch). Auto-detection stays CLI-driven (best-effort GUI, as agreed).

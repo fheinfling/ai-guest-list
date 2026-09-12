@@ -6,7 +6,7 @@ reversible via `acctsw uninstall`).
 
 ## Automated (safe)
 ```sh
-bash scripts/smoke.sh          # 136 python + 11 node UI tests
+bash scripts/smoke.sh          # full python suite + node UI tests (PY=python3 if .venv is stale)
 acctsw install --dry-run       # prints every action, changes nothing
 ```
 
@@ -14,7 +14,15 @@ acctsw install --dry-run       # prints every action, changes nothing
 - Identity: engine reads the live Codex email from the auth.json JWT and the live Claude email
   from `claude auth status` — verified.
 - Usage endpoints: Codex `wham/usage` (`rate_limit.{primary,secondary}_window`) and Claude
-  `oauth/usage` (`five_hour`/`seven_day`) parse correctly against the real APIs — verified.
+  `oauth/usage` (`five_hour`/`seven_day`) parse correctly against the real APIs — verified. The Codex
+  reader also keeps the endpoint's *authoritative* flags, which is what auto-switch trusts:
+```sh
+acctsw usage refresh --tool codex --json \
+  | grep -E '"(plan_type|allowed|reached_type|spend_control_reached)"'
+```
+  On a depleted workspace expect `allowed: false` and a non-empty `reached_type` (e.g.
+  `workspace_member_credits_depleted`) *with null windows* — percentages alone are blind there.
+  (Touches no credentials; only the usage cache is refreshed.)
 
 ## Install (non-destructive, reversible)
 ```sh
@@ -40,6 +48,55 @@ cx                             # supervised codex; on a real usage limit it auto
 ```
 - Continuity dry-run (no real limit): start `cx`, do one turn, Ctrl-C, `acctsw switch codex <other>`,
   then `codex resume --last` → same conversation continues under the other seat.
+
+### A — a manual switch never kills a live session
+```sh
+mkdir -p ~/gl-check && cd ~/gl-check && cx   # terminal 1: supervised codex, do one turn, leave it running
+acctsw switch codex <other-seat-email>       # terminal 2, while it is still running
+```
+Terminal 1 keeps working on its current seat. Exactly one notification — *"still running on `<seat>`;
+your new seat applies to the next session"* — and the new seat takes effect on the next `cx`.
+
+### B — a seat rested by another process makes the running session hop
+The field bug: the menubar's usage poll rests seat A while a supervised session is on it. Rest it the
+way the engine itself does, from a second terminal while `cx` runs on seat A:
+```sh
+python3 - <<'PY'
+from datetime import timedelta
+from acctsw.context import Context
+from acctsw.util import iso, now
+ctx = Context.default()
+with ctx.locked():                      # same cross-process lock every engine writer takes
+    st = ctx.load_state()
+    st.set_limited_until("codex", "<seat-A-email>", iso(now() + timedelta(hours=1)), source="usage")
+    st.save()
+PY
+```
+Within ~2 s the running session hops to seat B, relaunches with `codex resume --last`, and notifies.
+Then hand the seat back (same block, `None` instead of a timestamp — and no `source`):
+```sh
+python3 - <<'PY'
+from acctsw.context import Context
+ctx = Context.default()
+with ctx.locked():
+    st = ctx.load_state()
+    st.set_limited_until("codex", "<seat-A-email>", None)
+    st.save()
+PY
+```
+Only `source="usage"` (or `"hard"`) drives a hop; the launcher's own weak `"reactive"` guess never
+evicts a live session.
+
+### C — the structured signal, replayed offline (no real limit needed)
+Feed a real rollout file through the classifier — this is exactly what the launcher reads:
+```sh
+python3 -c 'import json,sys; from acctsw import rollout; print(*[s for s in (rollout.classify(json.loads(l)) for l in open(sys.argv[1]) if l.startswith("{")) if s], sep="\n")' <path to one ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl>
+```
+A depleted session prints hard limits, e.g.
+`RolloutSignal(kind='limit', hard=True, reset_at=None, detail='workspace_member_credits_depleted', ...)`
+and a `task_complete` line carrying `usage_limit_exceeded`. A healthy session prints
+`kind='healthy'` lines or nothing at all — in particular `credits.has_credits: false` must **never**
+produce a signal, since healthy accounts report it.
 
 ## Menubar app
 ```sh
@@ -68,8 +125,12 @@ acctsw uninstall --purge       # also deletes the store + all our keychain items
 ```
 
 ## Known gaps to confirm live (tracked)
-- Real limit-message strings: `launcher.LIMIT_PATTERNS` is conservative; confirm/extend against the
-  actual Codex/Claude limit output on a real cap.
+- Real limit-message strings: `launcher.LIMIT_PATTERNS` is now a **fallback only** — a banner match
+  merely triggers a usage check, a fresh structured "healthy" reading dismisses it, and the hard
+  banner acts alone only when no rollout file is attached. (Codex CLI 0.153.4 reworded the
+  out-of-credits banner and the old trusted match stopped firing; that is why the banners were
+  demoted.) Claude has no structured source yet, so its patterns still carry weight — confirm/extend
+  them against the actual Claude limit output on a real cap.
 - Resume-by-id: currently `codex resume --last` / `claude --continue` (MVP); capture the session id
   at spawn to resume by id if you run multiple concurrent sessions.
 - The Headroom "save credit" proxy is gone; only the one-time `cleanup_legacy` migration remains
