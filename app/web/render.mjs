@@ -149,13 +149,14 @@ function statusBit(tool, seat) {
 
 function bar(seat, win, label) {
   const v = pct(seat, win);
-  const known = !seat?.usage_unknown && v !== null;
+  const known = v !== null;
+  const lastKnown = seat?.usage_stale || seat?.usage_unknown;
   const reset = seat?.usage?.windows?.[win]?.resets_at;
   const resetTime = reset ? new Date(reset).getTime() : NaN;
   const timer = Number.isFinite(resetTime)
     ? `<div class="usage-reset mono" data-reset-at="${esc(reset)}" title="${esc(new Date(reset).toLocaleString())}">resets in ${fmtCountdown(reset)}</div>`
     : "";
-  return `<div class="usage${seat?.usage_stale ? " usage--stale" : ""}"><span class="mono u-k">${label}</span>
+  return `<div class="usage${lastKnown ? " usage--stale" : ""}"><span class="mono u-k">${label}</span>
     <span class="track"><span class="fill" style="width:${known ? v : 0}%"></span></span>
     <span class="mono u-v">${known ? `${Math.round(v)}%` : "—"}</span></div>${timer}`;
 }
@@ -167,6 +168,7 @@ function seatCard(tool, seat) {
     reported.includes("weekly") && !reported.includes("5h");
   const fetchedAt = seat.usage_fetched_at || seat.usage?.fetched_at || "";
   const error = seat.usage?.error;
+  const lastKnown = seat.usage_stale || seat.usage_unknown;
   const issue = ({ rate_limited: "usage updates throttled · retrying automatically",
     network: "connection unavailable · retrying automatically",
     token_expired: "usage refresh pending · open Claude to refresh",
@@ -175,7 +177,7 @@ function seatCard(tool, seat) {
     no_token: "usage unavailable · sign in to refresh",
   })[error] || (error ? "usage update failed · retrying automatically" : "");
   const freshness = seat.status === "resting" ? "" :
-    `<div class="usage-age mono${seat.usage_stale ? " usage-age--stale" : ""}"><span data-usage-at="${esc(fetchedAt)}">${fmtUsageAge(fetchedAt)}</span>${seat.usage_stale ? " · last known" : ""}</div>
+    `<div class="usage-age mono${lastKnown ? " usage-age--stale" : ""}"><span data-usage-at="${esc(fetchedAt)}">${fmtUsageAge(fetchedAt)}</span>${lastKnown ? " · last known" : ""}</div>
     ${issue ? `<div class="usage-error">${issue}</div>` : ""}`;
   const reassure = seat.status === "resting"
     ? `<div class="reassure mono">taking a breather — back ${fmtClock(seat.limited_until)}</div>` : "";
