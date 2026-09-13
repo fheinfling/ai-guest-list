@@ -352,7 +352,8 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
             )
             with ctx.locked():
                 state = ctx.load_state()
-                do_switch(ctx, state, tool, message["email"], live_identity=live_identity)
+                do_switch(ctx, state, tool, message["email"], manual=True,
+                          live_identity=live_identity)
                 state.data["last_switch_at"] = iso(now())
                 state.save()
             return {"ok": True, "celebrate": True, "state": snapshot_state(ctx)}

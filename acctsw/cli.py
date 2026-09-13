@@ -122,8 +122,11 @@ def _cmd_status(ctx: Context, ns) -> int:
 
 
 def _cmd_switch(ctx: Context, ns) -> int:
-    state = ctx.load_state()
-    do_switch(ctx, state, ns.tool, ns.email)
+    from . import identity as identity_mod
+    live_identity = identity_mod.claude_live_identity(ctx) if ns.tool == "claude" else None
+    with ctx.locked():
+        state = ctx.load_state()
+        do_switch(ctx, state, ns.tool, ns.email, manual=True, live_identity=live_identity)
     print(f"✓ {ns.tool} is now on {ns.email}")
     return EXIT_OK
 

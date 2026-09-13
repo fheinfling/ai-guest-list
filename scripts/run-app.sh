@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Launch the "ai guest list" menubar app from the repo (dev mode).
+# Launch source through a development .app so notifications use the app's identity and icon.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-exec .venv/bin/python -m app.menubar
+PY="${PY:-.venv/bin/python}"
+"$PY" setup.py py2app --alias --dist-dir build/dev/dist --bdist-base build/dev/temp
+exec open -n "build/dev/dist/AI Guest List.app"

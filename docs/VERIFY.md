@@ -100,10 +100,12 @@ produce a signal, since healthy accounts report it.
 
 ## Menubar app
 ```sh
-bash scripts/run-app.sh        # 🎟️ appears in the menu bar
+bash scripts/run-app.sh        # builds and opens a development .app with the real app icon
 ```
 - Popover shows seats, "on the floor", 5h/weekly bars + reset timers, switch, add-a-seat, toggles.
 - Dot glyph reflects fresh / resting / needs-a-hello.
+- Quit any previously running copy first. The development bundle uses the existing icon and app
+  identity; running `python -m app.menubar` directly identifies notifications as Python instead.
 
 ## Legacy "save credit" (Headroom) removal — migration check
 The Headroom compression proxy was removed (measured as not worth it; see

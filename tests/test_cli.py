@@ -37,6 +37,7 @@ def test_add_list_switch_status_flow(isolated, capsys):
 
     # switch back to a
     assert cli.main(["switch", "codex", "a@x.com"]) == 0
+    assert isolated.load_state().data["tools"]["codex"]["manual_switch"]["email"] == "a@x.com"
     capsys.readouterr()  # drain switch print
     assert cli.main(["status", "--json"]) == 0
     status = json.loads(capsys.readouterr().out)

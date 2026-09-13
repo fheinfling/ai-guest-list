@@ -48,6 +48,10 @@ anywhere.
 ## Why
 
 - **Stay on the floor.** Hit a limit → hop seats → resume — no manual re-login, no lost context.
+- **Switch a running Codex session.** Click a seat's **switch** button (or run
+  `acctsw switch codex EMAIL`) to restart supervised Codex in the same terminal and resume the
+  conversation on that seat. Manual switching works even with auto-switch off. After updating,
+  restart existing terminal launchers once so they load the new switching behavior.
 - **Pick the smartest seat.** All seats resting? It chooses the one that unlocks soonest (or the one
   with the most headroom, your call).
 - **Non-destructive & reversible.** A factory-image backup makes uninstall a clean restore.

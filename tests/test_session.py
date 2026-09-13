@@ -125,3 +125,36 @@ def test_session_mtime_signals_start_and_end_without_a_state_write(ctx):
 def test_session_mtime_is_per_tool(ctx):
     session.mark_session(ctx.data_dir, "codex", "a@x.com")
     assert session.session_mtime_ns(ctx.data_dir, "claude") == 0
+
+
+def test_terminals_keep_independent_session_records(ctx, monkeypatch):
+    monkeypatch.setattr(session, "_START_CACHE", {})
+    monkeypatch.setattr(session, "_alive", lambda pid: True)
+    monkeypatch.setattr(session, "_proc_start", lambda pid: "Stable Start")
+    monkeypatch.setattr(session.os, "getpid", lambda: 101)
+    session.mark_session(ctx.data_dir, "codex", "a@x.com")
+    monkeypatch.setattr(session.os, "getpid", lambda: 202)
+    session.mark_session(ctx.data_dir, "codex", "b@x.com")
+    assert len(session.active_sessions(ctx.data_dir, "codex")) == 2
+    assert session.active_session(ctx.data_dir, "codex", email="a@x.com")["pid"] == 101
+    before = session.session_mtime_ns(ctx.data_dir, "codex")
+    session.clear_session(ctx.data_dir, "codex")
+    assert session.active_session(ctx.data_dir, "codex")["email"] == "a@x.com"
+    assert session.session_mtime_ns(ctx.data_dir, "codex") != before
+    monkeypatch.setattr(session.os, "getpid", lambda: 101)
+    session.clear_session(ctx.data_dir, "codex")
+    assert session.active_sessions(ctx.data_dir, "codex") == []
+
+
+def test_clearing_older_terminal_does_not_delete_latest_legacy_record(ctx, monkeypatch):
+    monkeypatch.setattr(session, "_START_CACHE", {})
+    monkeypatch.setattr(session, "_alive", lambda pid: True)
+    monkeypatch.setattr(session, "_proc_start", lambda pid: "Stable Start")
+    monkeypatch.setattr(session.os, "getpid", lambda: 101)
+    session.mark_session(ctx.data_dir, "codex", "a@x.com")
+    monkeypatch.setattr(session.os, "getpid", lambda: 202)
+    session.mark_session(ctx.data_dir, "codex", "b@x.com")
+    monkeypatch.setattr(session.os, "getpid", lambda: 101)
+    session.clear_session(ctx.data_dir, "codex")
+    assert _path(ctx).exists()
+    assert session.active_session(ctx.data_dir, "codex")["pid"] == 202

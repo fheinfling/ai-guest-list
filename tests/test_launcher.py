@@ -896,6 +896,81 @@ def test_run_auth_prose_dismissed_when_token_provably_works(ctx):
     assert ctx.load_state().active("codex") == "a@x.com"  # no hop
 
 
+REFRESH_REVOKED_BANNER = (
+    "■ Your access token could not be refreshed because your refresh token was\n"
+    "revoked. Please log out and sign in again.\n"
+)
+
+
+@pytest.mark.parametrize("banner", [
+    REFRESH_REVOKED_BANNER,
+    REFRESH_REVOKED_BANNER.replace("could not", "could\nnot"),
+    "\x1b[31m" + REFRESH_REVOKED_BANNER + "\x1b[0m",
+])
+def test_detect_exact_refresh_revocation_banner(banner):
+    assert L.detect_refresh_revoked("codex", banner)
+    assert not L.detect_refresh_revoked("claude", banner)
+    assert not L.detect_refresh_revoked("codex", "Codex printed: " + banner)
+
+
+def test_refresh_revocation_survives_successful_usage_and_marks_both_seats(ctx):
+    """The field failure: a usage 200 says nothing about the refresh token's validity."""
+    from acctsw import bridge
+    _two_codex(ctx)
+    messages = []
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=20.0, secondary=30.0))})
+    spawn = FakeSpawn([
+        (REFRESH_REVOKED_BANNER.encode(), -15),
+        (REFRESH_REVOKED_BANNER.encode(), 0),
+    ])
+    assert run(ctx, "codex", [], spawn=spawn, get=get, notify=messages.append) == 0
+    assert len(spawn.calls) == 2 and spawn.stops == 1  # never bounce back onto known-dead a
+    state = ctx.load_state()
+    for email in ("a@x.com", "b@x.com"):
+        assert state.get_seat("codex", email)["auth_error"] == "refresh_token_revoked"
+        assert state.get_seat("codex", email)["limited_until"] is None
+    # A successful background usage reading must not hide the required re-login in the app.
+    L.usage_mod.refresh(ctx, state, "codex", force=True, get=get)
+    view = bridge.snapshot_state(ctx)["tools"]["codex"]["seats"]
+    assert all(seat["needs_login"] for seat in view)
+    assert any("no other codex seat is ready" in message for message in messages)
+    # A new supervisor must also refuse these credentials until the user signs in again.
+    unused_spawn = FakeSpawn([])
+    assert run(ctx, "codex", [], spawn=unused_spawn, notify=messages.append) == L.EXIT_GAVE_UP
+    assert unused_spawn.calls == []
+
+
+def test_refresh_revocation_bypasses_prose_scan_cooldown(ctx):
+    _two_codex(ctx)
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=20.0, secondary=30.0))})
+    spawn = FakeSpawn([
+        ([b"The documentation mentions refresh token revoked.\n",
+          REFRESH_REVOKED_BANNER.encode()], -15),
+        (b"resumed\n", 0),
+    ])
+    assert run(ctx, "codex", [], spawn=spawn, get=get) == 0
+    assert spawn.stops == 1
+    assert ctx.load_state().active("codex") == "b@x.com"
+
+
+def test_refresh_revocation_marks_launch_seat_after_pointer_moves(ctx):
+    from acctsw.switch import switch
+    _two_codex(ctx)
+
+    def move_pointer():
+        switch(ctx, ctx.load_state(), "codex", "b@x.com")
+
+    spawn = FakeSpawn([
+        ([b"booting\n", REFRESH_REVOKED_BANNER.encode()], -15, [move_pointer]),
+        (b"resumed\n", 0),
+    ])
+    assert run(ctx, "codex", [], spawn=spawn) == 0
+    state = ctx.load_state()
+    assert state.get_seat("codex", "a@x.com")["auth_error"] == "refresh_token_revoked"
+    assert not state.get_seat("codex", "b@x.com").get("auth_error")
+    assert state.active("codex") == "b@x.com"
+
+
 def test_run_leaves_child_alive_with_relogin_hint_when_only_seat_revoked(ctx):
     ctx.cred["codex"].set_live(make_codex_blob("solo@x.com"))
     acct.add(ctx, ctx.load_state(), "codex", email="solo@x.com")
@@ -1394,6 +1469,70 @@ def test_pty_spawn_nonzero_exit_propagates():
     assert rc == 7
 
 
+def test_manual_switch_restarts_real_pty_child_with_new_credentials(ctx, tmp_path, monkeypatch):
+    """Exercise actual process shutdown, saved conversation, and per-account homes together."""
+    import sys
+    from acctsw import bridge
+    monkeypatch.chdir(tmp_path)
+    state = _two_codex(ctx)
+    state.set_setting("auto_switch", False)
+    state.save()
+    _codex_sessions(ctx)
+    program = tmp_path / "test-codex"
+    program.write_text(f"#!{sys.executable}\n" + r'''
+import json, os, signal, sys
+from pathlib import Path
+home = Path(os.environ["CODEX_HOME"])
+account = json.loads((home / "auth.json").read_text())["tokens"]["account_id"]
+events = Path(__file__).with_suffix(".events")
+saved = Path(__file__).with_suffix(".saved")
+def record(event):
+    with events.open("a") as f:
+        f.write(json.dumps({"event": event, "account": account, "pid": os.getpid()}) + "\n")
+if sys.argv[1:]:
+    assert sys.argv[1:] == ["resume", "pty-conversation"], sys.argv
+    assert saved.read_text() == "conversation saved before restart"
+    record("resumed")
+    print("RESUMED", flush=True)
+    sys.exit(0)
+def stop(*_):
+    saved.write_text("conversation saved before restart")
+    record("stopped")
+    sys.exit(0)
+signal.signal(signal.SIGTERM, stop)
+signal.alarm(10)
+path = home / "sessions" / "rollout-test-pty-conversation.jsonl"
+path.write_text(json.dumps({"type": "session_meta", "payload": {
+    "id": "pty-conversation", "cwd": os.getcwd()}}) + "\n")
+record("started")
+print("READY_TO_SWITCH", flush=True)
+while True:
+    signal.pause()
+''')
+    program.chmod(0o755)
+    ctx.codex_bin = str(program)
+    output = bytearray()
+    clicked = False
+
+    def spawn(argv, on_output, on_tick=None):
+        def observe(chunk):
+            nonlocal clicked
+            output.extend(chunk)
+            if not clicked and b"READY_TO_SWITCH" in output:
+                clicked = True
+                result = bridge.handle(ctx, {"action": "switch", "tool": "codex", "email": "b@x.com"})
+                assert result["ok"]
+            return on_output(chunk)
+        return L.pty_spawn(argv, observe, on_tick=on_tick, tick_interval=0.05)
+
+    assert run(ctx, "codex", [], spawn=spawn, max_switches=0) == 0
+    events = [json.loads(line) for line in program.with_suffix(".events").read_text().splitlines()]
+    assert [event["event"] for event in events] == ["started", "stopped", "resumed"]
+    assert [event["account"] for event in events] == ["acct:a@x.com", "acct:a@x.com", "acct:b@x.com"]
+    assert events[0]["pid"] == events[1]["pid"] != events[2]["pid"]
+    assert b"RESUMED" in output
+
+
 def test_reset_terminal_disables_mouse_tracking_on_tty():
     """A killed TUI can't disable its own mouse reporting; teardown must, or the shell that
     inherits the terminal spews "\\e[<..M" mouse coordinates at the prompt."""
@@ -1613,9 +1752,8 @@ def test_tick_hops_when_another_process_rests_the_running_seat(ctx):
     assert ctx.load_state().active("codex") == "b@x.com"
 
 
-def test_tick_does_not_kill_healthy_session_when_user_switches_active_seat(ctx):
-    """The contract that must survive all of this: a seat the user re-pointed in the GUI is NOT a
-    limit. The healthy child keeps running (and owns its exit code); the new seat applies next time."""
+def test_tick_does_not_kill_healthy_session_for_an_incidental_active_pointer_change(ctx):
+    """Reconciliation without an explicit manual request must leave a healthy child alone."""
     _two_codex(ctx)  # active a
 
     def gui_switch():
@@ -1634,6 +1772,102 @@ def test_tick_does_not_kill_healthy_session_when_user_switches_active_seat(ctx):
     assert spawn.stops == 0 and len(spawn.calls) == 1
     assert sum("still running on a@x.com" in m for m in msgs) == 1
     assert ctx.load_state().active("codex") == "b@x.com"   # the user's choice stands untouched
+
+
+@pytest.mark.parametrize("auto_switch", [True, False])
+def test_manual_codex_switch_resumes_live_session(ctx, monkeypatch, tmp_path, auto_switch):
+    from acctsw import bridge
+    monkeypatch.chdir(tmp_path)
+    state = _two_codex(ctx)
+    state.set_setting("auto_switch", auto_switch)
+    state.save()
+    path = _rollout_session(ctx, os.getcwd(), thread="manual-thread")
+    rotated = make_codex_blob("a@x.com").replace('"refresh_token": "r"',
+                                               '"refresh_token": "rotated"')
+    homes = []
+    messages = []
+
+    def click():
+        homes.append(os.environ["CODEX_HOME"])
+        ctx.snapshot_set("codex", "a@x.com", rotated)
+        _appender(path, token_count_line(primary=window(20), timestamp=_soon()))()
+        result = bridge.handle(ctx, {"action": "switch", "tool": "codex", "email": "b@x.com"})
+        assert result["ok"]
+
+    def resumed():
+        homes.append(os.environ["CODEX_HOME"])
+
+    def get(*args, **kwargs):
+        raise AssertionError("an explicit switch must not require a usage endpoint")
+
+    spawn = FakeSpawn([(None, -15, [click]), (None, 0, [resumed, None])])
+    assert run(ctx, "codex", [], spawn=spawn, get=get, notify=messages.append,
+               max_switches=0) == 0
+    assert spawn.stops == 1
+    assert spawn.calls[1][-2:] == ["resume", "manual-thread"]
+    assert homes == [str(ctx.codex_home(email)) for email in ("a@x.com", "b@x.com")]
+    assert ctx.load_state().active("codex") == "b@x.com"
+    assert ctx.snapshot_get("codex", "a@x.com") == rotated
+    assert ctx.load_state().get_seat("codex", "a@x.com")["limited_until"] is None
+    assert any("switching to b@x.com" in message for message in messages)
+    assert not any("next session" in message for message in messages)
+
+
+@pytest.mark.parametrize("target", ["a@x.com", "b@x.com"])
+def test_manual_switch_uses_latest_choice_during_shutdown(ctx, target):
+    from acctsw.switch import switch
+    _two_codex(ctx)
+
+    def click(email):
+        with ctx.locked():
+            switch(ctx, ctx.load_state(), "codex", email, manual=True)
+
+    calls = []
+
+    def spawn(argv, on_output, on_tick=None):
+        calls.append(list(argv))
+        if len(calls) == 1:
+            click("b@x.com")
+            assert on_tick()
+            click(target)  # user changes their mind while the old process exits
+            return -15
+        assert os.environ["CODEX_HOME"] == str(ctx.codex_home(target))
+        assert not on_tick()  # consumed request must not restart the replacement again
+        return 0
+
+    assert run(ctx, "codex", [], spawn=spawn) == 0
+    assert len(calls) == 2
+    assert calls[1][-2:] == ["resume", "--last"]
+    assert ctx.load_state().active("codex") == target
+
+
+def test_manual_switch_to_current_seat_does_not_restart(ctx):
+    from acctsw.switch import switch
+    _two_codex(ctx)
+
+    def click():
+        with ctx.locked():
+            switch(ctx, ctx.load_state(), "codex", "a@x.com", manual=True)
+
+    spawn = FakeSpawn([(None, 0, [click, None])])
+    assert run(ctx, "codex", [], spawn=spawn) == 0
+    assert spawn.stops == 0
+
+
+def test_codex_manual_request_does_not_interrupt_claude(ctx):
+    from acctsw.switch import switch
+    _two_codex(ctx)
+    _two_claude(ctx)
+
+    def click():
+        with ctx.locked():
+            switch(ctx, ctx.load_state(), "codex", "b@x.com", manual=True)
+
+    messages = []
+    spawn = FakeSpawn([(None, 0, [click, None])])
+    assert run(ctx, "claude", [], spawn=spawn, notify=messages.append) == 0
+    assert spawn.stops == 0
+    assert messages == []
 
 
 def test_tick_ignores_our_own_reactive_stamp(ctx):

@@ -10,10 +10,13 @@ a seat whose token just failed at runtime), WITHOUT persisting any "dead" flag â
 errors are NOT a reliable health signal here (a non-active seat routinely shows ``unauthorized`` from
 a stale cached access token that is refreshed only when it becomes active).
 
-The one auth error that IS actionable is ``forbidden`` (403): the endpoint answered, and it answered
+The usage auth error that IS actionable is ``forbidden`` (403): the endpoint answered, and it answered
 "this account is not entitled" â€” a cancelled or terminated subscription. Unlike a 401 that a refresh
 would fix, switching onto such a seat can only fail, so it is not selectable. A 401 stays selectable,
 exactly as before.
+
+A confirmed Codex refresh-token revocation is stored separately as ``auth_error``. These seats
+remain unavailable until new credentials clear the flag; a successful usage poll cannot clear it.
 """
 from __future__ import annotations
 
@@ -44,7 +47,8 @@ def choose(state: State, tool: str, at: datetime | None = None,
            exclude: frozenset | set | tuple = ()) -> Selection:
     at = at or now()
     accounts = {e: s for e, s in state.accounts(tool).items()
-                if e not in exclude and (s.get("usage") or {}).get("error") != "forbidden"}
+                if e not in exclude and not s.get("auth_error")
+                and (s.get("usage") or {}).get("error") != "forbidden"}
     if not accounts:
         return Selection(email=None, available=False, unlocks_at=None, all_limited=False)
 

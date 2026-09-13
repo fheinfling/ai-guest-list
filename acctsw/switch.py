@@ -40,10 +40,10 @@ def sync_back(ctx: Context, state: State, tool: str, *,
         return False
     if tool == "codex":
         from .session import active_session
-        running = active_session(ctx.data_dir, tool)
+        running = active_session(ctx.data_dir, tool, email=active)
         if running and running.get("email") == active:
-            # The child rotates credentials in its private home. A manual GUI/CLI switch only
-            # changes the mirror for the next session; copying that older mirror back would lose
+            # The child rotates credentials in its private home. A GUI/CLI switch changes the
+            # mirror before the supervisor hands off; copying that older mirror back would lose
             # the running child's latest refresh token.
             return False
     live = ctx.cred[tool].get_live()
@@ -59,11 +59,13 @@ def sync_back(ctx: Context, state: State, tool: str, *,
 
 
 def switch(ctx: Context, state: State, tool: str, email: str, *, sync: bool = True,
+           manual: bool = False,
            live_identity: ClaudeLiveIdentity | None = None) -> None:
     """Make ``email`` the active seat for ``tool``.
 
     ``sync=False`` skips the sync-back-from-mirror — used by the launcher for codex, where codex
     maintains the account's own home directly (the home, not ~/.codex, is the source of truth).
+    ``manual=True`` records a request for supervised Codex sessions to resume on the selected seat.
     """
     if email not in state.accounts(tool):
         raise UnknownSeat(f"no seat '{email}' for {tool}")
@@ -81,4 +83,12 @@ def switch(ctx: Context, state: State, tool: str, email: str, *, sync: bool = Tr
     # 3. record active
     state.set_active(tool, email)
     state.set_last_on_floor(tool, email, iso(now()))
+    if manual and tool == "codex":
+        # An explicit click/CLI request authorizes a live handoff. Ordinary active-pointer
+        # changes (login reconciliation, usage polling) must never interrupt a healthy child.
+        # The caller holds the state lock and save() increments this revision. It already
+        # gives every click a unique ID without an extra stdlib dependency in older bundles.
+        state.data["tools"][tool]["manual_switch"] = {
+            "id": int(state.data.get("rev", 0)) + 1, "email": email,
+        }
     state.save()

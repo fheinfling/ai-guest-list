@@ -583,7 +583,7 @@ def _seat_blob(ctx, state, tool: str, email: str) -> str | None:
         # mirror may be both stale and pointed at another account, so the private snapshot is the
         # source of truth while that process owns this seat.
         from . import session
-        running = session.active_session(ctx.data_dir, "codex")
+        running = session.active_session(ctx.data_dir, "codex", email=email)
         if running and running.get("email") == email:
             return snapshot
         live = ctx.cred[tool].get_live()

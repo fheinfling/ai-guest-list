@@ -117,7 +117,7 @@ def test_manual_switch_preserves_supervised_codex_token_rotation(ctx, monkeypatc
     rotated = make_codex_blob("running@x.com").replace('"refresh_token": "r"',
                                                       '"refresh_token": "ROTATED"')
     ctx.snapshot_set("codex", "running@x.com", rotated)
-    monkeypatch.setattr(session, "active_session", lambda *_: {"email": "running@x.com"})
+    monkeypatch.setattr(session, "active_session", lambda *_, **_kw: {"email": "running@x.com"})
 
     result = bridge.handle(ctx, {"action": "switch", "tool": "codex", "email": "spare@x.com"})
 

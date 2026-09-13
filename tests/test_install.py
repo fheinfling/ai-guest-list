@@ -404,7 +404,7 @@ def test_ensure_launchers_uses_bundle_python_when_frozen(tmp_path, monkeypatch):
     inst.ensure_launchers(bin_dir=bindir)
     body = (bindir / "acctsw").read_text()
     assert "PYTHONHOME=/Bundle.app/Contents/Resources" in body
-    assert "exec /Bundle.app/Contents/MacOS/python -m acctsw" in body
+    assert "exec /Bundle.app/Contents/MacOS/python -P -m acctsw" in body
     assert "SSL_CERT_FILE=/Bundle.app/Contents/Resources/openssl.ca/cert.pem" in body
     assert "SSL_CERT_DIR=/Bundle.app/Contents/Resources/openssl.ca/no-such-file" in body
     assert "PYTHONPATH=" not in body           # no PYTHONPATH *assignment* (the ≤0.2.3 crash cause)
@@ -532,7 +532,7 @@ def test_ensure_launchers_heals_wrapper_with_dead_interpreter(tmp_path, monkeypa
     monkeypatch.setattr(inst.sys, "executable", "/Bundle.app/Contents/MacOS/python")
     changed, _ = inst.ensure_launchers(bin_dir=bindir, wire_rc=False)
     assert changed
-    assert "/Bundle.app/Contents/MacOS/python -m acctsw" in (bindir / "acctsw").read_text()
+    assert "/Bundle.app/Contents/MacOS/python -P -m acctsw" in (bindir / "acctsw").read_text()
 
 
 def test_ensure_launchers_preserves_wrapper_with_live_interpreter(tmp_path, monkeypatch):
@@ -547,6 +547,74 @@ def test_ensure_launchers_preserves_wrapper_with_live_interpreter(tmp_path, monk
     monkeypatch.setattr(inst.sys, "executable", "/Bundle.app/Contents/MacOS/python")
     inst.ensure_launchers(bin_dir=bindir, wire_rc=False)
     assert (bindir / "acctsw").read_text() == good    # preserved verbatim
+
+
+@pytest.mark.parametrize("packaged", [False, True], ids=["source", "packaged"])
+def test_wrapper_uses_its_installation_from_a_conflicting_checkout(tmp_path, packaged):
+    """Execute generated wrappers with foreign Python settings and a same-named cwd package."""
+    installation = tmp_path / "installation with spaces"
+    work = tmp_path / "unrelated checkout"
+    for root, body in (
+        (installation, 'print("correct installation")\n'),
+        (work, 'raise RuntimeError("imported the working directory")\n'),
+    ):
+        package = root / "acctsw"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("")
+        (package / "__main__.py").write_text(body)
+
+    python = sys.executable
+    if packaged:
+        # Stand in for a bundled runtime with its own package search path, preserving all
+        # command-line flags so dropping -P genuinely reproduces the reported cwd collision.
+        interpreter = tmp_path / "Renamed App.app" / "Contents" / "MacOS" / "python"
+        interpreter.parent.mkdir(parents=True)
+        interpreter.write_text(
+            "#!/bin/sh\nunset PYTHONHOME PYTHONPATH PYTHONEXECUTABLE __PYVENV_LAUNCHER__\n"
+            f"PYTHONPATH={shlex.quote(str(installation))} exec {shlex.quote(sys.executable)} \"$@\"\n"
+        )
+        interpreter.chmod(0o755)
+        python = str(interpreter)
+    wrapper = tmp_path / "acctsw-wrapper"
+    wrapper.write_text(inst._wrapper_script("acctsw", python, installation, tmp_path))
+    wrapper.chmod(0o755)
+    env = dict(os.environ, PYTHONHOME="/missing/foreign/python", PYTHONPATH=str(work),
+               PYTHONEXECUTABLE="/missing/python", __PYVENV_LAUNCHER__="/missing/venv")
+    result = subprocess.run([str(wrapper)], cwd=work, env=env,
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "correct installation"
+
+
+def test_bundle_wrapper_without_safe_path_is_repaired(tmp_path):
+    interpreter = tmp_path / "Relocated.app" / "Contents" / "MacOS" / "python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.touch()
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    body = inst._wrapper_script("acctsw", str(interpreter), tmp_path, bindir)
+    (bindir / "acctsw").write_text(body.replace(" -P -m ", " -m "))
+    assert inst._wrapper_stale((bindir / "acctsw").read_text())
+    inst.ensure_launchers(bin_dir=bindir, python=str(interpreter), wire_rc=False)
+    assert (bindir / "acctsw").read_text() == body
+    assert not inst._wrapper_stale(body)
+    interpreter.unlink()
+    assert inst._wrapper_stale(body)  # -P must not hide a subsequently moved/deleted interpreter
+
+
+def test_alias_bundle_wrapper_uses_the_source_interpreter(tmp_path):
+    import plistlib
+    bundle = tmp_path / "Development.app" / "Contents"
+    executable = bundle / "MacOS" / "python"
+    executable.parent.mkdir(parents=True)
+    executable.symlink_to(sys.executable)
+    (bundle / "Info.plist").write_bytes(plistlib.dumps({
+        "PythonInfoDict": {"py2app": {"alias": True}},
+    }))
+    source = tmp_path / "checkout"
+    assert inst._wrapper_script("acctsw", str(executable), source, tmp_path) == (
+        inst._wrapper_script("acctsw", sys.executable, source, tmp_path)
+    )
 
 
 def test_ensure_launchers_heals_wrapper_after_python_version_bump(tmp_path, monkeypatch):

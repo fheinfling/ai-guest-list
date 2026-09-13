@@ -137,7 +137,7 @@ function statusBit(tool, seat) {
     case "active":
       return seat.in_session
         ? `<span class="pill floor floor--live"><span class="live-dot" aria-hidden="true"></span>on the floor</span>`
-        : `<span class="pill floor floor--idle">on the floor</span>`;
+        : `<span class="pill floor floor--idle">selected</span>`;
     case "queued": return `<span class="pill queued">up next 💛</span>`;
     case "resting":
       return `<span class="mono rest-count" data-reset-at="${esc(seat.limited_until)}" data-clock-prefix="back in">back in ${fmtCountdown(seat.limited_until)}</span>`;

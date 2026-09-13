@@ -111,6 +111,32 @@ def test_reconcile_codex_clears_error_on_changed_creds(ctx):
     assert ctx.load_state().get_seat("codex", "a@x.com")["usage"]["error"] is None
 
 
+def test_relogin_clears_refresh_revocation(ctx):
+    from acctsw.selection import choose
+    state, _ = _add_codex(ctx, "a@x.com")
+    state.get_seat("codex", "a@x.com")["auth_error"] = "refresh_token_revoked"
+    state.save()
+    assert choose(state, "codex").email is None
+    ctx.cred["codex"].set_live(make_codex_blob("a@x.com").replace(
+        '"refresh_token": "r"', '"refresh_token": "new-login"'))
+    acct.add(ctx, ctx.load_state(), "codex", email="a@x.com")
+    state = ctx.load_state()
+    assert not state.get_seat("codex", "a@x.com").get("auth_error")
+    assert choose(state, "codex").email == "a@x.com"
+
+
+def test_repeated_manual_switches_have_distinct_persisted_requests(ctx):
+    _add_codex(ctx, "a@x.com")
+    requests = []
+    for _ in range(2):
+        with ctx.locked():
+            switch(ctx, ctx.load_state(), "codex", "a@x.com", manual=True)
+        state = ctx.load_state()
+        requests.append(state.data["tools"]["codex"]["manual_switch"])
+    assert requests[0] != requests[1]
+    assert requests[1]["id"] == state.data["rev"]
+
+
 def test_add_snapshots_and_activates(ctx):
     state, seat = _add_codex(ctx, "a@x.com")
     assert seat["email"] == "a@x.com"
@@ -262,8 +288,8 @@ def test_list_seats_projects_live_session_onto_matching_seat(ctx, monkeypatch):
     """The heartbeat belongs only to its named seat; active state alone must not invent a session."""
     state, _ = _add_codex(ctx, "a@x.com")
     started = "2026-07-31T10:00:00+00:00"
-    monkeypatch.setattr(acct.session, "active_session",
-                        lambda data_dir, tool: {"email": "a@x.com", "pid": 42,
-                                                "started_at": started})
+    monkeypatch.setattr(acct.session, "active_sessions",
+                        lambda data_dir, tool: [{"email": "a@x.com", "pid": 42,
+                                                "started_at": started}])
     seat = acct.list_seats(state, "codex", data_dir=ctx.data_dir)[0]
     assert seat["in_session"] is True and seat["session_started_at"] == started
