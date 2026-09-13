@@ -13,7 +13,7 @@ permissions:
   contents: read        # least-privilege GITHUB_TOKEN (tests need only checkout)
 
 jobs:
-  test:
+  platform_tests:
     strategy:
       fail-fast: false
       matrix:
@@ -77,3 +77,15 @@ jobs:
           files: coverage.xml
           flags: ${{ matrix.os }}-py${{ matrix.python }}
           fail_ci_if_error: false                # don't break CI if the token isn't set yet
+
+  # Branch protection requires the stable `test` context. Matrix names change as platforms are
+  # added, so expose one gate that succeeds only after every platform test and build succeeds.
+  test:
+    needs: platform_tests
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every platform test and build to pass
+        env:
+          MATRIX_RESULT: ${{ needs.platform_tests.result }}
+        run: test "$MATRIX_RESULT" = success
