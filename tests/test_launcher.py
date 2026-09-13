@@ -533,6 +533,52 @@ def test_run_with_auto_switch_off_keeps_a_limited_live_child_on_its_seat(ctx):
     assert any("auto-switch is off" in m for m in msgs)
 
 
+def test_disabling_auto_switch_during_hard_landing_probe_does_not_stop_child(ctx):
+    _two_codex(ctx)
+    probes = []
+
+    def get(_url, headers, _timeout):
+        probes.append(headers.get("ChatGPT-Account-Id"))
+        state = ctx.load_state()
+        state.set_setting("auto_switch", False)
+        state.save()
+        return 200, codex_ok_body(primary=10)
+
+    spawn = FakeSpawn([(b"Your workspace is out of credits. Add credits to continue.\n", 17)])
+    rc = run(ctx, "codex", [], spawn=spawn, get=get)
+    assert probes == ["acct:b@x.com"]
+    assert rc == 17 and spawn.stops == 0 and len(spawn.calls) == 1
+    assert ctx.load_state().active("codex") == "a@x.com"
+
+
+@pytest.mark.parametrize("change", ["toggle", "manual_switch"])
+def test_terminal_handoff_rechecks_settings_and_active_seat_after_child_stops(ctx, change):
+    _two_codex(ctx)
+    child = FakeSpawn([(b"you've hit your usage limit\n", 17)])
+
+    def spawn(*args, **kwargs):
+        status = child(*args, **kwargs)
+        assert child.stops == 1
+        state = ctx.load_state()
+        if change == "toggle":
+            state.set_setting("auto_switch", False)
+            state.save()
+        else:
+            from acctsw.switch import switch
+            switch(ctx, state, "codex", "b@x.com", sync=False)
+        return status
+
+    notices = []
+    rc = run(ctx, "codex", [], spawn=spawn,
+             get=fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(
+                 primary=100, p_reset=iso(now() + timedelta(hours=1))))}),
+             notify=notices.append)
+    assert rc == 17 and len(child.calls) == 1
+    expected = "turned off" if change == "toggle" else "another switch changed"
+    assert any(expected in notice for notice in notices)
+    assert ctx.load_state().active("codex") == ("a@x.com" if change == "toggle" else "b@x.com")
+
+
 def test_run_hops_off_forbidden_seat_without_resting_it(ctx):
     """A live limit banner plus a 403 is positive proof that the subscription is gone. The
     supervisor must treat that verdict like dead credentials, stop only after preflighting the

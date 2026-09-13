@@ -60,6 +60,26 @@ def test_codex_restart_does_not_launch_over_a_quit_that_was_refused():
     assert codex.terminate_calls == 1
 
 
+def test_restart_identifies_renamed_codex_by_bundle_and_ignores_name_collisions():
+    renamed = _RunningApp(name="My Coding App")
+    unrelated = _RunningApp(name="Codex", bundle="org.example.editor")
+    assert request_codex_restart([renamed, unrelated]) == (True, None)
+    assert renamed.terminate_calls == 1
+    assert unrelated.terminate_calls == 0
+
+
+def test_launch_codex_uses_bundle_identity_independent_of_install_name():
+    import subprocess
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    assert launch_codex_desktop(run=run) is None
+    assert calls == [["open", "-b", "com.openai.codex"]]
+
+
 def test_launch_codex_reports_failures_and_does_not_raise():
     def fail(_argv, **_kwargs):
         raise OSError("open is unavailable")

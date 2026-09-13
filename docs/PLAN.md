@@ -228,6 +228,16 @@ migration path: [`SECURITY-headroom.md`](SECURITY-headroom.md).
   the state lock, with identity checks before committing results; overlapping polls are coalesced.
 
 ## Verification (end-to-end)
+
+CI runs the isolated engine and native callback tests on macOS 14/15/26, including Intel and Apple
+silicon, with Python 3.11 and 3.13. Intel and Apple-silicon jobs also build the standalone app and
+verify its executable architecture. Tests inject provider responses, Keychain contents, app
+identities, and process identities; no developer account or Codex installation is required. Actual
+process inspection is a separate integration test and skips where the host prohibits it. GitHub's
+hosted runners do not cover macOS 12/13, so those advertised minimum versions still require manual
+release verification. Desktop restart resolves Codex by bundle identifier rather than display name
+or installation directory.
+
 1. `acctsw install` (dry-run first) → backups + manifest written, stock `codex`/`claude` unaffected.
 2. `acctsw add codex` ×2 → `acctsw list` shows both emails (cross-check via JWT / `claude auth status`).
 3. `acctsw usage refresh --json` → real 5h/weekly % + reset times for each account (Codex `wham/usage`,

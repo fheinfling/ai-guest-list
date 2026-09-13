@@ -127,3 +127,49 @@ def test_handoff_requires_a_current_limit_and_enabled_spare(ctx, monkeypatch, re
     calls = probe(monkeypatch)
     assert bridge._auto_switch_after_usage(ctx, summary) is None
     assert calls == []
+
+
+@pytest.mark.parametrize("reason", ["out_flag", "unknown", "stale", "old", "relogin"])
+def test_handoff_rejects_unproven_landing_usage(ctx, monkeypatch, reason):
+    summary = seed(ctx, spare_count=1)
+
+    def invalidate(ctx, tool, email):
+        state = ctx.load_state()
+        reading = state.get_seat(tool, email)["usage"]
+        if reason == "out_flag":
+            reading["allowed"] = False
+        elif reason == "unknown":
+            reading["windows"] = {}
+        elif reason == "stale":
+            reading["stale"] = True
+        elif reason == "old":
+            reading["fetched_at"] = iso(now() - timedelta(seconds=usage.MAX_TRUSTED_AGE_S + 1))
+        else:
+            reading["fetched_at"] = None
+        state.save()
+
+    probe(monkeypatch, after=invalidate)
+    assert bridge._auto_switch_after_usage(ctx, summary) is None
+    assert ctx.load_state().active("codex") == "seat0@test.example"
+
+
+def test_handoff_reports_filesystem_failure_for_native_notification(ctx, monkeypatch):
+    summary = seed(ctx, spare_count=1)
+    probe(monkeypatch)
+
+    def fail(*_args, **_kwargs):
+        raise OSError("credential store is read-only")
+
+    monkeypatch.setattr(bridge, "do_switch", fail)
+    result = bridge._auto_switch_after_usage(ctx, summary)
+    assert result["status"] == "failed"
+    assert result["error"] == "credential store is read-only"
+    assert ctx.load_state().active("codex") == "seat0@test.example"
+
+
+def test_handoff_never_retries_a_throttled_spare_on_every_active_poll(ctx, monkeypatch):
+    summary = seed(ctx, spare_count=1)
+    calls = probe(monkeypatch, error_seat="seat1@test.example")
+    assert bridge._auto_switch_after_usage(ctx, summary) is None
+    assert bridge._auto_switch_after_usage(ctx, summary) is None
+    assert calls == ["seat1@test.example"]

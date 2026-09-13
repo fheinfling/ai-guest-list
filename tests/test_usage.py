@@ -793,6 +793,25 @@ def test_refresh_live_rejects_result_older_than_stored_attempt(ctx):
     assert stored["windows"] == {}
 
 
+def test_late_transport_exception_cannot_overwrite_a_newer_success(ctx):
+    state = _seed_two_codex(ctx)
+    email = state.active("codex")
+
+    def get(*_):
+        current = ctx.load_state()
+        U.store_fetch(current, "codex", email, U.Usage(
+            ok=True, fetched_at=iso(now()), windows={"5h": U.Window(used_pct=12)}),
+            blob=ctx.cred["codex"].get_live())
+        current.save()
+        raise TimeoutError("the older request timed out after another poll completed")
+
+    result = U.refresh_live(ctx, "codex", only=email, force=True, get=get)
+    assert result["codex"][email] == "stale"
+    stored = ctx.load_state().get_seat("codex", email)["usage"]
+    assert stored["ok"] is True and stored["error"] is None
+    assert stored["windows"]["5h"]["used_pct"] == 12
+
+
 def test_refresh_live_rejects_mutation_between_credential_check_and_commit(ctx, monkeypatch):
     state = _seed_two_codex(ctx)
     email = state.active("codex")

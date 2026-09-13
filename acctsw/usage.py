@@ -611,12 +611,15 @@ def _detached_blob(ctx, state, tool: str, email: str, *, active: bool) -> str | 
 
 
 def _fetch_job(job: UsageFetchJob, get: HttpGet) -> UsageFetchResult:
+    attempted_at = iso(now())
     try:
         fetched = _fetch_for(job.tool, job.blob, get, job.user_agent)
     except Exception:
         # A custom transport may raise even though the stdlib transport normally classifies errors.
         # Background polling must still release its in-flight gate and record a retryable failure.
-        fetched = Usage(error="network", fetched_at=iso(now()))
+        # Order failures by request start, like successful fetches. A late exception must not
+        # overwrite a successful response from a request that started while this one was pending.
+        fetched = Usage(error="network", fetched_at=attempted_at)
     return UsageFetchResult(job, fetched)
 
 

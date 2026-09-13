@@ -62,7 +62,7 @@ def _codex_desktop_app(app) -> bool:
         name = app.localizedName() or ""
     except Exception:
         return False
-    return bundle == "com.openai.codex" or name == "Codex"
+    return bundle == "com.openai.codex" if bundle else name == "Codex"
 
 
 def request_codex_restart(running_apps) -> tuple[bool, str | None]:
@@ -88,7 +88,7 @@ def launch_codex_desktop(*, run=subprocess.run) -> str | None:
     """Open Codex after its graceful quit and verify that macOS accepted the request."""
     try:
         from acctsw.procenv import harden_env
-        completed = run(["open", "-a", "Codex"], env=harden_env(), capture_output=True,
+        completed = run(["open", "-b", "com.openai.codex"], env=harden_env(), capture_output=True,
                         text=True, timeout=10)
         if completed.returncode != 0:
             return completed.stderr.strip() or f"open exited {completed.returncode}"

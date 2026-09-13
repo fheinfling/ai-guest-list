@@ -228,7 +228,7 @@ def _auto_switch_after_usage(ctx: Context, summary: dict[str, Any], *,
                 do_switch(ctx, state, tool, candidate, live_identity=live_identity)
                 state.data["last_switch_at"] = iso(now())
                 state.save()
-            except AcctswError as exc:
+            except (AcctswError, OSError) as exc:
                 return {"status": "failed", "tool": tool, "from": active, "to": candidate,
                         "reason": "usage_limit", "error": str(exc)}
             return {"status": "switched", "tool": tool, "from": active, "to": candidate,

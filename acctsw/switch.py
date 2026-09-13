@@ -38,6 +38,14 @@ def sync_back(ctx: Context, state: State, tool: str, *,
     active = state.active(tool)
     if not active:
         return False
+    if tool == "codex":
+        from .session import active_session
+        running = active_session(ctx.data_dir, tool)
+        if running and running.get("email") == active:
+            # The child rotates credentials in its private home. A manual GUI/CLI switch only
+            # changes the mirror for the next session; copying that older mirror back would lose
+            # the running child's latest refresh token.
+            return False
     live = ctx.cred[tool].get_live()
     if not live:
         return False
