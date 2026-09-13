@@ -69,6 +69,9 @@ test("fmtCountdown", () => {
   const now = Date.parse("2026-06-28T12:00:00Z");
   assert.equal(fmtCountdown("2026-06-28T12:12:00Z", now), "12m");
   assert.equal(fmtCountdown("2026-06-28T14:30:00Z", now), "2h 30m");
+  assert.equal(fmtCountdown("2026-06-29T12:00:00Z", now), "24h");
+  assert.equal(fmtCountdown("2026-07-05T11:00:00Z", now), "6d23h");
+  assert.equal(fmtCountdown("2026-07-05T13:00:00Z", now), "7d1h");
 });
 
 test("type discipline: Outfit wordmark w/ gold 'ai', email mono, seat name NOT mono", () => {
@@ -106,6 +109,24 @@ test("stale usage preserves bars and labels the last successful reading", () => 
   assert.match(html, /usage-age--stale/);
   assert.match(html, /last known/);
   assert.match(html, /20%/);  // stale is last-known and labeled; only unknown suppresses the number
+});
+
+test("resting cards show the breather return time without duplicate refresh-status lines", () => {
+  const html = buildHTML(state({ tools: {
+    codex: { seats: [seat({
+      status: "resting",
+      limited: true,
+      limited_until: "2026-09-13T18:57:00Z",
+      usage_stale: true,
+      usage_fetched_at: "2026-09-13T18:25:00Z",
+      usage: { error: "network" },
+    })] },
+    claude: { seats: [] },
+  } }));
+  assert.match(html, /taking a breather — back/);
+  assert.match(html, /class="usage usage--stale"/);  // retained data stays visibly muted
+  assert.doesNotMatch(html, /last known|connection unavailable|retrying automatically/);
+  assert.doesNotMatch(html, /data-usage-at=/);
 });
 
 test("unknown usage renders dashes instead of unsupported percentages", () => {
@@ -174,6 +195,25 @@ test("both usage windows stay visible on collapsed Codex and Claude cards", () =
   }
 });
 
+test("Codex hides 5h only when durations confirm a weekly-only quota", () => {
+  const renderSeat = (tool, usage) => buildHTML(state({ tools: {
+    [tool]: { seats: [seat({ usage })] },
+    [tool === "codex" ? "claude" : "codex"]: { seats: [] },
+  } }));
+
+  const weeklyOnly = renderSeat("codex", { reported_windows: ["weekly"] });
+  assert.doesNotMatch(weeklyOnly, /class="mono u-k">5h</);
+  assert.match(weeklyOnly, /class="mono u-k">7d</);
+
+  const legacy = renderSeat("codex", { windows: { weekly: { used_pct: 10 } } });
+  assert.match(legacy, /class="mono u-k">5h</);
+  assert.match(legacy, /class="mono u-k">7d</);
+
+  const claude = renderSeat("claude", { reported_windows: ["weekly"] });
+  assert.match(claude, /class="mono u-k">5h</);
+  assert.match(claude, /class="mono u-k">7d</);
+});
+
 test("usage ages handle fresh, old, missing, and future timestamps", () => {
   const at = Date.parse("2026-09-13T12:00:00Z");
   assert.equal(fmtUsageAge("2026-09-13T11:59:31Z", at), "updated 29s ago");
@@ -189,12 +229,14 @@ test("clock ticks update age and reset text without replacing the DOM", () => {
   const age = { dataset: { usageAt: "2026-09-13T11:59:30Z" } };
   const reset = { dataset: { resetAt: "2026-09-13T12:02:00Z" } };
   const rest = { dataset: { resetAt: "2026-09-13T12:03:00Z", clockPrefix: "back in" } };
-  const root = { querySelectorAll: (selector) => selector === "[data-usage-at]" ? [age] : [reset, rest],
+  const long = { dataset: { resetAt: "2026-09-20T13:00:00Z" } };
+  const root = { querySelectorAll: (selector) => selector === "[data-usage-at]" ? [age] : [reset, rest, long],
     set innerHTML(_) { assert.fail("clock ticks must preserve existing controls and focus"); } };
   updateClockText(root, Date.parse("2026-09-13T12:00:00Z"));
   assert.equal(age.textContent, "updated 30s ago");
   assert.equal(reset.textContent, "resets in 2m");
   assert.equal(rest.textContent, "back in 3m");
+  assert.equal(long.textContent, "resets in 7d1h");
 });
 
 test("provider throttling is visible alongside retained usage", () => {
@@ -219,6 +261,19 @@ test("header substatus + plan chip + section meta", () => {
   assert.match(html, /class="mono chip">BUSINESS|class="mono chip">Business/);
   assert.match(html, /class="mono g-meta">CHATGPT BUSINESS/);
   assert.match(html, /made with <span class="heart">💛/);
+});
+
+test("seat cards hide internal provider plan enums but retain known plan chips", () => {
+  const html = buildHTML(state({ tools: {
+    codex: { seats: [
+      seat({ email: "lite@x.com", name: "Lite", plan: "SELF_SERVE_BUSINESS_PROLITE" }),
+      seat({ email: "team@x.com", name: "Team seat", plan: "team" }),
+    ] },
+    claude: { seats: [seat({ email: "max@x.com", name: "Max seat", plan: "Max" })] },
+  } }));
+  assert.doesNotMatch(html, /SELF_SERVE_BUSINESS_PROLITE|Self_Serve_Business_Prolite/);
+  assert.match(html, /class="mono chip">Team<\/span>/);
+  assert.match(html, /class="mono chip">Max<\/span>/);
 });
 
 test("buildHTML escapes user content", () => {

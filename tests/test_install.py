@@ -1,7 +1,10 @@
 """Feature tests for install/uninstall — factory image, restore round-trip, non-destructive."""
 import json
 import os
+import shlex
+import ssl
 import stat
+import subprocess
 import sys
 
 import pytest
@@ -400,7 +403,10 @@ def test_ensure_launchers_uses_bundle_python_when_frozen(tmp_path, monkeypatch):
     monkeypatch.setattr(inst.sys, "executable", "/Bundle.app/Contents/MacOS/python")
     inst.ensure_launchers(bin_dir=bindir)
     body = (bindir / "acctsw").read_text()
-    assert "PYTHONHOME=/Bundle.app/Contents/Resources exec /Bundle.app/Contents/MacOS/python -m acctsw" in body
+    assert "PYTHONHOME=/Bundle.app/Contents/Resources" in body
+    assert "exec /Bundle.app/Contents/MacOS/python -m acctsw" in body
+    assert "SSL_CERT_FILE=/Bundle.app/Contents/Resources/openssl.ca/cert.pem" in body
+    assert "SSL_CERT_DIR=/Bundle.app/Contents/Resources/openssl.ca/no-such-file" in body
     assert "PYTHONPATH=" not in body           # no PYTHONPATH *assignment* (the ≤0.2.3 crash cause)
     assert "unset PYTHONHOME PYTHONPATH" in body   # clears any inherited leak before setting our own
     assert "python311.zip" not in body and "/usr/bin/python3" not in body
@@ -440,6 +446,77 @@ def test_ensure_launchers_heals_bundle_wrapper_missing_pythonhome(tmp_path, monk
     changed, _ = inst.ensure_launchers(bin_dir=bindir, wire_rc=False)
     assert changed
     assert "PYTHONHOME=/Bundle.app/Contents/Resources" in (bindir / "acctsw").read_text()
+
+
+def test_ensure_launchers_heals_bundle_wrapper_missing_portable_ca(tmp_path, monkeypatch):
+    """The 0.8.3 wrapper found the bundled stdlib but skipped py2app's TLS setup, leaving ssl to use
+    the build machine's compiled-in CA path. Bootstrap must replace it with a relocatable CA path."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "acctsw").write_text(
+        '#!/bin/sh\n# ai guest list engine\n'
+        'unset PYTHONHOME PYTHONPATH PYTHONEXECUTABLE __PYVENV_LAUNCHER__\n'
+        'PYTHONHOME=/Bundle.app/Contents/Resources '
+        'exec /Bundle.app/Contents/MacOS/python -m acctsw "$@"\n')
+    monkeypatch.setattr(inst, "shell_rc_path", lambda: tmp_path / ".zshrc")
+    monkeypatch.setattr(inst.sys, "executable", "/Bundle.app/Contents/MacOS/python")
+
+    changed, _ = inst.ensure_launchers(bin_dir=bindir, wire_rc=False)
+
+    body = (bindir / "acctsw").read_text()
+    assert changed
+    assert "SSL_CERT_FILE=/Bundle.app/Contents/Resources/openssl.ca/cert.pem" in body
+
+
+def test_bundle_wrapper_gives_ssl_a_relocatable_verified_ca(tmp_path):
+    """Execute an installed wrapper in an isolated bundle-shaped tree. The interpreter shim hands
+    off to real Python after recording the bundle PYTHONHOME, so real ``ssl`` proves that a stale
+    inherited build-machine path is replaced and certificate verification remains required."""
+    bundle = tmp_path / "Some Other Machine" / "AI Guest List.app" / "Contents"
+    resources = bundle / "Resources"
+    ca_file = resources / "openssl.ca" / "cert.pem"
+    ca_dir = resources / "openssl.ca" / "no-such-file"
+    ca_file.parent.mkdir(parents=True)
+    ca_file.write_text("simulated packaged CA bundle\n")
+
+    bundle_python = bundle / "MacOS" / "python"
+    bundle_python.parent.mkdir(parents=True)
+    probe = (
+        "import os, ssl; "
+        "paths = ssl.get_default_verify_paths(); "
+        "context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT); "
+        "print(os.environ['BUNDLE_TEST_PYTHONHOME']); "
+        "print(paths.cafile); print(paths.capath); print(context.verify_mode)"
+    )
+    bundle_python.write_text(
+        "#!/bin/sh\n"
+        "BUNDLE_TEST_PYTHONHOME=$PYTHONHOME\n"
+        "export BUNDLE_TEST_PYTHONHOME\n"
+        "unset PYTHONHOME PYTHONPATH PYTHONEXECUTABLE __PYVENV_LAUNCHER__\n"
+        f"exec {shlex.quote(sys.executable)} -c {shlex.quote(probe)}\n"
+    )
+    bundle_python.chmod(0o755)
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    wrapper = bindir / "acctsw"
+    wrapper.write_text(inst._wrapper_script("acctsw", str(bundle_python), tmp_path, bindir))
+    wrapper.chmod(0o755)
+    env = dict(os.environ)
+    env.update({
+        "SSL_CERT_FILE": "/Library/Frameworks/Python.framework/build-machine/cert.pem",
+        "SSL_CERT_DIR": "/Library/Frameworks/Python.framework/build-machine/certs",
+    })
+
+    result = subprocess.run([str(wrapper)], env=env, capture_output=True, text=True, check=True)
+
+    assert result.stdout.splitlines() == [
+        str(resources),
+        str(ca_file),
+        "None",
+        str(ssl.CERT_REQUIRED),
+    ]
+    assert not ca_dir.exists()
 
 
 def test_ensure_launchers_heals_wrapper_with_dead_interpreter(tmp_path, monkeypatch):

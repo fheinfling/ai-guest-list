@@ -6,7 +6,7 @@ import pytest
 
 from acctsw import accounts as acct
 from acctsw import bridge
-from acctsw.errors import MissingSnapshot
+from acctsw.errors import CredentialIdentityMismatch, MissingSnapshot, UnsafeCodexMirror
 from acctsw.identity import ClaudeLiveIdentity
 from acctsw.switch import switch, sync_back
 from tests.conftest import make_codex_blob, make_claude_blob
@@ -70,6 +70,43 @@ def test_sync_back_skips_on_codex_account_mismatch(ctx):
     assert sync_back(ctx, state, "codex") is False
     # a's snapshot was NOT overwritten with c's creds
     assert ctx.snapshot_get("codex", "a@x.com") == a_snapshot_before
+
+
+def test_sync_back_skips_codex_blob_without_a_jwt_email(ctx):
+    """An unreadable identity is not permission to overwrite a known seat."""
+    state = _add_codex(ctx, "a@x.com")
+    before = ctx.snapshot_get("codex", "a@x.com")
+    ctx.cred["codex"].set_live('{"tokens": {"id_token": "not-a-jwt"}}')
+
+    assert sync_back(ctx, state, "codex") is False
+    assert ctx.snapshot_get("codex", "a@x.com") == before
+
+
+def test_codex_snapshot_write_rejects_mismatched_jwt_and_preserves_destination(ctx):
+    """A valid alias JWT can never overwrite the plain-email seat's private auth.json."""
+    _add_codex(ctx, "plain@x.com")
+    before = ctx.snapshot_get("codex", "plain@x.com")
+
+    with pytest.raises(CredentialIdentityMismatch):
+        ctx.snapshot_set("codex", "plain@x.com", make_codex_blob("plain+codex@x.com"))
+
+    assert ctx.snapshot_get("codex", "plain@x.com") == before
+
+
+def test_switch_refuses_a_context_whose_canonical_mirror_is_a_private_seat_home(ctx):
+    """A leaked managed CODEX_HOME must not turn an alias switch into a private-home write."""
+    state = _add_codex(ctx, "plain@x.com")
+    _add_codex(ctx, "plain+codex@x.com")
+    state = ctx.load_state()
+    switch(ctx, state, "codex", "plain@x.com")
+    before = ctx.snapshot_get("codex", "plain@x.com")
+    ctx.cred["codex"].auth_path = ctx.codex_home("plain@x.com") / "auth.json"
+
+    with pytest.raises(UnsafeCodexMirror):
+        switch(ctx, state, "codex", "plain+codex@x.com", sync=False)
+
+    assert ctx.snapshot_get("codex", "plain@x.com") == before
+    assert state.active("codex") == "plain@x.com"
 
 
 def test_manual_switch_preserves_supervised_codex_token_rotation(ctx, monkeypatch):

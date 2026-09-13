@@ -23,8 +23,28 @@ CODEX_HOMES = DATA_DIR / "codex-homes"
 KEYCHAIN_SERVICE = "acct-switcher"  # accounts named "codex:<email>" / "claude:<email>"
 
 # --- canonical locations the official tools read ---------------------------------------------
-# Codex stores the active account here (honours $CODEX_HOME).
-CODEX_HOME = Path(os.environ.get("CODEX_HOME", HOME / ".codex"))
+def _canonical_codex_home() -> Path:
+    """Return the shared Codex home, never one of acctsw's private seat homes.
+
+    ``launcher.run`` points its own process at a seat-specific ``CODEX_HOME`` while Codex runs.
+    A child process can inherit that value and later construct a fresh ``Context.default()`` (for
+    example, ``cx --version``).  Treating the inherited private home as the canonical mirror lets a
+    normal switch overwrite that seat with another account's valid snapshot.  External custom
+    ``CODEX_HOME`` values remain supported; only our managed per-seat subtree is rejected.
+    """
+    inherited = os.environ.get("CODEX_HOME")
+    if not inherited:
+        return HOME / ".codex"
+    candidate = Path(inherited).expanduser()
+    try:
+        candidate.resolve().relative_to(CODEX_HOMES.resolve())
+    except ValueError:
+        return candidate
+    return HOME / ".codex"
+
+
+# Codex normally stores the active account here (and may honour an external $CODEX_HOME).
+CODEX_HOME = _canonical_codex_home()
 CODEX_AUTH = CODEX_HOME / "auth.json"
 CODEX_SESSIONS = CODEX_HOME / "sessions"
 

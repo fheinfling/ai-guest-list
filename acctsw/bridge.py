@@ -432,7 +432,7 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
             with ctx.locked():
                 state = ctx.load_state()
                 sync_back(ctx, state, tool)         # preserve the outgoing seat's rotated token
-                ctx.cred[tool].set_live(blob)
+                ctx.set_live(tool, blob)
                 seat = acct.add(ctx, state, tool, name=message.get("name"), email=email)
             return {"ok": True, "celebrate": True, "added": seat["email"],
                     "state": snapshot_state(ctx)}

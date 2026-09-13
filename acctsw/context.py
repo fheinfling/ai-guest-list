@@ -16,6 +16,8 @@ from pathlib import Path
 
 from . import paths as P
 from .credlocations import ClaudeCredLocation, CodexCredLocation, CredLocation
+from .credlocations import codex_jwt_matches
+from .errors import CredentialIdentityMismatch, UnsafeCodexMirror
 from .keychain import InMemoryKeychain, KeychainBackend, SecurityKeychain
 from .state import State
 from .util import chmod_dir
@@ -147,14 +149,41 @@ class Context:
         from . import codexhome
         return codexhome.home_dir(email, self._homes_root)
 
+    def _codex_mirror_is_private_home(self) -> bool:
+        """Whether the canonical Codex writer was accidentally aimed at a seat home."""
+        path = getattr(self.cred["codex"], "auth_path", None)
+        if path is None:
+            return False
+        try:
+            Path(path).resolve().relative_to(self._homes_root.resolve())
+        except ValueError:
+            return False
+        return True
+
+    def set_live(self, tool: str, blob: str) -> None:
+        """Write canonical credentials, refusing a managed private home as the mirror target."""
+        if tool == "codex" and self._codex_mirror_is_private_home():
+            raise UnsafeCodexMirror(
+                "refusing to write the shared Codex mirror through a private account home; "
+                "restart acctsw outside a managed CODEX_HOME"
+            )
+        self.cred[tool].set_live(blob)
+
     def snapshot_get(self, tool: str, email: str) -> str | None:
         if tool == "codex":
             from . import codexhome
-            return codexhome.load(email, root=self._homes_root)
+            blob = codexhome.load(email, root=self._homes_root)
+            # Treat an old/corrupted snapshot as unavailable rather than ever installing it under
+            # its label.  The caller can re-authenticate that seat without harming another one.
+            return blob if blob and codex_jwt_matches(email, blob) else None
         return self.keychain.get(self.keychain_service, self.snapshot_key(tool, email))
 
     def snapshot_set(self, tool: str, email: str, blob: str) -> None:
         if tool == "codex":
+            if not codex_jwt_matches(email, blob):
+                raise CredentialIdentityMismatch(
+                    f"refusing to save Codex credentials for {email}: JWT identity does not match"
+                )
             from . import codexhome
             codexhome.save(email, blob, codex_home=self._codex_real, root=self._homes_root)
         else:

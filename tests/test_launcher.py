@@ -1109,7 +1109,7 @@ def test_run_claude_resume_uses_continue(ctx):
     assert spawn.calls[1][-1] == "--continue"
 
 
-def test_run_claude_waits_and_resumes_when_all_seats_resting(ctx):
+def test_run_claude_waits_then_starts_original_invocation_when_all_seats_resting(ctx):
     state = _two_claude(ctx)
     first = iso(now() + timedelta(seconds=30))
     second = iso(now() + timedelta(seconds=60))
@@ -1126,7 +1126,7 @@ def test_run_claude_waits_and_resumes_when_all_seats_resting(ctx):
     assert rc == 0
     assert len(sleeps) == 1
     assert sleeps[0] > 0
-    assert spawn.calls[0][-1] == "--continue"
+    assert spawn.calls[0] == build_cmd(ctx, "claude", [])
     assert any("waiting until" in m for m in msgs)
     assert ctx.load_state().get_seat("claude", "c1@x.com").get("limited_until") is None
 

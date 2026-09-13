@@ -2,6 +2,7 @@
 import os
 
 from acctsw import context as C
+from acctsw import paths as P
 
 
 def test_hydrate_path_adds_common_dirs_without_dupes(monkeypatch):
@@ -35,3 +36,16 @@ def test_which_tool_prefers_path_hit(tmp_path, monkeypatch):
     monkeypatch.setattr(C, "_COMMON_BIN_DIRS", ())
     monkeypatch.setenv("PATH", str(onpath))
     assert C.which_tool("faketool") == str(tool)
+
+
+def test_managed_codex_home_env_is_not_used_as_the_shared_mirror(tmp_path, monkeypatch):
+    """A child launched from another cwd must not inherit a seat home as Context.default's mirror."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CODEX_HOME", str(P.CODEX_HOMES / "plain@example.test"))
+    assert P._canonical_codex_home() == P.HOME / ".codex"
+
+
+def test_external_codex_home_env_remains_a_supported_shared_mirror(tmp_path, monkeypatch):
+    custom = tmp_path / "custom-codex"
+    monkeypatch.setenv("CODEX_HOME", str(custom))
+    assert P._canonical_codex_home() == custom

@@ -50,8 +50,10 @@ def sync_back(ctx: Context, state: State, tool: str, *,
     if not live:
         return False
     live_email = ctx.cred[tool].email_of(live)
-    if live_email is not None and live_email != active:
-        return False  # mismatch — don't clobber the active seat's store
+    if tool == "codex" and live_email != active:
+        return False  # unknown or mismatch — never clobber the active seat's store
+    if tool != "codex" and live_email is not None and live_email != active:
+        return False
     ctx.snapshot_set(tool, active, live)   # codex → per-account home; claude → keychain
     return True
 
@@ -74,7 +76,7 @@ def switch(ctx: Context, state: State, tool: str, email: str, *, sync: bool = Tr
     blob = ctx.snapshot_get(tool, email)
     if blob is None:
         raise MissingSnapshot(f"stored creds for {tool}:{email} not found — re-add this seat")
-    ctx.cred[tool].set_live(blob)
+    ctx.set_live(tool, blob)
 
     # 3. record active
     state.set_active(tool, email)
