@@ -81,6 +81,7 @@ def _creds_refreshed(state: State, tool: str, em: str) -> None:
     seat = state.get_seat(tool, em)
     if seat is None:
         return
+    seat.pop("auth_error", None)  # a new login replaces the revoked refresh credential
     u = seat.get("usage")
     if not isinstance(u, dict):  # upsert_seat seeds usage as None until the first poll
         u = {}
@@ -194,7 +195,8 @@ def _seat_view(seat: dict, *, active: bool, at: datetime,
         "limited_until": seat.get("limited_until") if limited else None,
         # A 401 is actionable only for the active seat: cached access-token expiry on a parked seat
         # is routine. A 403 means the entitlement itself is gone and is actionable on every seat.
-        "needs_login": (active and error == "unauthorized") or error == "forbidden",
+        "needs_login": bool(seat.get("auth_error")) or (active and error == "unauthorized")
+                       or error == "forbidden",
         "entitlement_revoked": error == "forbidden",
         "in_session": in_session,
         "session_started_at": active_session.get("started_at") if in_session else None,
@@ -262,7 +264,7 @@ def _assign_statuses(seats: list[dict[str, Any]]) -> None:
     for s in seats:
         if s["needs_login"]:
             s["status"] = "needs-login"
-        elif s["active"]:
+        elif s["active"] or s.get("in_session"):
             s["status"] = "active"
         elif all_capped and s["email"] == soonest:
             s["status"] = "queued"
@@ -281,9 +283,10 @@ def list_seats(state: State, tool: str, at: datetime | None = None,
     """
     at = at or now()
     active = state.active(tool)
-    running = session.active_session(data_dir, tool) if data_dir is not None else None
+    running = ({s["email"]: s for s in session.active_sessions(data_dir, tool)}
+               if data_dir is not None else {})
     seats = [
-        _seat_view(seat, active=(email == active), at=at, active_session=running)
+        _seat_view(seat, active=(email == active), at=at, active_session=running.get(email))
         for email, seat in state.accounts(tool).items()
     ]
     _assign_statuses(seats)

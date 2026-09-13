@@ -881,7 +881,7 @@ def test_seat_blob_uses_fresh_private_snapshot_for_supervised_codex(ctx, monkeyp
     ctx.snapshot_set("codex", email, fresh)
     state = ctx.load_state()
     monkeypatch.setattr(session, "active_session",
-                        lambda _data_dir, _tool: {"email": email, "pid": 1, "started_at": "x"})
+                        lambda _data_dir, _tool, **_kwargs: {"email": email, "pid": 1, "started_at": "x"})
     assert U.codex_token_account(U._seat_blob(ctx, state, "codex", email))[0] == "fresh"
 
 

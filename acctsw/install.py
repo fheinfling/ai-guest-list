@@ -253,7 +253,7 @@ def install(ctx: Context, *, dry_run: bool = False, register: bool = True,
 _POISON_RE = re.compile(r"python3\d+\.zip")
 
 # The interpreter path an `acctsw` wrapper execs: `… exec <py> -m acctsw …` (py may be shell-quoted).
-_EXEC_PY_RE = re.compile(r"""exec\s+(?:'([^']*)'|"([^"]*)"|(\S+))\s+-m\s+acctsw""")
+_EXEC_PY_RE = re.compile(r"""exec\s+(?:'([^']*)'|"([^"]*)"|(\S+))\s+(?:-P\s+)?-m\s+acctsw""")
 
 
 def _is_bundle_python(python: str) -> bool:
@@ -284,6 +284,8 @@ def _wrapper_stale(body: str) -> bool:
         on a machine that lacks a system Python.framework), or
       - the bundle python without its bundled OpenSSL CA file (0.8.3 — TLS otherwise falls back to
         the Python build machine's compiled-in certificate path), or
+      - the bundle python without safe-path mode (imports a checkout in the working directory
+        against the bundle's incomplete stdlib instead of loading its packaged engine), or
       - an interpreter path that no longer exists (the .app was moved/renamed, or a venv was deleted)."""
     if _POISON_RE.search(body):
         return True
@@ -293,6 +295,8 @@ def _wrapper_stale(body: str) -> bool:
     if exe.endswith(".app/Contents/MacOS/python") and "PYTHONHOME=" not in body:
         return True
     if exe.endswith(".app/Contents/MacOS/python") and "SSL_CERT_FILE=" not in body:
+        return True
+    if exe.endswith(".app/Contents/MacOS/python") and " -P -m acctsw" not in body:
         return True
     try:
         return os.path.isabs(exe) and not Path(exe).exists()
@@ -352,10 +356,24 @@ def ensure_launchers(*, bin_dir: Path | None = None, python: str | None = None,
 
 
 def _wrapper_script(name: str, python: str, pkg_root: Path, bin_dir: Path) -> str:
+    # Alias bundles give development runs an app identity/icon but borrow the source Python.
+    # Follow only their executable symlink: resolving further would lose a venv's dependencies.
+    if _is_bundle_python(python):
+        import plistlib
+        executable = Path(python)
+        try:
+            info = plistlib.loads((executable.parent.parent / "Info.plist").read_bytes())
+            if info.get("PythonInfoDict", {}).get("py2app", {}).get("alias"):
+                target = Path(os.readlink(executable))
+                python = str(target if target.is_absolute() else executable.parent / target)
+        except (OSError, ValueError, plistlib.InvalidFileException):
+            pass
     # shlex.quote the interpolated paths so an install dir containing a quote/backtick/$() can't break
     # out of the generated /bin/sh script (defense-in-depth; these paths aren't attacker-controlled).
     py, pr, acctsw = shlex.quote(str(python)), shlex.quote(str(pkg_root)), shlex.quote(str(bin_dir / "acctsw"))
     if name == "acctsw":
+        from .procenv import _PY_ENV_STRIP
+        clean_python = f"unset {' '.join(_PY_ENV_STRIP)}\n"
         if _is_bundle_python(python):
             # The bundled interpreter is the framework python3.11 copied into the app; on its own it
             # derives sys.prefix from a compiled-in framework path that need not exist on the user's
@@ -367,7 +385,6 @@ def _wrapper_script(name: str, python: str, pkg_root: Path, bin_dir: Path) -> st
             # back to the Python build machine's compiled-in /Library or Homebrew location.
             # `unset` the leaked redirect vars first (a Terminal the app spawned inherits py2app's
             # PYTHONHOME/PYTHONPATH) so only our explicit PYTHONHOME on the exec line takes effect.
-            from .procenv import _PY_ENV_STRIP
             resources = Path(python).parent.parent / "Resources"
             home = shlex.quote(str(resources))
             ca_file = shlex.quote(str(resources / "openssl.ca" / "cert.pem"))
@@ -375,14 +392,15 @@ def _wrapper_script(name: str, python: str, pkg_root: Path, bin_dir: Path) -> st
             # OpenSSL from consulting a compiled-in host CA directory after loading the bundled PEM.
             ca_dir = shlex.quote(str(resources / "openssl.ca" / "no-such-file"))
             return (f"#!/bin/sh\n# ai guest list engine\n"
-                    f"unset {' '.join(_PY_ENV_STRIP)}\n"
+                    + clean_python +
                     f"PYTHONHOME={home} SSL_CERT_FILE={ca_file} SSL_CERT_DIR={ca_dir} "
-                    f'exec {py} -m acctsw "$@"\n')
+                    f'exec {py} -P -m acctsw "$@"\n')
         # Source checkout: set PYTHONPATH to ONLY pkg_root — do NOT append "$PYTHONPATH". If this wrapper
         # runs from a shell that inherited py2app's leaked PYTHONPATH (the frozen 3.11 stdlib zip),
         # appending it would shadow the interpreter's stdlib and crash `python -m acctsw`.
         return (f"#!/bin/sh\n# ai guest list engine\n"
-                f'PYTHONPATH={pr} exec {py} -m acctsw "$@"\n')
+                + clean_python +
+                f'PYTHONPATH={pr} exec {py} -P -m acctsw "$@"\n')
     tool = "codex" if name == "cx" else "claude"
     # No `exec`: we keep this shell resident so its trap fires after the tool exits. A TUI killed
     # mid-session (supervisor auto-switch) — or, when the app is closed, a stock tool that crashes

@@ -336,9 +336,13 @@ class RolloutWatcher:
             return None
         return signal if signal is not None and self._honoured(signal) else None
 
-    def poll(self) -> list[RolloutSignal]:
+    def poll(self, *, force_attach: bool = False) -> list[RolloutSignal]:
         """Signals from bytes appended since the previous poll (never raises; [] when unattached)."""
         try:
+            if force_attach:
+                # A child that just exited may have created/flushed its session during the
+                # discovery cooldown. Handoffs need one final lookup before choosing a thread.
+                self._next_scan = None
             if self.attached is None or not self.unambiguous:
                 self._try_attach()   # unattached, or attached only provisionally — keep looking
             if self.attached is None:

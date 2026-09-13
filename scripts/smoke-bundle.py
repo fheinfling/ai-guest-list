@@ -7,6 +7,7 @@ the point is to catch packaging omissions after py2app has produced the release 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import plistlib
@@ -118,6 +119,13 @@ def smoke(bundle_arg: Path) -> None:
     info = plistlib.loads(info_path.read_bytes())
     plist_version = str(info["CFBundleShortVersionString"])
     plist_build = str(info["CFBundleVersion"])
+    _check(info.get("CFBundleIdentifier") == "com.fheinfling.aiguestlist",
+           "bundle has the wrong application identity")
+    icon = resources / str(info.get("CFBundleIconFile", ""))
+    _check(icon.is_file(), f"missing app icon: {icon}")
+    _check(hashlib.sha256(icon.read_bytes()).digest()
+           == hashlib.sha256((repo / "app" / "icon.icns").read_bytes()).digest(),
+           "packaged app icon differs from the approved icon")
 
     with tempfile.TemporaryDirectory(prefix="acctsw-bundle-smoke-") as raw_tmp:
         tmp = Path(raw_tmp)
@@ -138,6 +146,13 @@ def smoke(bundle_arg: Path) -> None:
             # Direct bundle-Python bootstrap needed to ask the packaged installer for its wrapper.
             "PYTHONHOME": str(resources),
         })
+        app_check = json.loads(_run(
+            [str(contents / "MacOS" / info["CFBundleExecutable"]), "--check-app"],
+            cwd=work, env=clean_env,
+        ).stdout)
+        _check(app_check["bundle_identifier"] == info["CFBundleIdentifier"],
+               "native process did not load the application identity")
+        _check(app_check["icon_valid"] is True, "AppKit could not load the application icon")
         generated = json.loads(_run(
             [str(bundle_python), "-c", _GENERATE, str(bundle_python), str(resources), str(bindir)],
             cwd=work,
@@ -179,6 +194,13 @@ def smoke(bundle_arg: Path) -> None:
         probe_wrapper = bindir / "acctsw-bundle-probe"
         probe_wrapper.write_text(wrapper_body.replace(needle, f"-c {shlex.quote(_PROBE)}"))
         probe_wrapper.chmod(probe_wrapper.stat().st_mode | stat.S_IXUSR)
+        # A checkout in the user's cwd must not override the packaged engine. This caused
+        # installed launchers to import new code with old, missing stdlib modules (uuid).
+        shadow_package = work / "acctsw"
+        shadow_package.mkdir()
+        (shadow_package / "__init__.py").write_text(
+            'raise RuntimeError("launcher imported acctsw from the working directory")\n')
+        _run([str(wrapper), "--version"], cwd=work, env=poisoned_env)
         probe = json.loads(_run([str(probe_wrapper)], cwd=work, env=poisoned_env).stdout)
 
         expected_home = home / ".codex"

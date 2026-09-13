@@ -89,7 +89,7 @@ test("type discipline: Outfit wordmark w/ gold 'ai', email mono, seat name NOT m
 test("status: active=pill, ready=switch btn, resting=countdown+reassurance, needs-login=log in", () => {
   const mk = (st, extra) => buildHTML(state({ tools: {
     codex: { plan_label: "CHATGPT BUSINESS", seats: [seat({ status: st, ...extra })] }, claude: { seats: [] } } }));
-  assert.match(mk("active", { active: true }), /pill floor floor--idle">on the floor/);
+  assert.match(mk("active", { active: true }), /pill floor floor--idle">selected/);
   assert.match(mk("ready"), /btn switch"[^>]*data-action="switch"/);
   const resting = mk("resting", { limited: true, limited_until: new Date(Date.now() + 6e6).toISOString() });
   assert.match(resting, /back in/);
@@ -172,7 +172,7 @@ test("active seats distinguish a live session from loaded-but-idle credentials",
   assert.match(live, /session started/);
 
   const idle = mk({ in_session: false });
-  assert.match(idle, /pill floor floor--idle">on the floor/);
+  assert.match(idle, /pill floor floor--idle">selected/);
   assert.doesNotMatch(idle, /live-dot|session started/);
 });
 

@@ -5,7 +5,7 @@ All real logic is in acctsw.bridge.handle (pure, tested); this file only does Ap
 forward JS messages to the bridge, push state back into the web view, update the dot glyph, fire
 notifications, and run the official login flows in Terminal for "add a seat".
 
-Run (dev):  PYTHONPATH=. .venv/bin/python -m app.menubar
+Run (dev):  bash scripts/run-app.sh
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ try:
                         NSVariableStatusItemLength, NSApplicationActivationPolicyAccessory,
                         NSUserNotification, NSUserNotificationCenter, NSImage, NSWorkspace)
     from WebKit import WKWebView, WKWebViewConfiguration, WKUserContentController
-    from Foundation import NSObject, NSURL, NSTimer, NSMakeRect, NSMakeSize
+    from Foundation import NSObject, NSURL, NSTimer, NSMakeRect, NSMakeSize, NSBundle
 except ImportError:  # allows importing this module's pure helpers without pyobjc installed
     objc = None
 
@@ -748,6 +748,23 @@ def main() -> int:
     if objc is None:
         print("pyobjc not installed; run `pip install '.[app]'`", file=sys.stderr)
         return 1
+    if "--check-app" in sys.argv[1:]:
+        # Exercise the native app entrypoint in packaging checks without starting polling,
+        # changing shell setup, or opening any account credentials.
+        bundle = NSBundle.mainBundle()
+        info = bundle.infoDictionary()
+        icon_name = str(info.get("CFBundleIconFile") or "")
+        icon_path = Path(str(bundle.resourcePath())) / icon_name
+        icon = NSImage.alloc().initWithContentsOfFile_(str(icon_path)) if icon_name else None
+        print(json.dumps({
+            "bundle_identifier": str(bundle.bundleIdentifier() or ""),
+            "bundle_name": str(info.get("CFBundleName") or ""),
+            "icon_path": str(icon_path),
+            "icon_valid": bool(icon and icon.isValid()),
+            "python": sys.executable,
+            "engine_file": str(Path(bridge.__file__)),
+        }), flush=True)
+        return 0
     # A GUI launch gives us only launchd's minimal PATH; add the dirs where claude/codex/node live
     # BEFORE resolving them, or the app can't run the CLIs (identify a login → seat, poll usage).
     hydrate_path()

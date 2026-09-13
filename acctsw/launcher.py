@@ -150,6 +150,13 @@ AUTH_DEAD_PATTERNS = {
 _LIMIT_RE = {t: [re.compile(p, re.IGNORECASE) for p in pats] for t, pats in LIMIT_PATTERNS.items()}
 _AUTH_RE = {t: [re.compile(p, re.IGNORECASE) for p in pats] for t, pats in AUTH_DEAD_PATTERNS.items()}
 
+# Exact Codex error, including terminal line wrapping. A still-valid access token can read usage
+# even after the refresh token has been revoked, so a usage 200 cannot disprove this banner.
+# Require the TUI error glyph and full wording; ordinary prose still goes through the probe.
+_CODEX_REFRESH_REVOKED = re.compile(
+    r"(?m)^\s*■\s+Your access token could not be refreshed because your refresh token was"
+    r"\s+revoked\.\s+Please log out and sign in again\.", re.IGNORECASE)
+
 # Codex's hard billing banner (the ChatGPT workspace has no credits left). This is a HINT and a
 # FALLBACK, never the primary evidence: the decision belongs to the structured signals (the rollout
 # JSONL's own error code / reached-type, and the usage endpoint's flags), and when we are tailing
@@ -194,6 +201,13 @@ def detect_limit(tool: str, text: str) -> bool:
 def detect_auth_dead(tool: str, text: str) -> bool:
     """True if recent output says the seat's credentials are dead (revoked / signed out)."""
     return _is_auth_dead(tool, _ANSI.sub("", text))
+
+
+def detect_refresh_revoked(tool: str, text: str) -> bool:
+    clean = _ANSI.sub("", text)
+    # Wrapping can occur between any words, not just before "revoked".
+    lines = re.sub(r"(?<=\S)[ \t]*\r?\n[ \t]*(?=\w)", " ", clean)
+    return tool == "codex" and bool(_CODEX_REFRESH_REVOKED.search(lines))
 
 
 def detect_hard_limit(tool: str, text: str) -> bool:
@@ -511,9 +525,10 @@ def handle_auth_dead(ctx: Context, state, tool: str, *, exclude: set | frozenset
     """The active seat's credentials are dead (revoked/signed out) for THIS run. Choose a DIFFERENT
     seat, skipping the active one plus any that already failed auth this session (``exclude``).
 
-    We deliberately do NOT persist a "dead" flag on the seat: a usage-poll ``unauthorized`` is not a
+    This helper does NOT persist a "dead" flag on the seat: a usage-poll ``unauthorized`` is not a
     reliable health signal (a non-active seat shows it from a stale cached access token), and a benign
-    output match shouldn't disable a seat beyond the current run. Re-login is detected fresh next time.
+    output match shouldn't disable a seat beyond the current run. Only the caller handling Codex's
+    exact refresh-token-revoked error persists a re-login requirement.
     """
     active = state.active(tool)
     skip = set(exclude) | ({active} if active else set())
@@ -716,6 +731,10 @@ def pty_spawn(argv: list, on_output: Callable[[bytes], bool],
                 if on_tick():
                     stop_requested = True
                     break
+        if stop_requested:
+            # Keep the PTY open while the child handles SIGTERM and saves its conversation.
+            # Closing the master first sends SIGHUP, killing it before its shutdown handler.
+            return _terminate(pid)
     finally:
         # Re-assert the terminal's default private modes the child TUI may have left set (mouse
         # tracking especially) — on the kill path the child never got to do this itself.
@@ -733,9 +752,7 @@ def pty_spawn(argv: list, on_output: Callable[[bytes], bool],
         except OSError:
             pass
 
-    # Reap exactly once. On the stop path, _terminate kills AND reaps and returns the status.
-    if stop_requested:
-        return _terminate(pid)
+    # Reap exactly once. The stop path above already killed and reaped before closing the PTY.
     try:
         _, status = os.waitpid(pid, 0)
         return _exitcode(status)
@@ -806,6 +823,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
     state = ctx.load_state()
     if not state.accounts(tool):
         raise NoSeats(f"no {tool} seats yet — add one first")
+    seen_manual_switch = state.data["tools"][tool].get("manual_switch")
 
     # NB: legacy-Headroom cleanup deliberately lives in `cli._cmd_run`, BEFORE the app-running split
     # — the passthrough and NoSeats branches above return without ever reaching this far, so cleaning
@@ -941,8 +959,13 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             state = ctx.load_state()
             if tool == "codex":
                 from . import accounts as _acct
-                _acct.reconcile_codex(ctx, state)   # freshen home(s) from ~/.codex before using them
+                if active_session(ctx.data_dir, tool) is None:
+                    # A live supervisor owns its private tokens; its shared mirror can be older.
+                    _acct.reconcile_codex(ctx, state)
             sel = choose(state, tool)
+            if not sel.email and all(s.get("auth_error") for s in state.accounts(tool).values()):
+                notify(f"all {tool} seats need you to sign in again — re-add them via the app")
+                return EXIT_GAVE_UP
             claude_switch_needed = (
                 tool == "claude"
                 and sel.available
@@ -969,6 +992,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
 
         switches = 0
         resuming = False
+        resume_thread = None
         if initial_resting is not None:
             # No child has run yet. Even after waiting, honor the original invocation (including
             # --version or a fresh prompt); only a handoff during a session should add resume.
@@ -1046,7 +1070,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     if status == "forbidden":
                         return "revoked"  # positive lost-entitlement evidence, never a quota rest
                     if reason == "auth":
-                        # the creds just authenticated a usage fetch → they aren't dead
+                        # Dismiss loose auth prose when access still works. The exact refresh-token
+                        # revocation banner bypasses this probe: usage cannot test a refresh token.
                         return "dismiss" if status == "ok" else "unknown"
                     if _seat_confirmed_healthy(st, tool, seat, {tool: {seat: status}}):
                         return "dismiss"
@@ -1055,6 +1080,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 return "unknown"
 
         def _decide_and_maybe_stop(*, reason: str, hard: bool = False,
+                                   refresh_revoked: bool = False,
                                    reset_at: str | None = None, source: str | None = None,
                                    detail: str | None = None,
                                    clear: Callable[[], None] = lambda: None) -> bool:
@@ -1077,7 +1103,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 # the seat this child is running on — that is exactly the field failure this whole
                 # tick exists for. CODEX_HOME was pointed at ``launch_email`` before the spawn and
                 # is process-global, so the seat to rest and leave is ALWAYS launch_email.
-                realigned = (reason == "limit" and bool(launch_email) and active != launch_email
+                realigned = (bool(launch_email) and active != launch_email
                              and state.get_seat(tool, launch_email) is not None)
                 if realigned:
                     state.set_active(tool, launch_email)
@@ -1085,6 +1111,10 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 if reason in ("auth", "revoked"):
                     if active:
                         auth_failed.add(active)
+                        seat = state.get_seat(tool, active)
+                        if refresh_revoked and seat is not None:
+                            seat["auth_error"] = "refresh_token_revoked"
+                            state.save()
                     dec = handle_auth_dead(ctx, state, tool, exclude=auth_failed)
                 else:
                     dec = handle_limit(ctx, state, tool, get=get, exclude=auth_failed,
@@ -1206,15 +1236,20 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
 
         while True:
             argv = resume_cmd(ctx, tool) if resuming else build_cmd(ctx, tool, args)
+            if resuming and tool == "codex" and resume_thread:
+                argv = [argv[0], "resume", resume_thread]
             with ctx.locked():
                 launch_email = ctx.load_state().active(tool)
+                # A click between the previous handoff and this launch may have moved active.
+                # Keep the child's actual credentials and its recorded launch seat together.
+                _activate_codex_home(launch_email)
             if launch_email:
                 mark_session(ctx.data_dir, tool, launch_email)
             # ``reason`` is set ONLY for a fully approved stop. ``handled`` also covers matches that
             # deliberately leave this child alive, preventing the post-exit safety net from turning
             # that same banner into a re-derived hop after the child later exits on its own.
             hit = {
-                "reason": None,       # None | "limit" | "auth" | "revoked"
+                "reason": None,       # None | "manual" | "limit" | "auth" | "revoked"
                 "email": None,        # exact pre-flight landing seat
                 "active": None,       # seat the still-live child was using
                 "hard": False,
@@ -1253,6 +1288,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 that back in. One os.stat per tick, a lock-free read only when it changed (state
                 writes are atomic temp+os.replace, so a reader never sees a torn file).
                 """
+                nonlocal seen_manual_switch
                 try:
                     m = os.stat(ctx.state_file).st_mtime_ns
                 except OSError:
@@ -1264,6 +1300,18 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 if snap.data.get("rev") == tick["seen_rev"]:
                     return False   # touched but unchanged (e.g. an idle poll's rewrite)
                 tick["seen_rev"] = snap.data.get("rev")
+                request = snap.data["tools"][tool].get("manual_switch")
+                if tool == "codex" and request != seen_manual_switch:
+                    seen_manual_switch = request
+                    target = request.get("email") if isinstance(request, dict) else None
+                    if (target and target != launch_email and target == snap.active(tool)
+                            and snap.get_seat(tool, target) is not None
+                            and ctx.snapshot_get(tool, target)):
+                        # The user chose this exact seat; auto-switch preferences and the
+                        # automatic hop budget do not veto an explicit manual action.
+                        hit.update(reason="manual", email=target, active=launch_email,
+                                   handled=True)
+                        return True
                 # ALWAYS the seat this child was spawned with: CODEX_HOME is process-global and
                 # ``active`` may already point somewhere else.
                 seat = snap.get_seat(tool, launch_email) or {}
@@ -1362,6 +1410,9 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 buf.extend(chunk)
                 del buf[:-4096]  # keep a rolling tail
                 text = buf.decode("utf-8", "replace")
+                if detect_refresh_revoked(tool, text):
+                    return _decide_and_maybe_stop(reason="auth", refresh_revoked=True,
+                                                  clear=buf.clear)
                 hard = detect_hard_limit(tool, text)
                 if hard:
                     reason = "limit"
@@ -1423,7 +1474,32 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
 
             status = spawn(argv, on_output, on_tick=_tick)  # NO lock held here
             if rollout_source is not None:
+                if hit["reason"] == "manual":
+                    rollout_source.poll(force_attach=True)
+                if (hit["reason"] == "manual" and rollout_source.attached is not None
+                        and rollout_source.unambiguous):
+                    meta = rollout.session_meta(rollout_source.attached) or {}
+                    thread = meta.get("id")
+                    if isinstance(thread, str) and thread:
+                        resume_thread = thread
                 rollout_source.close()
+
+            if hit["reason"] == "manual":
+                # The child has flushed its session. Re-read the selection so rapid clicks
+                # during shutdown cannot restore an older choice (including a switch back).
+                with ctx.locked():
+                    state = ctx.load_state()
+                    target = state.active(tool)
+                    if (not target or state.get_seat(tool, target) is None
+                            or not ctx.snapshot_get(tool, target)):
+                        notify(f"{tool}: selected seat is no longer available; resume after choosing a seat")
+                        return status
+                    _commit_switch(state, target)
+                    seen_manual_switch = state.data["tools"][tool].get("manual_switch")
+                mark_session(ctx.data_dir, tool, target)
+                notify(f"{tool}: switching to {target}, resuming your work")
+                resuming = True
+                continue
 
             # The child exited right after its OWN log recorded a limit (codex often just ends the
             # turn with `usage_limit_exceeded` and quits). That is positive, structured evidence in
