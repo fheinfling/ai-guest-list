@@ -221,6 +221,19 @@ test("header substatus + plan chip + section meta", () => {
   assert.match(html, /made with <span class="heart">💛/);
 });
 
+test("seat cards hide internal provider plan enums but retain known plan chips", () => {
+  const html = buildHTML(state({ tools: {
+    codex: { seats: [
+      seat({ email: "lite@x.com", name: "Lite", plan: "SELF_SERVE_BUSINESS_PROLITE" }),
+      seat({ email: "team@x.com", name: "Team seat", plan: "team" }),
+    ] },
+    claude: { seats: [seat({ email: "max@x.com", name: "Max seat", plan: "Max" })] },
+  } }));
+  assert.doesNotMatch(html, /SELF_SERVE_BUSINESS_PROLITE|Self_Serve_Business_Prolite/);
+  assert.match(html, /class="mono chip">Team<\/span>/);
+  assert.match(html, /class="mono chip">Max<\/span>/);
+});
+
 test("buildHTML escapes user content", () => {
   const html = buildHTML(state({ tools: {
     codex: { seats: [seat({ name: "<script>x" })] }, claude: { seats: [] } } }));

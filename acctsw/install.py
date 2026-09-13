@@ -371,7 +371,9 @@ def _wrapper_script(name: str, python: str, pkg_root: Path, bin_dir: Path) -> st
             resources = Path(python).parent.parent / "Resources"
             home = shlex.quote(str(resources))
             ca_file = shlex.quote(str(resources / "openssl.ca" / "cert.pem"))
-            ca_dir = shlex.quote(str(resources / "openssl.ca" / "certs"))
+            # Match py2app's 3.11 boot setup: the deliberately nonexistent directory prevents
+            # OpenSSL from consulting a compiled-in host CA directory after loading the bundled PEM.
+            ca_dir = shlex.quote(str(resources / "openssl.ca" / "no-such-file"))
             return (f"#!/bin/sh\n# ai guest list engine\n"
                     f"unset {' '.join(_PY_ENV_STRIP)}\n"
                     f"PYTHONHOME={home} SSL_CERT_FILE={ca_file} SSL_CERT_DIR={ca_dir} "

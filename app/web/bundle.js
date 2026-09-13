@@ -113,6 +113,17 @@ function esc(s) {
   return String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 }
 
+const PLAN_CHIPS = {
+  business: "Business", team: "Team", enterprise: "Enterprise", pro: "Pro",
+  plus: "Plus", max: "Max", free: "Free",
+};
+
+function planChip(plan) {
+  const key = typeof plan === "string" ? plan.trim().toLowerCase() : "";
+  const label = Object.prototype.hasOwnProperty.call(PLAN_CHIPS, key) ? PLAN_CHIPS[key] : null;
+  return label ? `<span class="mono chip">${label}</span>` : "";
+}
+
 // --- seat card --------------------------------------------------------------------------------
 
 function statusBit(tool, seat) {
@@ -147,7 +158,7 @@ function bar(seat, win, label) {
 }
 
 function seatCard(tool, seat) {
-  const plan = seat.plan ? `<span class="mono chip">${esc(seat.plan)}</span>` : "";
+  const plan = planChip(seat.plan);
   const fetchedAt = seat.usage_fetched_at || seat.usage?.fetched_at || "";
   const error = seat.usage?.error;
   const issue = ({ rate_limited: "usage updates throttled · retrying automatically",

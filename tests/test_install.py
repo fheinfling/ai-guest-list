@@ -406,7 +406,7 @@ def test_ensure_launchers_uses_bundle_python_when_frozen(tmp_path, monkeypatch):
     assert "PYTHONHOME=/Bundle.app/Contents/Resources" in body
     assert "exec /Bundle.app/Contents/MacOS/python -m acctsw" in body
     assert "SSL_CERT_FILE=/Bundle.app/Contents/Resources/openssl.ca/cert.pem" in body
-    assert "SSL_CERT_DIR=/Bundle.app/Contents/Resources/openssl.ca/certs" in body
+    assert "SSL_CERT_DIR=/Bundle.app/Contents/Resources/openssl.ca/no-such-file" in body
     assert "PYTHONPATH=" not in body           # no PYTHONPATH *assignment* (the ≤0.2.3 crash cause)
     assert "unset PYTHONHOME PYTHONPATH" in body   # clears any inherited leak before setting our own
     assert "python311.zip" not in body and "/usr/bin/python3" not in body
@@ -475,8 +475,8 @@ def test_bundle_wrapper_gives_ssl_a_relocatable_verified_ca(tmp_path):
     bundle = tmp_path / "Some Other Machine" / "AI Guest List.app" / "Contents"
     resources = bundle / "Resources"
     ca_file = resources / "openssl.ca" / "cert.pem"
-    ca_dir = resources / "openssl.ca" / "certs"
-    ca_dir.mkdir(parents=True)
+    ca_dir = resources / "openssl.ca" / "no-such-file"
+    ca_file.parent.mkdir(parents=True)
     ca_file.write_text("simulated packaged CA bundle\n")
 
     bundle_python = bundle / "MacOS" / "python"
@@ -513,9 +513,10 @@ def test_bundle_wrapper_gives_ssl_a_relocatable_verified_ca(tmp_path):
     assert result.stdout.splitlines() == [
         str(resources),
         str(ca_file),
-        str(ca_dir),
+        "None",
         str(ssl.CERT_REQUIRED),
     ]
+    assert not ca_dir.exists()
 
 
 def test_ensure_launchers_heals_wrapper_with_dead_interpreter(tmp_path, monkeypatch):

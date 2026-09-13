@@ -60,7 +60,7 @@ payload = {
     },
 }
 windows = parse_codex(payload)
-verify_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+verify_context = ssl.create_default_context()
 verify_paths = ssl.get_default_verify_paths()
 print(json.dumps({
     "module_file": acctsw.__file__,
@@ -69,6 +69,7 @@ print(json.dumps({
     "cafile": verify_paths.cafile,
     "capath": verify_paths.capath,
     "verify_mode": verify_context.verify_mode,
+    "cert_store_stats": verify_context.cert_store_stats(),
     "canonical_codex_home": str(paths.CODEX_HOME),
     "commands": sorted(subcommands),
     "five_hour_pct": windows["5h"].used_pct,
@@ -104,13 +105,12 @@ def smoke(bundle_arg: Path) -> None:
     bundle_python = contents / "MacOS" / "python"
     info_path = contents / "Info.plist"
     ca_file = resources / "openssl.ca" / "cert.pem"
-    ca_dir = resources / "openssl.ca" / "certs"
+    ca_dir = resources / "openssl.ca" / "no-such-file"
 
     for path, description in (
         (bundle_python, "bundled Python interpreter"),
         (info_path, "bundle Info.plist"),
         (ca_file, "packaged CA file"),
-        (ca_dir, "packaged CA directory"),
     ):
         _check(path.exists(), f"missing {description}: {path}")
     _check(ca_file.is_file() and ca_file.stat().st_size > 0, f"packaged CA file is empty: {ca_file}")
@@ -190,10 +190,12 @@ def smoke(bundle_arg: Path) -> None:
                "wrapper probe package version/build does not match Info.plist")
         _check(probe["cafile"] == str(ca_file),
                f"ssl CA file is not bundle-relative: {probe['cafile']!r}")
-        _check(probe["capath"] == str(ca_dir),
-               f"ssl CA directory is not bundle-relative: {probe['capath']!r}")
+        _check(probe["capath"] is None and not ca_dir.exists(),
+               f"ssl unexpectedly uses a CA directory: {probe['capath']!r}")
         _check(probe["verify_mode"] == ssl.CERT_REQUIRED,
                f"TLS certificate verification is not required: mode={probe['verify_mode']}")
+        _check(probe["cert_store_stats"]["x509_ca"] > 0,
+               f"bundled CA file loaded no trust roots: {probe['cert_store_stats']!r}")
         _check(probe["canonical_codex_home"] == str(expected_home),
                f"private inherited CODEX_HOME became canonical: {probe['canonical_codex_home']!r}")
         _check(CORE_COMMANDS <= set(probe["commands"]),
