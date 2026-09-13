@@ -5,12 +5,74 @@ from pathlib import Path
 from acctsw import accounts as acct
 from acctsw import install as inst
 from acctsw.web_dot import dot_for, door_for
-from app.menubar import bootstrap_supervision
+from app.menubar import (bootstrap_supervision, usage_poll_interval,
+                         USAGE_POLL_OPEN_SECONDS, USAGE_POLL_HIDDEN_SECONDS,
+                         request_codex_restart, launch_codex_desktop, usage_poll_scope)
 from app import terminal
 from tests.conftest import make_codex_blob
 
 FIXTURE = Path(__file__).parent / "fixtures" / "dot_cases.json"
 DOOR_FIXTURE = Path(__file__).parent / "fixtures" / "door_cases.json"
+
+
+def test_usage_poll_cadence_is_fast_only_while_the_popover_is_open():
+    """The native timer may be responsive while visible without hammering provider endpoints hidden."""
+    assert usage_poll_interval(True) == USAGE_POLL_OPEN_SECONDS == 30.0
+    assert usage_poll_interval(False) == USAGE_POLL_HIDDEN_SECONDS == 180.0
+
+
+def test_open_popover_keeps_a_full_seat_sweep_on_the_hidden_cadence():
+    assert usage_poll_scope(True, 100.0, at=129.0) == "active"
+    assert usage_poll_scope(True, 100.0, at=280.0) == "all"
+    assert usage_poll_scope(False, 270.0, at=271.0) == "all"
+
+
+class _RunningApp:
+    def __init__(self, *, name="Codex", bundle="com.openai.codex", accepts=True):
+        self.name, self.bundle, self.accepts = name, bundle, accepts
+        self.terminate_calls = 0
+
+    def localizedName(self):
+        return self.name
+
+    def bundleIdentifier(self):
+        return self.bundle
+
+    def terminate(self):
+        self.terminate_calls += 1
+        return self.accepts
+
+
+def test_codex_restart_requests_a_graceful_quit_without_touching_other_apps():
+    codex = _RunningApp()
+    other = _RunningApp(name="Safari", bundle="com.apple.Safari")
+
+    assert request_codex_restart([other, codex]) == (True, None)
+    assert codex.terminate_calls == 1 and other.terminate_calls == 0
+
+
+def test_codex_restart_does_not_launch_over_a_quit_that_was_refused():
+    codex = _RunningApp(accepts=False)
+
+    running, error = request_codex_restart([codex])
+
+    assert running is True and "did not accept" in error
+    assert codex.terminate_calls == 1
+
+
+def test_launch_codex_reports_failures_and_does_not_raise():
+    def fail(_argv, **_kwargs):
+        raise OSError("open is unavailable")
+
+    assert launch_codex_desktop(run=fail) == "open is unavailable"
+
+
+def test_launch_codex_surfaces_a_nonzero_open_result():
+    class FailedOpen:
+        returncode = 1
+        stderr = "Application not found"
+
+    assert launch_codex_desktop(run=lambda *_args, **_kwargs: FailedOpen()) == "Application not found"
 
 
 def test_bootstrap_repairs_missing_rc_block_and_stays_idempotent(ctx):

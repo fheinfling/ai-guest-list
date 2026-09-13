@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   buildHTML, dotState, dotKey, doorKey, doorMark, creditLeft, pct, fmtCountdown, needsHello,
-  buildSettings, buildAddSeat, reduceReply, supervisionBanner,
+  buildSettings, buildAddSeat, reduceReply, supervisionBanner, fmtUsageAge, updateClockText,
 } from "./render.mjs";
 
 const mkAdd = (over = {}) => ({ step: "provider", provider: null, name: "", method: "browser", token: "", ...over });
@@ -93,7 +93,7 @@ test("status: active=pill, ready=switch btn, resting=countdown+reassurance, need
   assert.match(mk("needs-login"), /btn rose"[^>]*data-action="add"/);
 });
 
-test("stale usage dims bars and says when it was last checked", () => {
+test("stale usage preserves bars and labels the last successful reading", () => {
   const html = buildHTML(state({ tools: {
     codex: { seats: [seat({
       usage_stale: true,
@@ -102,7 +102,9 @@ test("stale usage dims bars and says when it was last checked", () => {
     claude: { seats: [] },
   } }));
   assert.equal((html.match(/class="usage usage--stale"/g) || []).length, 2);
-  assert.match(html, /class="reassure mono">last checked \d{1,2}:12 (?:AM|PM)</);
+  assert.match(html, /data-usage-at="2026-06-28T12:12:00Z"/);
+  assert.match(html, /usage-age--stale/);
+  assert.match(html, /last known/);
   assert.match(html, /20%/);  // stale is last-known and labeled; only unknown suppresses the number
 });
 
@@ -155,13 +157,52 @@ test("reassurance never appears on active/ready seats", () => {
   assert.doesNotMatch(html, /taking a breather/);
 });
 
-test("single 5h bar in collapsed card; 7d lives in expand", () => {
+test("both usage windows stay visible on collapsed Codex and Claude cards", () => {
+  for (const tool of ["codex", "claude"]) {
   const html = buildHTML(state({ tools: {
-    codex: { seats: [seat({ status: "ready", usage5h: 25, usageWeek: 60 })] }, claude: { seats: [] } } }));
-  assert.match(html, /u-k">5h</);
-  assert.match(html, /u-k">7d</);            // present but inside .expand (hidden until tapped)
-  assert.match(html, /class="expand"/);
-  assert.match(html, /25%/);
+    [tool]: { seats: [seat({ status: "active", usage5h: 0, usageWeek: 65,
+      usage_fetched_at: "2026-09-13T12:00:00Z",
+      usage: { windows: { weekly: { resets_at: "2026-09-14T17:00:00Z" } } },
+    })] } } }));
+  const collapsed = html.slice(0, html.indexOf('class="expand"'));
+  assert.match(collapsed, /u-k">5h</);
+  assert.match(collapsed, /u-k">7d</);
+  assert.match(collapsed, /0%/);
+  assert.match(collapsed, /65%/);
+  assert.match(collapsed, /data-reset-at="2026-09-14T17:00:00Z"/);
+  assert.match(collapsed, /data-usage-at="2026-09-13T12:00:00Z"/);
+  }
+});
+
+test("usage ages handle fresh, old, missing, and future timestamps", () => {
+  const at = Date.parse("2026-09-13T12:00:00Z");
+  assert.equal(fmtUsageAge("2026-09-13T11:59:31Z", at), "updated 29s ago");
+  assert.equal(fmtUsageAge("2026-09-13T11:58:00Z", at), "updated 2m ago");
+  assert.equal(fmtUsageAge("2026-09-13T10:00:00Z", at), "updated 2h ago");
+  assert.equal(fmtUsageAge("2026-09-11T12:00:00Z", at), "updated 2d ago");
+  assert.equal(fmtUsageAge("2026-09-13T12:01:00Z", at), "updated 0s ago");
+  assert.equal(fmtUsageAge(null, at), "waiting for first reading");
+  assert.equal(fmtUsageAge("invalid", at), "waiting for first reading");
+});
+
+test("clock ticks update age and reset text without replacing the DOM", () => {
+  const age = { dataset: { usageAt: "2026-09-13T11:59:30Z" } };
+  const reset = { dataset: { resetAt: "2026-09-13T12:02:00Z" } };
+  const rest = { dataset: { resetAt: "2026-09-13T12:03:00Z", clockPrefix: "back in" } };
+  const root = { querySelectorAll: (selector) => selector === "[data-usage-at]" ? [age] : [reset, rest],
+    set innerHTML(_) { assert.fail("clock ticks must preserve existing controls and focus"); } };
+  updateClockText(root, Date.parse("2026-09-13T12:00:00Z"));
+  assert.equal(age.textContent, "updated 30s ago");
+  assert.equal(reset.textContent, "resets in 2m");
+  assert.equal(rest.textContent, "back in 3m");
+});
+
+test("provider throttling is visible alongside retained usage", () => {
+  const html = buildHTML(state({ tools: { claude: { seats: [seat({ usage_stale: true,
+    usage: { error: "rate_limited" }, usage5h: 0, usageWeek: 65 })] } } }));
+  assert.match(html, /usage updates throttled · retrying automatically/);
+  assert.match(html, /65%/);
+  assert.match(html, /waiting for first reading/);
 });
 
 test("flat status dots, not emoji", () => {

@@ -845,10 +845,22 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
 
     auth_failed: set = set()   # seats whose token died THIS run — skip them for the rest of it
 
+    def _auto_switch_is_on() -> bool:
+        """Read the live preference at an unlocked decision boundary.
+
+        A hard-limit landing pre-flight performs network I/O, so the toggle may change while it is
+        in flight.  Every path that can stop a child rechecks at such a boundary rather than treating
+        the setting sampled before the fetch as a lease to swap credentials later.
+        """
+        with ctx.locked():
+            return bool(ctx.load_state().settings().get("auto_switch", True))
+
     def _wait_and_activate(cold_start: bool = False) -> bool:
+        if not cold_start and not _auto_switch_is_on():
+            return False
         email = _wait_for_unlock(ctx, tool, notify, sleep, get, exclude=auth_failed,
                                  cold_start=cold_start)
-        if email is None:
+        if email is None or (not cold_start and not _auto_switch_is_on()):
             return False
         hopped = False
         live_identity = None
@@ -861,6 +873,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             live_identity = _claude_live_identity()  # slow Claude status happens before the flock
         with ctx.locked():
             state = ctx.load_state()
+            if not cold_start and not state.settings().get("auto_switch", True):
+                return False
             if email != state.active(tool):
                 _commit_switch(state, email, live_identity)
                 hopped = True
@@ -970,6 +984,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             "auth_stay_notified": False,
             "revoked_stay_notified": False,
             "budget_notified": False,
+            "auto_switch_off_notified": False,
         }
 
         def _dismissed() -> None:
@@ -1066,7 +1081,13 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     dec = handle_limit(ctx, state, tool, get=get, exclude=auth_failed,
                                        corroborated=True, hard=hard, reset_at=reset_at,
                                        source=source, detail=detail)
-                approved = dec.action == "switch" and switches < max_switches
+                # The app can continue to supervise a session and record a confirmed rest while
+                # automatic hopping is disabled.  In that mode the running child keeps ownership
+                # of its terminal and exit code; a later cold start can still safely select a
+                # non-resting seat.  This check sits in the shared decision tail so rollout,
+                # stdout, the menubar state signal and auth/revocation paths all obey it.
+                auto_switch = bool(state.settings().get("auto_switch", True))
+                approved = auto_switch and dec.action == "switch" and switches < max_switches
                 if realigned and not approved:
                     # Not hopping after all: put the pointer back so a seat the user picked in the
                     # GUI still applies to their next session.
@@ -1112,6 +1133,16 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                         clear()
                         scan["next_probe"] = time.monotonic() + PROBE_COOLDOWN_S
                         return False
+                # A settings change while the hard-seat pre-flight was in flight wins.  Do this
+                # immediately before filling `hit`: the spawn callback stops the child only after
+                # this function returns True.
+                if not _auto_switch_is_on():
+                    _undo_realign()
+                    clear()
+                    if not scan["auto_switch_off_notified"]:
+                        notify(f"{tool} hit a confirmed limit, but auto-switch is off — staying on this seat")
+                        scan["auto_switch_off_notified"] = True
+                    return False
                 hit.update({
                     "reason": reason,
                     "email": landing,
@@ -1124,6 +1155,11 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             # output is not mistaken for a fresh banner; the child keeps its terminal and argv.
             clear()
             scan["next_probe"] = time.monotonic() + PROBE_COOLDOWN_S
+            if not auto_switch:
+                if not scan["auto_switch_off_notified"]:
+                    notify(f"{tool} hit a confirmed limit, but auto-switch is off — staying on this seat")
+                    scan["auto_switch_off_notified"] = True
+                return False
             if dec.action == "switch":  # a seat exists, but the budget is already spent
                 if not scan["budget_notified"]:
                     suffix = (
@@ -1405,7 +1441,10 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 # continues instead of dying on a maxed seat. A clean (0) exit is a real completion —
                 # never second-guess it, and a user abort (Ctrl-C/kill) is not a limit — only a
                 # POSITIVE, non-abort failure code is worth a usage check. See handle_exhausted.
-                if status > 0 and status not in _ABORT_EXITS and switches < max_switches:
+                with ctx.locked():
+                    auto_switch = bool(ctx.load_state().settings().get("auto_switch", True))
+                if (status > 0 and status not in _ABORT_EXITS and switches < max_switches
+                        and auto_switch):
                     ua = (usage_mod.claude_user_agent(getattr(ctx, "claude_bin", None))
                           if tool == "claude" else None)  # subprocess — before the state flock
                     with ctx.locked():
@@ -1426,7 +1465,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                         with ctx.locked():
                             state = ctx.load_state()
                             landing = choose(state, tool, exclude=auth_failed)
-                            if (state.active(tool) == active and landing.available
+                            if (state.settings().get("auto_switch", True)
+                                    and state.active(tool) == active and landing.available
                                     and landing.email == dec.email):
                                 _commit_switch(state, dec.email, live_identity)
                                 switched = True
@@ -1457,9 +1497,22 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             # checked the budget while the child was alive. Commit that decision without choose() or
             # another usage fetch on the corpse.
             live_identity = _claude_live_identity()  # slow Claude status happens before the flock
+            committed = False
+            handoff_blocked = ""
             with ctx.locked():
                 state = ctx.load_state()
-                _commit_switch(state, hit["email"], live_identity)
+                # The preference can change after the callback approved the stop but before the
+                # child exits.  Do not let that stale approval write a credential swap.
+                if not state.settings().get("auto_switch", True):
+                    handoff_blocked = "auto-switch was turned off before the handoff completed"
+                elif state.active(tool) != hit["active"]:
+                    handoff_blocked = "another switch changed the active seat before the handoff completed"
+                else:
+                    _commit_switch(state, hit["email"], live_identity)
+                    committed = True
+            if not committed:
+                notify(f"{tool} {handoff_blocked}")
+                return status
             mark_session(ctx.data_dir, tool, hit["email"])
             reason_msg = (
                 "needs you to sign in again 🔑" if hit["reason"] == "auth"

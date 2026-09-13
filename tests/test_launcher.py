@@ -510,6 +510,29 @@ def test_run_switches_and_resumes_on_limit(ctx):
     assert any("hopping to b@x.com" in m for m in msgs)
 
 
+def test_run_with_auto_switch_off_keeps_a_limited_live_child_on_its_seat(ctx):
+    """Turning the app toggle off must never turn a confirmed banner into a forced PTY stop.
+
+    The limit is still recorded for a safe next launch, but the child retains its own exit code and
+    the launcher neither swaps credentials nor resumes on the spare.
+    """
+    _two_codex(ctx)  # active a, spare b
+    state = ctx.load_state()
+    state.set_setting("auto_switch", False)
+    state.save()
+    reset = iso(now() + timedelta(hours=3))
+    get = fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=100.0, p_reset=reset))})
+    msgs = []
+    spawn = FakeSpawn([(b"... you've hit your usage limit ...\n", 17)])
+
+    rc = run(ctx, "codex", [], spawn=spawn, get=get, notify=msgs.append)
+
+    assert rc == 17
+    assert spawn.stops == 0 and len(spawn.calls) == 1
+    assert ctx.load_state().active("codex") == "a@x.com"
+    assert any("auto-switch is off" in m for m in msgs)
+
+
 def test_run_hops_off_forbidden_seat_without_resting_it(ctx):
     """A live limit banner plus a 403 is positive proof that the subscription is gone. The
     supervisor must treat that verdict like dead credentials, stop only after preflighting the

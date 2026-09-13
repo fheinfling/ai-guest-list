@@ -1,6 +1,6 @@
 // Live glue: render state into the DOM and forward user actions to the Python bridge.
 // All rendering logic lives in render.mjs (pure, unit-tested); this file is the thin wiring.
-import { buildHTML, buildSettings, buildAddSeat, addUsesPaste, reduceReply } from "./render.mjs";
+import { buildHTML, buildSettings, buildAddSeat, addUsesPaste, reduceReply, updateClockText } from "./render.mjs";
 
 const root = document.getElementById("root");
 const overlay = document.createElement("div");   // toast surface only (siblings of #root)
@@ -67,8 +67,8 @@ let clockTimer = null;
 function setPopoverVisible(visible) {
   if (visible && clockTimer === null) {
     clockTimer = setInterval(() => {
-      // Only the main screen has live countdowns. Never swap the add form under a focused input.
-      if (screen === "main") render();
+      // Tick text without rebuilding the DOM or disturbing keyboard focus.
+      if (screen === "main") updateClockText(root);
     }, 1000);
   } else if (!visible && clockTimer !== null) {
     clearInterval(clockTimer);

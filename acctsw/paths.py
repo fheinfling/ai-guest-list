@@ -46,8 +46,12 @@ ANTHROPIC_VERSION = "2023-06-01"
 # Codex usage requires identifying the ChatGPT account via this header.
 CODEX_ACCOUNT_ID_HEADER = "ChatGPT-Account-Id"
 
-# Usage caching: don't poll more often than this (Claude's endpoint rate-limits hard).
-USAGE_MIN_REFRESH_SECONDS = 150  # ~2.5 min
+# Usage caching.  The active seats are the values a person is watching in the popover, so they may
+# refresh on the visible 30-second cadence.  Parked seats retain the gentler 2.5-minute cadence.
+# Failed requests always use the parked-seat base for exponential backoff; opening the popover must
+# never turn an Anthropic 429 into a retry storm.
+USAGE_ACTIVE_REFRESH_SECONDS = 30
+USAGE_MIN_REFRESH_SECONDS = 150  # parked seats / error-backoff base (~2.5 min)
 
 
 def ensure_data_dirs() -> None:
