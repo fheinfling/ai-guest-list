@@ -267,10 +267,17 @@ def _verify_capacity(ctx: Context, tool: str, get, *, at, force: bool,
         state = ctx.load_state()
         changed = False
         for email, blob, u in results:
-            if state.get_seat(tool, email) is not None:   # seat may have been removed mid-wait
-                usage_mod.store_fetch(state, tool, email, u, at=at,
-                                      trust_reactive_lag=trust_reactive_lag, blob=blob)
-                changed = True
+            seat = state.get_seat(tool, email)
+            if seat is None or usage_mod._seat_blob(ctx, state, tool, email) != blob:
+                continue  # removed, re-authenticated, or changed identity while the request ran
+            previous = seat.get("usage") or {}
+            previous_attempt = parse_iso(previous.get("last_attempted_at") or previous.get("fetched_at"))
+            fetched_at = parse_iso(u.fetched_at)
+            if previous_attempt and fetched_at and previous_attempt > fetched_at:
+                continue  # a newer GUI/launcher observation already superseded this result
+            usage_mod.store_fetch(state, tool, email, u, at=at,
+                                  trust_reactive_lag=trust_reactive_lag, blob=blob)
+            changed = True
         # Trust the clock for markers the fetches did not re-stamp: clear EVERY seat whose rest has
         # expired by ``at`` (the old wait cleared only the one chosen seat, leaving stale siblings).
         for email, seat in state.accounts(tool).items():
@@ -938,10 +945,12 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             sel = choose(state, tool)
             claude_switch_needed = (
                 tool == "claude"
+                and sel.available
                 and bool(sel.email)
                 and sel.email != state.active(tool)
             )
-            if sel.email and sel.email != state.active(tool) and not claude_switch_needed:
+            if (sel.available and sel.email and sel.email != state.active(tool)
+                    and not claude_switch_needed):
                 switch(ctx, state, tool, sel.email, sync=(tool != "codex"),
                        live_identity=None)
             _activate_codex_home(state.active(tool))
@@ -950,7 +959,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             with ctx.locked():
                 state = ctx.load_state()
                 sel = choose(state, tool)  # selection may have changed while identity resolved
-                if sel.email and sel.email != state.active(tool):
+                if sel.available and sel.email and sel.email != state.active(tool):
                     switch(ctx, state, tool, sel.email, live_identity=live_identity)
         if sel.all_limited:
             # The wait verifies against the live endpoint and recomputes targets from state, so it
@@ -961,9 +970,9 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         switches = 0
         resuming = False
         if initial_resting is not None:
-            if _wait_and_activate(cold_start=True):   # initial launch: relax a stale reactive guess
-                resuming = True
-            else:
+            # No child has run yet. Even after waiting, honor the original invocation (including
+            # --version or a fresh prompt); only a handoff during a session should add resume.
+            if not _wait_and_activate(cold_start=True):
                 notify(f"all {tool} seats are resting; soonest unlocks at "
                        f"{initial_resting.unlocks_at}")
                 return EXIT_GAVE_UP
@@ -1549,7 +1558,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     if active:
                         blob = ctx.snapshot_get("codex", active)   # home = source of truth
                         if blob:
-                            ctx.cred["codex"].set_live(blob)        # mirror → ~/.codex
+                            ctx.set_live("codex", blob)             # mirror → ~/.codex
             else:
                 with ctx.locked():
                     st = ctx.load_state()

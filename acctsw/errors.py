@@ -20,3 +20,11 @@ class UnknownSeat(AcctswError):
 
 class MissingSnapshot(AcctswError):
     """A seat is registered but its credential snapshot is missing from the keychain."""
+
+
+class CredentialIdentityMismatch(AcctswError):
+    """Codex credential bytes do not identify as the seat they would overwrite."""
+
+
+class UnsafeCodexMirror(AcctswError):
+    """The shared Codex mirror was resolved to one of acctsw's private seat homes."""

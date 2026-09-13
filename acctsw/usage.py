@@ -332,6 +332,37 @@ def _codex_window_objs(src: dict) -> tuple[dict, dict]:
             secondary if isinstance(secondary, dict) else {})
 
 
+def _codex_labeled_windows(src: dict) -> dict[str, dict]:
+    """Map Codex windows by their declared duration, with a legacy positional fallback.
+
+    Most payloads historically omitted ``limit_window_seconds`` and used primary=5h and
+    secondary=weekly. Newer plans can expose only a seven-day *primary* window, so position is no
+    longer a reliable label when a duration is present. Explicit unknown durations get an honest
+    stable key so limit calculations retain them without presenting them as a 5h limit.
+    """
+    labeled: dict[str, dict] = {}
+    positions = (("primary", "5h"), ("secondary", "weekly"))
+    for window, (position, legacy_label) in zip(_codex_window_objs(src), positions):
+        if not window:
+            continue
+        if "limit_window_seconds" not in window:
+            label = legacy_label
+        else:
+            duration = _num(window, "limit_window_seconds")
+            label = {5 * 60 * 60: "5h", 7 * 24 * 60 * 60: "weekly"}.get(duration)
+            if label is None:
+                if duration is None:
+                    label = f"{position}_window"
+                elif duration.is_integer():
+                    label = f"window_{int(duration)}s"
+                else:
+                    label = f"window_{duration:g}s"
+        if label in labeled:
+            label = f"{label}_{position}"
+        labeled[label] = window
+    return labeled
+
+
 def parse_codex(payload: dict) -> dict[str, Window]:
     """Parse the real ChatGPT ``wham/usage`` shape (and tolerate minor variations).
 
@@ -340,8 +371,12 @@ def parse_codex(payload: dict) -> dict[str, Window]:
         {"rate_limit": {"primary_window":   {"used_percent": int, "reset_at": <epoch>},
                         "secondary_window": {"used_percent": int, "reset_at": <epoch>}}}
     """
-    primary, secondary = _codex_window_objs(_codex_rate_src(payload))
-    return {"5h": _window_from(primary), "weekly": _window_from(secondary)}
+    labeled = _codex_labeled_windows(_codex_rate_src(payload))
+    windows = {"5h": _window_from(labeled.get("5h")),
+               "weekly": _window_from(labeled.get("weekly"))}
+    windows.update({key: _window_from(window) for key, window in labeled.items()
+                    if key not in windows})
+    return windows
 
 
 def codex_limit_reached(payload: dict) -> bool | None:
@@ -365,23 +400,31 @@ def parse_codex_flags(payload: dict) -> dict[str, Any]:
     """
     p = payload if isinstance(payload, dict) else {}
     rl = _codex_rate_src(p)
-    reached = p.get("rate_limit_reached_type")
-    if not (isinstance(reached, str) and reached):
-        reached = rl.get("rate_limit_reached_type")
-    primary, secondary = _codex_window_objs(rl)
+    def _reached_type(value: Any) -> str | None:
+        if isinstance(value, dict):
+            value = value.get("type")
+        return value if (isinstance(value, str) and value) else None
+
+    reached = _reached_type(p.get("rate_limit_reached_type"))
+    if reached is None:
+        reached = _reached_type(rl.get("rate_limit_reached_type"))
+    labeled = _codex_labeled_windows(rl)
 
     def _secs(w: dict) -> int | None:
         n = _num(w, "reset_after_seconds")
         return int(n) if n is not None else None
 
+    relative_resets = {key: _secs(window) for key, window in labeled.items()}
+    relative_resets.setdefault("5h", None)
+    relative_resets.setdefault("weekly", None)
     plan = p.get("plan_type")
     return {
         "plan_type": plan if isinstance(plan, str) else None,
         "allowed": _bool(rl, "allowed"),
-        "reached_type": reached if (isinstance(reached, str) and reached) else None,
+        "reached_type": reached,
         "spend_control_reached": _bool(p.get("spend_control"), "reached"),
         "has_credits": _bool(p.get("credits"), "has_credits"),
-        "reset_after_seconds": {"5h": _secs(primary), "weekly": _secs(secondary)},
+        "reset_after_seconds": relative_resets,
     }
 
 
@@ -486,12 +529,26 @@ FALSE_ALARM_MAX_PCT = 90.0
 
 
 def _seat_blob(ctx, state, tool: str, email: str) -> str | None:
-    """Freshest creds for a seat: live blob if it's active, else the keychain snapshot."""
-    if state.active(tool) == email:
+    """Freshest credentials that can be proved to belong to the requested seat."""
+    snapshot = ctx.snapshot_get(tool, email)
+    if state.active(tool) != email:
+        return snapshot
+    if tool == "codex":
+        # A supervised Codex process rotates the auth file in its private CODEX_HOME. The shared
+        # mirror may be both stale and pointed at another account, so the private snapshot is the
+        # source of truth while that process owns this seat.
+        from . import session
+        running = session.active_session(ctx.data_dir, "codex")
+        if running and running.get("email") == email:
+            return snapshot
         live = ctx.cred[tool].get_live()
         if live:
-            return live
-    return ctx.snapshot_get(tool, email)
+            from .credlocations import codex_jwt_matches
+            if codex_jwt_matches(email, live):
+                return live
+        return snapshot
+    live = ctx.cred[tool].get_live()
+    return live or snapshot
 
 
 def _fetch_for(tool: str, blob: str, get: HttpGet, ua: str | None) -> Usage:
@@ -892,10 +949,9 @@ def _apply_limit(state, tool: str, email: str, u: Usage, at, *,
                  trust_reactive_lag: bool = True) -> None:
     """Update limited_until from usage, without prematurely clearing a rest the fetch can't disprove.
 
-    - A still-future ``hard`` flag (tool-side billing banner, e.g. codex "workspace out of credits")
-      is NEVER cleared, re-stamped, or downgraded early: the usage windows can look perfectly
-      healthy — or maxed with a short reset — while the seat is genuinely unusable, and replacing
-      the flag with a clearable ``usage`` stamp would re-pick the creditless seat in a ping-pong loop.
+    - A still-future ``hard`` flag survives ordinary and in-session polling. At a new Codex
+      launch only, an explicit provider ``allowed: true`` with clear headroom can disprove an
+      old billing block. Percentages alone cannot: they may look healthy while credits are out.
     - A limited fetch whose payload carries NO reset data stamps a DEFAULT_COOLDOWN estimate ONCE:
       an existing still-future stamp is kept STABLE rather than re-anchored to ``at`` on every poll,
       which would make the launcher's wait target recede forever (and re-notify on each poll).
@@ -904,7 +960,7 @@ def _apply_limit(state, tool: str, email: str, u: Usage, at, *,
       lag, so it clears the flag: that stale false positive is what wrongly blocked launches with
       "all seats resting" when capacity actually existed.
 
-    ``trust_reactive_lag`` (default True) governs ONLY the near-max reactive branch below:
+    ``trust_reactive_lag`` (default True) also preserves hard billing blocks in-session:
       - True  (in-session probes, menubar poll, in-wait polling sweeps): keep a reactive rest whenever
         the busiest window sits in the lag band (>=FALSE_ALARM_MAX_PCT). Mid-run the endpoint can trail
         a real limit by a few percent, and clearing it here would ping-pong the launcher back onto a
@@ -924,7 +980,10 @@ def _apply_limit(state, tool: str, email: str, u: Usage, at, *,
     until = parse_iso((seat or {}).get("limited_until"))
     live = until is not None and until > at
     if src == "hard" and live:
-        return  # billing banner: the seat is already rested; nothing here may weaken that
+        if (tool == "codex" and not trust_reactive_lag
+                and u.allowed is True and _confirmed_healthy(u)):
+            state.set_limited_until(tool, email, None)
+        return
     if _is_limited(u):
         reset = _limit_reset(u)
         if reset:

@@ -282,6 +282,8 @@ def _wrapper_stale(body: str) -> bool:
       - a frozen py2app stdlib zip on PYTHONPATH (≤0.2.3 — crashes a foreign python with "encodings"),
       - the bundle python WITHOUT PYTHONHOME (0.2.4 — the bundle python then can't find its own stdlib
         on a machine that lacks a system Python.framework), or
+      - the bundle python without its bundled OpenSSL CA file (0.8.3 — TLS otherwise falls back to
+        the Python build machine's compiled-in certificate path), or
       - an interpreter path that no longer exists (the .app was moved/renamed, or a venv was deleted)."""
     if _POISON_RE.search(body):
         return True
@@ -289,6 +291,8 @@ def _wrapper_stale(body: str) -> bool:
     if exe is None:
         return False
     if exe.endswith(".app/Contents/MacOS/python") and "PYTHONHOME=" not in body:
+        return True
+    if exe.endswith(".app/Contents/MacOS/python") and "SSL_CERT_FILE=" not in body:
         return True
     try:
         return os.path.isabs(exe) and not Path(exe).exists()
@@ -358,13 +362,20 @@ def _wrapper_script(name: str, python: str, pkg_root: Path, bin_dir: Path) -> st
             # machine, so it can't find its stdlib and dies with "can't find module 'encodings'". Point
             # PYTHONHOME at the bundle's own Resources (which carries lib/python311.zip + lib/python3.11)
             # so it ALWAYS resolves acctsw and the stdlib from inside the .app, machine-independently.
+            # Invoking this interpreter directly skips py2app's __boot__.py, which normally points
+            # OpenSSL at the CA bundle py2app ships. Set the same paths here: without them ssl falls
+            # back to the Python build machine's compiled-in /Library or Homebrew location.
             # `unset` the leaked redirect vars first (a Terminal the app spawned inherits py2app's
             # PYTHONHOME/PYTHONPATH) so only our explicit PYTHONHOME on the exec line takes effect.
             from .procenv import _PY_ENV_STRIP
-            home = shlex.quote(str(Path(python).parent.parent / "Resources"))
+            resources = Path(python).parent.parent / "Resources"
+            home = shlex.quote(str(resources))
+            ca_file = shlex.quote(str(resources / "openssl.ca" / "cert.pem"))
+            ca_dir = shlex.quote(str(resources / "openssl.ca" / "certs"))
             return (f"#!/bin/sh\n# ai guest list engine\n"
                     f"unset {' '.join(_PY_ENV_STRIP)}\n"
-                    f'PYTHONHOME={home} exec {py} -m acctsw "$@"\n')
+                    f"PYTHONHOME={home} SSL_CERT_FILE={ca_file} SSL_CERT_DIR={ca_dir} "
+                    f'exec {py} -m acctsw "$@"\n')
         # Source checkout: set PYTHONPATH to ONLY pkg_root — do NOT append "$PYTHONPATH". If this wrapper
         # runs from a shell that inherited py2app's leaked PYTHONPATH (the frozen 3.11 stdlib zip),
         # appending it would shadow the interpreter's stdlib and crash `python -m acctsw`.
@@ -438,7 +449,7 @@ def uninstall(ctx: Context, *, purge: bool = False, dry_run: bool = False,
             snap = (ctx.snapshot_get(tool, orig_email) if orig_email else None)
             if snap is not None:
                 plan.do(f"restore original {tool}:{orig_email} (freshest snapshot)",
-                        lambda t=tool, b=snap: ctx.cred[t].set_live(b))
+                        lambda t=tool, b=snap: ctx.set_live(t, b))
                 continue
             # (c) last resort: the frozen factory image, sha256-verified.
             factory = ctx.keychain.get(ctx.keychain_service, _backup_account(tool))
@@ -449,7 +460,7 @@ def uninstall(ctx: Context, *, purge: bool = False, dry_run: bool = False,
                 plan.actions.append(f"WARN: factory image for {tool} failed sha256; skipping restore")
                 continue
             plan.do(f"restore original {tool} creds (factory image)",
-                    lambda t=tool, b=factory: ctx.cred[t].set_live(b))
+                    lambda t=tool, b=factory: ctx.set_live(t, b))
     else:
         plan.actions.append("no backup manifest found; nothing to restore")
 

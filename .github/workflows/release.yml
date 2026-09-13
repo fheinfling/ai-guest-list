@@ -56,6 +56,9 @@ jobs:
           python scripts/build-web.py
           python setup.py py2app
 
+      - name: Smoke-test packaged app
+        run: python scripts/smoke-bundle.py
+
       - name: Zip the .app
         run: |
           ditto -c -k --keepParent "dist/AI Guest List.app" "AI-Guest-List-${GITHUB_REF_NAME}.zip"

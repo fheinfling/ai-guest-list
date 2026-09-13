@@ -105,6 +105,72 @@ def test_parse_codex_real_shape():
     assert w["5h"].resets_at is not None  # epoch → iso
 
 
+def test_parse_codex_labels_pro_lite_primary_as_weekly_from_duration():
+    """Pro Lite has one primary 7d window; its position must not make it look like a 5h limit."""
+    body = {
+        "plan_type": "self_serve_business_prolite",
+        "rate_limit": {
+            "allowed": True,
+            "primary_window": {
+                "used_percent": 3,
+                "limit_window_seconds": 604800,
+                "reset_after_seconds": 602784,
+                "reset_at": 1789911732,
+            },
+            "secondary_window": None,
+        },
+    }
+    w = U.parse_codex(body)
+    assert w["5h"].used_pct is None
+    assert w["weekly"].used_pct == 3.0
+    assert w["weekly"].resets_at is not None
+
+
+def test_parse_codex_labels_common_team_windows_from_duration():
+    body = {"rate_limit": {
+        "primary_window": {"used_percent": 4, "limit_window_seconds": 18000},
+        "secondary_window": {"used_percent": 8, "limit_window_seconds": 604800},
+    }}
+    w = U.parse_codex(body)
+    assert w["5h"].used_pct == 4.0
+    assert w["weekly"].used_pct == 8.0
+
+
+def test_parse_codex_retains_unknown_duration_without_labeling_it_as_5h():
+    body = {"rate_limit": {
+        "primary_window": {"used_percent": 91, "limit_window_seconds": 86400},
+        "secondary_window": None,
+    }}
+    w = U.parse_codex(body)
+    assert w["5h"].used_pct is None
+    assert w["weekly"].used_pct is None
+    assert w["window_86400s"].used_pct == 91.0
+
+
+def test_codex_unknown_duration_at_100_percent_still_blocks():
+    body = json.dumps({"rate_limit": {
+        "primary_window": {"used_percent": 100, "limit_window_seconds": 3600,
+                           "reset_after_seconds": 120},
+        "secondary_window": None,
+    }})
+    u = _codex_usage(body)
+    assert u.allowed is None
+    assert u.windows["window_3600s"].used_pct == 100.0
+    assert u.windows["window_3600s"].resets_at is not None
+    assert U._is_limited(u) is True
+    assert U._confirmed_healthy(u) is False
+
+
+def test_parse_codex_malformed_explicit_duration_does_not_use_legacy_label():
+    body = {"rate_limit": {
+        "primary_window": {"used_percent": 100, "limit_window_seconds": "unknown"},
+        "secondary_window": None,
+    }}
+    w = U.parse_codex(body)
+    assert w["5h"].used_pct is None
+    assert w["primary_window"].used_pct == 100.0
+
+
 def test_parse_codex_alt_layout_and_epoch_reset():
     body = {"usage": {"five_hour": {"percent": 33, "reset": 1893456000}}}
     w = U.parse_codex(body)
@@ -588,6 +654,34 @@ def test_codex_reset_after_seconds_used_when_reset_at_missing():
     assert U._limit_reset(u) == u.windows["5h"].resets_at   # the maxed window's own reset
 
 
+def test_codex_reset_after_seconds_follows_duration_label():
+    """The relative reset must stay attached when a primary window is labeled weekly."""
+    at = now()
+    body = json.dumps({"rate_limit": {
+        "primary_window": {"used_percent": 100, "limit_window_seconds": 604800,
+                           "reset_after_seconds": 120},
+        "secondary_window": None,
+    }})
+    u = _codex_usage(body)
+    assert u.windows["5h"].resets_at is None
+    weekly = parse_iso(u.windows["weekly"].resets_at)
+    assert abs((weekly - (at + timedelta(seconds=120))).total_seconds()) < 5
+    assert U._limit_reset(u) == u.windows["weekly"].resets_at
+
+
+def test_codex_reached_type_accepts_live_object_shape():
+    body = json.dumps({
+        "rate_limit": {"allowed": False, "primary_window": None, "secondary_window": None},
+        "rate_limit_reached_type": {
+            "type": "workspace_member_credits_depleted",
+            "details": None,
+        },
+    })
+    u = _codex_usage(body)
+    assert u.reached_type == "workspace_member_credits_depleted"
+    assert U._is_limited(u) is True
+
+
 def test_usage_snapshot_carries_plan_type_and_reached_type(ctx):
     """The new flags must round-trip into the persisted seat so state-only callers can see them."""
     assert set(U.Usage().to_dict()) >= {"plan_type", "allowed", "reached_type",
@@ -719,6 +813,32 @@ def test_seat_blob_prefers_live_for_active(ctx):
     # non-active seat uses its snapshot
     tok_b, _ = U.codex_token_account(U._seat_blob(ctx, state, "codex", "b@x.com"))
     assert tok_b == "a"
+
+
+def test_seat_blob_rejects_mismatched_live_identity_for_active_codex(ctx):
+    state = _seed_two_codex(ctx)  # state still says a@x.com is active
+    wrong = make_codex_blob("b@x.com").replace('"access_token": "a"',
+                                                '"access_token": "WRONG"')
+    ctx.cred["codex"].set_live(wrong)
+    blob = U._seat_blob(ctx, state, "codex", "a@x.com")
+    assert ctx.cred["codex"].email_of(blob) == "a@x.com"
+    assert U.codex_token_account(blob)[0] == "a"  # the rightful private snapshot
+
+
+def test_seat_blob_uses_fresh_private_snapshot_for_supervised_codex(ctx, monkeypatch):
+    from acctsw import session
+    email = "a@x.com"
+    stale = make_codex_blob(email).replace('"access_token": "a"',
+                                             '"access_token": "stale"')
+    fresh = make_codex_blob(email).replace('"access_token": "a"',
+                                             '"access_token": "fresh"')
+    ctx.cred["codex"].set_live(stale)
+    acct.add(ctx, ctx.load_state(), "codex", email=email)
+    ctx.snapshot_set("codex", email, fresh)
+    state = ctx.load_state()
+    monkeypatch.setattr(session, "active_session",
+                        lambda _data_dir, _tool: {"email": email, "pid": 1, "started_at": "x"})
+    assert U.codex_token_account(U._seat_blob(ctx, state, "codex", email))[0] == "fresh"
 
 
 def test_claude_refresh_path(ctx):

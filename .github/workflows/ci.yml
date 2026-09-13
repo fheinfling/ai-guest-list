@@ -70,6 +70,10 @@ jobs:
           python setup.py py2app
           lipo "dist/AI Guest List.app/Contents/MacOS/AI Guest List" -verify_arch "$EXPECTED_ARCH"
 
+      - name: Smoke-test packaged app
+        if: matrix.build
+        run: python scripts/smoke-bundle.py
+
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7 (pinned SHA; Dependabot keeps it current)
         with:
