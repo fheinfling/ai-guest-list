@@ -58,6 +58,8 @@ test("header renders the live door mark, not the old gradient avatar", () => {
 test("needsHello detects needs-login status", () => {
   assert.equal(needsHello(seat({ status: "needs-login" })), true);
   assert.equal(needsHello(seat({ status: "ready" })), false);
+  assert.equal(needsHello(seat({ status: "active", usage: { error: "token_expired" } })), false);
+  assert.equal(needsHello(seat({ status: "active", usage: { error: "unauthorized" } })), true);
 });
 
 test("pct + creditLeft from usage5h/usageWeek", () => {
@@ -129,14 +131,29 @@ test("resting cards show the breather return time without duplicate refresh-stat
   assert.doesNotMatch(html, /data-usage-at=/);
 });
 
-test("unknown usage renders dashes instead of unsupported percentages", () => {
+test("old cached usage keeps last-known percentages visible but excludes credit left", () => {
   const html = buildHTML(state({ tools: {
-    codex: { seats: [seat({ usage_unknown: true, usage5h: 25, usageWeek: 60 })] },
+    codex: { seats: [seat({ usage_unknown: true, usage5h: 100, usageWeek: 75,
+      usage_fetched_at: "2026-09-13T12:00:00Z" })] },
+    claude: { seats: [] },
+  } }));
+  assert.equal((html.match(/class="usage usage--stale"/g) || []).length, 2);
+  assert.match(html, /100%/);
+  assert.match(html, /75%/);
+  assert.match(html, /data-usage-at="2026-09-13T12:00:00Z"/);
+  assert.match(html, /last known/);
+  assert.doesNotMatch(html, /credit left/);
+});
+
+test("genuinely missing usage values still render dashes", () => {
+  const html = buildHTML(state({ tools: {
+    codex: { seats: [seat({ usage_unknown: true, usage5h: null, usageWeek: null,
+      usage: { windows: {} } })] },
     claude: { seats: [] },
   } }));
   assert.equal((html.match(/class="mono u-v">—/g) || []).length, 2);
   assert.equal((html.match(/style="width:0%"/g) || []).length, 2);
-  assert.doesNotMatch(html, /25%|60%|credit left/);
+  assert.doesNotMatch(html, /credit left/);
 });
 
 test("active seats distinguish a live session from loaded-but-idle credentials", () => {
@@ -245,6 +262,24 @@ test("provider throttling is visible alongside retained usage", () => {
   assert.match(html, /usage updates throttled · retrying automatically/);
   assert.match(html, /65%/);
   assert.match(html, /waiting for first reading/);
+});
+
+test("expired Claude token asks for an app refresh without implying logout", () => {
+  const active = buildHTML(state({ tools: {
+    codex: { seats: [] },
+    claude: { seats: [seat({ status: "active", active: true,
+      usage: { error: "token_expired" } })] },
+  } }));
+  assert.match(active, /usage refresh pending · open Claude to refresh/);
+  assert.doesNotMatch(active, />log in<|sign in to refresh|retrying automatically/);
+
+  const resting = buildHTML(state({ tools: {
+    codex: { seats: [] },
+    claude: { seats: [seat({ status: "resting", active: true, limited: true, usage5h: 100,
+      limited_until: "2026-09-13T18:57:00Z", usage: { error: "token_expired" } })] },
+  } }));
+  assert.match(resting, /taking a breather — back/);
+  assert.doesNotMatch(resting, />log in<|usage refresh pending|sign in to refresh/);
 });
 
 test("flat status dots, not emoji", () => {
