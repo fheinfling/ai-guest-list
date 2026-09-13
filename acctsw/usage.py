@@ -19,12 +19,15 @@ Network access is injected (``get`` parameter) so unit tests never hit the wire.
 from __future__ import annotations
 
 import json
+import hashlib
 import shutil
 import subprocess
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import timedelta
+from functools import lru_cache
 from typing import Any, Callable
 
 from . import paths as P
@@ -73,6 +76,25 @@ class Usage:
     def soonest_reset(self) -> str | None:
         resets = [w.resets_at for w in self.windows.values() if w.resets_at]
         return min(resets) if resets else None
+
+
+@dataclass(frozen=True)
+class UsageFetchJob:
+    """One detached provider request, tied to one exact seat incarnation and credential blob."""
+
+    tool: str
+    email: str
+    blob: str
+    credential_digest: str
+    added_at: str | None
+    active: bool
+    user_agent: str | None = None
+
+
+@dataclass(frozen=True)
+class UsageFetchResult:
+    job: UsageFetchJob
+    usage: Usage
 
 
 # --- real transport ---------------------------------------------------------------------------
@@ -220,8 +242,8 @@ def claude_token(blob: str) -> str | None:
     return (data.get("claudeAiOauth") or {}).get("accessToken")
 
 
-def claude_user_agent(claude_bin: str | None = None) -> str:
-    exe = claude_bin or shutil.which("claude")
+@lru_cache(maxsize=8)
+def _claude_user_agent_for_exe(exe: str | None) -> str:
     if exe:
         try:
             out = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=10)
@@ -232,6 +254,11 @@ def claude_user_agent(claude_bin: str | None = None) -> str:
         except (subprocess.SubprocessError, OSError):
             pass
     return P.CLAUDE_USER_AGENT_FALLBACK
+
+
+def claude_user_agent(claude_bin: str | None = None) -> str:
+    """Return the official CLI User-Agent, caching the version subprocess for this app process."""
+    return _claude_user_agent_for_exe(claude_bin or shutil.which("claude"))
 
 
 # --- defensive normalisers --------------------------------------------------------------------
@@ -490,7 +517,11 @@ def _backoff_seconds(prev_usage: dict | None, base: int, *, active: bool = False
     if streak <= 0:
         wait = base
     else:
-        wait = min(base * (2 ** streak), MAX_BACKOFF_SECONDS)
+        # A visible popover asks healthy active seats for a fresher cadence (30s), but an error must
+        # retain the existing provider-safe 150s base.  In particular, an Anthropic 429 may not be
+        # retried every 60 seconds merely because the card is on screen.
+        error_base = max(base, USAGE_MIN_REFRESH_SECONDS)
+        wait = min(error_base * (2 ** streak), MAX_BACKOFF_SECONDS)
     return min(wait, ACTIVE_MAX_BACKOFF_SECONDS) if active else wait
 
 
@@ -550,6 +581,181 @@ def refresh(ctx, state, tool: str | None = None, *, only: str | None = None,
     return summary
 
 
+def _credential_digest(blob: str | None) -> str | None:
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest() if blob else None
+
+
+def _detached_blob(ctx, state, tool: str, email: str, *, active: bool) -> str | None:
+    """Read credentials for a detached fetch without assigning a live login to the wrong seat.
+
+    Codex credentials identify themselves, so a mismatched live mirror falls back to that seat's
+    private home.  Claude's blob carries no identity; its live bytes are usable only when they match
+    the named snapshot.  The bridge reconciles a changed Claude login before reaching this helper.
+    """
+    snapshot = ctx.snapshot_get(tool, email)
+    if not active:
+        return snapshot
+    if tool == "codex":
+        # A supervised child owns and rotates its private CODEX_HOME.  The canonical ~/.codex mirror
+        # may still contain the pre-launch bytes, so observer polling must read the child's home.
+        from . import session
+        running = session.active_session(ctx.data_dir, "codex")
+        if running and running.get("email") == email:
+            return snapshot
+    live = ctx.cred[tool].get_live()
+    if not live:
+        return snapshot
+    if tool == "codex":
+        return live if ctx.cred[tool].email_of(live) == email else snapshot
+    return live if live == snapshot else None
+
+
+def _fetch_job(job: UsageFetchJob, get: HttpGet) -> UsageFetchResult:
+    attempted_at = iso(now())
+    try:
+        fetched = _fetch_for(job.tool, job.blob, get, job.user_agent)
+    except Exception:
+        # A custom transport may raise even though the stdlib transport normally classifies errors.
+        # Background polling must still release its in-flight gate and record a retryable failure.
+        # Order failures by request start, like successful fetches. A late exception must not
+        # overwrite a successful response from a request that started while this one was pending.
+        fetched = Usage(error="network", fetched_at=attempted_at)
+    return UsageFetchResult(job, fetched)
+
+
+def _commit_fetch_result(ctx, result: UsageFetchResult) -> str:
+    """Merge one detached result into freshly loaded state, rejecting every stale-result race."""
+    from .util import parse_iso
+
+    job, fetched = result.job, result.usage
+    before = ctx.load_state()
+    before_rev = int(before.data.get("rev", 0))
+    was_active = before.active(job.tool) == job.email
+    # Keychain reads are subprocesses on macOS.  Keep them outside the flock, then verify below that
+    # the active pointer did not change while the credential bytes were being read.
+    current_blob = _detached_blob(ctx, before, job.tool, job.email, active=was_active)
+    with ctx.locked():
+        state = ctx.load_state()
+        # Credential reads above are intentionally outside the flock.  Any intervening mutation may
+        # be a same-email re-login whose upsert preserves added_at and clears attempt timestamps, so
+        # conservatively discard and let the next tick retry rather than merge across that gap.
+        if int(state.data.get("rev", 0)) != before_rev:
+            return "stale"
+        seat = state.get_seat(job.tool, job.email)
+        # added_at is the seat incarnation: removing and re-adding the same email (even with the same
+        # credential bytes) must not let the old request paint the new card.
+        if seat is None or seat.get("added_at") != job.added_at:
+            return "stale"
+        if (state.active(job.tool) == job.email) != was_active:
+            return "stale"
+        if _credential_digest(current_blob) != job.credential_digest:
+            return "stale"
+        # Two independent processes may poll at once.  A response that started earlier may finish
+        # later; never let it replace the newer attempt already stored by the faster request.
+        attempt_at = parse_iso(fetched.fetched_at)
+        latest_at = parse_iso(((seat.get("usage") or {}).get("last_attempted_at")))
+        if attempt_at is not None and latest_at is not None and latest_at > attempt_at:
+            return "stale"
+        status = store_fetch(state, job.tool, job.email, fetched, blob=job.blob)
+        state.save()
+        return status
+
+
+def refresh_live(ctx, tool: str | None = None, *, only: str | None = None,
+                 active_only: bool = False, force: bool = False,
+                 get: HttpGet = _default_get,
+                 min_seconds: int = USAGE_MIN_REFRESH_SECONDS,
+                 active_min_seconds: int = P.USAGE_ACTIVE_REFRESH_SECONDS,
+                 user_agent: str | None = None) -> dict[str, Any]:
+    """Refresh usage without holding the cross-process flock during credentials or network I/O.
+
+    Preparation records one immutable job per due seat.  Active Codex and Claude requests start in
+    parallel so a slow provider cannot postpone the other provider's live card; each response is
+    committed immediately under a fresh, short lock.  Parked seats follow afterward on the gentler
+    cadence.  Commit revalidates the seat incarnation, credential bytes, and attempt ordering.
+    """
+    tools = [tool] if tool else ["codex", "claude"]
+    summary: dict[str, Any] = {t: {} for t in tools}
+
+    # State metadata is atomic/read-only here.  Credential reads deliberately happen after this
+    # lock-free snapshot because macOS Keychain access is itself a subprocess.
+    initial = ctx.load_state()
+    candidates: list[tuple[str, str, str | None, bool]] = []
+    at = now()
+    for t in tools:
+        active_email = initial.active(t)
+        for email, seat in list(initial.accounts(t).items()):
+            if only and email != only:
+                continue
+            active = email == active_email
+            if active_only and not active:
+                continue
+            interval = active_min_seconds if active else min_seconds
+            previous = seat.get("usage") or {}
+            if (not force or previous.get("error")) and not _due(previous, at, interval, active=active):
+                summary[t][email] = "cached"
+                continue
+            candidates.append((t, email, seat.get("added_at"), active))
+
+    ua = user_agent
+    if ua is None and any(t == "claude" for t, *_rest in candidates):
+        ua = claude_user_agent(getattr(ctx, "claude_bin", None))
+
+    prepared: list[UsageFetchJob] = []
+    for t, email, added_at, was_active in candidates:
+        blob = _detached_blob(ctx, initial, t, email, active=was_active)
+        if not blob:
+            summary[t][email] = "no_creds"
+            continue
+        prepared.append(UsageFetchJob(
+            tool=t, email=email, blob=blob,
+            credential_digest=_credential_digest(blob) or "",
+            added_at=added_at, active=was_active,
+            user_agent=ua if t == "claude" else None,
+        ))
+
+    # Recheck eligibility after slow Keychain reads.  Another poll, switch, remove, or re-add may
+    # have happened since the initial atomic state read.
+    eligible: list[UsageFetchJob] = []
+    with ctx.locked():
+        current = ctx.load_state()
+        checked_at = now()
+        for job in prepared:
+            seat = current.get_seat(job.tool, job.email)
+            if seat is None or seat.get("added_at") != job.added_at:
+                summary[job.tool][job.email] = "stale"
+                continue
+            is_active = current.active(job.tool) == job.email
+            if active_only and not is_active:
+                summary[job.tool][job.email] = "stale"
+                continue
+            interval = active_min_seconds if is_active else min_seconds
+            previous = seat.get("usage") or {}
+            if (not force or previous.get("error")) and not _due(previous, checked_at, interval,
+                                                               active=is_active):
+                summary[job.tool][job.email] = "cached"
+                continue
+            eligible.append(UsageFetchJob(
+                tool=job.tool, email=job.email, blob=job.blob,
+                credential_digest=job.credential_digest, added_at=job.added_at,
+                active=is_active, user_agent=job.user_agent,
+            ))
+
+    active_jobs = [job for job in eligible if job.active]
+    parked_jobs = [job for job in eligible if not job.active]
+    if active_jobs:
+        with ThreadPoolExecutor(max_workers=len(active_jobs),
+                                thread_name_prefix="acctsw-usage") as pool:
+            futures = {pool.submit(_fetch_job, job, get): job for job in active_jobs}
+            for future in as_completed(futures):
+                result = future.result()
+                summary[result.job.tool][result.job.email] = _commit_fetch_result(ctx, result)
+    for job in parked_jobs:
+        result = _fetch_job(job, get)
+        summary[job.tool][job.email] = _commit_fetch_result(ctx, result)
+    return summary
+
+
 def store_fetch(state, tool: str, email: str, u: Usage, at=None, *,
                 trust_reactive_lag: bool = True, blob: str | None = None) -> str:
     """Persist ONE fetch result onto a seat (windows, limit flags, error backoff) and return its
@@ -563,6 +769,8 @@ def store_fetch(state, tool: str, email: str, u: Usage, at=None, *,
     prev_usage = (state.get_seat(tool, email) or {}).get("usage") or {}
     d = u.to_dict()
     if u.ok:
+        # Bind handoff decisions to the credentials authenticated by this reading.
+        d["credential_digest"] = _credential_digest(blob)
         d["fetched_at"] = u.fetched_at or iso(at)
         d["last_attempted_at"] = d["fetched_at"]
         d["stale"] = False

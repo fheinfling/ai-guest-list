@@ -65,9 +65,12 @@ def test_garbage_heartbeat_reads_as_closed(ctx):
     assert appalive.app_running(ctx.data_dir) is False
 
 
-def test_recycled_pid_reads_as_closed(ctx):
+def test_recycled_pid_reads_as_closed(ctx, monkeypatch):
     """A live PID whose recorded start-time doesn't match (the OS recycled the PID for an unrelated
     process after a crash) must read as closed — not as the app still running."""
+    # Test a positive identity mismatch, independently of whether this host permits `ps`.
+    # Missing-ps fallback and actual locale-normalized process inspection have separate coverage.
+    monkeypatch.setattr(appalive, "_proc_start", lambda _: "Sun Sep 13 12:00:00 2026")
     (ctx.data_dir / "app.pid").write_text(f"{os.getpid()}\nNot The Real Start Time")
     assert appalive.app_running(ctx.data_dir) is False
 

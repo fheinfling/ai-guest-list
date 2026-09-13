@@ -77,6 +77,26 @@ export function fmtCountdown(iso, now = Date.now()) {
   return `${hrs}h${mins % 60 ? ` ${mins % 60}m` : ""}`;
 }
 
+export function fmtUsageAge(iso, now = Date.now()) {
+  const fetched = iso ? new Date(iso).getTime() : NaN;
+  if (!Number.isFinite(fetched)) return "waiting for first reading";
+  const seconds = Math.max(0, Math.floor((now - fetched) / 1000));
+  if (seconds < 60) return `updated ${seconds}s ago`;
+  if (seconds < 3600) return `updated ${Math.floor(seconds / 60)}m ago`;
+  if (seconds < 86400) return `updated ${Math.floor(seconds / 3600)}h ago`;
+  return `updated ${Math.floor(seconds / 86400)}d ago`;
+}
+
+// Clock ticks change text only: leave focused buttons, expanded cards, and scroll position intact.
+export function updateClockText(root, now = Date.now()) {
+  for (const node of root.querySelectorAll("[data-usage-at]")) {
+    node.textContent = fmtUsageAge(node.dataset.usageAt, now);
+  }
+  for (const node of root.querySelectorAll("[data-reset-at]")) {
+    node.textContent = `${node.dataset.clockPrefix || "resets in"} ${fmtCountdown(node.dataset.resetAt, now)}`;
+  }
+}
+
 function fmtClock(iso) {
   if (!iso) return "";
   const d = new Date(iso);
@@ -100,7 +120,7 @@ function statusBit(tool, seat) {
         : `<span class="pill floor floor--idle">on the floor</span>`;
     case "queued": return `<span class="pill queued">up next 💛</span>`;
     case "resting":
-      return `<span class="mono rest-count">back in ${fmtCountdown(seat.limited_until)}</span>`;
+      return `<span class="mono rest-count" data-reset-at="${esc(seat.limited_until)}" data-clock-prefix="back in">back in ${fmtCountdown(seat.limited_until)}</span>`;
     case "needs-login":
       return seat.entitlement_revoked
         ? `<button class="btn rose revoked" data-action="add" data-tool="${tool}">subscription ended — sign in again</button>`
@@ -113,22 +133,33 @@ function statusBit(tool, seat) {
 function bar(seat, win, label) {
   const v = pct(seat, win);
   const known = !seat?.usage_unknown && v !== null;
+  const reset = seat?.usage?.windows?.[win]?.resets_at;
+  const resetTime = reset ? new Date(reset).getTime() : NaN;
+  const timer = Number.isFinite(resetTime)
+    ? `<div class="usage-reset mono" data-reset-at="${esc(reset)}" title="${esc(new Date(reset).toLocaleString())}">resets in ${fmtCountdown(reset)}</div>`
+    : "";
   return `<div class="usage${seat?.usage_stale ? " usage--stale" : ""}"><span class="mono u-k">${label}</span>
     <span class="track"><span class="fill" style="width:${known ? v : 0}%"></span></span>
-    <span class="mono u-v">${known ? `${Math.round(v)}%` : "—"}</span></div>`;
+    <span class="mono u-v">${known ? `${Math.round(v)}%` : "—"}</span></div>${timer}`;
 }
 
 function seatCard(tool, seat) {
   const plan = seat.plan ? `<span class="mono chip">${esc(seat.plan)}</span>` : "";
-  const lastChecked = fmtClock(seat.usage_fetched_at);
-  const freshness = seat.usage_stale
-    ? `<div class="reassure mono">last checked ${esc(lastChecked || "—")}</div>` : "";
+  const fetchedAt = seat.usage_fetched_at || seat.usage?.fetched_at || "";
+  const error = seat.usage?.error;
+  const issue = ({ rate_limited: "usage updates throttled · retrying automatically",
+    network: "connection unavailable · retrying automatically",
+    unauthorized: "usage unavailable · sign in to refresh",
+    forbidden: "usage unavailable · check your subscription",
+    no_token: "usage unavailable · sign in to refresh",
+  })[error] || (error ? "usage update failed · retrying automatically" : "");
+  const freshness = `<div class="usage-age mono${seat.usage_stale ? " usage-age--stale" : ""}"><span data-usage-at="${esc(fetchedAt)}">${fmtUsageAge(fetchedAt)}</span>${seat.usage_stale ? " · last known" : ""}</div>
+    ${issue ? `<div class="usage-error">${issue}</div>` : ""}`;
   const reassure = seat.status === "resting"
     ? `<div class="reassure mono">taking a breather — back ${fmtClock(seat.limited_until)}</div>` : "";
   const credit = creditLeft(seat);
   const sessionStarted = fmtClock(seat.session_started_at);
   const expanded = `<div class="expand">
-    ${bar(seat, "weekly", "7d")}
     ${credit !== null ? `<div class="x-row"><span>credit left</span><span class="mono">${credit}%</span></div>` : ""}
     ${seat.last_on_floor ? `<div class="x-row"><span>last on the floor</span><span class="mono">${esc(fmtClock(seat.last_on_floor))}</span></div>` : ""}
     ${sessionStarted ? `<div class="x-row"><span>session started</span><span class="mono">${esc(sessionStarted)}</span></div>` : ""}
@@ -142,6 +173,7 @@ function seatCard(tool, seat) {
     </div>
     <div class="seat-email mono">${esc(seat.email)}</div>
     ${bar(seat, "5h", "5h")}
+    ${bar(seat, "weekly", "7d")}
     ${freshness}
     ${reassure}
     ${expanded}

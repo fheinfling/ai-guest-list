@@ -60,7 +60,13 @@ anywhere.
   screen text — so a reworded banner can't fool it. And if a seat is put to rest while you're working
   on it (the menubar's usage poll notices first), the *running* session hops too.
 - **Live limits in the bar** — 5-hour + weekly usage and reset timers, read from the official usage
-  endpoints (cached, gently polled).
+  endpoints. Both windows stay visible, with the age of the last successful reading. Active seats
+  refresh every 30 seconds while the popover is open; background and parked-seat refreshes run
+  every three minutes. Provider throttling backs off and keeps the last reading visibly stale.
+- **Desktop switching** — the menubar moves a confirmed-limited seat to a verified healthy seat of
+  the same tool when auto-switch is enabled. With “restart Codex after a swap” enabled, a running
+  Codex desktop app quits gracefully and reopens; continue in your existing thread. Supervised
+  terminal sessions resume automatically. Nearly full seats stay active until a confirmed limit.
 - **Zero-touch setup** — installing the app wires `codex` / `claude` to the supervised launchers; when
   the app is closed they behave exactly like stock.
 - **Add / remove seats** — official browser sign-in, plus a no-browser path for Codex (paste an

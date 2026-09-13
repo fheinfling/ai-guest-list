@@ -217,10 +217,27 @@ migration path: [`SECURITY-headroom.md`](SECURITY-headroom.md).
   workspace stay separate seats with their own 5h/weekly windows (only credits pool there, and
   the launcher's hard-limit landing pre-flight already proves the landing seat).
 - **auth.json race during refresh** → atomic swap only between child runs.
-- **GUI apps** → menubar `switch` swaps the same creds the apps read; they may need a restart (app
-  reads creds at launch). Auto-detection stays CLI-driven (best-effort GUI, as agreed).
+- **GUI apps** → the menubar's usage poll switches a confirmed-limited active seat only after a
+  fresh check proves another same-tool seat has headroom. Manual switching uses the same credential
+  primitive. The Codex restart setting gracefully quits and reopens an already-running desktop app;
+  continuing its existing thread may require sending a message. Terminal supervisors resume their
+  own sessions. The app does not force-quit a desktop app that refuses to exit.
+- **Usage freshness** → show both 5h and weekly windows, resets, and last-success age on every seat.
+  While the popover is open, active seats refresh every 30 seconds; background and inactive seats
+  keep a three-minute cadence. Backoff takes priority over that target. Network fetches run outside
+  the state lock, with identity checks before committing results; overlapping polls are coalesced.
 
 ## Verification (end-to-end)
+
+CI runs the isolated engine and native callback tests on macOS 14/15/26, including Intel and Apple
+silicon, with Python 3.11 and 3.13. Intel and Apple-silicon jobs also build the standalone app and
+verify its executable architecture. Tests inject provider responses, Keychain contents, app
+identities, and process identities; no developer account or Codex installation is required. Actual
+process inspection is a separate integration test and skips where the host prohibits it. GitHub's
+hosted runners do not cover macOS 12/13, so those advertised minimum versions still require manual
+release verification. Desktop restart resolves Codex by bundle identifier rather than display name
+or installation directory.
+
 1. `acctsw install` (dry-run first) → backups + manifest written, stock `codex`/`claude` unaffected.
 2. `acctsw add codex` ×2 → `acctsw list` shows both emails (cross-check via JWT / `claude auth status`).
 3. `acctsw usage refresh --json` → real 5h/weekly % + reset times for each account (Codex `wham/usage`,
@@ -229,9 +246,10 @@ migration path: [`SECURITY-headroom.md`](SECURITY-headroom.md).
    Codex.app reflects active account after restart.
 5. **Continuity dry-run** (no real limit): start `cx`, one turn, note rollout uuid; `Ctrl-C`;
    `acctsw switch codex <b>`; `codex resume <uuid>` → same conversation continues under B.
-6. **Limit path**: on a real limit, capture exact message + reset wording, set regex, confirm
-   auto-switch + resume. Force all-limited by hand-editing `state.json` → verify soonest pick +
-   countdown message.
+6. **Limit path**: use isolated test accounts and injected usage responses to exercise 100%,
+   provider out flags, no healthy spare, disabled auto-switch, and concurrent terminal handoff.
+   Verify a 97% reading alone does not move the account. On a naturally occurring live limit,
+   confirm the destination identity and session continuation; do not edit the live store to force it.
 7. **Legacy Headroom cleanup**: on a machine that had "save credit" on, the next app launch or
    `cx`/`cl` run leaves no `model_provider = "headroom"` in `~/.codex/config.toml` and no loopback
    `ANTHROPIC_BASE_URL` in `~/.claude/settings.json`; plain `codex`/`claude` reach the provider

@@ -180,6 +180,11 @@ html, body { background:transparent; width:100%; overflow:hidden; }
 .seat--resting .fill, .seat--queued .fill { background:var(--amber); }
 .u-v { color:var(--t1); font-weight:700; min-width:36px; text-align:right; }
 .usage--stale { opacity:.52; }
+.usage + .usage { margin-top:7px; }
+.usage-reset { color:var(--t3); font-size:9px; margin:2px 0 7px 26px; }
+.usage-age { color:var(--t3); font-size:9px; margin-top:7px; }
+.usage-age--stale, .usage-error { color:var(--amber); }
+.usage-error { font-size:10px; margin-top:3px; }
 
 .reassure { color:var(--amber); font-size:10.5px; margin-top:6px; }
 

@@ -3,6 +3,7 @@
 No network: a fake `get` transport returns canned (status, body) per URL.
 """
 import json
+import threading
 from datetime import timedelta
 
 import pytest
@@ -686,6 +687,29 @@ def test_active_seat_error_backoff_is_capped_for_prompt_recovery():
     assert U._backoff_seconds(usage, 150, active=True) == U.ACTIVE_MAX_BACKOFF_SECONDS == 300
 
 
+def test_visible_active_cadence_does_not_shorten_error_backoff():
+    usage = {"error_streak": 1}
+    assert U._backoff_seconds(usage, P.USAGE_ACTIVE_REFRESH_SECONDS, active=True) == 300
+
+
+def test_refresh_live_uses_30s_active_and_gentle_parked_cadence(ctx):
+    state = _seed_two_codex(ctx)
+    attempted = iso(now() - timedelta(seconds=31))
+    for seat in state.accounts("codex").values():
+        seat["usage"] = {"last_attempted_at": attempted, "error_streak": 0}
+    state.save()
+    calls = []
+
+    def get(url, headers, timeout):
+        calls.append(headers["Authorization"])
+        return 200, codex_ok_body()
+
+    summary = U.refresh_live(ctx, "codex", get=get)
+    assert summary["codex"]["a@x.com"] == "ok"       # active: due after 30s
+    assert summary["codex"]["b@x.com"] == "cached"  # parked: still inside 150s floor
+    assert len(calls) == 1
+
+
 def test_seat_blob_prefers_live_for_active(ctx):
     state = _seed_two_codex(ctx)  # active = a@x.com
     ctx.cred["codex"].set_live(make_codex_blob("a@x.com").replace('"access_token": "a"',
@@ -705,6 +729,175 @@ def test_claude_refresh_path(ctx):
     summary = U.refresh(ctx, state, "claude", force=True, get=get, user_agent="claude-code/x")
     assert summary["claude"]["c@x.com"] == "ok"
     assert state.get_seat("claude", "c@x.com")["usage"]["windows"]["weekly"]["used_pct"] == 60.0
+
+
+def test_refresh_live_fetches_outside_lock_and_commits_fresh_state(ctx, monkeypatch):
+    state = _seed_two_codex(ctx)
+    held = {"value": False}
+    real_locked = ctx.locked
+
+    from contextlib import contextmanager
+    @contextmanager
+    def tracked_locked():
+        with real_locked():
+            held["value"] = True
+            try:
+                yield
+            finally:
+                held["value"] = False
+
+    def get(url, headers, timeout):
+        assert held["value"] is False
+        return 200, codex_ok_body(primary=31, secondary=62)
+
+    monkeypatch.setattr(ctx, "locked", tracked_locked)
+    summary = U.refresh_live(ctx, "codex", only=state.active("codex"), force=True, get=get)
+    assert summary["codex"][state.active("codex")] == "ok"
+    stored = ctx.load_state().get_seat("codex", state.active("codex"))["usage"]
+    assert stored["windows"]["5h"]["used_pct"] == 31
+
+
+def test_refresh_live_rejects_result_after_credentials_change(ctx):
+    state = _seed_two_codex(ctx)
+    email = state.active("codex")
+
+    def get(url, headers, timeout):
+        changed = make_codex_blob(email).replace('"access_token": "a"',
+                                                  '"access_token": "new"')
+        ctx.cred["codex"].set_live(changed)
+        return 200, codex_ok_body(primary=88)
+
+    summary = U.refresh_live(ctx, "codex", only=email, force=True, get=get)
+    assert summary["codex"][email] == "stale"
+    assert ctx.load_state().get_seat("codex", email)["usage"]["last_attempted_at"] is None
+
+
+def test_refresh_live_rejects_result_older_than_stored_attempt(ctx):
+    state = _seed_two_codex(ctx)
+    email = state.active("codex")
+
+    def get(url, headers, timeout):
+        with ctx.locked():
+            current = ctx.load_state()
+            current.get_seat("codex", email)["usage"] = {
+                "ok": True, "error": None, "windows": {},
+                "fetched_at": iso(now() + timedelta(minutes=1)),
+                "last_attempted_at": iso(now() + timedelta(minutes=1)),
+            }
+            current.save()
+        return 200, codex_ok_body(primary=88)
+
+    summary = U.refresh_live(ctx, "codex", only=email, force=True, get=get)
+    assert summary["codex"][email] == "stale"
+    stored = ctx.load_state().get_seat("codex", email)["usage"]
+    assert stored["windows"] == {}
+
+
+def test_late_transport_exception_cannot_overwrite_a_newer_success(ctx):
+    state = _seed_two_codex(ctx)
+    email = state.active("codex")
+
+    def get(*_):
+        current = ctx.load_state()
+        U.store_fetch(current, "codex", email, U.Usage(
+            ok=True, fetched_at=iso(now()), windows={"5h": U.Window(used_pct=12)}),
+            blob=ctx.cred["codex"].get_live())
+        current.save()
+        raise TimeoutError("the older request timed out after another poll completed")
+
+    result = U.refresh_live(ctx, "codex", only=email, force=True, get=get)
+    assert result["codex"][email] == "stale"
+    stored = ctx.load_state().get_seat("codex", email)["usage"]
+    assert stored["ok"] is True and stored["error"] is None
+    assert stored["windows"]["5h"]["used_pct"] == 12
+
+
+def test_refresh_live_rejects_mutation_between_credential_check_and_commit(ctx, monkeypatch):
+    state = _seed_two_codex(ctx)
+    email = state.active("codex")
+    real_blob = U._detached_blob
+    calls = {"n": 0}
+
+    def racing_blob(*args, **kwargs):
+        blob = real_blob(*args, **kwargs)
+        calls["n"] += 1
+        if calls["n"] == 2:  # commit-time read completed; mutate before its next lock acquisition
+            with ctx.locked():
+                current = ctx.load_state()
+                current.get_seat("codex", email)["plan"] = "new subscription"
+                current.save()
+        return blob
+
+    monkeypatch.setattr(U, "_detached_blob", racing_blob)
+    summary = U.refresh_live(
+        ctx, "codex", only=email, force=True,
+        get=fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body(primary=88))}),
+    )
+    assert summary["codex"][email] == "stale"
+    assert ctx.load_state().get_seat("codex", email)["plan"] == "new subscription"
+
+
+def test_refresh_live_rejects_removed_and_readded_same_email(ctx):
+    state = _seed_two_codex(ctx)
+    email = state.active("codex")
+
+    def get(url, headers, timeout):
+        with ctx.locked():
+            current = ctx.load_state()
+            current.remove_seat("codex", email)
+            seat = current.upsert_seat("codex", email)
+            seat["added_at"] = "new-seat-incarnation"
+            current.set_active("codex", email)
+            current.save()
+        return 200, codex_ok_body(primary=88)
+
+    summary = U.refresh_live(ctx, "codex", only=email, force=True, get=get)
+    assert summary["codex"][email] == "stale"
+    assert ctx.load_state().get_seat("codex", email)["usage"] is None
+
+
+def test_refresh_live_starts_both_active_providers_before_either_finishes(ctx):
+    ctx.cred["codex"].set_live(make_codex_blob("a@x.com"))
+    acct.add(ctx, ctx.load_state(), "codex", email="a@x.com")
+    ctx.cred["claude"].set_live(make_claude_blob())
+    acct.add(ctx, ctx.load_state(), "claude", email="c@x.com")
+    both_started = threading.Event()
+    seen = []
+    guard = threading.Lock()
+
+    def get(url, headers, timeout):
+        with guard:
+            seen.append(url)
+            if len(seen) == 2:
+                both_started.set()
+        assert both_started.wait(1), "the other active provider was postponed"
+        body = codex_ok_body() if url == P.CODEX_USAGE_URL else claude_ok_body()
+        return 200, body
+
+    summary = U.refresh_live(ctx, active_only=True, force=True, get=get,
+                             user_agent="claude-code/x")
+    assert summary["codex"]["a@x.com"] == "ok"
+    assert summary["claude"]["c@x.com"] == "ok"
+
+
+def test_refresh_live_reads_supervised_codex_home_instead_of_shared_mirror(ctx, monkeypatch):
+    from acctsw import session
+    email = "a@x.com"
+    old = make_codex_blob(email).replace('"access_token": "a"', '"access_token": "old"')
+    fresh = make_codex_blob(email).replace('"access_token": "a"', '"access_token": "fresh"')
+    ctx.cred["codex"].set_live(old)
+    acct.add(ctx, ctx.load_state(), "codex", email=email)
+    ctx.snapshot_set("codex", email, fresh)
+    monkeypatch.setattr(session, "active_session",
+                        lambda _data_dir, _tool: {"email": email, "pid": 1, "started_at": "x"})
+    seen = {}
+
+    def get(url, headers, timeout):
+        seen["authorization"] = headers["Authorization"]
+        return 200, codex_ok_body()
+
+    assert U.refresh_live(ctx, "codex", only=email, force=True, get=get)["codex"][email] == "ok"
+    assert seen["authorization"] == "Bearer fresh"
 
 
 def test_refresh_codex_blob_success():
@@ -738,6 +931,22 @@ def test_claude_user_agent_fallback(monkeypatch):
     import acctsw.usage as um
     monkeypatch.setattr(um.shutil, "which", lambda _: None)
     assert U.claude_user_agent(None) == P.CLAUDE_USER_AGENT_FALLBACK
+
+
+def test_claude_user_agent_caches_version_subprocess(monkeypatch):
+    import acctsw.usage as um
+    um._claude_user_agent_for_exe.cache_clear()
+    calls = []
+
+    class Result:
+        returncode = 0
+        stdout = "9.9.1 (Claude Code)\n"
+
+    monkeypatch.setattr(um.subprocess, "run", lambda *args, **kwargs: calls.append(args) or Result())
+    assert U.claude_user_agent("/fake/claude") == "claude-code/9.9.1"
+    assert U.claude_user_agent("/fake/claude") == "claude-code/9.9.1"
+    assert len(calls) == 1
+    um._claude_user_agent_for_exe.cache_clear()
 
 
 def _epoch(iso_s):

@@ -13,21 +13,45 @@ permissions:
   contents: read        # least-privilege GITHUB_TOKEN (tests need only checkout)
 
 jobs:
-  test:
-    runs-on: macos-14
+  platform_tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            python: "3.11"
+            arch: arm64
+            build: true
+          - os: macos-15-intel
+            python: "3.11"
+            arch: x86_64
+            build: true
+          - os: macos-15
+            python: "3.13"
+            arch: arm64
+            build: false
+          - os: macos-26
+            python: "3.13"
+            arch: arm64
+            build: false
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python }}
 
       - name: Install deps
         run: |
           python -m venv .venv
           . .venv/bin/activate
           python -m pip install --upgrade pip
-          pip install -e ".[app,dev]"
+          pip install -e ".[app,build,dev]"
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
 
       - name: Run tests
         run: |
@@ -35,9 +59,33 @@ jobs:
           python -m pytest -q --cov=acctsw --cov-report=xml
           node --test app/web/*.test.mjs
 
+      - name: Build native app for this architecture
+        if: matrix.build
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: |
+          . .venv/bin/activate
+          python scripts/build-web.py
+          git diff --exit-code -- app/web/bundle.js
+          python setup.py py2app
+          lipo "dist/AI Guest List.app/Contents/MacOS/AI Guest List" -verify_arch "$EXPECTED_ARCH"
+
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7 (pinned SHA; Dependabot keeps it current)
         with:
           token: ${{ secrets.CODECOV_TOKEN }}   # add this secret once at codecov.io
           files: coverage.xml
+          flags: ${{ matrix.os }}-py${{ matrix.python }}
           fail_ci_if_error: false                # don't break CI if the token isn't set yet
+
+  # Branch protection requires the stable `test` context. Matrix names change as platforms are
+  # added, so expose one gate that succeeds only after every platform test and build succeeds.
+  test:
+    needs: platform_tests
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every platform test and build to pass
+        env:
+          MATRIX_RESULT: ${{ needs.platform_tests.result }}
+        run: test "$MATRIX_RESULT" = success

@@ -1,6 +1,7 @@
 """Unit tests for the UI↔engine bridge dispatch (no pyobjc)."""
 import json
 import os
+from datetime import timedelta
 
 import pytest
 
@@ -9,6 +10,8 @@ from acctsw import bridge
 from acctsw import install as inst
 from acctsw.state import State
 from tests.conftest import make_claude_blob, make_codex_blob
+from acctsw.util import now, iso
+from acctsw.switch import switch
 
 
 def _add(ctx, email):
@@ -37,18 +40,123 @@ def test_shared_account_warning_rides_the_nested_state(ctx):
 
 
 def test_usage_reconciles_both_provider_identities_before_poll(ctx, monkeypatch):
-    """A popover usage poll must capture Claude out-of-band login identity just like Codex."""
+    """A poll captures a changed Claude login, while ordinary ticks skip the slow identity CLI."""
     seen = []
+    ctx.cred["claude"].set_live(make_claude_blob("max"))
+    acct.add(ctx, ctx.load_state(), "claude", email="c@x.com")
+    ctx.cred["claude"].set_live(make_claude_blob("pro"))
     monkeypatch.setattr(acct, "reconcile_codex", lambda _ctx, _state: seen.append("codex"))
+    monkeypatch.setattr(
+        bridge.identity_mod, "claude_live_identity",
+        lambda _ctx: bridge.identity_mod.ClaudeLiveIdentity(
+            blob=ctx.cred["claude"].get_live(), email="c@x.com"),
+    )
     monkeypatch.setattr(
         acct, "reconcile_claude",
         lambda _ctx, _state, **_kwargs: seen.append("claude"),
     )
-    monkeypatch.setattr(bridge.usage_mod, "refresh",
-                        lambda _ctx, _state, _tool=None, **_kwargs: {"codex": {}, "claude": {}})
+    monkeypatch.setattr(bridge.usage_mod, "refresh_live",
+                        lambda _ctx, _tool=None, **_kwargs: {"codex": {}, "claude": {}})
     result = bridge.handle(ctx, {"action": "usage"})
     assert result["ok"] is True
     assert seen == ["codex", "claude"]
+
+
+def test_usage_auto_switches_a_confirmed_limited_codex_seat_to_a_fresh_spare(ctx, monkeypatch):
+    """The desktop owns a no-session handoff only after it freshly verifies the landing seat."""
+    _add(ctx, "a@x.com")
+    _add(ctx, "b@x.com")
+    state = ctx.load_state()
+    switch(ctx, state, "codex", "a@x.com")
+    state.set_limited_until("codex", "a@x.com", iso(now() + timedelta(hours=2)), source="usage")
+    state.set_usage("codex", "a@x.com", {
+        "credential_digest": bridge._blob_digest(ctx.snapshot_get("codex", "a@x.com")),
+    })
+    state.set_usage("codex", "b@x.com", {
+        "error": None, "stale": False, "windows": {
+            "5h": {"used_pct": 10.0}, "weekly": {"used_pct": 20.0},
+        }, "ok": True, "fetched_at": iso(now()), "last_attempted_at": iso(now()),
+        "credential_digest": bridge._blob_digest(ctx.snapshot_get("codex", "b@x.com")),
+    })
+    state.save()
+
+    def fresh(_ctx, tool=None, *, only=None, **_kwargs):
+        if only:
+            return {tool: {only: "ok"}}
+        return {"codex": {"a@x.com": "ok"}, "claude": {}}
+
+    monkeypatch.setattr(bridge.usage_mod, "refresh_live", fresh)
+    result = bridge.handle(ctx, {"action": "usage", "scope": "all"})
+
+    assert result["auto_switch"] == {
+        "status": "switched", "tool": "codex", "from": "a@x.com", "to": "b@x.com",
+        "reason": "usage_limit",
+    }
+    assert ctx.load_state().active("codex") == "b@x.com"
+
+
+def test_usage_poll_yields_a_confirmed_limit_to_an_active_supervised_session(ctx, monkeypatch):
+    """The launcher must own the live child swap/resume; observer polling only records its rest."""
+    _add(ctx, "a@x.com")
+    _add(ctx, "b@x.com")
+    state = ctx.load_state()
+    switch(ctx, state, "codex", "a@x.com")
+    state.set_limited_until("codex", "a@x.com", iso(now() + timedelta(hours=2)), source="usage")
+    state.save()
+    monkeypatch.setattr(bridge.session_mod, "active_session", lambda *_args: {"email": "a@x.com"})
+    monkeypatch.setattr(
+        bridge.usage_mod, "refresh_live",
+        lambda *_args, **_kwargs: {"codex": {"a@x.com": "ok"}, "claude": {}},
+    )
+
+    result = bridge.handle(ctx, {"action": "usage", "scope": "all"})
+
+    assert result["auto_switch"] is None
+    assert ctx.load_state().active("codex") == "a@x.com"
+
+
+def test_usage_scope_and_target_are_forwarded_to_detached_refresh(ctx, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(
+        bridge.usage_mod, "refresh_live",
+        lambda _ctx, tool=None, **kwargs: seen.update(tool=tool, **kwargs) or {"codex": {}},
+    )
+    result = bridge.handle(ctx, {
+        "action": "usage", "scope": "active", "tool": "codex",
+        "only": "a@x.com", "force": True,
+    })
+    assert result["ok"] is True and result["refresh"] == {"codex": {}}
+    assert seen["tool"] == "codex" and seen["only"] == "a@x.com"
+    assert seen["active_only"] is True and seen["force"] is True
+
+
+def test_targeted_codex_usage_does_not_probe_claude(ctx, monkeypatch):
+    ctx.cred["claude"].set_live(make_claude_blob())
+    acct.add(ctx, ctx.load_state(), "claude", email="c@x.com")
+    monkeypatch.setattr(
+        bridge.identity_mod, "claude_live_identity",
+        lambda _ctx: pytest.fail("targeted Codex refresh must not run Claude auth status"),
+    )
+    monkeypatch.setattr(
+        bridge.usage_mod, "claude_user_agent",
+        lambda _bin: pytest.fail("targeted Codex refresh must not run Claude --version"),
+    )
+    monkeypatch.setattr(bridge.usage_mod, "refresh_live", lambda *_args, **_kwargs: {})
+    assert bridge.handle(ctx, {"action": "usage", "tool": "codex", "force": True})["ok"] is True
+
+
+def test_usage_rejects_unknown_scope(ctx):
+    result = bridge.handle(ctx, {"action": "usage", "scope": "nearby"})
+    assert result == {"ok": False, "error": "bad usage scope: nearby"}
+
+
+def test_usage_skips_codex_reconciliation_during_supervised_session(ctx, monkeypatch):
+    monkeypatch.setattr(bridge.session_mod, "active_session",
+                        lambda _data_dir, _tool: {"email": "a@x.com"})
+    monkeypatch.setattr(acct, "reconcile_codex",
+                        lambda *_args, **_kwargs: pytest.fail("must not overwrite session home"))
+    monkeypatch.setattr(bridge.usage_mod, "refresh_live", lambda *_args, **_kwargs: {})
+    assert bridge.handle(ctx, {"action": "usage"})["ok"] is True
 
 
 def test_state_carries_app_version_and_build(ctx):

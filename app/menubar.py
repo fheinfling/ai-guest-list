@@ -10,14 +10,16 @@ Run (dev):  PYTHONPATH=. .venv/bin/python -m app.menubar
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 try:
     import objc
     from AppKit import (NSApplication, NSStatusBar, NSPopover, NSViewController,
                         NSVariableStatusItemLength, NSApplicationActivationPolicyAccessory,
-                        NSUserNotification, NSUserNotificationCenter, NSImage)
+                        NSUserNotification, NSUserNotificationCenter, NSImage, NSWorkspace)
     from WebKit import WKWebView, WKWebViewConfiguration, WKUserContentController
     from Foundation import NSObject, NSURL, NSTimer, NSMakeRect, NSMakeSize
 except ImportError:  # allows importing this module's pure helpers without pyobjc installed
@@ -27,7 +29,11 @@ from acctsw import TOOLS, appalive, bridge, session
 from acctsw.context import Context, hydrate_path
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
-USAGE_POLL_SECONDS = 180.0
+# The open popover is the one place where a person is actively making a decision from the
+# numbers, so keep its cache moving promptly.  Hidden polling stays deliberately slower: both
+# usage endpoints throttle hard and the engine applies its own per-seat backoff as a second guard.
+USAGE_POLL_OPEN_SECONDS = 30.0
+USAGE_POLL_HIDDEN_SECONDS = 180.0
 STATE_POLL_SECONDS = 3.0
 # The menu-bar mark is the door (icon handoff): open onto the disco when a model's free, shut when
 # every seat is resting. SF Symbols give a native, template (auto light/dark) glyph; emoji is the
@@ -35,6 +41,60 @@ STATE_POLL_SECONDS = 3.0
 DOOR_SYMBOL = {"open": "door.left.hand.open", "shut": "door.left.hand.closed"}
 DOOR_EMOJI = {"open": "🪩", "shut": "🚪"}
 NS_TERMINATE_NOW = 1      # NSApplicationTerminateReply.terminateNow
+
+
+def usage_poll_interval(popover_visible: bool) -> float:
+    """The native scheduler cadence; kept pure so it is testable without AppKit."""
+    return USAGE_POLL_OPEN_SECONDS if popover_visible else USAGE_POLL_HIDDEN_SECONDS
+
+
+def usage_poll_scope(popover_visible: bool, last_all_at: float, *, at: float) -> str:
+    """Keep active cards quick while guaranteeing a full-seat refresh at least every hidden cadence."""
+    if not popover_visible or at - last_all_at >= USAGE_POLL_HIDDEN_SECONDS:
+        return "all"
+    return "active"
+
+
+def _codex_desktop_app(app) -> bool:
+    """Whether an NSRunningApplication is the Codex desktop app (testable without AppKit)."""
+    try:
+        bundle = app.bundleIdentifier() or ""
+        name = app.localizedName() or ""
+    except Exception:
+        return False
+    return bundle == "com.openai.codex" if bundle else name == "Codex"
+
+
+def request_codex_restart(running_apps) -> tuple[bool, str | None]:
+    """Ask a running Codex app to quit normally; never force-terminate it.
+
+    The caller schedules the relaunch after this returns.  Separating the request from launching
+    makes it impossible for a failed graceful quit to be masked by an `open -a Codex` activation.
+    """
+    matches = [app for app in running_apps if _codex_desktop_app(app)]
+    if not matches:
+        return False, None
+    for app in matches:
+        try:
+            if not app.terminate():
+                return True, "Codex did not accept the restart request"
+        except Exception as exc:
+            detail = str(exc).strip() or exc.__class__.__name__
+            return True, f"couldn't ask Codex to quit: {detail}"
+    return True, None
+
+
+def launch_codex_desktop(*, run=subprocess.run) -> str | None:
+    """Open Codex after its graceful quit and verify that macOS accepted the request."""
+    try:
+        from acctsw.procenv import harden_env
+        completed = run(["open", "-b", "com.openai.codex"], env=harden_env(), capture_output=True,
+                        text=True, timeout=10)
+        if completed.returncode != 0:
+            return completed.stderr.strip() or f"open exited {completed.returncode}"
+    except Exception as exc:
+        return str(exc).strip() or exc.__class__.__name__
+    return None
 
 
 def _bootstrap_notice(notify, title: str, text: str) -> None:
@@ -124,6 +184,15 @@ if objc is not None:
             self.popover = None
             self.webview = None
             self._state_timer = None
+            self._usage_timer = None
+            self._usage_interval = None
+            self._usage_poll_inflight = False
+            self._pending_usage_request = None
+            self._last_all_usage_poll = 0.0
+            self._codex_restart_pending = False
+            self._codex_restart_timer = None
+            self._codex_restart_attempts = 0
+            self._auto_handoff_warnings = set()
             self._last_state_sig = None          # (state rev, session heartbeat mtimes)
             self._acctWarned = set()              # shared-account warnings already toasted this session
             self._login_baseline = {}             # tool → (op, digest of live creds at that login launch)
@@ -212,9 +281,20 @@ if objc is not None:
             self.popover.setBehavior_(1)  # NSPopoverBehaviorTransient
 
         @objc.python_method
+        def _setUsagePollInterval(self, interval):
+            """Run one coalesced usage poll on the cadence appropriate for popover visibility."""
+            if self._usage_timer is not None and self._usage_interval == interval:
+                return
+            if self._usage_timer is not None:
+                self._usage_timer.invalidate()
+                self._usage_timer = None
+            self._usage_interval = interval
+            self._usage_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                interval, self, objc.selector(self.pollUsage_, signature=b"v@:@"), None, True)
+
+        @objc.python_method
         def _startUsageTimer(self):
-            NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-                USAGE_POLL_SECONDS, self, objc.selector(self.pollUsage_, signature=b"v@:@"), None, True)
+            self._setUsagePollInterval(usage_poll_interval(False))
             self.pollUsage_(None)  # don't wait 180s for the first usage read
 
         # --- actions ------------------------------------------------------------------------
@@ -228,12 +308,14 @@ if objc is not None:
                 self.popover.showRelativeToRect_ofView_preferredEdge_(btn.bounds(), btn, 1)
                 self._setWebVisible(True)
                 self._startStateTimer()
+                self._setUsagePollInterval(usage_poll_interval(True))
                 self.pollUsage_(None)  # refresh usage each time the popover opens (cache-guarded)
 
         def popoverDidClose_(self, _notification):
             # Transient popovers also close when the user clicks elsewhere, bypassing togglePopover_.
             self._stopStateTimer()
             self._setWebVisible(False)
+            self._setUsagePollInterval(usage_poll_interval(False))
 
         @objc.python_method
         def _startStateTimer(self):
@@ -285,16 +367,63 @@ if objc is not None:
             self.applyResult_(result)
 
         def pollUsage_(self, _timer):
-            # Run the network refresh OFF the main thread so the menubar UI never freezes.
+            # Run the network refresh OFF the main thread so the menubar UI never freezes.  A slow
+            # Claude auth-status/usage request can overlap an open-popover 30s tick; one in-flight
+            # poll is enough because bridge/usage refreshes every provider together.
+            if self._usage_poll_inflight:
+                # A just-switched active seat needs its own forced read; retain that request after
+                # the ordinary in-flight poll finishes instead of silently dropping it.
+                if isinstance(_timer, dict) and _timer.get("force"):
+                    self._pending_usage_request = dict(_timer)
+                return
+            self._usage_poll_inflight = True
             self.performSelectorInBackground_withObject_(
-                objc.selector(self.pollBg_, signature=b"v@:@"), None)
+                objc.selector(self.pollBg_, signature=b"v@:@"), _timer)
 
-        def pollBg_(self, _arg):
-            appalive.mark_alive(self.ctx.data_dir)   # refresh heartbeat so a spurious removal self-heals within one poll
-            result = dict(bridge.handle(self.ctx, {"action": "usage"}))
+        def pollBg_(self, request):
+            try:
+                appalive.mark_alive(self.ctx.data_dir)   # refresh heartbeat so a spurious removal self-heals within one poll
+                if not isinstance(request, dict):
+                    visible = self._usage_interval == USAGE_POLL_OPEN_SECONDS
+                    scope = usage_poll_scope(visible, self._last_all_usage_poll, at=time.monotonic())
+                    request = {"scope": scope}
+                    if scope == "all":
+                        self._last_all_usage_poll = time.monotonic()
+                result = dict(bridge.handle(self.ctx, {"action": "usage", **request}))
+            except Exception as exc:
+                detail = str(exc).strip() or exc.__class__.__name__
+                result = {"ok": False, "error": f"couldn't refresh usage: {detail}"}
             result["background"] = True   # the JS must not toast a transient poll error over the UI
             self.performSelectorOnMainThread_withObject_waitUntilDone_(
-                objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
+                objc.selector(self.finishUsagePoll_, signature=b"v@:@"), result, False)
+
+        def finishUsagePoll_(self, result):
+            self._usage_poll_inflight = False
+            self.applyResult_(result)
+            handoff = result.get("auto_switch") or {}
+            if handoff.get("status") == "switched":
+                notify_on = ((result.get("state") or {}).get("settings") or {}).get("notify", True)
+                if notify_on:
+                    self._notify(
+                        f"switched {handoff.get('tool')} ✨",
+                        f"{handoff.get('from')} hit its usage limit — {handoff.get('to')} is on now",
+                    )
+                self._restartCodexAfterSwap_(handoff.get("tool"))
+                # The new active credentials have just landed.  Prime its card rather than making
+                # the person wait for the next visible/hidden cadence.
+                tool, email = handoff.get("tool"), handoff.get("to")
+                if tool and email:
+                    self.pollUsage_({"scope": "active", "tool": tool, "only": email,
+                                     "force": True})
+            elif handoff.get("status") == "failed" and handoff.get("error"):
+                key = (handoff.get("tool"), handoff.get("from"), handoff.get("to"), handoff["error"])
+                if key not in self._auto_handoff_warnings:
+                    self._auto_handoff_warnings.add(key)
+                    self._notify("couldn't switch automatically", handoff["error"])
+            pending = self._pending_usage_request
+            self._pending_usage_request = None
+            if pending is not None:
+                self.pollUsage_(pending)
 
         @objc.python_method
         def _credDigest(self, tool):
@@ -396,6 +525,84 @@ if objc is not None:
                 self._notify("seat saved ✨", "your seat's on the floor")
 
         @objc.python_method
+        def _restartCodexAfterSwap_(self, tool):
+            """Gracefully restart Codex after a successful Codex handoff when requested.
+
+            Claude reads Keychain credentials live, so it is intentionally excluded.  This never
+            force-terminates Codex: an unsuccessful normal quit is surfaced and no launch is tried
+            against the still-running process.  The pending flag coalesces duplicate poll replies.
+            """
+            if tool != "codex" or self._codex_restart_pending:
+                return
+            try:
+                enabled = bool(self.ctx.load_state().settings().get("restart_app", False))
+            except Exception:
+                enabled = False
+            if not enabled:
+                return
+            try:
+                was_running, error = request_codex_restart(
+                    NSWorkspace.sharedWorkspace().runningApplications()
+                )
+            except Exception as exc:
+                was_running = False
+                error = str(exc).strip() or exc.__class__.__name__
+            if error:
+                self._notify("couldn't restart Codex", error)
+                return
+            if not was_running:
+                # This is a restart option, not a request to start a desktop app the user left
+                # closed.  The CLI/menubar credentials were still switched successfully.
+                return
+            self._codex_restart_pending = True
+            # `terminate()` is asynchronous. Poll the running-app list until it has actually
+            # exited; `open -a` while the old process still exists merely activates it, then
+            # leaves no replacement when it later finishes quitting.
+            self._codex_restart_attempts = 0
+            self._codex_restart_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                0.25, self, objc.selector(self.waitForCodexExit_, signature=b"v@:@"), None, True)
+
+        def waitForCodexExit_(self, timer):
+            self._codex_restart_attempts += 1
+            try:
+                still_running = any(
+                    _codex_desktop_app(app)
+                    for app in NSWorkspace.sharedWorkspace().runningApplications()
+                )
+            except Exception as exc:
+                timer.invalidate()
+                self._codex_restart_timer = None
+                self._codex_restart_pending = False
+                detail = str(exc).strip() or exc.__class__.__name__
+                self._notify("couldn't restart Codex", f"couldn't confirm it exited: {detail}")
+                return
+            if still_running and self._codex_restart_attempts < 40:  # ten seconds, never force-kill
+                return
+            timer.invalidate()
+            self._codex_restart_timer = None
+            if still_running:
+                self._codex_restart_pending = False
+                self._notify("couldn't restart Codex", "Codex did not quit within 10 seconds")
+                return
+            self.launchCodexAfterSwap_(None)
+
+        def launchCodexAfterSwap_(self, _timer):
+            # `open` is a short subprocess but still belongs off AppKit's main thread.  Its result
+            # is returned to the main thread so an unavailable/misnamed app is never silent.
+            self.performSelectorInBackground_withObject_(
+                objc.selector(self.launchCodexBg_, signature=b"v@:@"), None)
+
+        def launchCodexBg_(self, _arg):
+            error = launch_codex_desktop()
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                objc.selector(self.finishCodexLaunch_, signature=b"v@:@"), error or "", False)
+
+        def finishCodexLaunch_(self, error):
+            self._codex_restart_pending = False
+            if error:
+                self._notify("couldn't restart Codex", error)
+
+        @objc.python_method
         def _notifyAccountWarnings(self, result):
             """Toast each shared-account warning ONCE per session — the user needs to know two seats
             are secretly the same account (no real headroom). Keyed on the exact message so a new or
@@ -449,15 +656,37 @@ if objc is not None:
                     objc.selector(self.addBg_, signature=b"v@:@"), msg)
                 return
 
+            if action == "switch":
+                # Claude identity can take seconds; keep paints and usage updates responsive.
+                self.performSelectorInBackground_withObject_(
+                    objc.selector(self.switchBg_, signature=b"v@:@"), msg)
+                return
             result = bridge.handle(self.ctx, msg)
             if action == "dot":
                 self._updateDot(result.get("state"))
                 return
             self._pushResult(result)
             self._updateDot(result.get("state"))
-            if action == "switch" and result.get("ok") \
-                    and self.ctx.load_state().settings().get("notify", True):
+
+        def switchBg_(self, msg):
+            try:
+                result = dict(bridge.handle(self.ctx, msg))
+            except Exception as exc:
+                result = {"ok": False, "error": str(exc).strip() or exc.__class__.__name__}
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                objc.selector(self.finishSwitch_, signature=b"v@:@"), [msg, result], False)
+
+        def finishSwitch_(self, response):
+            msg, result = response
+            self.applyResult_(result)
+            if result.get("ok") and self.ctx.load_state().settings().get("notify", True):
                 self._notify("just switched you ✨", "your seat's on the floor")
+            if result.get("ok"):
+                self._restartCodexAfterSwap_(msg.get("tool"))
+                # A manual switch is equally entitled to a current card; if a background sweep is
+                # still running this is retained as the one coalesced follow-up request.
+                self.pollUsage_({"scope": "active", "tool": msg.get("tool"),
+                                 "only": msg.get("email"), "force": True})
 
         # --- helpers ------------------------------------------------------------------------
         @objc.python_method

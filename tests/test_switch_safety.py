@@ -72,6 +72,24 @@ def test_sync_back_skips_on_codex_account_mismatch(ctx):
     assert ctx.snapshot_get("codex", "a@x.com") == a_snapshot_before
 
 
+def test_manual_switch_preserves_supervised_codex_token_rotation(ctx, monkeypatch):
+    """A GUI swap must not save its old mirror over the running child's rotated private home."""
+    from acctsw import session
+    _add_codex(ctx, "spare@x.com")
+    state = _add_codex(ctx, "running@x.com")
+    rotated = make_codex_blob("running@x.com").replace('"refresh_token": "r"',
+                                                      '"refresh_token": "ROTATED"')
+    ctx.snapshot_set("codex", "running@x.com", rotated)
+    monkeypatch.setattr(session, "active_session", lambda *_: {"email": "running@x.com"})
+
+    result = bridge.handle(ctx, {"action": "switch", "tool": "codex", "email": "spare@x.com"})
+
+    assert result["ok"]
+    assert ctx.load_state().active("codex") == "spare@x.com"
+    assert ctx.snapshot_get("codex", "running@x.com") == rotated
+    assert ctx.cred["codex"].email_of(ctx.cred["codex"].get_live()) == "spare@x.com"
+
+
 def test_sync_back_claude_unknown_identity_never_clobbers_old_seat(ctx, monkeypatch):
     """Claude email_of is permanently None; an unknown auth-status identity must stop account B's
     Keychain bytes from being saved under active seat A."""
