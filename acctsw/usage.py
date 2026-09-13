@@ -247,6 +247,26 @@ def claude_token(blob: str) -> str | None:
     return (data.get("claudeAiOauth") or {}).get("accessToken")
 
 
+def _claude_access_token_expired(blob: str) -> bool:
+    """An expired access token with a refresh credential is not proof of a signed-out session.
+
+    Claude owns token renewal. The usage reader must neither rotate its refresh token nor ask
+    the user to sign in merely because this short-lived access token has reached its expiry.
+    """
+    try:
+        data = json.loads(blob)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
+    if not isinstance(oauth, dict):
+        return False
+    refresh = oauth.get("refreshToken")
+    expiry = oauth.get("expiresAt")
+    return (isinstance(refresh, str) and bool(refresh)
+            and isinstance(expiry, (int, float)) and not isinstance(expiry, bool)
+            and 0 < expiry <= now().timestamp() * 1000)
+
+
 @lru_cache(maxsize=8)
 def _claude_user_agent_for_exe(exe: str | None) -> str:
     if exe:
@@ -581,7 +601,10 @@ def _fetch_for(tool: str, blob: str, get: HttpGet, ua: str | None) -> Usage:
         token, account = codex_token_account(blob)
         return fetch_codex(token, account, get=get)
     token = claude_token(blob)
-    return fetch_claude(token, user_agent=ua, get=get)
+    fetched = fetch_claude(token, user_agent=ua, get=get)
+    if fetched.error == "unauthorized" and _claude_access_token_expired(blob):
+        fetched.error = "token_expired"
+    return fetched
 
 
 MAX_BACKOFF_SECONDS = 3600

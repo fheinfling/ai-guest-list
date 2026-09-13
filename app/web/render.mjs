@@ -169,6 +169,7 @@ function seatCard(tool, seat) {
   const error = seat.usage?.error;
   const issue = ({ rate_limited: "usage updates throttled · retrying automatically",
     network: "connection unavailable · retrying automatically",
+    token_expired: "usage refresh pending · open Claude to refresh",
     unauthorized: "usage unavailable · sign in to refresh",
     forbidden: "usage unavailable · check your subscription",
     no_token: "usage unavailable · sign in to refresh",
