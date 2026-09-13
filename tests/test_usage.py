@@ -126,6 +126,38 @@ def test_parse_codex_labels_pro_lite_primary_as_weekly_from_duration():
     assert w["weekly"].resets_at is not None
 
 
+def test_fetch_codex_reports_explicit_weekly_only_window_for_display():
+    body = json.dumps({"rate_limit": {
+        "primary_window": {"used_percent": 3, "limit_window_seconds": 604800},
+        "secondary_window": None,
+    }})
+    usage = U.fetch_codex("token", "account", get=lambda *_: (200, body))
+    assert usage.reported_windows == ["weekly"]
+
+
+def test_fetch_codex_reports_both_explicit_standard_windows_for_display():
+    body = json.dumps({"rate_limit": {
+        "primary_window": {"used_percent": 3, "limit_window_seconds": 18000},
+        "secondary_window": {"used_percent": 7, "limit_window_seconds": 604800},
+    }})
+    usage = U.fetch_codex("token", "account", get=lambda *_: (200, body))
+    assert usage.reported_windows == ["5h", "weekly"]
+
+
+def test_fetch_codex_reports_explicit_unknown_duration_for_display():
+    body = json.dumps({"rate_limit": {
+        "primary_window": {"used_percent": 3, "limit_window_seconds": 86400},
+        "secondary_window": None,
+    }})
+    usage = U.fetch_codex("token", "account", get=lambda *_: (200, body))
+    assert usage.reported_windows == ["window_86400s"]
+
+
+def test_fetch_codex_does_not_infer_reported_windows_from_legacy_positions():
+    usage = U.fetch_codex("token", "account", get=lambda *_: (200, codex_ok_body()))
+    assert usage.reported_windows is None
+
+
 def test_parse_codex_labels_common_team_windows_from_duration():
     body = {"rate_limit": {
         "primary_window": {"used_percent": 4, "limit_window_seconds": 18000},
@@ -743,6 +775,18 @@ def test_error_preserves_last_known_windows(ctx):
     assert usage["error_streak"] == 1
 
 
+def test_error_preserves_last_known_reported_windows(ctx):
+    state = _seed_two_codex(ctx)
+    good = U.Usage(ok=True, reported_windows=["weekly"],
+                   windows={"weekly": U.Window(used_pct=3.0)}, fetched_at=iso(now()))
+    U.store_fetch(state, "codex", "a@x.com", good, blob=ctx.cred["codex"].get_live())
+    U.store_fetch(state, "codex", "a@x.com",
+                  U.Usage(error="network", fetched_at=iso(now())))
+
+    usage = state.get_seat("codex", "a@x.com")["usage"]
+    assert usage["reported_windows"] == ["weekly"]
+
+
 def test_error_preserves_last_success_time_for_honest_usage_age(ctx):
     """A failed fetch must not timestamp frozen windows as freshly fetched; their age starts at the
     last successful response while a separate attempt time continues driving retry backoff."""
@@ -1067,6 +1111,17 @@ def test_claude_user_agent_caches_version_subprocess(monkeypatch):
     assert U.claude_user_agent("/fake/claude") == "claude-code/9.9.1"
     assert len(calls) == 1
     um._claude_user_agent_for_exe.cache_clear()
+
+
+@pytest.mark.parametrize("duration", [None, "unknown", True, 0, -1, float("inf")])
+def test_malformed_primary_duration_cannot_confirm_weekly_only_plan(duration):
+    body = json.dumps({"rate_limit": {
+        "primary_window": {"used_percent": 5, "limit_window_seconds": duration},
+        "secondary_window": {"used_percent": 10, "limit_window_seconds": 604800},
+    }})
+    fetched = U.fetch_codex("token", "account", get=lambda *_: (200, body))
+    assert fetched.ok
+    assert fetched.reported_windows is None
 
 
 def _epoch(iso_s):

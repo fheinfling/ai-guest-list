@@ -73,6 +73,12 @@ export function fmtCountdown(iso, now = Date.now()) {
   if (isNaN(ms) || ms <= 0) return "now";
   const mins = Math.round(ms / 60000);
   if (mins < 60) return `${mins}m`;
+  if (mins > 24 * 60) {
+    const totalHours = Math.floor(mins / 60);
+    const days = Math.floor(totalHours / 24);
+    const hours = totalHours % 24;
+    return `${days}d${hours ? `${hours}h` : ""}`;
+  }
   const hrs = Math.floor(mins / 60);
   return `${hrs}h${mins % 60 ? ` ${mins % 60}m` : ""}`;
 }
@@ -156,6 +162,9 @@ function bar(seat, win, label) {
 
 function seatCard(tool, seat) {
   const plan = planChip(seat.plan);
+  const reported = seat?.usage?.reported_windows;
+  const weeklyOnly = tool === "codex" && Array.isArray(reported) &&
+    reported.includes("weekly") && !reported.includes("5h");
   const fetchedAt = seat.usage_fetched_at || seat.usage?.fetched_at || "";
   const error = seat.usage?.error;
   const issue = ({ rate_limited: "usage updates throttled · retrying automatically",
@@ -184,7 +193,7 @@ function seatCard(tool, seat) {
       <span class="grow"></span>${statusBit(tool, seat)}
     </div>
     <div class="seat-email mono">${esc(seat.email)}</div>
-    ${bar(seat, "5h", "5h")}
+    ${weeklyOnly ? "" : bar(seat, "5h", "5h")}
     ${bar(seat, "weekly", "7d")}
     ${freshness}
     ${reassure}

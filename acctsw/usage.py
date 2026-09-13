@@ -48,6 +48,10 @@ class Usage:
     ok: bool = False
     error: str | None = None  # "unauthorized" | "forbidden" | "rate_limited" | "network" | ...
     windows: dict[str, Window] = field(default_factory=dict)  # "5h" / "weekly"
+    # Exact Codex window labels when the provider supplied durations. ``None`` means the response
+    # used legacy positional buckets (or came from Claude/failed), so consumers must keep their
+    # normal UI rather than infer that a missing 5h window was intentionally absent.
+    reported_windows: list[str] | None = None
     limit_reached: bool | None = None  # authoritative flag when the API provides one (Codex)
     # Authoritative NON-percentage signals (codex). In the credits-depleted case the windows come
     # back null, so percentages prove nothing and only these say whether the seat can be used.
@@ -62,6 +66,7 @@ class Usage:
         return {
             "ok": self.ok,
             "error": self.error,
+            "reported_windows": self.reported_windows,
             "limit_reached": self.limit_reached,
             "plan_type": self.plan_type,
             "allowed": self.allowed,
@@ -363,6 +368,24 @@ def _codex_labeled_windows(src: dict) -> dict[str, dict]:
     return labeled
 
 
+def _codex_reported_window_labels(src: dict) -> list[str] | None:
+    """Provider-declared Codex window labels, without treating legacy positions as facts.
+
+    A primary-only legacy payload cannot tell us whether it was actually a 5h or weekly tier. Only
+    duration-bearing windows can drive a display decision such as hiding the 5h bar. Unknown
+    valid durations still remain explicit labels (``window_86400s``) for callers
+    that want to show the provider's real shape.
+    """
+    labeled = _codex_labeled_windows(src)
+    if not labeled:
+        return None
+    for window in labeled.values():
+        duration = _num(window, "limit_window_seconds")
+        if duration is None or not 0 < duration < float("inf"):
+            return None  # missing/malformed durations cannot establish that the 5h quota is absent
+    return list(labeled)
+
+
 def parse_codex(payload: dict) -> dict[str, Window]:
     """Parse the real ChatGPT ``wham/usage`` shape (and tolerate minor variations).
 
@@ -460,7 +483,9 @@ def fetch_codex(token: str | None, account_id: str | None, *,
         return u
     try:
         payload = json.loads(body)
+        rate_src = _codex_rate_src(payload)
         u.windows = parse_codex(payload)
+        u.reported_windows = _codex_reported_window_labels(rate_src)
         u.limit_reached = codex_limit_reached(payload)
         flags = parse_codex_flags(payload)
         u.plan_type = flags["plan_type"]
@@ -863,6 +888,7 @@ def store_fetch(state, tool: str, email: str, u: Usage, at=None, *,
         # Preserve last-known-good windows AND their successful timestamp. The failed-attempt time is
         # separate so backoff still works while the renderer can age the data actually on screen.
         d["windows"] = prev_usage.get("windows", d["windows"])
+        d["reported_windows"] = prev_usage.get("reported_windows", d["reported_windows"])
         if prev_usage.get("stale") and "last_attempted_at" not in prev_usage:
             # Pre-fix stale records used fetched_at for the failed attempt, not the retained windows;
             # there is no honest success age to recover, so treat them as never successfully fetched.

@@ -69,6 +69,9 @@ test("fmtCountdown", () => {
   const now = Date.parse("2026-06-28T12:00:00Z");
   assert.equal(fmtCountdown("2026-06-28T12:12:00Z", now), "12m");
   assert.equal(fmtCountdown("2026-06-28T14:30:00Z", now), "2h 30m");
+  assert.equal(fmtCountdown("2026-06-29T12:00:00Z", now), "24h");
+  assert.equal(fmtCountdown("2026-07-05T11:00:00Z", now), "6d23h");
+  assert.equal(fmtCountdown("2026-07-05T13:00:00Z", now), "7d1h");
 });
 
 test("type discipline: Outfit wordmark w/ gold 'ai', email mono, seat name NOT mono", () => {
@@ -192,6 +195,25 @@ test("both usage windows stay visible on collapsed Codex and Claude cards", () =
   }
 });
 
+test("Codex hides 5h only when durations confirm a weekly-only quota", () => {
+  const renderSeat = (tool, usage) => buildHTML(state({ tools: {
+    [tool]: { seats: [seat({ usage })] },
+    [tool === "codex" ? "claude" : "codex"]: { seats: [] },
+  } }));
+
+  const weeklyOnly = renderSeat("codex", { reported_windows: ["weekly"] });
+  assert.doesNotMatch(weeklyOnly, /class="mono u-k">5h</);
+  assert.match(weeklyOnly, /class="mono u-k">7d</);
+
+  const legacy = renderSeat("codex", { windows: { weekly: { used_pct: 10 } } });
+  assert.match(legacy, /class="mono u-k">5h</);
+  assert.match(legacy, /class="mono u-k">7d</);
+
+  const claude = renderSeat("claude", { reported_windows: ["weekly"] });
+  assert.match(claude, /class="mono u-k">5h</);
+  assert.match(claude, /class="mono u-k">7d</);
+});
+
 test("usage ages handle fresh, old, missing, and future timestamps", () => {
   const at = Date.parse("2026-09-13T12:00:00Z");
   assert.equal(fmtUsageAge("2026-09-13T11:59:31Z", at), "updated 29s ago");
@@ -207,12 +229,14 @@ test("clock ticks update age and reset text without replacing the DOM", () => {
   const age = { dataset: { usageAt: "2026-09-13T11:59:30Z" } };
   const reset = { dataset: { resetAt: "2026-09-13T12:02:00Z" } };
   const rest = { dataset: { resetAt: "2026-09-13T12:03:00Z", clockPrefix: "back in" } };
-  const root = { querySelectorAll: (selector) => selector === "[data-usage-at]" ? [age] : [reset, rest],
+  const long = { dataset: { resetAt: "2026-09-20T13:00:00Z" } };
+  const root = { querySelectorAll: (selector) => selector === "[data-usage-at]" ? [age] : [reset, rest, long],
     set innerHTML(_) { assert.fail("clock ticks must preserve existing controls and focus"); } };
   updateClockText(root, Date.parse("2026-09-13T12:00:00Z"));
   assert.equal(age.textContent, "updated 30s ago");
   assert.equal(reset.textContent, "resets in 2m");
   assert.equal(rest.textContent, "back in 3m");
+  assert.equal(long.textContent, "resets in 7d1h");
 });
 
 test("provider throttling is visible alongside retained usage", () => {
