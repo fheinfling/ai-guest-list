@@ -108,6 +108,24 @@ test("stale usage preserves bars and labels the last successful reading", () => 
   assert.match(html, /20%/);  // stale is last-known and labeled; only unknown suppresses the number
 });
 
+test("resting cards show the breather return time without duplicate refresh-status lines", () => {
+  const html = buildHTML(state({ tools: {
+    codex: { seats: [seat({
+      status: "resting",
+      limited: true,
+      limited_until: "2026-09-13T18:57:00Z",
+      usage_stale: true,
+      usage_fetched_at: "2026-09-13T18:25:00Z",
+      usage: { error: "network" },
+    })] },
+    claude: { seats: [] },
+  } }));
+  assert.match(html, /taking a breather — back/);
+  assert.match(html, /class="usage usage--stale"/);  // retained data stays visibly muted
+  assert.doesNotMatch(html, /last known|connection unavailable|retrying automatically/);
+  assert.doesNotMatch(html, /data-usage-at=/);
+});
+
 test("unknown usage renders dashes instead of unsupported percentages", () => {
   const html = buildHTML(state({ tools: {
     codex: { seats: [seat({ usage_unknown: true, usage5h: 25, usageWeek: 60 })] },

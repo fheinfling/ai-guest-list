@@ -167,7 +167,8 @@ function seatCard(tool, seat) {
     forbidden: "usage unavailable · check your subscription",
     no_token: "usage unavailable · sign in to refresh",
   })[error] || (error ? "usage update failed · retrying automatically" : "");
-  const freshness = `<div class="usage-age mono${seat.usage_stale ? " usage-age--stale" : ""}"><span data-usage-at="${esc(fetchedAt)}">${fmtUsageAge(fetchedAt)}</span>${seat.usage_stale ? " · last known" : ""}</div>
+  const freshness = seat.status === "resting" ? "" :
+    `<div class="usage-age mono${seat.usage_stale ? " usage-age--stale" : ""}"><span data-usage-at="${esc(fetchedAt)}">${fmtUsageAge(fetchedAt)}</span>${seat.usage_stale ? " · last known" : ""}</div>
     ${issue ? `<div class="usage-error">${issue}</div>` : ""}`;
   const reassure = seat.status === "resting"
     ? `<div class="reassure mono">taking a breather — back ${fmtClock(seat.limited_until)}</div>` : "";
