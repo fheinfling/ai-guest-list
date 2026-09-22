@@ -75,7 +75,7 @@ jobs:
         run: python scripts/smoke-bundle.py
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7 (pinned SHA; Dependabot keeps it current)
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7 (pinned SHA; Dependabot keeps it current)
         with:
           token: ${{ secrets.CODECOV_TOKEN }}   # add this secret once at codecov.io
           files: coverage.xml
