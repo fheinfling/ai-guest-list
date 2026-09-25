@@ -269,7 +269,8 @@ or installation directory.
   *after* login and cannot recover them.
 - **Unattended switching (M4 launcher) uses the Codex live-vs-active guard** in `switch.sync_back`
   (skip sync-back when live creds belong to a different account than `state.active`).
-- **Per-account Codex homes hold exactly one real file, `auth.json`.** Everything else in
+- **Per-account Codex homes hold exactly one real file, `auth.json`** (plus whatever the seat's own
+  app-server daemon keeps, and any parked `.orphaned-*` copy). Everything else in
   `~/.account-switcher/ch/<id>/` is a symlink into the shared `~/.codex`, which stays the
   source of truth for config and sessions. **SQLite sidecars (`-wal`/`-shm`/`-journal`) are never
   linked** — SQLite resolves a symlinked database and writes them beside the real file, while a real

@@ -336,9 +336,29 @@ def test_a_seat_home_leaves_room_for_the_daemon_control_socket():
     assert not codexhome.daemon_socket_fits(home / "one-directory-deeper-than-fits")
 
 
-def test_the_installed_store_layout_fits_the_socket_budget():
-    """The one that would have caught the 0.157 breakage: the REAL ~/.account-switcher layout."""
-    assert codexhome.daemon_socket_fits(codexhome.home_dir(EMAIL))
+def test_the_store_layout_fits_up_to_a_23_character_username():
+    """Where the layout runs out of room — an environment fact, pinned on synthetic homes so it is
+    not the test machine's own username that decides whether the suite passes."""
+    def fits(user):
+        store = Path(f"/Users/{user}/.account-switcher") / P.CODEX_HOMES.name
+        return codexhome.daemon_socket_fits(codexhome.home_dir(EMAIL, store))
+
+    assert fits("u" * 23)
+    assert not fits("u" * 24)
+
+
+def test_the_fit_check_measures_the_path_codex_actually_binds(tmp_path):
+    """codex resolves CODEX_HOME before building the socket path, so a short home that is really a
+    symlink into a deep directory still fails — and the check has to fail with it."""
+    deep = tmp_path / ("d" * 40) / ("e" * 40)
+    deep.mkdir(parents=True)
+    short = Path("/tmp") / f"acctsw-fit-{os.getpid()}"
+    short.symlink_to(deep)
+    try:
+        assert len(str(short)) <= codexhome.MAX_HOME_LEN     # short by name …
+        assert not codexhome.daemon_socket_fits(short)       # … but not where it lands
+    finally:
+        short.unlink()
 
 
 # --- the by-address index (and the pre-1.0.2 move) -----------------------------------------------
@@ -351,21 +371,54 @@ def test_a_seat_is_findable_by_address(ctx):
     assert not os.path.isabs(os.readlink(link))                 # relative: the store stays movable
 
 
-def test_a_pre_1_0_2_home_is_moved_onto_the_short_path_with_its_auth(ctx):
+def _legacy_home(ctx, token='{"tokens": {}}'):
+    """A seat as the pre-1.0.2 layout left it: a real directory named by address."""
     old = codexhome.by_address(EMAIL, ctx._homes_root)
     old.mkdir(parents=True)
-    (old / "auth.json").write_text('{"tokens": {}}')
+    (old / "auth.json").write_text(token)
     (old / f"x.sqlite{codexhome.ORPHAN_MARK}20260101T000000").write_bytes(b"parked")
     (old / "sessions").symlink_to(ctx._codex_real / "sessions")
+    return old
 
-    assert codexhome.load(EMAIL, root=ctx._homes_root) == '{"tokens": {}}'   # a read is enough
 
-    home = _home(ctx)
+def test_a_pre_1_0_2_home_is_moved_onto_the_short_path_with_its_auth(ctx):
+    old = _legacy_home(ctx)
+
+    home = _ensure(ctx)
+
     assert (home / "auth.json").read_text() == '{"tokens": {}}'
     assert (home / f"x.sqlite{codexhome.ORPHAN_MARK}20260101T000000").read_bytes() == b"parked"
     assert (home / "sessions").is_symlink()
-    _ensure(ctx)
     assert old.is_symlink() and old.resolve() == home.resolve()  # the address still finds the seat
+
+
+def test_reading_a_seat_never_moves_it(ctx):
+    """Usage polling reads seats on a timer, outside the state lock. A read that renamed the home
+    would pull it out from under a codex child standing in it — and the pre-1.0.2 path that child
+    still holds would be gone with it."""
+    old = _legacy_home(ctx, token="legacy-token")
+
+    assert codexhome.load(EMAIL, root=ctx._homes_root) == "legacy-token"
+
+    assert old.is_dir() and not old.is_symlink()
+    assert not _home(ctx).exists()
+
+
+def test_adoption_that_loses_the_race_changes_nothing(ctx):
+    """If the short home appeared meanwhile, the legacy directory stays put — it must never end up
+    nested INSIDE the new home, where the next promoting heal would hand it to ~/.codex."""
+    codexhome.save(EMAIL, "winning token", codex_home=ctx._codex_real, root=ctx._homes_root)
+    home = _home(ctx)                         # the winner: short home + index already published
+    old = codexhome.by_address(EMAIL, ctx._homes_root)
+    old.unlink()
+    old.mkdir(parents=True)                   # the loser, still holding a real directory
+    (old / "auth.json").write_text("racing token")
+
+    codexhome._adopt_legacy(EMAIL, ctx._homes_root)
+
+    assert (old / "auth.json").read_text() == "racing token"
+    assert (home / "auth.json").read_text() == "winning token"
+    assert [p.name for p in home.iterdir() if not p.is_symlink()] == ["auth.json"]
 
 
 def test_an_un_adoptable_legacy_home_is_never_clobbered(ctx):
@@ -387,3 +440,34 @@ def test_delete_removes_both_the_home_and_its_address(ctx):
 
     assert codexhome.delete(EMAIL, root=ctx._homes_root) is True
     assert not home.exists() and not link.is_symlink() and not link.exists()
+
+
+def test_delete_reports_failure_while_the_token_is_still_on_disk(ctx, monkeypatch):
+    """Dropping the address must not read as "seat erased" when the home survived the rmtree."""
+    _ensure(ctx)
+    codexhome.save(EMAIL, "still-here", codex_home=ctx._codex_real, root=ctx._homes_root)
+    monkeypatch.setattr(codexhome.shutil, "rmtree", lambda *a, **k: None)
+
+    assert codexhome.delete(EMAIL, root=ctx._homes_root) is False
+    assert codexhome.load(EMAIL, root=ctx._homes_root) == "still-here"
+
+
+def test_one_login_spelled_two_ways_is_one_home(ctx):
+    """``codex_jwt_matches`` case-folds, and the old address-named homes collapsed on a
+    case-insensitive filesystem — the hash has to agree with both."""
+    assert codexhome.home_dir("A@X.com", ctx._homes_root) == codexhome.home_dir("a@x.com",
+                                                                               ctx._homes_root)
+
+
+def test_a_repointed_address_is_replaced_atomically(ctx):
+    """A stale index entry is repaired without ever unlinking it first."""
+    home = _ensure(ctx)
+    link = codexhome.by_address(EMAIL, ctx._homes_root)
+    link.unlink()
+    link.symlink_to("../somewhere-else")
+
+    _ensure(ctx)
+
+    assert link.resolve() == home.resolve()
+    assert not any(p.name.startswith(".") and p.name.endswith(".tmp")
+                   for p in link.parent.iterdir())        # nothing staged left behind

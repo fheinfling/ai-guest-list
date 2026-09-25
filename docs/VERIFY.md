@@ -137,13 +137,16 @@ acctsw uninstall --purge       # also deletes the store + all our keychain items
   now healed automatically on the next `cx` launch with no other supervised codex session running:
   `ls -la ~/.account-switcher/codex-homes/<seat>/` (the by-address symlink into `ch/<id>`) must show
   `auth.json` as the ONLY real file and no `*-wal` / `*-shm` links — apart from the app-server
-  daemon's own `app-server-control/` and `app-server-daemon/`, which are per-seat by design and must
-  never appear in `~/.codex` or as symlinks here (a shared daemon serves the wrong account's auth).
-  A `*.orphaned-<stamp>` copy parked there is expected and inert.
-- Codex daemon socket: a seat home must stay under 60 characters so
+  daemon's own `app-server-control/` and `app-server-daemon/`, which are real and per-seat by design.
+  Stock codex legitimately owns copies of those in `~/.codex`; what must never happen is a seat
+  *sharing* them — they are never symlinked into a home and never promoted out of one, because a
+  shared daemon serves the wrong account's auth. A `*.orphaned-<stamp>` copy parked there is
+  expected and inert.
+- Codex daemon socket: a seat home must stay at most 60 bytes **as resolved** so
   `<home>/app-server-control/app-server-control.sock` fits macOS's 104-byte `SUN_LEN`; past it every
-  `cx` launch dies with "app server did not become ready … path must be shorter than SUN_LEN".
-  Check with `python3 -c "from acctsw import codexhome as c; print(c.daemon_socket_fits(c.home_dir('<seat>')))"`.
+  interactive `cx` launch dies with "app server did not become ready … path must be shorter than
+  SUN_LEN" (`--no-daemon` still runs). Check with
+  `python3 -c "from acctsw import codexhome as c; print(c.daemon_socket_fits(c.home_dir('<seat>')))"`.
 - Resume-by-id: currently `codex resume --last` / `claude --continue` (MVP); capture the session id
   at spawn to resume by id if you run multiple concurrent sessions.
 - The Headroom "save credit" proxy is gone; only the one-time `cleanup_legacy` migration remains
