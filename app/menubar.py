@@ -88,8 +88,9 @@ def launch_codex_desktop(*, run=subprocess.run) -> str | None:
     """Open Codex after its graceful quit and verify that macOS accepted the request."""
     try:
         from acctsw.procenv import harden_env
+        # A malformed LaunchServices diagnostic should still be shown, not fail decoding.
         completed = run(["open", "-b", "com.openai.codex"], env=harden_env(), capture_output=True,
-                        text=True, timeout=10)
+                        text=True, encoding="utf-8", errors="replace", timeout=10)
         if completed.returncode != 0:
             return completed.stderr.strip() or f"open exited {completed.returncode}"
     except Exception as exc:
@@ -150,7 +151,7 @@ def bootstrap_supervision(ctx: Context, notify) -> dict:
 
     if first_run:
         try:
-            sentinel.write_text("")
+            sentinel.write_text("", encoding="utf-8")
         except OSError as exc:
             detail = str(exc).strip() or exc.__class__.__name__
             _bootstrap_notice(

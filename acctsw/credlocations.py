@@ -71,7 +71,7 @@ class CodexCredLocation:
 
     def get_live(self) -> str | None:
         try:
-            return self.auth_path.read_text()
+            return self.auth_path.read_text(encoding="utf-8")
         except FileNotFoundError:
             return None
 

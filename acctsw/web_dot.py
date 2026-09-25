@@ -22,6 +22,7 @@ def dot_for(state: dict[str, Any]) -> str:
         return "hello"
     if state.get("recently_switched"):
         return "switched"
+    # Like render.mjs, use the same status as the header counts: a terminal cannot free quota.
     if any(s.get("status") in ("resting", "queued") for s in seats):
         return "amber"
     return "green"
@@ -29,7 +30,8 @@ def dot_for(state: dict[str, Any]) -> str:
 
 def door_for(state: dict[str, Any]) -> str:
     """The menu-bar door (icon handoff): 'open' onto the disco when a model is free, 'shut' when every
-    seat is rate-limited. 'free' = any seat ready/active. The door is shut ONLY when there are seats
+    seat is unavailable. Only ready/active statuses keep the door open, matching the header counts.
+    The door is shut ONLY when there are seats
     and none are free — a fresh install (no seats) stays 'open' (welcoming, matches the green dot)."""
     seats = _all_seats(state)
     free = any(s.get("status") in ("ready", "active") for s in seats)

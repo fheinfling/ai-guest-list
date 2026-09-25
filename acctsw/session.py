@@ -77,7 +77,7 @@ def mark_session(data_dir: Path, tool: str, email: str) -> None:
     # preserving its existing owner before another terminal replaces it during an upgrade.
     legacy = _session_file(data_dir, tool)
     try:
-        previous = json.loads(legacy.read_text())
+        previous = json.loads(legacy.read_text(encoding="utf-8"))
         previous_pid = int(previous["pid"])
         if previous_pid != pid and _read_session(legacy) is not None:
             # Never overwrite another supervisor's newer record. A hard link snapshots the
@@ -97,7 +97,7 @@ def clear_session(data_dir: Path, tool: str) -> None:
         pass
     try:
         legacy = _session_file(data_dir, tool)
-        data = json.loads(legacy.read_text())
+        data = json.loads(legacy.read_text(encoding="utf-8"))
         if isinstance(data, dict) and data.get("pid") == os.getpid():
             legacy.unlink()
     except (OSError, ValueError, TypeError):
@@ -117,12 +117,18 @@ def session_mtime_ns(data_dir: Path, tool: str) -> int:
     return signature
 
 
+def newest_session(sessions: list[dict]) -> dict | None:
+    """Share one selection rule so seat ages and the launcher's session lookup agree."""
+    # util.iso writes ISO-8601 UTC strings, so lexicographic order is chronological order.
+    return max(sessions, key=lambda s: s["started_at"], default=None)
+
+
 def active_session(data_dir: Path, tool: str, *, email: str | None = None) -> dict | None:
     """Return the live session's public fields, rejecting dead or recycled recorded PIDs."""
     sessions = active_sessions(data_dir, tool)
     if email is not None:
         sessions = [s for s in sessions if s["email"] == email]
-    return max(sessions, key=lambda s: s["started_at"]) if sessions else None
+    return newest_session(sessions)
 
 
 def active_sessions(data_dir: Path, tool: str) -> list[dict]:
@@ -132,22 +138,43 @@ def active_sessions(data_dir: Path, tool: str) -> list[dict]:
         data = _read_session(path)
         if data is not None:
             previous = sessions.get(data["pid"])
-            if previous is None or data["started_at"] > previous["started_at"]:
-                sessions[data["pid"]] = data
+            sessions[data["pid"]] = (newest_session([previous, data])
+                                     if previous is not None else data)
     return list(sessions.values())
 
 
 def _read_session(path: Path) -> dict | None:
+    record = None
+
+    def discard() -> None:
+        # Another supervisor may replace the legacy mirror while ps runs. Only prune the inode
+        # we actually read, never a replacement we already know belongs to a newer writer.
+        try:
+            current = path.stat()
+            if record is not None and (current.st_dev, current.st_ino) == (record.st_dev, record.st_ino):
+                path.unlink()
+        except OSError:
+            pass  # housekeeping must never prevent the remaining sessions from being read
+
     try:
-        data = json.loads(path.read_text())
+        with path.open(encoding="utf-8") as source:
+            record = os.fstat(source.fileno())
+            data = json.load(source)
         email = data["email"]
         pid = int(data["pid"])
         started_at = data["started_at"]
         if not isinstance(email, str) or not isinstance(started_at, str):
+            discard()
             return None
-    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+    except OSError:
+        return None  # an unreadable record is not evidence of a dead session
+    except (ValueError, TypeError, KeyError):
+        # write_json uses atomic temp+rename, so a parse failure cannot be a partial heartbeat
+        # from a concurrent writer. This inode is junk; a replacement is left alone.
+        discard()
         return None
     if not _alive(pid):
+        discard()
         return None
     stored_start = data.get("process_start")
     start = _proc_start(pid)
@@ -158,5 +185,6 @@ def _read_session(path: Path) -> dict | None:
     elif stored_start and not same_proc_start(stored_start, start):
         # Tolerant compare: a heartbeat written by a pre-fix build carries the writer's locale
         # formatting until that supervisor exits, so raw inequality is not proof of PID reuse.
+        discard()
         return None
     return {"email": email, "pid": pid, "started_at": started_at}

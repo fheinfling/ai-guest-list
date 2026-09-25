@@ -63,8 +63,21 @@ def atomic_write_bytes(path: Path, data: bytes, *, mode: int = 0o600) -> None:
         raise
 
 
-def atomic_write_text(path: Path, text: str, *, mode: int = 0o600) -> None:
-    atomic_write_bytes(path, text.encode("utf-8"), mode=mode)
+def read_text(path: Path) -> str:
+    """Our files are UTF-8 even when LaunchServices starts us without a locale."""
+    return Path(path).read_text(encoding="utf-8")
+
+
+def read_text_lossless(path: Path) -> str:
+    """Keep foreign bytes in user-owned files reversible rather than guessing their codec."""
+    # surrogateescape preserves legacy bytes; newline="" also keeps CRLF/CR untouched.
+    # Either kind of normalization would silently rewrite unrelated shell settings.
+    with Path(path).open(encoding="utf-8", errors="surrogateescape", newline="") as f:
+        return f.read()
+
+
+def atomic_write_text(path: Path, text: str, *, mode: int = 0o600, errors: str = "strict") -> None:
+    atomic_write_bytes(path, text.encode("utf-8", errors), mode=mode)
 
 
 def write_json(path: Path, obj, *, mode: int = 0o600) -> None:

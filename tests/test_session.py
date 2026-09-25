@@ -2,6 +2,9 @@
 import os
 import stat
 import subprocess
+from pathlib import Path
+
+import pytest
 
 from acctsw import procenv, session
 from acctsw.util import write_json
@@ -59,6 +62,7 @@ def test_dead_pid_reads_as_no_session(ctx):
         "started_at": "2026-01-01T00:00:00+00:00",
     })
     assert session.active_session(ctx.data_dir, "codex") is None
+    assert not _path(ctx).exists()
 
 
 def test_recycled_pid_reads_as_no_session(ctx, monkeypatch):
@@ -71,6 +75,7 @@ def test_recycled_pid_reads_as_no_session(ctx, monkeypatch):
         "started_at": "2026-01-01T00:00:00+00:00",
     })
     assert session.active_session(ctx.data_dir, "codex") is None
+    assert not _path(ctx).exists()
 
 
 def test_session_shares_the_locale_normalized_proc_start(ctx):
@@ -108,6 +113,71 @@ def test_active_session_rejects_a_different_start_time_across_locales(ctx, monke
 def test_garbage_session_reads_as_none(ctx):
     _path(ctx).write_text("{not json")
     assert session.active_session(ctx.data_dir, "codex") is None
+    assert not _path(ctx).exists()
+
+
+@pytest.mark.parametrize("process_start", ["Stable Start", None])
+@pytest.mark.parametrize("filename", ["session-codex.json", "session-codex-101.json"])
+def test_read_session_preserves_live_record_even_without_ps(ctx, monkeypatch, process_start, filename):
+    monkeypatch.setattr(session, "_alive", lambda pid: True)
+    monkeypatch.setattr(session, "_proc_start", lambda pid: process_start)
+    path = ctx.data_dir / filename
+    data = {"email": "a@x.com", "pid": 101, "process_start": "Stable Start",
+            "started_at": "2026-09-14T08:47:00+00:00"}
+    write_json(path, data)
+    before = path.read_bytes()
+    assert session._read_session(path) == {k: data[k] for k in ("email", "pid", "started_at")}
+    assert path.read_bytes() == before
+
+
+def test_read_session_prunes_dead_process_record(ctx, monkeypatch):
+    monkeypatch.setattr(session, "_alive", lambda pid: False)
+    path = ctx.data_dir / "session-codex-101.json"
+    write_json(path, {"email": "gone@x.com", "pid": 101, "started_at": "yesterday"})
+    assert session._read_session(path) is None
+    assert not path.exists()
+
+
+def test_read_session_cleanup_is_best_effort(ctx, monkeypatch):
+    monkeypatch.setattr(session, "_alive", lambda pid: False)
+    write_json(_path(ctx), {"email": "gone@x.com", "pid": 101, "started_at": "yesterday"})
+
+    def denied(path):
+        raise PermissionError("read-only store")
+
+    monkeypatch.setattr(Path, "unlink", denied)
+    assert session._read_session(_path(ctx)) is None
+    assert _path(ctx).exists()
+
+
+def test_read_session_keeps_concurrent_legacy_replacement(ctx, monkeypatch):
+    """Pruning an old mirror must not delete the new supervisor that replaced it during ps."""
+    write_json(_path(ctx), {"email": "old@x.com", "pid": 101, "process_start": "Old Start",
+                           "started_at": "yesterday"})
+    replacement = {"email": "new@x.com", "pid": 202, "started_at": "today"}
+    monkeypatch.setattr(session, "_alive", lambda pid: True)
+
+    def recycled(pid):
+        write_json(_path(ctx), replacement)
+        return "Recycled Start"
+
+    monkeypatch.setattr(session, "_proc_start", recycled)
+    assert session._read_session(_path(ctx)) is None
+    assert 'new@x.com' in _path(ctx).read_text()
+
+
+@pytest.mark.parametrize("old_alive", [True, False])
+def test_mark_session_upgrades_live_legacy_only(ctx, monkeypatch, old_alive):
+    """Dead mirrors may be pruned during upgrade; live owners still get their hard-link snapshot."""
+    monkeypatch.setattr(session, "_START_CACHE", {})
+    monkeypatch.setattr(session.os, "getpid", lambda: 202)
+    monkeypatch.setattr(session, "_alive", lambda pid: old_alive if pid == 101 else True)
+    monkeypatch.setattr(session, "_proc_start", lambda pid: "Stable Start")
+    write_json(_path(ctx), {"email": "old@x.com", "pid": 101, "process_start": "Stable Start",
+                           "started_at": "2026-09-14T08:47:00+00:00"})
+    session.mark_session(ctx.data_dir, "codex", "new@x.com")
+    assert (ctx.data_dir / "session-codex-101.json").exists() is old_alive
+    assert session._read_session(_path(ctx))["email"] == "new@x.com"
 
 
 def test_session_mtime_signals_start_and_end_without_a_state_write(ctx):

@@ -76,7 +76,7 @@ class State:
         path = Path(path)
         if not path.exists():
             return cls(path=path, data=_empty())
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
         # forward-compatible defaults
         data.setdefault("version", STATE_VERSION)
         data.setdefault("tools", {})

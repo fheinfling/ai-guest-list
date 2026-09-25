@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   buildHTML, dotState, dotKey, doorKey, doorMark, creditLeft, pct, fmtCountdown, needsHello,
-  buildSettings, buildAddSeat, reduceReply, supervisionBanner, fmtUsageAge, updateClockText,
+  buildSettings, buildAddSeat, reduceReply, supervisionBanner, fmtUsageAge, fmtSessionAge, updateClockText,
 } from "./render.mjs";
 
 const mkAdd = (over = {}) => ({ step: "provider", provider: null, name: "", method: "browser", token: "", ...over });
@@ -176,6 +176,40 @@ test("active seats distinguish a live session from loaded-but-idle credentials",
   assert.doesNotMatch(idle, /live-dot|session started/);
 });
 
+test("only the credential holder is on the floor; a parked terminal keeps its switch action", () => {
+  const html = buildHTML(state({ tools: { codex: { seats: [
+    seat({ email: "live@x.com", status: "active", active: true, in_session: true }),
+    seat({ email: "parked@x.com", in_session: true, session_started_at: "2026-09-14T08:47:00Z" }),
+  ] }, claude: { seats: [] } } }));
+  assert.equal((html.match(/on the floor/g) || []).length, 1);
+  const parked = html.slice(html.indexOf('class="seat seat--ready"'));
+  const row = parked.slice(0, parked.indexOf('class="seat-email'));
+  assert.match(row, /class="mono chip terminal-chip"[^>]*>in a terminal/);
+  assert.match(row, /data-session-at="2026-09-14T08:47:00Z"/);
+  assert.match(row, /data-action="switch" data-tool="codex" data-email="parked@x.com"/);
+  assert.doesNotMatch(parked, /floor--live/);
+});
+
+test("parked terminals retain resting, queued, and sign-in signals beside the chip", () => {
+  for (const [status, signal] of [["resting", /back in/], ["queued", /up next/],
+    ["needs-login", /data-action="add"/]]) {
+    const html = buildHTML(state({ tools: { codex: { seats: [seat({ status, in_session: true })] } } }));
+    assert.match(html, /in a terminal/);
+    assert.match(html, signal);
+    assert.doesNotMatch(html, /floor--live/);
+  }
+});
+
+test("terminal ages expose long-lived sessions without inventing missing start times", () => {
+  const at = Date.parse("2026-09-25T08:47:00Z");
+  assert.equal(fmtSessionAge("2026-09-14T08:47:00Z", at), " · 11d");
+  assert.equal(fmtSessionAge("2026-09-25T06:47:00Z", at), " · 2h");
+  assert.equal(fmtSessionAge("2026-09-25T08:40:00Z", at), " · 7m");
+  assert.equal(fmtSessionAge("2026-09-25T08:48:00Z", at), " · 0m");
+  assert.equal(fmtSessionAge(null, at), "");
+  assert.equal(fmtSessionAge("invalid", at), "");
+});
+
 test("revoked entitlement has distinct sign-in copy on a non-active seat", () => {
   const html = buildHTML(state({ tools: {
     codex: { seats: [seat({
@@ -247,13 +281,16 @@ test("clock ticks update age and reset text without replacing the DOM", () => {
   const reset = { dataset: { resetAt: "2026-09-13T12:02:00Z" } };
   const rest = { dataset: { resetAt: "2026-09-13T12:03:00Z", clockPrefix: "back in" } };
   const long = { dataset: { resetAt: "2026-09-20T13:00:00Z" } };
-  const root = { querySelectorAll: (selector) => selector === "[data-usage-at]" ? [age] : [reset, rest, long],
+  const terminal = { dataset: { sessionAt: "2026-09-02T12:00:00Z" } };
+  const root = { querySelectorAll: (selector) => ({ "[data-usage-at]": [age],
+    "[data-reset-at]": [reset, rest, long], "[data-session-at]": [terminal] })[selector],
     set innerHTML(_) { assert.fail("clock ticks must preserve existing controls and focus"); } };
   updateClockText(root, Date.parse("2026-09-13T12:00:00Z"));
   assert.equal(age.textContent, "updated 30s ago");
   assert.equal(reset.textContent, "resets in 2m");
   assert.equal(rest.textContent, "back in 3m");
   assert.equal(long.textContent, "resets in 7d1h");
+  assert.equal(terminal.textContent, " · 11d");
 });
 
 test("provider throttling is visible alongside retained usage", () => {
@@ -280,6 +317,18 @@ test("expired Claude token asks for an app refresh without implying logout", () 
   } }));
   assert.match(resting, /taking a breather — back/);
   assert.doesNotMatch(resting, />log in<|usage refresh pending|sign in to refresh/);
+});
+
+test("expired Codex token names Codex without implying logout", () => {
+  for (const active of [false, true]) {
+    const html = buildHTML(state({ tools: {
+      codex: { seats: [seat({ active, status: active ? "active" : "ready",
+        usage: { error: "token_expired" } })] },
+      claude: { seats: [] },
+    } }));
+    assert.match(html, /usage refresh pending · open Codex to refresh/);
+    assert.doesNotMatch(html, /open Claude|>log in<|sign in to refresh/);
+  }
 });
 
 test("flat status dots, not emoji", () => {
@@ -331,6 +380,18 @@ test("inactive supervision shows a repair banner", () => {
   assert.match(banner, /won't auto-switch/);
   assert.match(banner, /data-action="supervision-on"/);
   assert.match(buildHTML(st), /supervision-banner--error/);
+});
+
+test("supervision read errors name the file and reason without offering installation", () => {
+  const st = state({ supervision: {
+    wrappers: true, block: false, active: false,
+    error: "couldn't read /Users/<guest>/.zshrc: Permission denied",
+  } });
+  const banner = supervisionBanner(st);
+  assert.match(banner, /role="alert"/);
+  assert.match(banner, /couldn't read \/Users\/&lt;guest&gt;\/\.zshrc: Permission denied/);
+  assert.doesNotMatch(banner, /terminal supervision is off|supervision-on|turn it on|<guest>/);
+  assert.ok(buildHTML(st).includes(banner));
 });
 
 test("wired supervision outside the current PATH asks for a new terminal", () => {

@@ -264,7 +264,9 @@ def _assign_statuses(seats: list[dict[str, Any]]) -> None:
     for s in seats:
         if s["needs_login"]:
             s["status"] = "needs-login"
-        elif s["active"] or s.get("in_session"):
+        # A terminal can outlive a credential switch. Its heartbeat says nothing about this
+        # seat's health or who holds the live credentials; keep those signals independent.
+        elif s["active"]:
             s["status"] = "active"
         elif all_capped and s["email"] == soonest:
             s["status"] = "queued"
@@ -279,14 +281,17 @@ def list_seats(state: State, tool: str, at: datetime | None = None,
     """Return renderer-ready seats.
 
     ``data_dir`` is optional for CLI/backward compatibility. The menubar passes it so the read side
-    can attach the verified supervised-session heartbeat to the one matching seat.
+    can attach the newest verified supervised-session heartbeat to each matching seat.
     """
     at = at or now()
     active = state.active(tool)
-    running = ({s["email"]: s for s in session.active_sessions(data_dir, tool)}
-               if data_dir is not None else {})
+    running: dict[str, list[dict]] = {}
+    if data_dir is not None:
+        for s in session.active_sessions(data_dir, tool):
+            running.setdefault(s["email"], []).append(s)
     seats = [
-        _seat_view(seat, active=(email == active), at=at, active_session=running.get(email))
+        _seat_view(seat, active=(email == active), at=at,
+                   active_session=session.newest_session(running.get(email, [])))
         for email, seat in state.accounts(tool).items()
     ]
     _assign_statuses(seats)

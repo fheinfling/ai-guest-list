@@ -51,8 +51,10 @@ def claude_status_email(claude_bin: str | None = None) -> str | None:
     if not exe:
         return None
     try:
+        # A malformed diagnostic must not turn an identity probe into a decoding crash.
         proc = subprocess.run(
-            [exe, "auth", "status", "--json"], capture_output=True, text=True, timeout=30
+            [exe, "auth", "status", "--json"], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=30
         )
     except (subprocess.SubprocessError, OSError):
         return None

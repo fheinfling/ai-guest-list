@@ -63,12 +63,14 @@ def open_in_terminal(command: str) -> None:
     fd, path = tempfile.mkstemp(suffix=".command", prefix="ai-guest-list-signin-")
     launched = False
     try:
-        with os.fdopen(fd, "w") as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(script)
         os.chmod(path, 0o700)  # owner-only executable; content is just the login command, not a secret
         # env=harden_env() keeps the frozen interpreter vars out of the `open` process too.
+        # Preserve a readable failure reason even if LaunchServices emits malformed bytes.
         proc = subprocess.run(["open", "-a", "Terminal", path],
-                              capture_output=True, text=True, env=harden_env())
+                              capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              env=harden_env())
         launched = proc.returncode == 0
         if not launched:
             detail = (proc.stderr or "").strip()   # surface the real LaunchServices reason if any

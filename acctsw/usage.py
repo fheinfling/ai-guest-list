@@ -25,7 +25,7 @@ import subprocess
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from functools import lru_cache
 from typing import Any, Callable
@@ -94,6 +94,7 @@ class UsageFetchJob:
     added_at: str | None
     active: bool
     user_agent: str | None = None
+    recover_codex: bool = False
 
 
 @dataclass(frozen=True)
@@ -145,7 +146,8 @@ def _default_post(url: str, payload: dict, timeout: float) -> tuple[int, str]:
 def refresh_codex_blob(blob: str, *, post=_default_post) -> tuple[str | None, str | None]:
     """Use the refresh_token to mint a fresh codex auth.json blob (what codex does on its own).
 
-    Returns (new_blob, error). error == "invalidated" means the session ended (re-login needed).
+    Returns (new_blob, error). "invalidated" means the provider rejected the refresh credential;
+    callers must rule out concurrent rotation before treating that as a need to log in again.
     """
     from .util import jwt_payload
     try:
@@ -247,6 +249,27 @@ def claude_token(blob: str) -> str | None:
     return (data.get("claudeAiOauth") or {}).get("accessToken")
 
 
+def _codex_access_token_expired(blob: str) -> bool:
+    """Local expiry explains a usage 401; it does not prove the session was revoked.
+
+    Read only the access token's structural expiry, never the provider's error prose. Without a
+    refresh credential there is no path to renewal, so keep the sign-in prompt. Match Claude's
+    clock boundary (no early-expiry allowance): a token that still works must not be called expired.
+    """
+    from .util import jwt_payload
+    try:
+        data = json.loads(blob)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    tokens = data.get("tokens") if isinstance(data, dict) else None
+    if not isinstance(tokens, dict) or not _codex_refresh_token(blob):
+        return False
+    claims = jwt_payload(tokens.get("access_token"))
+    expiry = claims.get("exp") if isinstance(claims, dict) else None
+    return (isinstance(expiry, (int, float)) and not isinstance(expiry, bool)
+            and 0 < expiry <= now().timestamp())
+
+
 def _claude_access_token_expired(blob: str) -> bool:
     """An expired access token with a refresh credential is not proof of a signed-out session.
 
@@ -271,7 +294,9 @@ def _claude_access_token_expired(blob: str) -> bool:
 def _claude_user_agent_for_exe(exe: str | None) -> str:
     if exe:
         try:
-            out = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=10)
+            # CLI diagnostics need not be valid UTF-8; a version probe must still be safe.
+            out = subprocess.run([exe, "--version"], capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace", timeout=10)
             if out.returncode == 0:
                 ver = out.stdout.strip().split()[0]
                 if ver:
@@ -599,7 +624,10 @@ def _seat_blob(ctx, state, tool: str, email: str) -> str | None:
 def _fetch_for(tool: str, blob: str, get: HttpGet, ua: str | None) -> Usage:
     if tool == "codex":
         token, account = codex_token_account(blob)
-        return fetch_codex(token, account, get=get)
+        fetched = fetch_codex(token, account, get=get)
+        if fetched.error == "unauthorized" and _codex_access_token_expired(blob):
+            fetched.error = "token_expired"
+        return fetched
     token = claude_token(blob)
     fetched = fetch_claude(token, user_agent=ua, get=get)
     if fetched.error == "unauthorized" and _claude_access_token_expired(blob):
@@ -676,11 +704,16 @@ def refresh(ctx, state, tool: str | None = None, *, only: str | None = None,
                 summary[t][email] = "no_creds"
                 continue
             u = _fetch_for(t, blob, get, ua)
-            # NOTE: we deliberately do NOT auto-refresh/rotate the token here. Codex's refresh
-            # tokens are single-use; rotating one that codex itself owns (the active auth.json) can
-            # invalidate codex's own session (reviewer KR-B2). For usage display we report
-            # last-known/unauthorized instead. Per-account isolation (each account owning its home)
-            # makes codex maintain its own tokens — refresh moves there.
+            # NOTE (KR-B2): Codex's refresh tokens are single-use; rotating the active auth.json
+            # can invalidate Codex's own session, so active seats remain observers. Parked seats
+            # differ: no child renews their expired token, leaving usage too stale for handoff.
+            # Only refresh_live recovers them: expiry + refresh-token checks prove renewal is
+            # possible, existing backoff limits retries, and session/incarnation/active checks
+            # avoid applying usage to a seat now owned by a child or a different login. Its token CAS
+            # preserves a newer refresh credential; comparing the sent refresh token on failure
+            # prevents a lost race from being called revocation. This accepts, rather than closes,
+            # the remaining window: cx launching on this seat between the session check and the
+            # token POST can still double-spend the token. No network I/O runs under the flock.
             summary[t][email] = store_fetch(state, t, email, u, at=at, blob=blob)
     state.save()
     return summary
@@ -766,19 +799,91 @@ def _commit_fetch_result(ctx, result: UsageFetchResult) -> str:
         return status
 
 
+def _codex_refresh_token(blob: str | None) -> str | None:
+    try:
+        data = json.loads(blob)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    tokens = data.get("tokens") if isinstance(data, dict) else None
+    token = tokens.get("refresh_token") if isinstance(tokens, dict) else None
+    return token if isinstance(token, str) and token else None
+
+
+def _recover_parked_codex(ctx, job: UsageFetchJob, *, post,
+                          min_seconds: int) -> tuple[UsageFetchJob | None, str | None]:
+    """Spend outside the flock, then CAS the private snapshot; never write the shared mirror.
+
+    A None job is a benign skip: in particular, no stale usage GET may turn a lost refresh race
+    into an auth error. See the KR-B2 note above for the accepted concurrent-launch window.
+    """
+    from . import session
+
+    sent_refresh_token = _codex_refresh_token(job.blob)
+    try:
+        new_blob, error = refresh_codex_blob(job.blob, post=post)
+    except Exception:
+        # Match the detached GET's handling of custom transports: leave credentials alone and
+        # let the ordinary usage attempt record its existing error/backoff classification.
+        return job, None
+    if not new_blob and error != "invalidated":
+        return job, None
+
+    with ctx.locked():
+        state = ctx.load_state()
+        seat = state.get_seat("codex", job.email)
+        # Codex snapshots are local files, so this CAS read belongs inside the short lock.
+        current_blob = ctx.snapshot_get("codex", job.email)
+        same_refresh = _codex_refresh_token(current_blob) == sent_refresh_token
+        if error == "invalidated" and not same_refresh:
+            return None, "refresh_raced"
+        if new_blob and same_refresh:
+            # The POST spent the token still on disk. Even a cadence/ownership skip must save its
+            # replacement; preserving these old bytes would turn a healthy seat into a logout.
+            try:
+                ctx.snapshot_set("codex", job.email, new_blob)
+            except Exception:
+                # Identity validation or disk I/O must not abort the other parked jobs. Let the
+                # ordinary usage attempt record a retryable failure using the stored credential.
+                return job, None
+        is_active = state.active("codex") == job.email
+        running = session.active_session(ctx.data_dir, "codex", email=job.email)
+        if (seat is None or seat.get("added_at") != job.added_at or is_active
+                or running is not None):
+            # Credential rotation is saved above, but this request no longer owns the usage result.
+            return None, "stale"
+        if _credential_digest(current_blob) != job.credential_digest:
+            return None, "refresh_raced"
+        if not _due(seat.get("usage"), now(), min_seconds, active=False):
+            return None, "cached"
+        if not (_codex_access_token_expired(current_blob)
+                and _codex_refresh_token(current_blob)):
+            return job, None
+        if new_blob:
+            return replace(job, blob=new_blob,
+                           credential_digest=_credential_digest(new_blob) or "",
+                           recover_codex=False), None
+        # Only the still-current refresh credential can prove revocation. A different token
+        # above means another consumer succeeded, even though our POST reported invalidated.
+        seat["auth_error"] = "refresh_token_revoked"
+        state.save()
+        return job, None
+
+
 def refresh_live(ctx, tool: str | None = None, *, only: str | None = None,
                  active_only: bool = False, force: bool = False,
-                 get: HttpGet = _default_get,
+                 get: HttpGet = _default_get, post=_default_post,
                  min_seconds: int = USAGE_MIN_REFRESH_SECONDS,
                  active_min_seconds: int = P.USAGE_ACTIVE_REFRESH_SECONDS,
                  user_agent: str | None = None) -> dict[str, Any]:
-    """Refresh usage without holding the cross-process flock during credentials or network I/O.
+    """Refresh usage without holding the cross-process flock during Keychain or network I/O.
 
     Preparation records one immutable job per due seat.  Active Codex and Claude requests start in
     parallel so a slow provider cannot postpone the other provider's live card; each response is
     committed immediately under a fresh, short lock.  Parked seats follow afterward on the gentler
     cadence.  Commit revalidates the seat incarnation, credential bytes, and attempt ordering.
     """
+    from . import session
+
     tools = [tool] if tool else ["codex", "claude"]
     summary: dict[str, Any] = {t: {} for t in tools}
 
@@ -819,6 +924,14 @@ def refresh_live(ctx, tool: str | None = None, *, only: str | None = None,
             user_agent=ua if t == "claude" else None,
         ))
 
+    # Session probes can spawn ps and prune stale heartbeats. Keep that sweep outside the flock;
+    # this is only an eligibility hint, and recovery rechecks ownership after its POST.
+    running_codex = {
+        job.email: session.active_session(ctx.data_dir, "codex", email=job.email) is not None
+        for job in prepared if job.tool == "codex" and not job.active
+        and _codex_access_token_expired(job.blob)
+    }
+
     # Recheck eligibility after slow Keychain reads.  Another poll, switch, remove, or re-add may
     # have happened since the initial atomic state read.
     eligible: list[UsageFetchJob] = []
@@ -844,6 +957,11 @@ def refresh_live(ctx, tool: str | None = None, *, only: str | None = None,
                 tool=job.tool, email=job.email, blob=job.blob,
                 credential_digest=job.credential_digest, added_at=job.added_at,
                 active=is_active, user_agent=job.user_agent,
+                recover_codex=(job.tool == "codex" and not is_active and not job.active
+                               and _codex_access_token_expired(job.blob)
+                               and bool(_codex_refresh_token(job.blob))
+                               and _due(previous, checked_at, min_seconds, active=False)
+                               and not running_codex.get(job.email, False)),
             ))
 
     active_jobs = [job for job in eligible if job.active]
@@ -856,6 +974,13 @@ def refresh_live(ctx, tool: str | None = None, *, only: str | None = None,
                 result = future.result()
                 summary[result.job.tool][result.job.email] = _commit_fetch_result(ctx, result)
     for job in parked_jobs:
+        if job.recover_codex:
+            recovered, skipped = _recover_parked_codex(ctx, job, post=post,
+                                                      min_seconds=min_seconds)
+            if recovered is None:
+                summary[job.tool][job.email] = skipped
+                continue
+            job = recovered
         result = _fetch_job(job, get)
         summary[job.tool][job.email] = _commit_fetch_result(ctx, result)
     return summary

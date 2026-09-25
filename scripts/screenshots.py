@@ -107,13 +107,14 @@ def shoot(name: str, settings_view: bool, payload: dict) -> Path:
     # captures the viewport, so the window has to be sized to the content before the real shot.
     boot.write_text(
         f"const P = {json.dumps(payload)};\n{call};\n"
-        "document.title = 'H' + Math.ceil(document.documentElement.getBoundingClientRect().height);\n")
+        "document.title = 'H' + Math.ceil(document.documentElement.getBoundingClientRect().height);\n",
+        encoding="utf-8")
     page.write_text(
         '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
         '<link rel="stylesheet" href="styles.css">'
         f"<style>{SHOT_CSS}</style></head><body>"
         '<div id="root"></div><script src="bundle.js"></script>'
-        '<script src="_shot.js"></script></body></html>')
+        '<script src="_shot.js"></script></body></html>', encoding="utf-8")
     srv = subprocess.Popen([sys.executable, "-m", "http.server", str(PORT)],
                            cwd=WEB, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     tmp = Path(tempfile.mkdtemp())
@@ -122,8 +123,10 @@ def shoot(name: str, settings_view: bool, payload: dict) -> Path:
               "--default-background-color=00000000"]
     try:
         # pass 1: measure
+        # A bad browser diagnostic byte must not prevent reading the measured height.
         dom = subprocess.run(common + ["--dump-dom", "--window-size=848,900", url],
-                             check=True, capture_output=True, text=True, timeout=90, cwd=tmp).stdout
+                             check=True, capture_output=True, text=True, encoding="utf-8",
+                             errors="replace", timeout=90, cwd=tmp).stdout
         m = re.search(r"<title>H(\d+)</title>", dom)
         if not m:
             raise RuntimeError("could not measure rendered height (did the UI render?)")
