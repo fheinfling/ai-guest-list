@@ -194,7 +194,7 @@ function seatCard(tool, seat) {
   const lastKnown = seat.usage_stale || seat.usage_unknown;
   const issue = ({ rate_limited: "usage updates throttled · retrying automatically",
     network: "connection unavailable · retrying automatically",
-    token_expired: "usage refresh pending · open Claude to refresh",
+    token_expired: `usage refresh pending · open ${tool === "codex" ? "Codex" : "Claude"} to refresh`,
     unauthorized: "usage unavailable · sign in to refresh",
     forbidden: "usage unavailable · check your subscription",
     no_token: "usage unavailable · sign in to refresh",

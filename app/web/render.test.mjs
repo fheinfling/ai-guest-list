@@ -319,6 +319,18 @@ test("expired Claude token asks for an app refresh without implying logout", () 
   assert.doesNotMatch(resting, />log in<|usage refresh pending|sign in to refresh/);
 });
 
+test("expired Codex token names Codex without implying logout", () => {
+  for (const active of [false, true]) {
+    const html = buildHTML(state({ tools: {
+      codex: { seats: [seat({ active, status: active ? "active" : "ready",
+        usage: { error: "token_expired" } })] },
+      claude: { seats: [] },
+    } }));
+    assert.match(html, /usage refresh pending · open Codex to refresh/);
+    assert.doesNotMatch(html, /open Claude|>log in<|sign in to refresh/);
+  }
+});
+
 test("flat status dots, not emoji", () => {
   const html = buildHTML(state({ tools: {
     codex: { seats: [seat({ status: "resting", limited: true })] }, claude: { seats: [] } } }));
