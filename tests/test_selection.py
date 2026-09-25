@@ -1,6 +1,8 @@
 from datetime import timedelta
 
-from acctsw.selection import choose
+import pytest
+
+from acctsw.selection import choose, choose_key
 from acctsw.state import State
 from acctsw.util import now, iso
 
@@ -111,3 +113,74 @@ def test_naive_reset_timestamp_does_not_crash(tmp_path):
     s = _state_with(tmp_path, [("a@x", naive)])
     sel = choose(s, "codex", at=at)
     assert sel.all_limited is True and sel.email == "a@x"
+
+
+def _key(state, id="key1", harness="codex", error=None):
+    seat = {"id": id, "harness": harness}
+    if error is not None:
+        seat["last_validation"] = {"error": error}
+    state.data["keys"][id] = seat
+
+
+@pytest.mark.parametrize("seats", [[], [("a@x", "2999-01-01T00:00:00+00:00")]])
+def test_key_fallback_requires_opt_in(tmp_path, seats):
+    s = _state_with(tmp_path, seats)
+    _key(s)
+    result = choose_key(s, "codex")
+    assert result.seat_id is None and result.reason == "key_fallback_disabled"
+    s.set_setting("key_fallback", True)
+    result = choose_key(s, "codex")
+    assert result.seat_id == "key1" and result.reason == "selected"
+
+
+@pytest.mark.parametrize("error", [None, "unauthorized"])
+def test_key_never_preempts_healthy_subscription(tmp_path, error):
+    at = now()
+    s = _state_with(tmp_path, [("resting@x", iso(at + timedelta(hours=1))), ("healthy@x", None)])
+    s.set_active("codex", "resting@x")
+    s.get_seat("codex", "healthy@x")["usage"] = {"error": error}
+    s.set_setting("key_fallback", True)
+    _key(s)
+    result = choose_key(s, "codex", at=at)
+    assert result.seat_id is None and result.reason == "subscription_available"
+    s.set_limited_until("codex", "healthy@x", iso(at - timedelta(seconds=1)))
+    assert choose_key(s, "codex", at=at).reason == "subscription_available"
+
+
+def test_no_keys_and_wrong_harness_have_distinct_reasons(tmp_path):
+    s = _state_with(tmp_path, [])
+    s.set_setting("key_fallback", True)
+    assert choose_key(s, "codex").reason == "no_key_seats"
+    _key(s, harness="claude")
+    result = choose_key(s, "codex")
+    assert result.seat_id is None and result.reason == "harness_mismatch"
+    assert choose_key(s, "claude").seat_id == "key1"
+
+
+@pytest.mark.parametrize("error", ["invalid_key", "insufficient_quota"])
+def test_key_validation_can_exclude_candidate(tmp_path, error):
+    s = _state_with(tmp_path, [])
+    s.set_setting("key_fallback", True)
+    _key(s, error=error)
+    result = choose_key(s, "codex")
+    assert result.seat_id is None and result.reason == "ineligible_validation"
+    _key(s, id="usable", error="unknown")
+    assert choose_key(s, "codex").seat_id == "usable"
+
+
+@pytest.mark.parametrize("error", [None, "unknown", "rate_limited"])
+def test_eligible_keys_use_store_order(tmp_path, error):
+    s = _state_with(tmp_path, [])
+    s.set_setting("key_fallback", True)
+    _key(s, id="z-first", error=error)
+    _key(s, id="a-second", error=error)
+    assert choose_key(s, "codex").seat_id == "z-first"
+
+
+def test_filtered_subscription_is_not_proof_all_seats_rest(tmp_path):
+    s = _state_with(tmp_path, [("a@x", None)])
+    s.get_seat("codex", "a@x")["usage"] = {"error": "forbidden"}
+    s.set_setting("key_fallback", True)
+    _key(s)
+    result = choose_key(s, "codex")
+    assert result.seat_id is None and result.reason == "subscriptions_not_resting"

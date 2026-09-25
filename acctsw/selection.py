@@ -17,11 +17,15 @@ exactly as before.
 
 A confirmed Codex refresh-token revocation is stored separately as ``auth_error``. These seats
 remain unavailable until new credentials clear the flag; a successful usage poll cannot clear it.
+
+Key fallback is a separate opt-in rule: metered seats only follow exhausted subscriptions of the
+same harness, and its result explains which gate prevented a candidate from being offered.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Literal
 
 from .state import State
 from .util import now, parse_iso
@@ -66,3 +70,39 @@ def choose(state: State, tool: str, at: datetime | None = None,
         unlocks_at=_limited_until(accounts[soonest_email], at),
         all_limited=True,
     )
+
+
+@dataclass(frozen=True)
+class KeySelection:
+    seat_id: str | None
+    reason: Literal["selected", "key_fallback_disabled", "subscription_available",
+                    "subscriptions_not_resting", "no_key_seats", "harness_mismatch",
+                    "ineligible_validation"]
+
+
+def choose_key(state: State, tool: str, at: datetime | None = None) -> KeySelection:
+    """Offer metered fallback only after the subscription rule has yielded the floor.
+
+    Deliberately accepts no exclusion list: a caller excluding a healthy subscription must not
+    turn that into permission to spend money. An empty *filtered* subscription selection is not
+    proof all saved seats are resting either. Unknown key validation is not proof of failure.
+    """
+    subscription = choose(state, tool, at=at)
+    if not state.settings()["key_fallback"]:
+        return KeySelection(None, "key_fallback_disabled")
+    if subscription.available:
+        return KeySelection(None, "subscription_available")
+    if state.accounts(tool) and not subscription.all_limited:
+        return KeySelection(None, "subscriptions_not_resting")
+    keys = state.data["keys"]
+    if not keys:
+        return KeySelection(None, "no_key_seats")
+    matching = {id: seat for id, seat in keys.items() if seat.get("harness") == tool}
+    if not matching:
+        return KeySelection(None, "harness_mismatch")
+    for id, seat in matching.items():
+        # Preserve store order, just as choose() does for equally eligible subscriptions.
+        if (seat.get("last_validation") or {}).get("error") not in (
+                "invalid_key", "insufficient_quota"):
+            return KeySelection(id, "selected")
+    return KeySelection(None, "ineligible_validation")

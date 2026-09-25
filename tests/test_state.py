@@ -1,5 +1,6 @@
 import os
 import stat
+import json
 
 from acctsw.state import State, DEFAULT_SETTINGS
 
@@ -10,6 +11,9 @@ def test_empty_state_defaults(tmp_path):
     assert s.accounts("claude") == {}
     assert s.settings() == DEFAULT_SETTINGS
     assert s.settings()["supervise_shell"] is True
+    assert s.settings()["confirm_key_switch"] is True
+    assert s.settings()["key_fallback"] is False
+    assert s.data["keys"] == {}
 
 
 def test_no_retired_headroom_settings(tmp_path):
@@ -59,3 +63,25 @@ def test_load_merges_new_default_settings(tmp_path):
     assert s.settings()["auto_switch"] is True
     assert s.settings()["supervise_shell"] is True
     assert s.active("codex") is None  # tool scaffolding repaired
+    assert s.settings()["confirm_key_switch"] is True
+    assert s.settings()["key_fallback"] is False
+    assert s.data["keys"] == {}
+
+
+def test_key_defaults_preserve_existing_and_future_fields_without_saving(tmp_path):
+    p = tmp_path / "state.json"
+    data = {"rev": 17, "keys": {"id": {"model": "m", "future_field": 42}},
+            "settings": {"confirm_key_switch": False, "key_fallback": True, "future": "yes"},
+            "future_section": {"value": 1}}
+    p.write_text(json.dumps(data))
+    before = p.read_bytes()
+    s = State.load(p)
+    assert s.data["keys"] == data["keys"]
+    assert s.data["future_section"] == data["future_section"]
+    assert s.settings()["confirm_key_switch"] is False
+    assert s.settings()["key_fallback"] is True
+    assert s.settings()["future"] == "yes"
+    assert s.data["rev"] == 17
+    assert p.read_bytes() == before
+    s.save()
+    assert State.load(p).data["rev"] == 18

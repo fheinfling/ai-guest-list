@@ -8,9 +8,10 @@ Holds only metadata — NEVER credentials (those live in the Keychain). Shape::
         "codex":  {"active": "<email>|null", "accounts": {"<email>": <Seat>}},
         "claude": {"active": "<email>|null", "accounts": {"<email>": <Seat>}}
       },
+      "keys": {"<id>": <key-seat metadata>},
       "settings": {"auto_switch": true, "same_tool_only": true, "notify": true,
                    "restart_app": false, "celebrations": true, "supervise_shell": true,
-                   "theme": "dark"}
+                   "theme": "light", "confirm_key_switch": true, "key_fallback": false}
     }
 
 A ``Seat`` is::
@@ -54,6 +55,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "supervise_shell": True,  # wire terminal codex/claude through the supervised cx/cl launchers
     "strategy": "soonest_back",  # "soonest_back" | "most_headroom"
     "theme": "light",         # the design default
+    "confirm_key_switch": True,  # consent for each hop onto metered API usage
+    "key_fallback": False,    # metered seats must be explicitly opted into
 }
 
 
@@ -61,6 +64,7 @@ def _empty() -> dict[str, Any]:
     return {
         "version": STATE_VERSION,
         "tools": {t: {"active": None, "accounts": {}} for t in TOOLS},
+        "keys": {},  # id -> metadata; secrets remain in Keychain
         "settings": dict(DEFAULT_SETTINGS),
     }
 
@@ -84,6 +88,7 @@ class State:
             data["tools"].setdefault(t, {"active": None, "accounts": {}})
             data["tools"][t].setdefault("active", None)
             data["tools"][t].setdefault("accounts", {})
+        data.setdefault("keys", {})
         settings = dict(DEFAULT_SETTINGS)
         settings.update(data.get("settings") or {})
         data["settings"] = settings
