@@ -137,6 +137,8 @@ def smoke(bundle_arg: Path) -> None:
         home.mkdir()
         work.mkdir()
         bindir.mkdir()
+        # Deliberately the PRE-1.0.2 home path: an inherited CODEX_HOME can name a layout we no
+        # longer write, and it must still never be mistaken for the user's own canonical home.
         private_codex_home = home / ".account-switcher" / "codex-homes" / "poison-seat"
 
         clean_env = dict(os.environ)

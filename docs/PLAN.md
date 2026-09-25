@@ -270,13 +270,21 @@ or installation directory.
 - **Unattended switching (M4 launcher) uses the Codex live-vs-active guard** in `switch.sync_back`
   (skip sync-back when live creds belong to a different account than `state.active`).
 - **Per-account Codex homes hold exactly one real file, `auth.json`.** Everything else in
-  `~/.account-switcher/codex-homes/<seat>/` is a symlink into the shared `~/.codex`, which stays the
+  `~/.account-switcher/ch/<id>/` is a symlink into the shared `~/.codex`, which stays the
   source of truth for config and sessions. **SQLite sidecars (`-wal`/`-shm`/`-journal`) are never
   linked** — SQLite resolves a symlinked database and writes them beside the real file, while a real
   database next to linked sidecars fails every open with error 14. Real files a supervised child
   created in a home are **promoted** into `~/.codex` on the next launch with no live codex session
   (moving files under a running child is not worth the risk); a copy whose name `~/.codex` already
   has is **parked** as `<name>.orphaned-<stamp>` — never deleted, never linked again.
+- **A home is named by hash and its root is two letters** because codex 0.157+ binds its app-server
+  daemon at `<CODEX_HOME>/app-server-control/app-server-control.sock` and connects to that literal
+  resolved path, which macOS caps at 104 bytes (`SUN_LEN`) — the old
+  `codex-homes/<address>` layout blew that budget and broke every launch. `codex-homes/<address>`
+  survives as a **by-address symlink** into `ch/<id>` (the index, and what a pre-1.0.2 child still
+  resolves through). **The daemon's runtime state is per-seat** — `app-server-control/` and
+  `app-server-daemon/` are never linked in from `~/.codex` and never promoted out to it, since one
+  daemon serves exactly one account's credentials.
 - **All timestamps are tz-aware** (`parse_iso` coerces naive→UTC) so selection comparisons never
   raise.
 - **Real usage shapes (verified live):** Claude `oauth/usage` → `five_hour`/`seven_day`

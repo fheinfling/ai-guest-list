@@ -17,7 +17,12 @@ BACKUP_MANIFEST = BACKUP_DIR / "manifest.json"
 APP_SRC_DIR = DATA_DIR / "app"
 # Per-account Codex homes (each a CODEX_HOME with its own auth.json; shared state symlinked to the
 # real ~/.codex). Isolation so codex maintains each account's token lifecycle independently.
-CODEX_HOMES = DATA_DIR / "codex-homes"
+# Two letters, and a hashed directory per seat, because a CODEX_HOME must stay short enough for the
+# app-server daemon's unix socket to fit in SUN_LEN — see codexhome.MAX_HOME_LEN.
+CODEX_HOMES = DATA_DIR / "ch"
+# Pre-1.0.2 homes lived here, one directory per address. Now the by-address index: a symlink per
+# seat into CODEX_HOMES, so `ls ~/.account-switcher/codex-homes/` still answers "which seats?".
+CODEX_HOMES_LEGACY = DATA_DIR / "codex-homes"
 
 # Keychain service that holds our per-account credential snapshots.
 KEYCHAIN_SERVICE = "acct-switcher"  # accounts named "codex:<email>" / "claude:<email>"
@@ -31,13 +36,17 @@ def _canonical_codex_home() -> Path:
     example, ``cx --version``).  Treating the inherited private home as the canonical mirror lets a
     normal switch overwrite that seat with another account's valid snapshot.  External custom
     ``CODEX_HOME`` values remain supported; only our managed per-seat subtree is rejected.
+
+    The test is containment in the whole store, not just the homes root: an inherited value can
+    name a home from an older layout, or one that no longer exists (``resolve`` then resolves
+    nothing), and neither may be mistaken for a user's own custom home.
     """
     inherited = os.environ.get("CODEX_HOME")
     if not inherited:
         return HOME / ".codex"
     candidate = Path(inherited).expanduser()
     try:
-        candidate.resolve().relative_to(CODEX_HOMES.resolve())
+        candidate.resolve().relative_to(DATA_DIR.resolve())
     except ValueError:
         return candidate
     return HOME / ".codex"

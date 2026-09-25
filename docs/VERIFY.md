@@ -135,8 +135,15 @@ acctsw uninstall --purge       # also deletes the store + all our keychain items
   them against the actual Claude limit output on a real cap.
 - Codex SQLite error 14 ("unable to open database file") from a mixed database/sidecar family is
   now healed automatically on the next `cx` launch with no other supervised codex session running:
-  `ls -la ~/.account-switcher/codex-homes/<seat>/` must show `auth.json` as the ONLY real file and
-  no `*-wal` / `*-shm` links (a `*.orphaned-<stamp>` copy parked there is expected and inert).
+  `ls -la ~/.account-switcher/codex-homes/<seat>/` (the by-address symlink into `ch/<id>`) must show
+  `auth.json` as the ONLY real file and no `*-wal` / `*-shm` links — apart from the app-server
+  daemon's own `app-server-control/` and `app-server-daemon/`, which are per-seat by design and must
+  never appear in `~/.codex` or as symlinks here (a shared daemon serves the wrong account's auth).
+  A `*.orphaned-<stamp>` copy parked there is expected and inert.
+- Codex daemon socket: a seat home must stay under 60 characters so
+  `<home>/app-server-control/app-server-control.sock` fits macOS's 104-byte `SUN_LEN`; past it every
+  `cx` launch dies with "app server did not become ready … path must be shorter than SUN_LEN".
+  Check with `python3 -c "from acctsw import codexhome as c; print(c.daemon_socket_fits(c.home_dir('<seat>')))"`.
 - Resume-by-id: currently `codex resume --last` / `claude --continue` (MVP); capture the session id
   at spawn to resume by id if you run multiple concurrent sessions.
 - The Headroom "save credit" proxy is gone; only the one-time `cleanup_legacy` migration remains

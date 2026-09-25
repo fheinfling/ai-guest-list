@@ -4,13 +4,16 @@ A home that mixes a REAL database with symlinked ``-wal``/``-shm`` files makes S
 with error 14 ("unable to open database file") — the regression these tests pin down.
 """
 import errno
+import os
 import shutil
 import sqlite3
 from datetime import datetime
+from pathlib import Path
 
 import pytest
 
 from acctsw import codexhome
+from acctsw import paths as P
 
 EMAIL = "a@x.com"
 
@@ -276,3 +279,111 @@ def test_delete_removes_parked_files_and_never_follows_symlinks(ctx):
     assert codexhome.delete(EMAIL, root=ctx._homes_root) is True
     assert not home.is_symlink()
     assert (ctx._codex_real / "sessions" / "keep.jsonl").exists()
+
+
+# --- rule 4: the app-server daemon's runtime state is per-seat -----------------------------------
+
+def test_daemon_runtime_is_never_linked_in_from_the_shared_home(ctx):
+    """A shared control socket would hand this seat the daemon that holds ANOTHER account's auth."""
+    for name in ("app-server-control", "app-server-daemon"):
+        (ctx._codex_real / name).mkdir(parents=True)
+    (ctx._codex_real / "config.toml").write_text("x")
+
+    home = _ensure(ctx)
+
+    assert (home / "config.toml").is_symlink()                  # shared state still links
+    assert not (home / "app-server-control").exists()
+    assert not (home / "app-server-daemon").exists()
+
+
+def test_stale_daemon_links_from_an_older_build_are_removed(ctx):
+    (ctx._codex_real / "app-server-daemon").mkdir(parents=True)
+    home = _ensure(ctx)
+    (home / "app-server-daemon").symlink_to(ctx._codex_real / "app-server-daemon")
+
+    _ensure(ctx)
+
+    assert not (home / "app-server-daemon").is_symlink()
+
+
+def test_daemon_runtime_survives_promotion_in_the_seats_own_home(ctx):
+    home = _ensure(ctx)
+    sock_dir = home / "app-server-control"
+    sock_dir.mkdir()
+    (sock_dir / "app-server-startup.lock").write_bytes(b"")
+    (home / "app-server-daemon").mkdir()
+    (home / "app-server-daemon" / "daemon.pid").write_text("{}")
+
+    _ensure(ctx, promote=True)
+
+    assert (sock_dir / "app-server-startup.lock").exists()      # still real, still this seat's
+    assert (home / "app-server-daemon" / "daemon.pid").read_text() == "{}"
+    assert not (ctx._codex_real / "app-server-control").exists()
+    assert not (ctx._codex_real / "app-server-daemon").exists()
+
+
+# --- the socket-path budget (SUN_LEN) ------------------------------------------------------------
+
+def test_a_seat_home_leaves_room_for_the_daemon_control_socket():
+    """codex 0.157+ binds <CODEX_HOME>/app-server-control/app-server-control.sock and connects to
+    that literal path — macOS rejects it beyond SUN_LEN, which is why the home is short. The address
+    is the longest part of a seat and must not reach the path, whatever length it is."""
+    store = Path("/Users/a-twenty-char-user/.account-switcher") / P.CODEX_HOMES.name
+    home = codexhome.home_dir("someone.with.a.very.long.address+codex@example.com", store)
+
+    assert len(str(home)) <= codexhome.MAX_HOME_LEN
+    assert codexhome.daemon_socket_fits(home)
+    assert not codexhome.daemon_socket_fits(home / "one-directory-deeper-than-fits")
+
+
+def test_the_installed_store_layout_fits_the_socket_budget():
+    """The one that would have caught the 0.157 breakage: the REAL ~/.account-switcher layout."""
+    assert codexhome.daemon_socket_fits(codexhome.home_dir(EMAIL))
+
+
+# --- the by-address index (and the pre-1.0.2 move) -----------------------------------------------
+
+def test_a_seat_is_findable_by_address(ctx):
+    home = _ensure(ctx)
+    link = codexhome.by_address(EMAIL, ctx._homes_root)
+
+    assert link.is_symlink() and link.resolve() == home.resolve()
+    assert not os.path.isabs(os.readlink(link))                 # relative: the store stays movable
+
+
+def test_a_pre_1_0_2_home_is_moved_onto_the_short_path_with_its_auth(ctx):
+    old = codexhome.by_address(EMAIL, ctx._homes_root)
+    old.mkdir(parents=True)
+    (old / "auth.json").write_text('{"tokens": {}}')
+    (old / f"x.sqlite{codexhome.ORPHAN_MARK}20260101T000000").write_bytes(b"parked")
+    (old / "sessions").symlink_to(ctx._codex_real / "sessions")
+
+    assert codexhome.load(EMAIL, root=ctx._homes_root) == '{"tokens": {}}'   # a read is enough
+
+    home = _home(ctx)
+    assert (home / "auth.json").read_text() == '{"tokens": {}}'
+    assert (home / f"x.sqlite{codexhome.ORPHAN_MARK}20260101T000000").read_bytes() == b"parked"
+    assert (home / "sessions").is_symlink()
+    _ensure(ctx)
+    assert old.is_symlink() and old.resolve() == home.resolve()  # the address still finds the seat
+
+
+def test_an_un_adoptable_legacy_home_is_never_clobbered(ctx):
+    home = _ensure(ctx)                       # short home exists first …
+    old = codexhome.by_address(EMAIL, ctx._homes_root)
+    old.unlink()
+    old.mkdir(parents=True)                   # … so this one cannot be moved onto it
+    (old / "auth.json").write_text("someone's token")
+
+    _ensure(ctx)
+
+    assert (old / "auth.json").read_text() == "someone's token"
+    assert home.is_dir()
+
+
+def test_delete_removes_both_the_home_and_its_address(ctx):
+    home = _ensure(ctx)
+    link = codexhome.by_address(EMAIL, ctx._homes_root)
+
+    assert codexhome.delete(EMAIL, root=ctx._homes_root) is True
+    assert not home.exists() and not link.is_symlink() and not link.exists()
