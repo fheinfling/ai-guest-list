@@ -298,10 +298,13 @@ def test_wrapper_without_utf8_is_repaired(tmp_path, packaged):
     assert "PYTHONUTF8=1" in body
     assert not inst._wrapper_stale(body)
     old = body.replace("PYTHONUTF8=1 ", "")
-    assert inst._wrapper_stale(old)
+    assert not inst._wrapper_stale(old)
     (bindir / "acctsw").write_text(old, encoding="utf-8")
     inst.ensure_launchers(bin_dir=bindir, python=str(interpreter), pkg_root=tmp_path, wire_rc=False)
-    assert (bindir / "acctsw").read_text(encoding="utf-8") == body
+    healed = old.replace("exec ", "PYTHONUTF8=1 exec ", 1)
+    assert (bindir / "acctsw").read_text(encoding="utf-8") == healed
+    assert not inst.ensure_launchers(bin_dir=bindir, python=str(interpreter),
+                                     pkg_root=tmp_path, wire_rc=False)[0]
 
 
 @pytest.mark.parametrize(
@@ -683,18 +686,20 @@ def test_ensure_launchers_heals_wrapper_with_dead_interpreter(tmp_path, monkeypa
     assert "/Bundle.app/Contents/MacOS/python -P -m acctsw" in (bindir / "acctsw").read_text()
 
 
-def test_ensure_launchers_preserves_wrapper_with_live_interpreter(tmp_path, monkeypatch):
+@pytest.mark.parametrize("utf8", ["", "PYTHONUTF8=1 "])
+def test_ensure_launchers_preserves_wrapper_with_live_interpreter(tmp_path, monkeypatch, utf8):
     """A source-install wrapper that execs a real, existing interpreter is NOT stale — the app
     bootstrap must not clobber it just because it differs from the bundle form."""
     bindir = tmp_path / "bin"
     bindir.mkdir()
     good = ('#!/bin/sh\n# ai guest list engine\n'
-            f'PYTHONUTF8=1 PYTHONPATH=/src/checkout exec {sys.executable} -m acctsw "$@"\n')
+            f'{utf8}PYTHONPATH=/src/checkout exec {sys.executable} -P -m acctsw "$@"\n')
     (bindir / "acctsw").write_text(good)
     monkeypatch.setattr(inst, "shell_rc_path", lambda: tmp_path / ".zshrc")
     monkeypatch.setattr(inst.sys, "executable", "/Bundle.app/Contents/MacOS/python")
     inst.ensure_launchers(bin_dir=bindir, wire_rc=False)
-    assert (bindir / "acctsw").read_text() == good    # preserved verbatim
+    expected = good if utf8 else good.replace("exec ", "PYTHONUTF8=1 exec ", 1)
+    assert (bindir / "acctsw").read_text() == expected
 
 
 @pytest.mark.parametrize("packaged", [False, True], ids=["source", "packaged"])

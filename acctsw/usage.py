@@ -252,9 +252,9 @@ def claude_token(blob: str) -> str | None:
 def _codex_access_token_expired(blob: str) -> bool:
     """Local expiry explains a usage 401; it does not prove the session was revoked.
 
-    Read only the access token's structural expiry, never the provider's error prose. A missing
-    refresh token does not turn expiry into evidence of logout. Match Claude's clock boundary
-    (no early-expiry allowance): a token that still works must not be called expired.
+    Read only the access token's structural expiry, never the provider's error prose. Without a
+    refresh credential there is no path to renewal, so keep the sign-in prompt. Match Claude's
+    clock boundary (no early-expiry allowance): a token that still works must not be called expired.
     """
     from .util import jwt_payload
     try:
@@ -262,7 +262,7 @@ def _codex_access_token_expired(blob: str) -> bool:
     except (json.JSONDecodeError, TypeError):
         return False
     tokens = data.get("tokens") if isinstance(data, dict) else None
-    if not isinstance(tokens, dict):
+    if not isinstance(tokens, dict) or not _codex_refresh_token(blob):
         return False
     claims = jwt_payload(tokens.get("access_token"))
     expiry = claims.get("exp") if isinstance(claims, dict) else None
@@ -709,8 +709,8 @@ def refresh(ctx, state, tool: str | None = None, *, only: str | None = None,
             # differ: no child renews their expired token, leaving usage too stale for handoff.
             # Only refresh_live recovers them: expiry + refresh-token checks prove renewal is
             # possible, existing backoff limits retries, and session/incarnation/active checks
-            # avoid writing into a seat now owned by a child or a different login. Its digest CAS
-            # preserves another writer's credentials; comparing the sent refresh token on failure
+            # avoid applying usage to a seat now owned by a child or a different login. Its token CAS
+            # preserves a newer refresh credential; comparing the sent refresh token on failure
             # prevents a lost race from being called revocation. This accepts, rather than closes,
             # the remaining window: cx launching on this seat between the session check and the
             # token POST can still double-spend the token. No network I/O runs under the flock.
@@ -833,20 +833,24 @@ def _recover_parked_codex(ctx, job: UsageFetchJob, *, post,
         seat = state.get_seat("codex", job.email)
         # Codex snapshots are local files, so this CAS read belongs inside the short lock.
         current_blob = ctx.snapshot_get("codex", job.email)
-        if error == "invalidated" and _codex_refresh_token(current_blob) != sent_refresh_token:
+        same_refresh = _codex_refresh_token(current_blob) == sent_refresh_token
+        if error == "invalidated" and not same_refresh:
             return None, "refresh_raced"
+        if new_blob and same_refresh:
+            # The POST spent the token still on disk. Even a cadence/ownership skip must save its
+            # replacement; preserving these old bytes would turn a healthy seat into a logout.
+            try:
+                ctx.snapshot_set("codex", job.email, new_blob)
+            except Exception:
+                # Identity validation or disk I/O must not abort the other parked jobs. Let the
+                # ordinary usage attempt record a retryable failure using the stored credential.
+                return job, None
         is_active = state.active("codex") == job.email
         running = session.active_session(ctx.data_dir, "codex", email=job.email)
         if (seat is None or seat.get("added_at") != job.added_at or is_active
                 or running is not None):
-            # Ownership changed while the POST ran. Fetch only the current stored credentials,
-            # tying that new request to the current incarnation; never install our spent blob.
-            if seat is None or not current_blob:
-                return None, "stale"
-            return replace(job, blob=current_blob,
-                           credential_digest=_credential_digest(current_blob) or "",
-                           added_at=seat.get("added_at"), active=is_active,
-                           recover_codex=False), None
+            # Credential rotation is saved above, but this request no longer owns the usage result.
+            return None, "stale"
         if _credential_digest(current_blob) != job.credential_digest:
             return None, "refresh_raced"
         if not _due(seat.get("usage"), now(), min_seconds, active=False):
@@ -855,8 +859,6 @@ def _recover_parked_codex(ctx, job: UsageFetchJob, *, post,
                 and _codex_refresh_token(current_blob)):
             return job, None
         if new_blob:
-            # snapshot_set already delegates to codexhome.save: exactly one private-home write.
-            ctx.snapshot_set("codex", job.email, new_blob)
             return replace(job, blob=new_blob,
                            credential_digest=_credential_digest(new_blob) or "",
                            recover_codex=False), None
@@ -922,6 +924,14 @@ def refresh_live(ctx, tool: str | None = None, *, only: str | None = None,
             user_agent=ua if t == "claude" else None,
         ))
 
+    # Session probes can spawn ps and prune stale heartbeats. Keep that sweep outside the flock;
+    # this is only an eligibility hint, and recovery rechecks ownership after its POST.
+    running_codex = {
+        job.email: session.active_session(ctx.data_dir, "codex", email=job.email) is not None
+        for job in prepared if job.tool == "codex" and not job.active
+        and _codex_access_token_expired(job.blob)
+    }
+
     # Recheck eligibility after slow Keychain reads.  Another poll, switch, remove, or re-add may
     # have happened since the initial atomic state read.
     eligible: list[UsageFetchJob] = []
@@ -951,8 +961,7 @@ def refresh_live(ctx, tool: str | None = None, *, only: str | None = None,
                                and _codex_access_token_expired(job.blob)
                                and bool(_codex_refresh_token(job.blob))
                                and _due(previous, checked_at, min_seconds, active=False)
-                               and session.active_session(ctx.data_dir, "codex",
-                                                          email=job.email) is None),
+                               and not running_codex.get(job.email, False)),
             ))
 
     active_jobs = [job for job in eligible if job.active]

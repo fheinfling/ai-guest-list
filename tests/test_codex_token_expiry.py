@@ -42,9 +42,9 @@ def test_expiry_boundary_matches_claude(monkeypatch):
 
 
 @pytest.mark.parametrize("refresh", [None, "", "refresh-credential"])
-def test_expiry_classification_does_not_require_refresh_credential(refresh):
+def test_expiry_classification_requires_refresh_credential(refresh):
     result = usage._fetch_for("codex", _blob(1, refresh=refresh), lambda *_: (401, "{}"), None)
-    assert result.error == "token_expired"
+    assert result.error == ("token_expired" if refresh else "unauthorized")
 
 
 def test_unexpired_rejection_does_not_trust_provider_prose():
@@ -90,7 +90,8 @@ def test_usage_preserves_credentials_when_rotation_is_forbidden(ctx, monkeypatch
         seat = state.get_seat("codex", email)
     else:
         result = usage.refresh(ctx, state, "codex", force=True, get=get, post=no_rotation)
-    assert result["codex"][email] == ("unauthorized" if case == "valid" else "token_expired")
+    assert result["codex"][email] == ("unauthorized" if case in {"valid", "no_refresh"}
+                                       else "token_expired")
     assert not seat.get("auth_error")
     assert accounts._seat_view(seat, active=case == "active", at=now())["needs_login"] is False
     assert ctx.snapshot_get("codex", email) == blob
@@ -238,8 +239,13 @@ def test_refresh_race_preserves_other_writer_and_healthy_state(ctx, parked_seat,
 
     result = usage.refresh_live(ctx, "codex", post=post, get=no_get)
     assert result["codex"][email] == "refresh_raced"
-    assert ctx.snapshot_get("codex", email) == other_blob
-    assert (ctx.codex_home(email) / "auth.json").read_bytes() == other_blob.encode()
+    stored = ctx.snapshot_get("codex", email)
+    if outcome == "success" and not changed_refresh:
+        # Different access bytes do not save the refresh token that our successful POST spent.
+        assert usage._codex_refresh_token(stored) == "renewed-refresh"
+    else:
+        assert stored == other_blob
+    assert (ctx.codex_home(email) / "auth.json").read_bytes() == stored.encode()
     assert ctx.state_file.read_bytes() == after["state"]
     seat = ctx.load_state().get_seat("codex", email)
     assert not seat.get("auth_error")
@@ -249,13 +255,12 @@ def test_refresh_race_preserves_other_writer_and_healthy_state(ctx, parked_seat,
 
 @pytest.mark.parametrize("outcome", ["success", "invalidated"])
 @pytest.mark.parametrize("change", ["session", "active", "readded", "removed"])
-def test_recovery_discards_result_when_seat_ownership_changes(ctx, monkeypatch, parked_seat,
-                                                            outcome, change):
+def test_recovery_saves_rotation_but_skips_usage_when_seat_ownership_changes(
+        ctx, monkeypatch, parked_seat, outcome, change):
     email = parked_seat
     before = ctx.snapshot_get("codex", email)
     running = None
     monkeypatch.setattr(session, "active_session", lambda *a, **kw: running)
-    gets = []
 
     def post(*args):
         nonlocal running
@@ -271,15 +276,16 @@ def test_recovery_discards_result_when_seat_ownership_changes(ctx, monkeypatch, 
         current.save()
         return _renewal_response() if outcome == "success" else (401, "{}")
 
-    def get(url, headers, timeout):
-        gets.append(headers["Authorization"])
-        assert headers["Authorization"] == "Bearer " + json.loads(before)["tokens"]["access_token"]
-        return 401, "{}"
+    def get(*args):
+        pytest.fail("an ownership skip must not fetch usage for the old job")
 
     result = usage.refresh_live(ctx, "codex", post=post, get=get)
-    assert result["codex"][email] == ("stale" if change == "removed" else "token_expired")
-    assert len(gets) == (0 if change == "removed" else 1)
-    assert ctx.snapshot_get("codex", email) == before
+    assert result["codex"][email] == "stale"
+    stored = ctx.snapshot_get("codex", email)
+    if outcome == "success":
+        assert usage._codex_refresh_token(stored) == "renewed-refresh"
+    else:
+        assert stored == before
     seat = ctx.load_state().get_seat("codex", email)
     assert not (seat or {}).get("auth_error")
 
@@ -314,11 +320,140 @@ def test_recovery_obeys_due_even_when_forced_and_rechecks_at_commit(ctx, parked_
         recent_usage()
         return _renewal_response()
 
+    def get(*args):
+        assert not midflight, "a cadence skip must not fetch usage"
+        return 401, "{}"
+
     if not midflight:
         recent_usage()
-    result = usage.refresh_live(ctx, "codex", force=True, post=post,
-                                get=lambda *_: (401, "{}"))
+    result = usage.refresh_live(ctx, "codex", force=True, post=post, get=get)
     assert result["codex"][email] == ("cached" if midflight else "token_expired")
     assert len(posts) == int(midflight)
-    assert ctx.snapshot_get("codex", email) == before
+    if midflight:
+        assert usage._codex_refresh_token(ctx.snapshot_get("codex", email)) == "renewed-refresh"
+    else:
+        assert ctx.snapshot_get("codex", email) == before
     assert not ctx.load_state().get_seat("codex", email).get("auth_error")
+
+
+def test_overlapping_poll_keeps_spent_token_replacement_for_next_cycle(ctx, monkeypatch,
+                                                                     parked_seat):
+    email = parked_seat
+    at = now()
+    monkeypatch.setattr(usage, "now", lambda: at)
+
+    def post(*args):
+        # A second poll finishes while the first provider POST is in flight. Its failed usage
+        # attempt changes cadence but cannot renew the credential that the first POST spent.
+        other = usage.refresh_live(ctx, "codex", post=lambda *_: (500, "{}"),
+                                   get=lambda *_: (401, "{}"))
+        assert other["codex"][email] == "token_expired"
+        return _renewal_response()
+
+    def no_get(*args):
+        pytest.fail("the overlapping poll already recorded this cycle's usage attempt")
+
+    assert usage.refresh_live(ctx, "codex", post=post, get=no_get)["codex"][email] == "cached"
+    stored = ctx.snapshot_get("codex", email)
+    assert usage._codex_refresh_token(stored) == "renewed-refresh"
+    monkeypatch.setattr(usage, "now", lambda: at + timedelta(minutes=30))
+
+    def no_post(*args):
+        pytest.fail("the next poll must use the saved live token, not spend the dead refresh token")
+
+    def get(url, headers, timeout):
+        assert headers["Authorization"] == "Bearer " + json.loads(stored)["tokens"]["access_token"]
+        return 200, codex_ok_body()
+
+    assert usage.refresh_live(ctx, "codex", post=no_post, get=get)["codex"][email] == "ok"
+    seat = ctx.load_state().get_seat("codex", email)
+    assert not seat.get("auth_error")
+    assert seat["usage"]["error_streak"] == 0
+
+
+@pytest.mark.parametrize("failure", ["identity", "disk"])
+def test_recovery_write_failure_records_retry_and_continues_poll(ctx, monkeypatch,
+                                                               parked_seat, failure):
+    email = parked_seat
+    before = ctx.snapshot_get("codex", email)
+    other = "next@example.test"
+    state = ctx.load_state()
+    state.upsert_seat("codex", other)
+    ctx.snapshot_set("codex", other, make_codex_blob(other))
+    state.save()
+    real_save = codexhome.save
+
+    def save(saved_email, *args, **kwargs):
+        if saved_email == email and failure == "disk":
+            raise OSError("disk full")
+        return real_save(saved_email, *args, **kwargs)
+
+    def post(*args):
+        status, body = _renewal_response()
+        data = json.loads(body)
+        if failure == "identity":
+            data["id_token"] = _jwt({"email": "wrong@example.test"})
+        return status, json.dumps(data)
+
+    def get(url, headers, timeout):
+        if headers["Authorization"] == "Bearer " + json.loads(before)["tokens"]["access_token"]:
+            return 401, "{}"
+        return 200, codex_ok_body()
+
+    monkeypatch.setattr(codexhome, "save", save)
+    result = usage.refresh_live(ctx, "codex", post=post, get=get)
+    assert result["codex"] == {email: "token_expired", other: "ok"}
+    seat = ctx.load_state().get_seat("codex", email)
+    assert seat["usage"]["error_streak"] == 1
+    assert not seat.get("auth_error")
+    assert ctx.snapshot_get("codex", email) == before
+
+
+def test_recovery_preparation_probes_sessions_outside_lock(ctx, monkeypatch, parked_seat):
+    held = False
+    posted = False
+    probes = []
+    real_locked = ctx.locked
+
+    @contextmanager
+    def locked():
+        nonlocal held
+        with real_locked():
+            held = True
+            try:
+                yield
+            finally:
+                held = False
+
+    def active_session(*args, **kwargs):
+        # Preparation must not serialize launches behind a ps sweep. The post-POST ownership
+        # check still belongs to recovery's credential/state compare-and-swap.
+        assert held == posted
+        probes.append(held)
+        return None
+
+    def post(*args):
+        nonlocal posted
+        posted = True
+        return _renewal_response()
+
+    monkeypatch.setattr(ctx, "locked", locked)
+    monkeypatch.setattr(session, "active_session", active_session)
+    result = usage.refresh_live(ctx, "codex", post=post, get=lambda *_: (200, codex_ok_body()))
+    assert result["codex"][parked_seat] == "ok"
+    assert probes == [False, True]
+
+
+def test_active_expired_codex_without_refresh_still_prompts_login(ctx):
+    email = "person@example.test"
+    blob = _blob(1, refresh=None)
+    state = ctx.load_state()
+    state.upsert_seat("codex", email)
+    state.set_active("codex", email)
+    ctx.snapshot_set("codex", email, blob)
+    ctx.cred["codex"].set_live(blob)
+    state.save()
+    result = usage.refresh_live(ctx, "codex", get=lambda *_: (401, "{}"))
+    assert result["codex"][email] == "unauthorized"
+    seat = ctx.load_state().get_seat("codex", email)
+    assert accounts._seat_view(seat, active=True, at=now())["needs_login"] is True

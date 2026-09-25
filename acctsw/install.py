@@ -293,16 +293,12 @@ def _wrapper_stale(body: str) -> bool:
         the Python build machine's compiled-in certificate path), or
       - the bundle python without safe-path mode (imports a checkout in the working directory
         against the bundle's incomplete stdlib instead of loading its packaged engine), or
-      - no explicit PYTHONUTF8 (LaunchServices can leave the locale at ASCII, making non-ASCII
-        settings or diagnostics crash otherwise working bundle/source interpreters), or
       - an interpreter path that no longer exists (the .app was moved/renamed, or a venv was deleted)."""
     if _POISON_RE.search(body):
         return True
     exe = _wrapper_exe(body)
     if exe is None:
         return False
-    if "PYTHONUTF8=" not in body:
-        return True
     if exe.endswith(".app/Contents/MacOS/python") and "PYTHONHOME=" not in body:
         return True
     if exe.endswith(".app/Contents/MacOS/python") and "SSL_CERT_FILE=" not in body:
@@ -321,7 +317,9 @@ def ensure_launchers(*, bin_dir: Path | None = None, python: str | None = None,
     """Make cx/cl usable end-to-end with zero manual steps: (re)write the bin wrappers if missing or
     stale, and (when ``wire_rc``) wire the shell rc (PATH + codex/claude aliases). Idempotent and
     cheap — safe to call on every app launch so a fresh install "just works", a deleted rc block
-    self-heals, and a wrapper baked with a broken interpreter gets corrected. Returns
+    self-heals, and a wrapper baked with a broken interpreter gets corrected. Good recognized
+    wrappers missing PYTHONUTF8 get it on their existing exec line, preserving their interpreter
+    and PYTHONPATH so a menubar launch cannot silently switch a checkout to the bundle. Returns
     (changed, messages)."""
     bin_dir = bin_dir or BIN_DIR
     # Interpreter for the wrappers. When called from the menubar app (no python passed), sys.executable
@@ -345,6 +343,13 @@ def ensure_launchers(*, bin_dir: Path | None = None, python: str | None = None,
             except OSError:
                 continue
             if body == desired or not _wrapper_stale(body):
+                if "PYTHONUTF8=" not in body and _wrapper_exe(body) is not None:
+                    # LaunchServices may supply an ASCII locale. Heal that without redirecting a
+                    # working checkout or hand-written wrapper to the app's bundled interpreter.
+                    body = _EXEC_PY_RE.sub(lambda m: "PYTHONUTF8=1 " + m.group(0), body, count=1)
+                    target.write_text(body, encoding="utf-8")
+                    changed = True
+                    msgs.append(f"healed UTF-8 {target}")
                 # Presence is not enough: a wrapper whose execute bit was stripped is just as
                 # unreachable as a missing one. Restore owner-execute without rewriting a good or
                 # hand-maintained body (and without broadening its read/write permissions).

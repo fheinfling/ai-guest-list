@@ -27,8 +27,9 @@ function dotKey(state) {
   const seats = ["codex", "claude"].flatMap((t) => state?.tools?.[t]?.seats || []);
   if (seats.some((s) => (s.status || "") === "needs-login")) return "hello";
   if (state?.recently_switched) return "switched";
-  // Preserve the native glyph's live-session behavior without hiding a parked seat's health.
-  if (seats.some((s) => ["resting", "queued"].includes(s.status) && !(s.active || s.in_session))) return "amber";
+  // Mirror acctsw.web_dot (shared golden fixtures): a terminal cannot free quota, so use status
+  // just like the header counts.
+  if (seats.some((s) => ["resting", "queued"].includes(s.status))) return "amber";
   return "green";
 }
 
@@ -36,8 +37,7 @@ function dotKey(state) {
 function doorKey(state) {
   if (state?.door === "open" || state?.door === "shut") return state.door;
   const seats = ["codex", "claude"].flatMap((t) => state?.tools?.[t]?.seats || []);
-  const free = seats.some((s) => ["ready", "active"].includes(s.status) ||
-    (s.status !== "needs-login" && (s.active || s.in_session)));
+  const free = seats.some((s) => ["ready", "active"].includes(s.status));
   return free || seats.length === 0 ? "open" : "shut";
 }
 
