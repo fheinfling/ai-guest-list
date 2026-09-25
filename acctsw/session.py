@@ -77,7 +77,7 @@ def mark_session(data_dir: Path, tool: str, email: str) -> None:
     # preserving its existing owner before another terminal replaces it during an upgrade.
     legacy = _session_file(data_dir, tool)
     try:
-        previous = json.loads(legacy.read_text())
+        previous = json.loads(legacy.read_text(encoding="utf-8"))
         previous_pid = int(previous["pid"])
         if previous_pid != pid and _read_session(legacy) is not None:
             # Never overwrite another supervisor's newer record. A hard link snapshots the
@@ -97,7 +97,7 @@ def clear_session(data_dir: Path, tool: str) -> None:
         pass
     try:
         legacy = _session_file(data_dir, tool)
-        data = json.loads(legacy.read_text())
+        data = json.loads(legacy.read_text(encoding="utf-8"))
         if isinstance(data, dict) and data.get("pid") == os.getpid():
             legacy.unlink()
     except (OSError, ValueError, TypeError):
@@ -139,7 +139,7 @@ def active_sessions(data_dir: Path, tool: str) -> list[dict]:
 
 def _read_session(path: Path) -> dict | None:
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
         email = data["email"]
         pid = int(data["pid"])
         started_at = data["started_at"]

@@ -24,7 +24,7 @@ from . import accounts as acct
 from .context import Context
 from .identity import live_email
 from .switch import sync_back
-from .util import now, iso, sha256_text, write_json
+from .util import atomic_write_text, now, iso, read_text, read_text_lossless, sha256_text, write_json
 
 BIN_DIR = Path.home() / ".local" / "bin"
 BIN_NAMES = ("acctsw", "cx", "cl")
@@ -75,7 +75,7 @@ def supervision_status(bin_dir: Path | None = None, rc_path: Path | None = None)
     block = False
     error = None
     try:
-        existing = rc_path.read_text() if rc_path.exists() else ""
+        existing = read_text_lossless(rc_path) if rc_path.exists() else ""
         block = BLOCK_BEGIN in existing and _BLOCK_RE.search(existing) is not None
     except (OSError, UnicodeError) as exc:
         error = f"couldn't read {rc_path}: {exc}"
@@ -112,8 +112,10 @@ def ensure_shell_setup(bin_dir: Path | None = None, rc_path: Path | None = None,
     changed; never touches the user's other lines. Returns (changed, message)."""
     bin_dir = bin_dir or BIN_DIR
     rc_path = rc_path or shell_rc_path()
+    # Replace the dotfile, not its symlink; lexists also preserves links to missing targets.
+    target = Path(os.path.realpath(rc_path)) if os.path.lexists(rc_path) else rc_path
     block = shell_block(bin_dir, aliases=aliases)
-    existing = rc_path.read_text() if rc_path.exists() else ""
+    existing = read_text_lossless(target) if target.exists() else ""
     if BLOCK_BEGIN in existing:
         # Replace via a function, not a string: a literal home path can contain re replacement
         # metachars (\g, \1, a backslash), which sub() would otherwise interpret and corrupt.
@@ -123,8 +125,10 @@ def ensure_shell_setup(bin_dir: Path | None = None, rc_path: Path | None = None,
         new = existing + prefix + "\n" + block
     if new == existing:
         return False, f"{rc_path} already set up for cx/cl"
-    rc_path.parent.mkdir(parents=True, exist_ok=True)
-    rc_path.write_text(new)
+    # An rc is user-owned, not a credential file: retain its permissions and foreign bytes,
+    # but replace atomically so an interrupted setup cannot truncate their shell config.
+    mode = stat.S_IMODE(target.stat().st_mode) if target.exists() else 0o644
+    atomic_write_text(target, new, mode=mode, errors="surrogateescape")
     return True, f"wired cx/cl into {rc_path} — open a NEW terminal (or `source {rc_path}`)"
 
 
@@ -133,10 +137,13 @@ def remove_shell_setup(rc_path: Path | None = None) -> bool:
     rc_path = rc_path or shell_rc_path()
     if not rc_path.exists():
         return False
-    text = rc_path.read_text()
+    # Atomic replacement must leave the user's dotfiles symlink intact.
+    rc_path = Path(os.path.realpath(rc_path))
+    text = read_text_lossless(rc_path)
     if BLOCK_BEGIN not in text:
         return False
-    rc_path.write_text(_BLOCK_RE.sub("", text, count=1))
+    atomic_write_text(rc_path, _BLOCK_RE.sub("", text, count=1),
+                      mode=stat.S_IMODE(rc_path.stat().st_mode), errors="surrogateescape")
     return True
 
 
@@ -181,7 +188,7 @@ def install(ctx: Context, *, dry_run: bool = False, register: bool = True,
     manifest = {"created_at": iso(now()), "version": __version__, "entries": {}}
     if manifest_path.exists():
         import json
-        manifest = json.loads(manifest_path.read_text())
+        manifest = json.loads(read_text(manifest_path))
         manifest.setdefault("entries", {})
     for tool in TOOLS:
         # The Keychain factory image is authoritative — guard on it (not just the manifest) so a
@@ -225,7 +232,7 @@ def install(ctx: Context, *, dry_run: bool = False, register: bool = True,
         script = _wrapper_script(name, python, pkg_root, bin_dir)
         def _write(t=target, s=script):
             t.parent.mkdir(parents=True, exist_ok=True)
-            t.write_text(s)
+            t.write_text(s, encoding="utf-8")
             t.chmod(0o755)
         plan.do(f"install {target}", _write)
 
@@ -286,12 +293,16 @@ def _wrapper_stale(body: str) -> bool:
         the Python build machine's compiled-in certificate path), or
       - the bundle python without safe-path mode (imports a checkout in the working directory
         against the bundle's incomplete stdlib instead of loading its packaged engine), or
+      - no explicit PYTHONUTF8 (LaunchServices can leave the locale at ASCII, making non-ASCII
+        settings or diagnostics crash otherwise working bundle/source interpreters), or
       - an interpreter path that no longer exists (the .app was moved/renamed, or a venv was deleted)."""
     if _POISON_RE.search(body):
         return True
     exe = _wrapper_exe(body)
     if exe is None:
         return False
+    if "PYTHONUTF8=" not in body:
+        return True
     if exe.endswith(".app/Contents/MacOS/python") and "PYTHONHOME=" not in body:
         return True
     if exe.endswith(".app/Contents/MacOS/python") and "SSL_CERT_FILE=" not in body:
@@ -330,7 +341,7 @@ def ensure_launchers(*, bin_dir: Path | None = None, python: str | None = None,
             # hand-written / `acctsw install` wrapper. `errors="ignore"` + catching OSError keeps a
             # foreign/unreadable file at our name from aborting the whole bootstrap.
             try:
-                body = target.read_text(errors="ignore")
+                body = target.read_text(encoding="utf-8", errors="ignore")
             except OSError:
                 continue
             if body == desired or not _wrapper_stale(body):
@@ -344,7 +355,7 @@ def ensure_launchers(*, bin_dir: Path | None = None, python: str | None = None,
                 continue
             verb = "healed"
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(desired)
+        target.write_text(desired, encoding="utf-8")
         target.chmod(0o755)
         changed = True
         msgs.append(f"{verb} {target}")
@@ -374,6 +385,8 @@ def _wrapper_script(name: str, python: str, pkg_root: Path, bin_dir: Path) -> st
     if name == "acctsw":
         from .procenv import _PY_ENV_STRIP
         clean_python = f"unset {' '.join(_PY_ENV_STRIP)}\n"
+        # Wrappers can inherit LaunchServices' absent locale too. Set UTF-8 at interpreter
+        # startup so future text I/O cannot accidentally fall back to ASCII.
         if _is_bundle_python(python):
             # The bundled interpreter is the framework python3.11 copied into the app; on its own it
             # derives sys.prefix from a compiled-in framework path that need not exist on the user's
@@ -393,14 +406,14 @@ def _wrapper_script(name: str, python: str, pkg_root: Path, bin_dir: Path) -> st
             ca_dir = shlex.quote(str(resources / "openssl.ca" / "no-such-file"))
             return (f"#!/bin/sh\n# ai guest list engine\n"
                     + clean_python +
-                    f"PYTHONHOME={home} SSL_CERT_FILE={ca_file} SSL_CERT_DIR={ca_dir} "
+                    f"PYTHONUTF8=1 PYTHONHOME={home} SSL_CERT_FILE={ca_file} SSL_CERT_DIR={ca_dir} "
                     f'exec {py} -P -m acctsw "$@"\n')
         # Source checkout: set PYTHONPATH to ONLY pkg_root — do NOT append "$PYTHONPATH". If this wrapper
         # runs from a shell that inherited py2app's leaked PYTHONPATH (the frozen 3.11 stdlib zip),
         # appending it would shadow the interpreter's stdlib and crash `python -m acctsw`.
         return (f"#!/bin/sh\n# ai guest list engine\n"
                 + clean_python +
-                f'PYTHONPATH={pr} exec {py} -P -m acctsw "$@"\n')
+                f'PYTHONUTF8=1 PYTHONPATH={pr} exec {py} -P -m acctsw "$@"\n')
     tool = "codex" if name == "cx" else "claude"
     # No `exec`: we keep this shell resident so its trap fires after the tool exits. A TUI killed
     # mid-session (supervisor auto-switch) — or, when the app is closed, a stock tool that crashes
@@ -453,7 +466,7 @@ def uninstall(ctx: Context, *, purge: bool = False, dry_run: bool = False,
     manifest_path = ctx.backup_dir / "manifest.json"
     if manifest_path.exists():
         import json
-        manifest = json.loads(manifest_path.read_text())
+        manifest = json.loads(read_text(manifest_path))
         for tool, entry in manifest.get("entries", {}).items():
             if not entry.get("present"):
                 continue
@@ -495,7 +508,7 @@ def uninstall(ctx: Context, *, purge: bool = False, dry_run: bool = False,
 
     # remove the managed block we added (only ours — delimited by our begin/end markers).
     rc = shell_rc_path()
-    if rc.exists() and BLOCK_BEGIN in rc.read_text():
+    if rc.exists() and BLOCK_BEGIN in read_text_lossless(rc):
         plan.do(f"remove our cx/cl block from {rc}", lambda r=rc: remove_shell_setup(r))
     else:
         plan.actions.append(f"NOTE: if you added it manually, remove the cx/cl block for {bin_dir} from your shell rc")

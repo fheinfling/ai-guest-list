@@ -49,7 +49,11 @@ class KeychainBackend(Protocol):
 
 
 class SecurityKeychain:
-    """Real backend using `/usr/bin/security` (macOS login keychain)."""
+    """Real backend using `/usr/bin/security` (macOS login keychain).
+
+    Decode output as UTF-8 regardless of the app's locale. Replace malformed output so a
+    diagnostic cannot crash the caller; our base64 credential payloads stay ASCII-safe.
+    """
 
     def __init__(self, security_path: str = "/usr/bin/security") -> None:
         self._security = security_path
@@ -57,7 +61,7 @@ class SecurityKeychain:
     def get(self, service: str, account: str) -> str | None:
         proc = subprocess.run(
             [self._security, "find-generic-password", "-s", service, "-a", account, "-w"],
-            capture_output=True, text=True,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
         )
         if proc.returncode != 0:
             return None
@@ -76,7 +80,7 @@ class SecurityKeychain:
         blob = _encode(secret)
         proc = subprocess.run(
             [self._security, "add-generic-password", "-U", "-s", service, "-a", account, "-w", blob],
-            capture_output=True, text=True,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
         )
         if proc.returncode != 0:
             raise KeychainError(f"keychain set failed for {service}:{account}: {proc.stderr.strip()}")
@@ -84,7 +88,7 @@ class SecurityKeychain:
     def delete(self, service: str, account: str) -> bool:
         proc = subprocess.run(
             [self._security, "delete-generic-password", "-s", service, "-a", account],
-            capture_output=True, text=True,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
         )
         return proc.returncode == 0
 

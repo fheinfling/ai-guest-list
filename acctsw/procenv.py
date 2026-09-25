@@ -66,8 +66,10 @@ def proc_start(pid: int) -> str | None:
     if pid <= 0:
         return ""
     try:
+        # The C locale stabilizes ps's format; malformed diagnostics must not break decoding.
         r = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
-                           capture_output=True, text=True, timeout=2, env=_c_locale_env())
+                           capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=2, env=_c_locale_env())
     except Exception:
         return None  # ps unavailable → caller falls back to bare liveness
     return r.stdout.strip()  # empty when the PID is not running

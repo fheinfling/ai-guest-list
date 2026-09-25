@@ -271,7 +271,9 @@ def _claude_access_token_expired(blob: str) -> bool:
 def _claude_user_agent_for_exe(exe: str | None) -> str:
     if exe:
         try:
-            out = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=10)
+            # CLI diagnostics need not be valid UTF-8; a version probe must still be safe.
+            out = subprocess.run([exe, "--version"], capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace", timeout=10)
             if out.returncode == 0:
                 ver = out.stdout.strip().split()[0]
                 if ver:

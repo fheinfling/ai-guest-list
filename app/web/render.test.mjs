@@ -333,6 +333,18 @@ test("inactive supervision shows a repair banner", () => {
   assert.match(buildHTML(st), /supervision-banner--error/);
 });
 
+test("supervision read errors name the file and reason without offering installation", () => {
+  const st = state({ supervision: {
+    wrappers: true, block: false, active: false,
+    error: "couldn't read /Users/<guest>/.zshrc: Permission denied",
+  } });
+  const banner = supervisionBanner(st);
+  assert.match(banner, /role="alert"/);
+  assert.match(banner, /couldn't read \/Users\/&lt;guest&gt;\/\.zshrc: Permission denied/);
+  assert.doesNotMatch(banner, /terminal supervision is off|supervision-on|turn it on|<guest>/);
+  assert.ok(buildHTML(st).includes(banner));
+});
+
 test("wired supervision outside the current PATH asks for a new terminal", () => {
   const st = state({
     supervision: { wrappers: true, block: true, on_path: false, active: true },

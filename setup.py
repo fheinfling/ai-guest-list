@@ -24,10 +24,12 @@ APP = ["app/menubar.py"]
 # Single source of truth for the marketing version (acctsw/__init__.py); the build number is the
 # git commit count — monotonic and automatic, so every tagged build gets a fresh CFBundleVersion.
 VERSION = re.search(r'__version__\s*=\s*"([^"]+)"',
-                    Path("acctsw/__init__.py").read_text()).group(1)
+                    Path("acctsw/__init__.py").read_text(encoding="utf-8")).group(1)
 try:
+    # Decode independently of the build shell's locale without choking on diagnostic bytes.
     BUILD = subprocess.check_output(["git", "rev-list", "--count", "HEAD"],
-                                    text=True, stderr=subprocess.DEVNULL).strip() or "0"
+                                    text=True, encoding="utf-8", errors="replace",
+                                    stderr=subprocess.DEVNULL).strip() or "0"
 except Exception:
     BUILD = "0"
 
@@ -74,6 +76,8 @@ OPTIONS = {
         "CFBundleShortVersionString": VERSION,
         "CFBundleVersion": BUILD,
         "LSUIElement": True,            # status-bar only: no dock icon, no window
+        # LaunchServices need not supply LANG; set the codec before Python initializes.
+        "LSEnvironment": {"PYTHONUTF8": "1"},
         "LSMinimumSystemVersion": "12.0",
     },
 }

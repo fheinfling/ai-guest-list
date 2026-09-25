@@ -15,7 +15,8 @@ def test_security_keychain_set_passes_secret_inline_not_stdin(monkeypatch):
         returncode = 0
         stderr = ""
 
-    def fake_run(argv, input=None, capture_output=False, text=False):
+    def fake_run(argv, input=None, capture_output=False, text=False, encoding=None, errors=None):
+        assert encoding == "utf-8" and errors == "replace"
         captured["argv"], captured["input"] = argv, input
         return _R()
 

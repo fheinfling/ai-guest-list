@@ -69,7 +69,7 @@ def mark_alive(data_dir: Path) -> None:
     # first poll) must not share a temp path, else one os.replace() consumes the other's temp and the
     # second raises FileNotFoundError. pid+thread-id is unique across concurrent writers.
     tmp = f.with_name(f"{f.name}.{pid}.{threading.get_ident()}.tmp")
-    tmp.write_text(body)
+    tmp.write_text(body, encoding="utf-8")
     os.replace(tmp, f)
 
 
@@ -85,7 +85,7 @@ def app_running(data_dir: Path) -> bool:
     """True iff the menubar app is alive right now: the heartbeat's PID is live AND (when recorded)
     its start-time still matches — so a recycled PID does not read as the app."""
     try:
-        lines = _pidfile(data_dir).read_text().splitlines()
+        lines = _pidfile(data_dir).read_text(encoding="utf-8").splitlines()
         pid = int(lines[0].strip())
     except (OSError, ValueError, IndexError):
         return False

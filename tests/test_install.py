@@ -1,11 +1,13 @@
 """Feature tests for install/uninstall — factory image, restore round-trip, non-destructive."""
 import json
+import locale
 import os
 import shlex
 import ssl
 import stat
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -154,6 +156,154 @@ def test_ensure_shell_setup_adds_then_is_idempotent(tmp_path):
     assert rc.read_text().count(inst.BLOCK_BEGIN) == 1
 
 
+@pytest.fixture
+def ascii_rc(tmp_path, monkeypatch):
+    rc = tmp_path / ".zshrc"
+    # Modern Python can bypass getpreferredencoding() for open(). Force the rc's default
+    # codec too, so this reproduces LaunchServices even on a UTF-8 developer machine.
+    monkeypatch.setattr(locale, "getpreferredencoding", lambda *args: "ascii")
+    original_open = Path.open
+
+    def open_rc(path, mode="r", buffering=-1, encoding=None, errors=None, newline=None):
+        if path == rc and "b" not in mode and encoding in (None, "locale"):
+            encoding = "ascii"
+        return original_open(path, mode, buffering, encoding, errors, newline)
+
+    monkeypatch.setattr(Path, "open", open_rc)
+    prefix = b"# " + b"x" * 33 + "— user's settings\n".encode("utf-8")
+    assert prefix[35] == 0xe2  # the exact byte/offset in the reported failure
+    rc.write_bytes(prefix)
+    return rc
+
+
+def test_ensure_shell_setup_with_ascii_locale(ascii_rc, tmp_path):
+    original = ascii_rc.read_bytes()
+    changed, _ = inst.ensure_shell_setup(tmp_path / "bin", ascii_rc)
+    assert changed
+    assert ascii_rc.read_bytes() == original + b"\n" + inst.shell_block(tmp_path / "bin").encode("utf-8")
+    assert not inst.ensure_shell_setup(tmp_path / "bin", ascii_rc)[0]
+
+
+def test_supervision_status_with_ascii_locale(ascii_rc, tmp_path):
+    bindir = tmp_path / "bin"
+    inst.ensure_launchers(bin_dir=bindir, wire_rc=False)
+    ascii_rc.write_bytes(ascii_rc.read_bytes() + inst.shell_block(bindir).encode("utf-8"))
+    status = inst.supervision_status(bindir, ascii_rc)
+    assert status["block"] is True
+    assert status["active"] is True
+    assert "error" not in status
+
+
+@pytest.mark.parametrize("newline", [b"\n", b"\r\n", b"\r"])
+@pytest.mark.parametrize("mode", [0o600, 0o644])
+def test_shell_setup_preserves_foreign_bytes_and_mode(tmp_path, monkeypatch, newline, mode):
+    atomic_write_text = inst.atomic_write_text
+
+    def checked_write(*args, **kwargs):
+        # fchmod may silently mask file-type bits, hiding a non-portable mode argument.
+        assert kwargs["mode"] == mode
+        return atomic_write_text(*args, **kwargs)
+
+    monkeypatch.setattr(inst, "atomic_write_text", checked_write)
+    rc = tmp_path / ".zshrc"
+    bindir = tmp_path / "bin"
+    original = b"# caf\xe9" + newline + b"export EDITOR=vi" + newline
+    rc.write_bytes(original)
+    rc.chmod(mode)
+    inst.ensure_shell_setup(bindir, rc)
+    separator = b"\n" if original.endswith(b"\n") else b"\n\n"
+    assert rc.read_bytes() == original + separator + inst.shell_block(bindir).encode("utf-8")
+    assert stat.S_IMODE(rc.stat().st_mode) == mode
+    # Exercise in-place replacement and removal with foreign bytes on BOTH sides.
+    suffix = b"# apr\xe8s" + newline
+    rc.write_bytes(rc.read_bytes() + suffix)
+    inst.ensure_shell_setup(bindir, rc, aliases=False)
+    assert rc.read_bytes() == original + separator + inst.shell_block(bindir, aliases=False).encode("utf-8") + suffix
+    assert inst.remove_shell_setup(rc)
+    assert rc.read_bytes() == original + separator + suffix
+    assert stat.S_IMODE(rc.stat().st_mode) == mode
+
+
+def test_new_shell_rc_mode(tmp_path):
+    rc = tmp_path / ".zshrc"
+    inst.ensure_shell_setup(tmp_path / "bin", rc)
+    assert stat.S_IMODE(rc.stat().st_mode) == 0o644
+
+
+@pytest.mark.parametrize("chain_length", [1, 3])
+@pytest.mark.parametrize("target_exists", [False, True])
+def test_shell_setup_preserves_symlinks(tmp_path, monkeypatch, chain_length, target_exists):
+    real = tmp_path / "dotfiles" / "zshrc"
+    real.parent.mkdir()
+    original = b"# my dotfiles\nexport A=1\n" if target_exists else b""
+    if target_exists:
+        real.write_bytes(original)
+    links = []
+    target = real
+    for index in range(chain_length):
+        link = tmp_path / f".zshrc-{index}"
+        link.symlink_to(target.relative_to(tmp_path))
+        links.append((link, link.readlink()))
+        target = link
+    rc = target
+    atomic_write_text = inst.atomic_write_text
+
+    def checked_write(path, *args, **kwargs):
+        # The writer derives its temp directory from this path; it must be beside the target.
+        assert path == Path(os.path.realpath(real))
+        return atomic_write_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(inst, "atomic_write_text", checked_write)
+    if not target_exists:
+        assert not inst.remove_shell_setup(rc)
+        assert not real.exists()
+        assert all(link.is_symlink() and link.readlink() == dest for link, dest in links)
+    bindir = tmp_path / "bin"
+    assert inst.ensure_shell_setup(bindir, rc)[0]
+    assert all(link.is_symlink() and link.readlink() == dest for link, dest in links)
+    assert real.read_bytes() == original + b"\n" + inst.shell_block(bindir).encode("utf-8")
+    assert not inst.ensure_shell_setup(bindir, rc)[0]
+    assert inst.remove_shell_setup(rc)
+    assert all(link.is_symlink() and link.readlink() == dest for link, dest in links)
+    assert real.read_bytes() == original + b"\n"
+
+
+@pytest.mark.parametrize("chain_length", [1, 3])
+def test_remove_shell_setup_preserves_symlinks(tmp_path, chain_length):
+    real = tmp_path / "dotfiles" / "zshrc"
+    real.parent.mkdir()
+    original = b"# my dotfiles\nexport A=1\n"
+    real.write_bytes(original + inst.shell_block(tmp_path / "bin").encode("utf-8"))
+    links = []
+    target = real
+    for index in range(chain_length):
+        link = tmp_path / f".zshrc-{index}"
+        link.symlink_to(target.relative_to(tmp_path))
+        links.append((link, link.readlink()))
+        target = link
+    assert inst.remove_shell_setup(target)
+    assert all(link.is_symlink() and link.readlink() == dest for link, dest in links)
+    assert real.read_bytes() == original
+
+
+@pytest.mark.parametrize("packaged", [False, True], ids=["source", "bundle"])
+def test_wrapper_without_utf8_is_repaired(tmp_path, packaged):
+    interpreter = tmp_path / "App.app" / "Contents" / "MacOS" / "python" if packaged else Path(sys.executable)
+    if packaged:
+        interpreter.parent.mkdir(parents=True)
+        interpreter.touch()
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    body = inst._wrapper_script("acctsw", str(interpreter), tmp_path, bindir)
+    assert "PYTHONUTF8=1" in body
+    assert not inst._wrapper_stale(body)
+    old = body.replace("PYTHONUTF8=1 ", "")
+    assert inst._wrapper_stale(old)
+    (bindir / "acctsw").write_text(old, encoding="utf-8")
+    inst.ensure_launchers(bin_dir=bindir, python=str(interpreter), pkg_root=tmp_path, wire_rc=False)
+    assert (bindir / "acctsw").read_text(encoding="utf-8") == body
+
+
 @pytest.mark.parametrize(
     ("have_wrappers", "have_block", "path_live", "expected_active"),
     [
@@ -232,24 +382,22 @@ def test_supervision_status_survives_an_unreadable_rc(tmp_path, monkeypatch):
 
 
 def test_supervision_status_survives_an_undecodable_rc(tmp_path, monkeypatch):
-    """A readable rc holding non-UTF-8 bytes (a stray latin-1 line) hits the same guard."""
+    """A stray latin-1 line does not prevent us from recognizing our ASCII block."""
     bindir = tmp_path / "bin"
     rc = tmp_path / ".zshrc"
-    rc.write_bytes(b"export EDITOR=vi\n# caf\xe9 au lait (latin-1, not utf-8)\n")
+    rc.write_bytes(b"export EDITOR=vi\n# caf\xe9 au lait (latin-1, not utf-8)\n"
+                   + inst.shell_block(bindir).encode("utf-8"))
     monkeypatch.setenv("PATH", "/usr/bin")
 
     status = inst.supervision_status(bindir, rc)
 
     assert status == {
         "wrappers": False,
-        "block": False,
+        "block": True,
         "rc_path": str(rc),
         "on_path": False,
         "active": False,
-        "error": status["error"],
     }
-    assert status["error"].startswith(f"couldn't read {rc}: ")
-    assert "utf-8" in status["error"]
 
 
 def test_supervision_status_omits_error_when_the_rc_reads_fine(tmp_path, monkeypatch):
@@ -541,7 +689,7 @@ def test_ensure_launchers_preserves_wrapper_with_live_interpreter(tmp_path, monk
     bindir = tmp_path / "bin"
     bindir.mkdir()
     good = ('#!/bin/sh\n# ai guest list engine\n'
-            f'PYTHONPATH=/src/checkout exec {sys.executable} -m acctsw "$@"\n')
+            f'PYTHONUTF8=1 PYTHONPATH=/src/checkout exec {sys.executable} -m acctsw "$@"\n')
     (bindir / "acctsw").write_text(good)
     monkeypatch.setattr(inst, "shell_rc_path", lambda: tmp_path / ".zshrc")
     monkeypatch.setattr(inst.sys, "executable", "/Bundle.app/Contents/MacOS/python")

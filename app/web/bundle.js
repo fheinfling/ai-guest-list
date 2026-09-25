@@ -241,6 +241,13 @@ function controlBar(opts) {
 function supervisionBanner(state) {
   if (state?.settings?.supervise_shell === false || !state?.supervision) return "";
   const supervision = state.supervision;
+  // A failed read leaves the block unknown. Reinstalling cannot fix unreadable settings;
+  // show the path/reason from the probe so we don't claim their existing setup is off.
+  if (supervision.error) {
+    return `<div class="supervision-banner supervision-banner--error" role="alert">
+      <span>${esc(supervision.error)}</span>
+    </div>`;
+  }
   if (!supervision.active) {
     return `<div class="supervision-banner supervision-banner--error" role="alert">
       <span>terminal supervision is off — <span class="mono">codex/claude</span> won't auto-switch</span>

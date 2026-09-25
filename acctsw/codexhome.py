@@ -173,7 +173,7 @@ def save(email: str, blob: str, *, codex_home: Path | None = None, root: Path | 
 
 def load(email: str, *, root: Path | None = None) -> str | None:
     try:
-        return auth_path(email, root).read_text()
+        return auth_path(email, root).read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
 

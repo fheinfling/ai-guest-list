@@ -95,7 +95,9 @@ def _inside(path: str, directory: Path) -> bool:
 
 
 def _run(command: list[str], *, cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, cwd=cwd, env=env, text=True, capture_output=True, check=True)
+    # Keep the child's diagnostics readable even under the locale-free bundle environment.
+    return subprocess.run(command, cwd=cwd, env=env, text=True, encoding="utf-8", errors="replace",
+                          capture_output=True, check=True)
 
 
 def smoke(bundle_arg: Path) -> None:
@@ -169,7 +171,7 @@ def smoke(bundle_arg: Path) -> None:
 
         wrapper = bindir / "acctsw"
         wrapper_body = generated["wrapper"]
-        wrapper.write_text(wrapper_body)
+        wrapper.write_text(wrapper_body, encoding="utf-8")
         wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
 
         poisoned_env = dict(os.environ)
@@ -192,14 +194,14 @@ def smoke(bundle_arg: Path) -> None:
         needle = '-m acctsw "$@"'
         _check(wrapper_body.count(needle) == 1, "generated wrapper command has an unexpected shape")
         probe_wrapper = bindir / "acctsw-bundle-probe"
-        probe_wrapper.write_text(wrapper_body.replace(needle, f"-c {shlex.quote(_PROBE)}"))
+        probe_wrapper.write_text(wrapper_body.replace(needle, f"-c {shlex.quote(_PROBE)}"), encoding="utf-8")
         probe_wrapper.chmod(probe_wrapper.stat().st_mode | stat.S_IXUSR)
         # A checkout in the user's cwd must not override the packaged engine. This caused
         # installed launchers to import new code with old, missing stdlib modules (uuid).
         shadow_package = work / "acctsw"
         shadow_package.mkdir()
         (shadow_package / "__init__.py").write_text(
-            'raise RuntimeError("launcher imported acctsw from the working directory")\n')
+            'raise RuntimeError("launcher imported acctsw from the working directory")\n', encoding="utf-8")
         _run([str(wrapper), "--version"], cwd=work, env=poisoned_env)
         probe = json.loads(_run([str(probe_wrapper)], cwd=work, env=poisoned_env).stdout)
 

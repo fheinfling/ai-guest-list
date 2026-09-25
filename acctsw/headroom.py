@@ -78,7 +78,7 @@ def _scan(tool: str) -> tuple[bool, bool]:
     for cfg in _touched(tool):
         p = _edit_target(cfg)
         try:
-            text = p.read_text()
+            text = p.read_text(encoding="utf-8")
         except FileNotFoundError:
             continue                            # genuinely not there → nothing to clean
         except UnicodeDecodeError:
@@ -218,7 +218,7 @@ def _unroute_codex(store: Path | None = None) -> None:
     if not path.exists():
         return
     try:
-        content = path.read_text()      # strict, matching _scan: bad bytes are "unknown", not ours
+        content = path.read_text(encoding="utf-8")      # strict, matching _scan: bad bytes are "unknown", not ours
     except (OSError, UnicodeDecodeError):
         return
     stripped = _strip_codex_routing(content)
@@ -264,7 +264,7 @@ def _unroute_claude_file(path: Path, store: Path | None = None) -> None:
     if not path.exists():
         return
     try:
-        payload = json.loads(path.read_text() or "{}")
+        payload = json.loads(path.read_text(encoding="utf-8") or "{}")
     except (OSError, ValueError):
         return
     if not _claude_routed(payload):
@@ -308,7 +308,7 @@ def has_backup(store: Path | None = None) -> bool:
     """Is there a snapshot with anything usable in it? An EMPTY manifest is not a backup — treating
     it as one keeps legacy_present() true forever and re-runs the migration on every launch."""
     try:
-        manifest = json.loads((_global_backup(store) / "manifest.json").read_text())
+        manifest = json.loads((_global_backup(store) / "manifest.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
     return bool(manifest) if isinstance(manifest, dict) else False
@@ -337,7 +337,7 @@ def _snapshot_text(store: Path | None, want: Path) -> str | None:
     bdir = _global_backup(store)
     mf = bdir / "manifest.json"
     try:
-        manifest = json.loads(mf.read_text())
+        manifest = json.loads(mf.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     if not isinstance(manifest, dict):
@@ -348,7 +348,7 @@ def _snapshot_text(store: Path | None, want: Path) -> str | None:
         if not re.fullmatch(r"\d+", str(i)):
             return None     # the id indexes a sibling file; "../../x" would read outside the backup
         try:
-            entry = json.loads((bdir / f"{i}.json").read_text())
+            entry = json.loads((bdir / f"{i}.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return None
         if not isinstance(entry, dict) or entry.get("kind") != "file":
@@ -399,8 +399,9 @@ def _pid_is_proxy(pid: int) -> bool | None:
     if pid <= 0:
         return False
     try:
+        # Foreign argv/diagnostic bytes must not abort cleanup before we can inspect ps.
         proc = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
-                              capture_output=True, text=True, timeout=2)
+                              capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=2)
     except (OSError, subprocess.SubprocessError):
         return None                                     # unknown — do NOT signal, do NOT forget
     out = proc.stdout.strip()
@@ -433,7 +434,7 @@ def _proxy_pid(store: Path | None) -> int:
     cleanup delete the venv out from under a live process and forget it forever; -1 keeps it tracked.
     """
     try:
-        raw = _proxy_pidfile(store).read_text()
+        raw = _proxy_pidfile(store).read_text(encoding="utf-8")
     except FileNotFoundError:
         return 0
     except OSError:
