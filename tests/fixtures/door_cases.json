@@ -1,4 +1,10 @@
 [
+  {"name": "open-parked-terminal-resting", "expected": "open",
+   "state": {"tools": {"codex": {"seats": [{"status": "resting", "active": false, "in_session": true}]}}}},
+  {"name": "open-parked-terminal-queued", "expected": "open",
+   "state": {"tools": {"codex": {"seats": [{"status": "queued", "in_session": true}]}}}},
+  {"name": "shut-terminal-needs-login", "expected": "shut",
+   "state": {"tools": {"codex": {"seats": [{"status": "needs-login", "in_session": true}]}}}},
   {"name": "open-active", "expected": "open",
    "state": {"tools": {"codex": {"seats": [{"status": "active"}]}, "claude": {"seats": []}}}},
   {"name": "open-ready", "expected": "open",

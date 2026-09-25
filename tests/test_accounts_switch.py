@@ -293,3 +293,59 @@ def test_list_seats_projects_live_session_onto_matching_seat(ctx, monkeypatch):
                                                 "started_at": started}])
     seat = acct.list_seats(state, "codex", data_dir=ctx.data_dir)[0]
     assert seat["in_session"] is True and seat["session_started_at"] == started
+
+
+@pytest.mark.parametrize("newest_first", [False, True])
+def test_list_seats_uses_newest_session_for_each_seat(ctx, monkeypatch, newest_first):
+    """Directory order must not make a fresh terminal look days old."""
+    _add_codex(ctx, "a@x.com")
+    state, _ = _add_codex(ctx, "b@x.com")
+    older = "2026-09-14T17:02:00+00:00"
+    newer = "2026-09-25T11:15:00+00:00"
+    sessions = [
+        {"email": "a@x.com", "pid": 42, "started_at": older},
+        {"email": "a@x.com", "pid": 43, "started_at": newer},
+    ]
+    if newest_first:
+        sessions.reverse()
+    sessions.append({"email": "b@x.com", "pid": 44, "started_at": older})
+    monkeypatch.setattr(acct.session, "active_sessions", lambda data_dir, tool: sessions)
+
+    seats = {s["email"]: s for s in acct.list_seats(state, "codex", data_dir=ctx.data_dir)}
+    assert seats["a@x.com"]["in_session"] is True
+    assert seats["a@x.com"]["session_started_at"] == newer
+    assert seats["b@x.com"]["in_session"] is True
+    assert seats["b@x.com"]["session_started_at"] == older
+
+
+@pytest.mark.parametrize("health", ["ready", "resting", "queued", "needs-login"])
+def test_parked_terminal_keeps_its_health_and_session(ctx, monkeypatch, health):
+    """An old terminal is not proof that its seat still owns the live credentials or has quota."""
+    from datetime import timedelta
+    from acctsw.util import now, iso
+
+    _add_codex(ctx, "parked@x.com")
+    state, _ = _add_codex(ctx, "live@x.com")
+    at = now()
+    if health in ("resting", "queued"):
+        state.set_limited_until("codex", "parked@x.com", iso(at + timedelta(hours=1)))
+    if health == "queued":
+        state.set_limited_until("codex", "live@x.com", iso(at + timedelta(hours=2)))
+    if health == "needs-login":
+        state.get_seat("codex", "parked@x.com")["auth_error"] = "revoked"
+    started = iso(at - timedelta(days=11))
+    monkeypatch.setattr(acct.session, "active_sessions", lambda data_dir, tool: [
+        {"email": "parked@x.com", "pid": 42, "started_at": started},
+        {"email": "live@x.com", "pid": 43, "started_at": iso(at)},
+    ] if tool == "codex" else [])
+
+    seats = {s["email"]: s for s in acct.list_seats(state, "codex", at, ctx.data_dir)}
+    parked = seats["parked@x.com"]
+    assert parked["status"] == health
+    assert parked["active"] is False
+    assert parked["in_session"] is True
+    assert parked["session_started_at"] == started
+    assert seats["live@x.com"]["status"] == "active"
+    counts = acct.status(ctx, state, at)["counts"]
+    assert counts == {"resting": int(health in ("resting", "queued")),
+                      "ready": 1 + int(health == "ready")}

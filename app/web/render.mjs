@@ -24,7 +24,8 @@ export function dotKey(state) {
   const seats = ["codex", "claude"].flatMap((t) => state?.tools?.[t]?.seats || []);
   if (seats.some((s) => (s.status || "") === "needs-login")) return "hello";
   if (state?.recently_switched) return "switched";
-  if (seats.some((s) => ["resting", "queued"].includes(s.status))) return "amber";
+  // Preserve the native glyph's live-session behavior without hiding a parked seat's health.
+  if (seats.some((s) => ["resting", "queued"].includes(s.status) && !(s.active || s.in_session))) return "amber";
   return "green";
 }
 
@@ -32,7 +33,8 @@ export function dotKey(state) {
 export function doorKey(state) {
   if (state?.door === "open" || state?.door === "shut") return state.door;
   const seats = ["codex", "claude"].flatMap((t) => state?.tools?.[t]?.seats || []);
-  const free = seats.some((s) => ["ready", "active"].includes(s.status));
+  const free = seats.some((s) => ["ready", "active"].includes(s.status) ||
+    (s.status !== "needs-login" && (s.active || s.in_session)));
   return free || seats.length === 0 ? "open" : "shut";
 }
 
@@ -93,6 +95,15 @@ export function fmtUsageAge(iso, now = Date.now()) {
   return `updated ${Math.floor(seconds / 86400)}d ago`;
 }
 
+export function fmtSessionAge(iso, now = Date.now()) {
+  const started = iso ? new Date(iso).getTime() : NaN;
+  if (!Number.isFinite(started)) return "";
+  const minutes = Math.max(0, Math.floor((now - started) / 60000));
+  if (minutes < 60) return ` · ${minutes}m`;
+  if (minutes < 1440) return ` · ${Math.floor(minutes / 60)}h`;
+  return ` · ${Math.floor(minutes / 1440)}d`;
+}
+
 // Clock ticks change text only: leave focused buttons, expanded cards, and scroll position intact.
 export function updateClockText(root, now = Date.now()) {
   for (const node of root.querySelectorAll("[data-usage-at]")) {
@@ -100,6 +111,9 @@ export function updateClockText(root, now = Date.now()) {
   }
   for (const node of root.querySelectorAll("[data-reset-at]")) {
     node.textContent = `${node.dataset.clockPrefix || "resets in"} ${fmtCountdown(node.dataset.resetAt, now)}`;
+  }
+  for (const node of root.querySelectorAll("[data-session-at]")) {
+    node.textContent = fmtSessionAge(node.dataset.sessionAt, now);
   }
 }
 
@@ -163,6 +177,15 @@ function bar(seat, win, label) {
 
 function seatCard(tool, seat) {
   const plan = planChip(seat.plan);
+  const parkedSession = !seat.active && seat.in_session;
+  const started = seat.session_started_at || "";
+  const sessionDate = started && Number.isFinite(new Date(started).getTime())
+    ? new Date(started).toLocaleString() : "";
+  // A long-lived terminal is useful context, not a second claim to the live credentials.
+  // Keep the action alongside it; the pair can wrap below the name in the narrow popover.
+  const action = parkedSession
+    ? `<span class="seat-actions"><span class="mono chip terminal-chip" title="${esc(sessionDate ? `session started ${sessionDate}` : "supervised terminal attached")}">in a terminal<span data-session-at="${esc(started)}">${fmtSessionAge(started)}</span></span>${statusBit(tool, seat)}</span>`
+    : statusBit(tool, seat);
   const reported = seat?.usage?.reported_windows;
   const weeklyOnly = tool === "codex" && Array.isArray(reported) &&
     reported.includes("weekly") && !reported.includes("5h");
@@ -182,7 +205,7 @@ function seatCard(tool, seat) {
   const reassure = seat.status === "resting"
     ? `<div class="reassure mono">taking a breather — back ${fmtClock(seat.limited_until)}</div>` : "";
   const credit = creditLeft(seat);
-  const sessionStarted = fmtClock(seat.session_started_at);
+  const sessionStarted = sessionDate;
   const expanded = `<div class="expand">
     ${credit !== null ? `<div class="x-row"><span>credit left</span><span class="mono">${credit}%</span></div>` : ""}
     ${seat.last_on_floor ? `<div class="x-row"><span>last on the floor</span><span class="mono">${esc(fmtClock(seat.last_on_floor))}</span></div>` : ""}
@@ -190,10 +213,10 @@ function seatCard(tool, seat) {
     <button class="logout" data-action="remove" data-tool="${tool}" data-email="${esc(seat.email)}">log out ↗</button>
   </div>`;
   return `<div class="seat seat--${seat.status}" data-card data-tool="${tool}" data-email="${esc(seat.email)}">
-    <div class="seat-row">
+    <div class="seat-row${parkedSession ? " seat-row--session" : ""}">
       <span class="dot dot--${seat.status}"></span>
       <span class="seat-name">${esc(seat.name)}</span>${plan}
-      <span class="grow"></span>${statusBit(tool, seat)}
+      <span class="grow"></span>${action}
     </div>
     <div class="seat-email mono">${esc(seat.email)}</div>
     ${weeklyOnly ? "" : bar(seat, "5h", "5h")}

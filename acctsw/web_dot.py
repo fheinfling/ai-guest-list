@@ -22,15 +22,21 @@ def dot_for(state: dict[str, Any]) -> str:
         return "hello"
     if state.get("recently_switched"):
         return "switched"
-    if any(s.get("status") in ("resting", "queued") for s in seats):
+    # Keep the glyph's existing live-session behavior even though parked terminals now expose
+    # their real health in the seat status (and therefore in the header counts).
+    if any(s.get("status") in ("resting", "queued")
+           and not (s.get("active") or s.get("in_session")) for s in seats):
         return "amber"
     return "green"
 
 
 def door_for(state: dict[str, Any]) -> str:
     """The menu-bar door (icon handoff): 'open' onto the disco when a model is free, 'shut' when every
-    seat is rate-limited. 'free' = any seat ready/active. The door is shut ONLY when there are seats
+    seat is rate-limited. Ready seats and usable live credentials/terminals keep the door open.
+    The door is shut ONLY when there are seats
     and none are free — a fresh install (no seats) stays 'open' (welcoming, matches the green dot)."""
     seats = _all_seats(state)
-    free = any(s.get("status") in ("ready", "active") for s in seats)
+    free = any(s.get("status") in ("ready", "active") or
+               (s.get("status") != "needs-login" and (s.get("active") or s.get("in_session")))
+               for s in seats)
     return "open" if (free or not seats) else "shut"
