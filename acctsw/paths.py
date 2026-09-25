@@ -17,12 +17,27 @@ BACKUP_MANIFEST = BACKUP_DIR / "manifest.json"
 APP_SRC_DIR = DATA_DIR / "app"
 # Per-account Codex homes (each a CODEX_HOME with its own auth.json; shared state symlinked to the
 # real ~/.codex). Isolation so codex maintains each account's token lifecycle independently.
-CODEX_HOMES = DATA_DIR / "codex-homes"
+# Two letters, and a hashed directory per seat, because a CODEX_HOME must stay short enough for the
+# app-server daemon's unix socket to fit in SUN_LEN — see codexhome.MAX_HOME_LEN.
+CODEX_HOMES = DATA_DIR / "ch"
+# Pre-1.0.2 homes lived here, one directory per address. Now the by-address index: a symlink per
+# seat into CODEX_HOMES, so `ls ~/.account-switcher/codex-homes/` still answers "which seats?".
+CODEX_HOMES_LEGACY = DATA_DIR / "codex-homes"
 
 # Keychain service that holds our per-account credential snapshots.
 KEYCHAIN_SERVICE = "acct-switcher"  # accounts named "codex:<email>" / "claude:<email>"
 
 # --- canonical locations the official tools read ---------------------------------------------
+def _contains(root: Path, path: Path) -> bool:
+    """Whether ``path`` lies inside ``root`` — purely by name, so a path that no longer exists (or
+    never did) is still recognised as one of ours."""
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
 def _canonical_codex_home() -> Path:
     """Return the shared Codex home, never one of acctsw's private seat homes.
 
@@ -30,17 +45,21 @@ def _canonical_codex_home() -> Path:
     A child process can inherit that value and later construct a fresh ``Context.default()`` (for
     example, ``cx --version``).  Treating the inherited private home as the canonical mirror lets a
     normal switch overwrite that seat with another account's valid snapshot.  External custom
-    ``CODEX_HOME`` values remain supported; only our managed per-seat subtree is rejected.
+    ``CODEX_HOME`` values remain supported; only our managed per-seat subtrees are rejected — both
+    of them, and both lexically and resolved. An inherited value can name a home in the pre-1.0.2
+    layout, or reach the current one through its by-address symlink, or name a path that no longer
+    exists at all (``resolve`` then resolves nothing); none of those is a user's own custom home.
+    The test stays anchored on the two managed roots rather than the whole store, so a custom home a
+    developer parks elsewhere under ``~/.account-switcher`` is still honoured.
     """
     inherited = os.environ.get("CODEX_HOME")
     if not inherited:
         return HOME / ".codex"
     candidate = Path(inherited).expanduser()
-    try:
-        candidate.resolve().relative_to(CODEX_HOMES.resolve())
-    except ValueError:
-        return candidate
-    return HOME / ".codex"
+    for root in (CODEX_HOMES, CODEX_HOMES_LEGACY):
+        if _contains(root, candidate) or _contains(root.resolve(), candidate.resolve()):
+            return HOME / ".codex"
+    return candidate
 
 
 # Codex normally stores the active account here (and may honour an external $CODEX_HOME).

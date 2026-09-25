@@ -838,9 +838,9 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             # open — ours included, once this run has marked itself. Skipping costs nothing: the
             # heal happens at the next launch that finds the coast clear.
             promote = active_session(ctx.data_dir, "codex") is None
-            codexhome.ensure_home(email, codex_home=ctx._codex_real, root=ctx._homes_root,
-                                  promote=promote)
-            os.environ["CODEX_HOME"] = str(ctx.codex_home(email))
+            home = codexhome.ensure_home(email, codex_home=ctx._codex_real, root=ctx._homes_root,
+                                         promote=promote)
+            os.environ["CODEX_HOME"] = str(home)
 
     # Claude's official identity command can stall for 30 seconds. Resolve it with NO state flock,
     # and memoise the answer only for the exact live Keychain blob: each distinct credential value

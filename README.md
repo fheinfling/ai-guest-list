@@ -101,6 +101,10 @@ seats**.
 >   bypasses Gatekeeper on 15+); **macOS 14 and earlier** — right-click the app in `/Applications` →
 >   **Open** → **Open**.
 
+**Upgrading:** `brew upgrade --cask ai-guest-list` replaces the app on disk, but a menubar app that
+is already running keeps the engine it started with. **Quit it from the menubar and open it again**
+after upgrading, so the terminal and the app agree on how the store is laid out.
+
 **From source (CLI engine):**
 ```sh
 git clone https://github.com/fheinfling/ai-guest-list && cd ai-guest-list

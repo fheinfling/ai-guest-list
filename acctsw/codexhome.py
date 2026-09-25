@@ -1,6 +1,6 @@
 """Per-account Codex homes (isolation, spec §4).
 
-Each Codex account gets its own ``CODEX_HOME`` directory under ~/.account-switcher/codex-homes/<id>/
+Each Codex account gets its own ``CODEX_HOME`` directory under ~/.account-switcher/ch/<id>/
 containing that account's REAL ``auth.json`` plus symlinks to everything else in the user's real
 ``~/.codex`` (config.toml, sessions, plugins, sqlite, …). codex run with that ``CODEX_HOME`` reads
 and refreshes the account's own auth.json in place — so using/rotating one account NEVER touches
@@ -8,10 +8,23 @@ another (the cross-invalidation that the shared-auth.json swap model suffered). 
 shared via the symlinks, so cross-account `codex resume` still works.
 
 This keeps the user's real ~/.codex as the shared source of truth (we never relocate it); only
-auth.json is per-account. Fully reversible: delete the codex-homes dir.
+auth.json is per-account. Fully reversible: delete the store's home root.
 
-INVARIANT: a home holds exactly ONE real file, ``auth.json``. Everything else is shared state owned
-by the real ~/.codex and appears here only as a symlink. Three rules keep it that way:
+``<id>`` is a hash, not the address, because the path length is a hard constraint — see
+``MAX_HOME_LEN``. ``codex-homes/<address>`` remains as a symlink into ``ch/<id>`` so a seat is still
+findable by address (and a child spawned before the move keeps resolving its files).
+
+The index carries an ENGINE of this version or newer; it is not a compatibility layer for an older
+one. A pre-1.0.2 engine still reads and writes a seat correctly through it, but it knows neither
+rule 4 (its heal would promote a seat's daemon runtime into ~/.codex and link the shared copy into
+every other seat) nor this layout (its guards recognise only ``codex-homes``, so a short home
+inherited as ``CODEX_HOME`` looks like a user's own custom mirror, and its ``delete`` drops the
+address while leaving the home). That window is an app upgrade with the previous menubar process
+still resident, and it closes when the app restarts — which is what an upgrade should do.
+
+INVARIANT: a home holds exactly ONE real file, ``auth.json`` — plus the daemon's own runtime state
+(rule 4). Everything else is shared state owned by the real ~/.codex and appears here only as a
+symlink. Four rules keep it that way:
 
 1. **SQLite sidecars are never linked.** Codex keeps databases at the top level of CODEX_HOME
    (logs_2.sqlite, goals_1.sqlite, memories_1.sqlite, queue_1.sqlite). When the database itself is a
@@ -29,12 +42,19 @@ by the real ~/.codex and appears here only as a symlink. Three rules keep it tha
    copy is renamed ``<name>.orphaned-<YYYYmmddTHHMMSS>`` — never deleted, never linked, and ignored
    by every later pass. A real sidecar left behind without its database is parked as well, never
    moved: a stray -wal beside a canonical database would hand SQLite frames it never wrote.
+4. **The app-server daemon's runtime state is per-seat.** Codex 0.157+ runs a background app-server
+   per ``CODEX_HOME`` and keeps its socket, startup lock, pid and log under the names in
+   ``DAEMON_RUNTIME``. One daemon serves ONE account's auth, so sharing that state would hand a seat
+   another account's server: those names are never linked in from ~/.codex, never promoted out to
+   it, and any such link an older build left is removed on sight.
 
 Promotion MOVES files, so the launcher asks for it only when no supervised codex session is live;
 otherwise the heal simply waits for the next launch.
 """
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import os
 import shutil
 from datetime import datetime
@@ -45,8 +65,20 @@ from .util import atomic_write_text
 
 # Files SQLite creates beside a database. Never symlinked (see rule 1 above).
 SQLITE_SIDECARS = ("-wal", "-shm", "-journal")
+# The app-server daemon's per-home runtime state (see rule 4 above). Never shared between seats.
+DAEMON_RUNTIME = frozenset({"app-server-control", "app-server-daemon", "app-server-startup.lock"})
 # Marks a parked divergent copy. Such entries are inert: never linked, moved, parked or followed.
 ORPHAN_MARK = ".orphaned-"
+
+# Where codex 0.157+ binds the app-server daemon's control socket, relative to CODEX_HOME.
+SOCKET_REL = "app-server-control/app-server-control.sock"
+# macOS/BSD cap a unix-socket path at SUN_LEN bytes INCLUDING the NUL (Linux allows 108). Codex
+# resolves CODEX_HOME before building that path, so a short symlink to a long home does not help —
+# the home itself must fit, which is why a seat is a hash and its root is two letters. The old
+# ~/.account-switcher/codex-homes/<address> layout blew the budget for every real address, and codex
+# then failed every launch with "path must be shorter than SUN_LEN".
+SUN_LEN = 104
+MAX_HOME_LEN = SUN_LEN - 1 - len("/" + SOCKET_REL)   # 60 bytes for the CODEX_HOME path itself
 
 
 def _safe(email: str) -> str:
@@ -57,16 +89,62 @@ def _safe(email: str) -> str:
     return s if s not in ("", ".", "..") else "seat"
 
 
+def _slug(email: str) -> str:
+    """The home's directory name: short (MAX_HOME_LEN), stable, and a single path component.
+
+    Case-folded, like ``codex_jwt_matches``: one login spelled two ways is one seat with one token,
+    which is also what the old address-named homes gave us on a case-insensitive filesystem.
+    32 bits is a deliberate floor — a collision needs two addresses in the same store to share a
+    prefix (~1e-8 for a handful of seats), while every extra character spends the path budget that
+    a deep ``$HOME`` needs far more often.
+    """
+    return hashlib.sha256(email.casefold().encode("utf-8")).hexdigest()[:8]
+
+
 def home_dir(email: str, root: Path | None = None) -> Path:
-    return (root or P.CODEX_HOMES) / _safe(email)
+    return (root or P.CODEX_HOMES) / _slug(email)
+
+
+def index_root(root: Path | None = None) -> Path:
+    """Where the by-address symlinks live: ``<store>/codex-homes``, the pre-1.0.2 homes root."""
+    return (root or P.CODEX_HOMES).parent / P.CODEX_HOMES_LEGACY.name
+
+
+def by_address(email: str, root: Path | None = None) -> Path:
+    """The by-address index entry for a seat — a symlink to its home, and the pre-1.0.2 home path."""
+    return index_root(root) / _safe(email)
 
 
 def auth_path(email: str, root: Path | None = None) -> Path:
     return home_dir(email, root) / "auth.json"
 
 
+def socket_path(home: Path) -> Path:
+    """The daemon control socket codex will bind (and connect to) for this home."""
+    return home / SOCKET_REL
+
+
+def daemon_socket_fits(home: Path) -> bool:
+    """Whether ``home`` leaves room for the control socket path inside SUN_LEN.
+
+    Measured on the RESOLVED path, because that is the one codex builds the socket from: a home
+    reached through a symlinked ``$HOME`` (a relocated or network account) is longer than it looks,
+    and the check has to fail for exactly the launches that fail. False means every interactive
+    launch dies with "app server did not become ready … path must be shorter than SUN_LEN" until the
+    user passes --no-daemon. Nothing is left for us to shorten at that point — their home directory
+    itself is too deep — so this is a check to run (the layout test, and the VERIFY.md step), not a
+    condition to handle.
+    """
+    return len(str(socket_path(home).resolve()).encode("utf-8")) < SUN_LEN
+
+
 def _is_sidecar(name: str) -> bool:
     return name.endswith(SQLITE_SIDECARS)
+
+
+def _never_shared(name: str) -> bool:
+    """Names that must stay whatever the home itself made them: never linked in, never promoted out."""
+    return name in DAEMON_RUNTIME
 
 
 def _relocate(src: Path, dst: Path) -> None:
@@ -102,8 +180,8 @@ def _heal(home: Path, real: Path) -> None:
     """Give the home back its invariant: only auth.json is real, nothing dangles (rules 2 & 3)."""
     for entry in sorted(home.iterdir()):
         name = entry.name
-        if name == "auth.json" or ORPHAN_MARK in name:
-            continue                      # per-account token / inert parked copy
+        if name == "auth.json" or ORPHAN_MARK in name or _never_shared(name):
+            continue                      # per-account token / inert parked copy / this seat's daemon
         if entry.is_symlink():
             if not entry.exists():
                 entry.unlink()            # target is gone; the link pass re-creates it if it returns
@@ -127,6 +205,57 @@ def _heal(home: Path, real: Path) -> None:
     # The link pass now sees every promoted name in ~/.codex and symlinks the base names back.
 
 
+def _adopt_legacy(email: str, root: Path | None = None) -> None:
+    """Move a pre-1.0.2 ``codex-homes/<address>`` home onto its short path (see MAX_HOME_LEN).
+
+    A plain rename inside the store, so the seat keeps its auth.json, its parked copies and its
+    permissions. Best-effort and idempotent: if the short home already exists the old directory is
+    left untouched for the user to inspect, and a seat that cannot be moved simply re-authenticates.
+
+    Deliberately ``os.replace`` and not ``_relocate``: both paths are in the same store, so there is
+    no filesystem to cross, and ``shutil.move`` onto a destination another process just created
+    would move the home INSIDE it (``ch/<id>/<address>/auth.json``) — which the next promoting heal
+    would read as an ordinary shared directory and hand to ~/.codex. A lost race must be a no-op.
+    """
+    old, new = by_address(email, root), home_dir(email, root)
+    if old.is_symlink() or not old.is_dir() or new.exists() or new.is_symlink():
+        return
+    new.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(new.parent, 0o700)
+    try:
+        os.replace(old, new)
+    except OSError:
+        return
+    # The address must never be left pointing at nothing: a codex child started before the move
+    # still has the old path, and an older engine knows no other name for this seat.
+    _index_by_address(email, root, new)
+
+
+def _index_by_address(email: str, root: Path | None = None, home: Path | None = None) -> None:
+    """Keep ``codex-homes/<address>`` pointing at the seat's home.
+
+    The home is named by hash, so this symlink is how a seat stays findable by address — for a human
+    reading the store, for the docs, and for a codex child spawned before ``_adopt_legacy`` moved it.
+    Relative, so moving or copying the whole store keeps it valid. Published by an atomic rename, so
+    a reader racing a repair sees the old link or the new one, never a missing address.
+    """
+    home = home or home_dir(email, root)
+    link = by_address(email, root)
+    target = os.path.relpath(home, link.parent)
+    if link.is_symlink() and os.readlink(link) == target:
+        return
+    if link.exists() and not link.is_symlink():
+        return          # a real home _adopt_legacy could not move — never clobber someone's auth
+    link.parent.mkdir(parents=True, exist_ok=True)
+    staged = link.with_name(f".{link.name}.{os.getpid()}.tmp")
+    try:
+        staged.symlink_to(target)
+        os.replace(staged, link)
+    except OSError:
+        with contextlib.suppress(OSError):
+            staged.unlink()
+
+
 def ensure_home(email: str, *, codex_home: Path | None = None, root: Path | None = None,
                 promote: bool = False) -> Path:
     """Create the account's home: real auth.json lives here; everything else symlinks to ~/.codex.
@@ -140,12 +269,16 @@ def ensure_home(email: str, *, codex_home: Path | None = None, root: Path | None
     running may ask for it; the default keeps today's read-only behaviour.
     """
     real = codex_home or P.CODEX_HOME
+    _adopt_legacy(email, root)
     home = home_dir(email, root)
     home.mkdir(parents=True, exist_ok=True)
     os.chmod(home, 0o700)
+    _index_by_address(email, root, home)
     for entry in list(home.iterdir()):   # materialised: we unlink while walking
-        if entry.is_symlink() and _is_sidecar(entry.name) and ORPHAN_MARK not in entry.name:
+        if entry.is_symlink() and ORPHAN_MARK not in entry.name and (
+                _is_sidecar(entry.name) or _never_shared(entry.name)):
             entry.unlink()                # rule 1: SQLite never needs these, and they break it
+                                          # rule 4: a shared daemon would serve the wrong account
     if promote:
         _heal(home, real)
     if real.exists():
@@ -154,6 +287,8 @@ def ensure_home(email: str, *, codex_home: Path | None = None, root: Path | None
                 continue  # auth is per-account (a real file in the home)
             if _is_sidecar(entry.name):
                 continue  # rule 1: SQLite finds the sidecars next to the resolved real database
+            if _never_shared(entry.name):
+                continue  # rule 4: this seat's app-server daemon is its own, socket and all
             link = home / entry.name
             if link.is_symlink():
                 if link.resolve() != entry.resolve():
@@ -172,20 +307,40 @@ def save(email: str, blob: str, *, codex_home: Path | None = None, root: Path | 
 
 
 def load(email: str, *, root: Path | None = None) -> str | None:
-    try:
-        return auth_path(email, root).read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return None
+    """The seat's token, read wherever it currently lies — including a home still on the pre-1.0.2
+    path, which is a seat with a token and not a seat without one.
+
+    Reads never move anything. Usage polling calls this from outside the state lock and on a timer,
+    so adopting here would rename a directory out from under a codex child that is standing in it,
+    at a moment no one chose. ``ensure_home`` — which every launch and every save goes through —
+    owns the move.
+    """
+    for path in (auth_path(email, root), by_address(email, root) / "auth.json"):
+        try:
+            return path.read_text(encoding="utf-8")
+        except OSError:
+            continue     # missing, or the address is a real file / dangling link: try the next one
+    return None
 
 
-def delete(email: str, *, root: Path | None = None) -> bool:
-    home = home_dir(email, root)
-    if home.is_symlink():
-        home.unlink()   # a replaced home root: drop the link, never traverse into its target
+def _remove(path: Path) -> bool:
+    if path.is_symlink():
+        path.unlink()   # a replaced home root / the by-address index: never traverse into the target
         return True
-    if not home.exists():
+    if not path.exists():
         return False
     # rmtree unlinks symlinked entries instead of following them (so ~/.codex is untouched) while
     # still removing the real auth.json, parked .orphaned-* copies and any real dir a child left.
-    shutil.rmtree(home, ignore_errors=True)
-    return not home.exists()
+    shutil.rmtree(path, ignore_errors=True)
+    return not path.exists()
+
+
+def delete(email: str, *, root: Path | None = None) -> bool:
+    # The index entry goes first: dropping the home behind a live symlink would leave the address
+    # pointing at nothing, and a later ensure_home would have to guess whether it was ours.
+    home = home_dir(email, root)
+    indexed = _remove(by_address(email, root))
+    removed = _remove(home)
+    # A dropped address can stand for a seat that had no home left, but never for a home that
+    # survived: reporting a seat erased while its token is still on disk is the one wrong answer.
+    return removed or (indexed and not home.exists())

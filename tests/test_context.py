@@ -45,7 +45,23 @@ def test_managed_codex_home_env_is_not_used_as_the_shared_mirror(tmp_path, monke
     assert P._canonical_codex_home() == P.HOME / ".codex"
 
 
+def test_a_seat_home_in_the_pre_1_0_2_layout_is_still_rejected(tmp_path, monkeypatch):
+    """The inherited value can name a home from the old layout, or one that no longer exists at all
+    — the name alone has to be enough to recognise it as ours."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CODEX_HOME", str(P.CODEX_HOMES_LEGACY / "gone@example.test"))
+    assert P._canonical_codex_home() == P.HOME / ".codex"
+
+
 def test_external_codex_home_env_remains_a_supported_shared_mirror(tmp_path, monkeypatch):
     custom = tmp_path / "custom-codex"
+    monkeypatch.setenv("CODEX_HOME", str(custom))
+    assert P._canonical_codex_home() == custom
+
+
+def test_a_custom_codex_home_elsewhere_in_the_store_is_honoured(monkeypatch):
+    """Only the two managed seat roots are ours. A home a developer parks somewhere else under
+    ~/.account-switcher is their choice, and switching must keep targeting it."""
+    custom = P.APP_SRC_DIR / "dev-codex"
     monkeypatch.setenv("CODEX_HOME", str(custom))
     assert P._canonical_codex_home() == custom

@@ -110,7 +110,7 @@ class Context:
             keychain=keychain,
             keychain_service="acct-switcher-test",
             cred=cred,
-            homes_root=root / "codex-homes",
+            homes_root=root / ".account-switcher" / "ch",
             codex_real=root / "codex",
         )
 
@@ -150,15 +150,23 @@ class Context:
         return codexhome.home_dir(email, self._homes_root)
 
     def _codex_mirror_is_private_home(self) -> bool:
-        """Whether the canonical Codex writer was accidentally aimed at a seat home."""
+        """Whether the canonical Codex writer was accidentally aimed at a seat home.
+
+        Both roots count: a seat still on the pre-1.0.2 path (or reached through the by-address
+        index) is just as private as one under the current homes root.
+        """
+        from . import codexhome
         path = getattr(self.cred["codex"], "auth_path", None)
         if path is None:
             return False
-        try:
-            Path(path).resolve().relative_to(self._homes_root.resolve())
-        except ValueError:
-            return False
-        return True
+        roots = (self._homes_root, codexhome.index_root(self._homes_root))
+        for root in roots:
+            try:
+                Path(path).resolve().relative_to(root.resolve())
+            except ValueError:
+                continue
+            return True
+        return False
 
     def set_live(self, tool: str, blob: str) -> None:
         """Write canonical credentials, refusing a managed private home as the mirror target."""
