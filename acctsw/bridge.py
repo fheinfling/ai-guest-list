@@ -79,6 +79,10 @@ def snapshot_state(ctx: Context) -> dict[str, Any]:
     # the signed-in-but-not-added codex account (if any) → drives the one-tap import affordance
     data["codex_live_unregistered"] = _codex_live_unregistered(ctx, state)
     data["keys"] = list(state.data["keys"].values())  # metadata only; never open Keychain here
+    data["running_key_seats"] = [
+        seat["id"] for seat in data["keys"]
+        if session_mod.active_session(ctx.data_dir, seat["harness"], email=seat["id"]) is not None
+    ]
     # Read prompts from THIS revision, not a second load via pending(). That helper takes its own
     # flock, and snapshots are also used from already-locked error paths. The launcher/answer path
     # retires dead requests; expired prompts need not remain visible while waiting for its next poll.

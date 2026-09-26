@@ -1024,6 +1024,17 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             return not child_started
         candidates = (rollout.scan_rollouts(rollout.sessions_roots(ctx, state.active(tool)))
                       if tool == "codex" else _claude_transcripts())
+        # A stopped paid session lives in its private home. Include it in an explicit/last resume
+        # so enabling paid use later cannot replace its newer turns with the subscription copy.
+        home = ctx.codex_home(f"key:{tool}:{key_seat['id']}")
+        if tool == "codex":
+            candidates.update(rollout.scan_rollouts([home / "sessions"]))
+        else:
+            for path in (home / "projects").glob("*/*.jsonl"):
+                try:
+                    candidates[path] = path.stat().st_mtime_ns
+                except OSError:
+                    pass
         matches = []
         for path, stamp in candidates.items():
             meta = (rollout.session_meta(path) or {} if tool == "codex"
@@ -1103,7 +1114,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         nonlocal key_request, key_answer
         if key_request is None:
             return key_answer
-        record = handoff.resolve(ctx, key_request, at=at)
+        record = handoff.resolve(ctx, key_request, at=at, require_enabled=True)
         if record is not None and record["status"] == "pending":
             return "pending"
         key_request = None
@@ -1112,6 +1123,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             notify(f"{tool}: invitation accepted — getting {key_seat['model']} ready, paid per token")
         elif key_answer == "declined":
             notify(f"{tool}: paid-per-token invitation declined — keeping your subscription seats")
+        elif key_answer == "withdrawn":
+            notify(f"{tool}: paid use is off — the setting withdrew the invitation; your session is safe")
         else:
             notify(f"{tool}: paid-per-token invitation expired — freeing your terminal")
         return key_answer
@@ -1142,7 +1155,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
                 # Copy AFTER shutdown so the last turn is flushed. No auth/config/SQLite files
                 # and no links back into a subscription home: only this conversation travels.
-                shutil.copyfile(source, destination)
+                if source != destination:
+                    shutil.copyfile(source, destination)
                 destination.chmod(0o600)
         except Exception:
             notify(f"{tool}: couldn't prepare the paid-per-token seat — your saved session is safe")
@@ -1153,11 +1167,14 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         nonlocal key_answer
         with ctx.locked():
             st = ctx.load_state()
+            disabled = not st.settings()["key_fallback"]
             eligible = (_key_eligible(st, cold_start=cold_start)
                         and st.data["keys"].get(key_seat["id"]) == key_seat)
         if not eligible:
-            key_answer = "cancelled"  # a later settings change cannot resurrect consumed consent
-            notify(f"{tool}: the guest list changed before the paid-per-token handoff — please try again")
+            key_answer = "withdrawn" if disabled else "cancelled"
+            notify(f"{tool}: paid use is off — no paid session started; your saved session is safe"
+                   if disabled else
+                   f"{tool}: the guest list changed before the paid-per-token handoff — please try again")
         return eligible
 
     def _key_command() -> list:
@@ -1581,6 +1598,12 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
 
                 def key_tick():
                     nonlocal reported
+                    # The existing PTY heartbeat owns this stop too, including silent children.
+                    # Return through its normal SIGTERM/flush path; keep the private session home.
+                    if not ctx.load_state().settings()["key_fallback"]:
+                        notify(f"{tool}: paid use is off — stopping the session and new requests; "
+                               "the turn already sent may still bill. your session is saved for later")
+                        return True
                     signals = source.poll() if source is not None else ()
                     if not reported and any(sig.kind == "limit" for sig in signals):
                         notify(f"{tool}: {key_runtime.model}'s paid-per-token seat reported a limit "
@@ -1589,6 +1612,10 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     return False
 
                 try:
+                    # Setup, session marking and notification can all yield to a settings writer.
+                    # Re-read at the last boundary, with no work between this check and spawn.
+                    if not _key_approval_current(cold_start=key_cold_start):
+                        return EXIT_GAVE_UP
                     return spawn(argv, lambda chunk: False, on_tick=key_tick, env=key_env)
                 finally:
                     if source is not None:
@@ -1744,11 +1771,13 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                             return False  # settings/recovery raced the answer: do not kill the TUI
                         hit.update(reason="key", handled=True)
                         return True
-                    if answer not in ("pending", "declined"):
+                    if answer not in ("pending", "declined", "withdrawn"):
                         hit.update(reason="key_expired", handled=True)
                         return True
                     if answer == "pending":
                         return False
+                    if answer == "withdrawn":
+                        return False  # withdrawing paid consent must not stop a subscription child
                 for sig in (rollout_source.poll() if rollout_source is not None else ()):
                     if sig.kind == "healthy":
                         tick["healthy_at"] = time.monotonic()
@@ -1869,9 +1898,11 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 answer = _wait_key()
                 if answer == "approved":
                     hit.update(reason="key", handled=True)
+                elif answer == "withdrawn":
+                    hit.update(reason="key_withdrawn", handled=True)
                 elif answer != "declined":
                     hit.update(reason="key_expired", handled=True)
-            if hit["reason"] == "key_expired":
+            if hit["reason"] in ("key_expired", "key_withdrawn"):
                 return EXIT_GAVE_UP
             if hit["reason"] == "key":
                 if _activate_key():

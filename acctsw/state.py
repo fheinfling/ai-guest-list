@@ -107,6 +107,9 @@ class State:
 
     def set_setting(self, key: str, value: Any) -> None:
         self.data["settings"][key] = value
+        if key == "key_fallback" and not value:
+            from . import handoff
+            handoff.withdraw(self)  # same transaction: a late approval cannot revive paid use
 
     def _tool(self, tool: str) -> dict[str, Any]:
         if tool not in TOOLS:

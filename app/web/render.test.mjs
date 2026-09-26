@@ -711,7 +711,7 @@ test("reduceReply: a tool-less add-op error falls back to the current flow", () 
 });
 
 // Milestone 6: bridge-shaped key metadata/catalogs; all earlier tests above remain unchanged.
-import { buildAddKey, buildModelPicker, keySeatCard, keyConfirmations, keyRequest, reduceKeyReply, KEY_PROVIDERS } from "./render.mjs";
+import { buildAddKey, buildModelPicker, keySeatCard, keyConfirmations, keyRequest, reduceKeyReply, KEY_PROVIDERS, formatPrice } from "./render.mjs";
 import { runInNewContext } from "node:vm";
 
 const keySeat = (over = {}) => ({ id: "key-1", label: "late-night", provider: "openrouter",
@@ -816,18 +816,84 @@ test("unpriced picker sorts by id, has no price column, and explains missing pri
   assert.doesNotMatch(unavailable, /does not publish/);
 });
 
-test("confirmation names both seats and model, labels estimates, and offers equal decisions", () => {
+test("confirmation uses quiet hierarchy, names both seats, and preserves accessible decisions", () => {
   const h = keyConfirmations({ pending_key_switches: [keyPrompt()] });
-  assert.match(h, /leave work → use late-night \(openrouter\)/);
-  assert.match(h, /vendor\/model/); assert.match(h, /input \$1\/Mtok/);
-  assert.match(h, /live price estimate/); assert.match(h, /real money/); assert.match(h, /does not cap spend/);
+  assert.match(h, /class="k-q">use a paid key to keep going\?/);
+  assert.match(h, /class="quiet-meta">late-night · openrouter<br><span class="k-model">vendor\/model/);
+  assert.match(h, /class="fare"[^>]*>\$1<span class="unit" style="font-size:13px"> \/ \$3<\/span><\/span>/);
+  assert.match(h, /input \/ output per million tokens/);
+  assert.match(h, /live price estimate/);
+  assert.match(h, /class="k-fine">work is resting\. this app doesn't cap spend\./);
+  assert.match(h, /aria-label="paid key confirmation"/); assert.match(h, /aria-live="polite"/);
   const buttons = h.match(/<button[^>]+>[^<]+<\/button>/g);
   assert.equal(buttons.length, 2);
-  assert.ok(buttons.every((b) => b.includes('class="btn switch"') && b.includes('data-action="key-answer"')));
+  assert.ok(buttons.every((b) => b.includes('data-id="prompt-1"') && b.includes('data-action="key-answer"')));
+  assert.match(buttons[0], /class="k-no".*>not now<\/button>/);
+  assert.match(buttons[1], /class="k-go".*>use the key<\/button>/);
   assert.match(buttons[0], /data-approved="false"/); assert.match(buttons[1], /data-approved="true"/);
   assert.match(keyConfirmations({ pending_key_switches: [keyPrompt({ price: null })] }), /price unavailable/);
   assert.doesNotMatch(keyConfirmations({ pending_key_switches: [keyPrompt({ expires_at: "2000-01-01" })] }), /data-action="key-answer"/);
   assert.equal((keyConfirmations({ pending_key_switches: [keyPrompt()] }, new Set(["prompt-1"])).match(/ disabled/g) || []).length, 2);
+});
+
+test("price formatting strips zeros and keeps three significant figures for cheap models", () => {
+  for (const [value, expected] of [["3.000000", "$3"], [15, "$15"], [3.25, "$3.25"],
+    [3.256, "$3.26"], [1.005, "$1.01"], [0.5, "$0.5"], [0.075, "$0.075"],
+    [0.0002, "$0.0002"], [0.000201, "$0.000201"], [0.000202, "$0.000202"],
+    [0.07549, "$0.0755"], [0.00000001, "$0.00000001"], [0, "$0"], ["0.000", "$0"]]) {
+    assert.equal(formatPrice(value), expected, String(value));
+  }
+  for (const value of [null, undefined, "", " ", false, NaN, Infinity, "oops", -1]) {
+    assert.equal(formatPrice(value), "price unavailable");
+  }
+  const catalog = { sort_key: "input_usd_per_million_tokens", models: [
+    { id: "cheap", price: livePrice("0.000201", "3.000000") },
+    { id: "nearby", price: livePrice("0.000202", "15.000000") },
+  ] };
+  const picker = buildModelPicker(keyFlow({ catalog }));
+  assert.match(picker, /input \$0\.000201\/Mtok · output \$3\/Mtok/);
+  assert.match(picker, /input \$0\.000202\/Mtok · output \$15\/Mtok/);
+  const review = buildAddKey(state(), keyFlow({ step: "review", catalog, model: "cheap" }));
+  assert.match(review, /input \$0\.000201\/Mtok · output \$3\/Mtok/);
+  const confirmation = keyConfirmations({ pending_key_switches: [keyPrompt({ price: livePrice("3.000000", "15.000000") })] });
+  assert.match(confirmation, /class="fare"[^>]*>\$3<span[^>]*> \/ \$15<\/span>/);
+});
+
+test("unknown fare is explicit and both decisions remain usable", () => {
+  const h = keyConfirmations({ pending_key_switches: [keyPrompt({ price: null })] });
+  assert.match(h, /class="fare"[^>]*>price unavailable<\/span>/);
+  assert.doesNotMatch(h, /\$\d| disabled/);
+  assert.equal((h.match(/data-action="key-answer"/g) || []).length, 2);
+});
+
+test("confirmation takes its primary colour from the request harness", () => {
+  for (const tool of ["codex", "claude"]) {
+    // Deliberately disagree with the key fixture: the request owns this session's accent.
+    const h = keyConfirmations({ pending_key_switches: [keyPrompt({ tool,
+      key_seat: keySeat({ harness: tool === "claude" ? "codex" : "claude" }) })] });
+    assert.ok(h.includes(`style="--accent:var(--${tool})"`));
+    assert.match(h, /class="k-go".*data-approved="true"/);
+  }
+});
+
+test("confirmation names the resting seat and only includes a known reset time", () => {
+  for (const limited_until of ["2099-01-01T02:18:00", null, "invalid"]) {
+    const h = keyConfirmations(state({ pending_key_switches: [keyPrompt({ from_seat: { id: "work@x.com", label: "Work" } })],
+      tools: { codex: { seats: [seat({ limited_until })] },
+        claude: { seats: [seat({ limited_until: "2099-01-01T05:00:00" })] } } }));
+    if (limited_until?.startsWith("2099")) {
+      assert.match(h, /class="k-fine">Work is resting until 2:18am\. this app doesn't cap spend\./);
+    } else {
+      assert.match(h, /class="k-fine">Work is resting\. this app doesn't cap spend\./);
+      assert.doesNotMatch(h, /until/);
+    }
+  }
+});
+
+test("confirmation retains the stored endpoint proof", () => {
+  const h = keyConfirmations({ pending_key_switches: [keyPrompt()],
+    keys: [keySeat({ last_proof: { outcome: "incompatible", model: "vendor/model" } })] });
+  assert.match(h, /incompatible — this endpoint does not support Responses; this seat will not work/);
 });
 
 test("unknown amounts never become fabricated or bare zero prices in any key view", () => {
@@ -975,4 +1041,39 @@ test("partial prices and same-as rates preserve unknowns and cannot recurse fore
   assert.match(h, /price unavailable/); assert.doesNotMatch(h, /\$\d/);
   h = keyConfirmations({ pending_key_switches: [keyPrompt({ price: livePrice("2", "4", { currency: "EUR" }) })] });
   assert.doesNotMatch(h, /\$\d/);
+});
+
+test("a running paid seat offers a pinned one-tap stop that sends the kill switch action", () => {
+  const app = keyApp();
+  const snapshot = state({ rev: 1, settings: { key_fallback: true },
+    keys: [keySeat()], running_key_seats: ["key-1"] });
+  app.window.AGL.result({ state: snapshot });
+  const h = app.root.innerHTML;
+  assert.match(h, /a paid key is on the floor/);
+  assert.match(h, /data-action="key-stop">stop paid use<\/button>/);
+  assert.ok(h.indexOf('data-action="key-stop"') < h.indexOf('class="main-body"'));
+  assert.match(h, /stop new paid requests and the running session/);
+  assert.match(h, /the turn already sent may still bill/);
+  app.click({ action: "key-stop" });
+  assert.deepEqual(JSON.parse(JSON.stringify(app.sent.at(-1))),
+    { action: "toggle", key: "key_fallback", value: false });
+  app.window.AGL.result({ state: { ...snapshot, rev: 2, settings: { key_fallback: false } } });
+  assert.match(app.root.innerHTML, /paid use is stopping/);
+  assert.match(app.root.innerHTML, /data-action="key-stop" disabled/);
+  app.window.AGL.result({ state: { ...snapshot, rev: 2, running_key_seats: [],
+    settings: { key_fallback: false } } });
+  assert.doesNotMatch(app.root.innerHTML, /data-action="key-stop"/);
+});
+
+test("idle keys and subscription sessions do not offer the paid-session stop", () => {
+  const h = buildHTML(state({ keys: [keySeat()], running_key_seats: [],
+    tools: { codex: { seats: [seat({ status: "active", active: true, in_session: true })] } } }));
+  assert.doesNotMatch(h, /data-action="key-stop"/);
+});
+
+test("paid-use settings subtitle explains prevention, session stopping, and in-flight billing", () => {
+  const h = buildSettings(state());
+  const row = h.match(/<label class="set-toggle-row">(?:(?!<\/label>)[\s\S])*data-key="key_fallback"(?:(?!<\/label>)[\s\S])*<\/label>/)[0];
+  assert.match(row, /class="set-s">[^<]*off prevents new paid use and stops a running paid session/);
+  assert.match(row, /the turn already sent may still bill/);
 });

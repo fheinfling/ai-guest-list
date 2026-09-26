@@ -211,6 +211,7 @@ document.addEventListener("click", (e) => {
       if (answering.has(el.dataset.id)) break;
       answering.add(el.dataset.id); refreshKeyPrompts();
       send("answer_key_switch", { id: el.dataset.id, approved: el.dataset.approved === "true" }); break;
+    case "key-stop": send("toggle", { key: "key_fallback", value: false }); break;
     case "key-validate": send("key_validate", { id: el.dataset.id }); break;
     case "key-prove":
       if (!proving.has(el.dataset.id)) {

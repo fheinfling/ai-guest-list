@@ -536,7 +536,7 @@ function buildSettings(state) {
       ${segBlock("when a seat runs out", strategyHint(strat), "set_strategy", strat, STRATEGY_OPTS)}
       ${toggleRow("supervise_shell", "supervise terminal commands", "codex/claude auto-switch seats · off: only cx/cl do", s.supervise_shell !== false)}
       ${toggleRow("same_tool_only", "keep me on the same tool", "a Codex limit hops to your other Codex seat, never to Claude", s.same_tool_only)}
-      ${toggleRow("key_fallback", "let a key take the floor", "off by default. turning this on allows paid key use when this tool's subscription seats are resting — real money can be spent", s.key_fallback === true)}
+      ${toggleRow("key_fallback", "let a key take the floor", "off by default. on allows keys when subscription seats rest — real money can be spent. off prevents new paid use and stops a running paid session; the turn already sent may still bill", s.key_fallback === true)}
       ${toggleRow("confirm_key_switch", "ask before using a paid key", "ask me to approve each hop onto a key. turning this off lets eligible keys spend money without asking again", s.confirm_key_switch !== false)}
       ${toggleRow("notify", "tell me when it switches", "a gentle notification with who's on now", s.notify)}
       ${toggleRow("restart_app", "restart the Codex app after a swap", "the desktop app keeps the old account until it relaunches · terminals switch on their own", s.restart_app)}
@@ -586,6 +586,7 @@ function buildHTML(state) {
       </span>
     </header>
     ${keyConfirmations(state)}
+    ${paidUseControl(state)}
     <div class="main-body">
       ${supervisionBanner(state)}
       ${controlBar({ icon: REFRESH, title: "auto-switch", sub: "next ready seat · soonest-reset wins",
@@ -598,6 +599,16 @@ function buildHTML(state) {
         <button class="link" data-action="quit">quit</button></footer>
     </div>
   </div>`;
+}
+
+function paidUseControl(state) {
+  if (!state?.running_key_seats?.length) return "";
+  const stopping = state.settings?.key_fallback === false;
+  return `<section class="key-confirm set-card paid-use-control" aria-label="stop paid use">
+    <div class="k-q">${stopping ? "paid use is stopping…" : "a paid key is on the floor"}</div>
+    <div class="k-fine">stop new paid requests and the running session. the turn already sent may still bill.</div>
+    <div class="k-acts"><button class="k-go" data-action="key-stop"${stopping ? " disabled" : ""}>stop paid use</button></div>
+  </section>`;
 }
 
 // Key providers mirror providers.py's harness gate: chat-only catalogs are not usable seats.
@@ -618,10 +629,16 @@ function providerName(seat) {
 }
 
 // Reject missing/blank/boolean values before numeric coercion: Number(null) is NOT a free model.
-// Preserve decimal strings for display, including tiny nonzero rates that fixed precision hides.
+// Preserve decimal strings until formatting, including tiny nonzero rates.
 function amount(value) {
   if (!["string", "number"].includes(typeof value) || String(value).trim() === "") return null;
   return Number.isFinite(Number(value)) && Number(value) >= 0 ? String(value) : null;
+}
+function formatPrice(value) {
+  if (amount(value) === null) return "price unavailable";
+  const number = Number(value);
+  return `$${number.toLocaleString("en-US", { useGrouping: false,
+    ...(number >= 1 ? { maximumFractionDigits: 2 } : { maximumSignificantDigits: 3 }) })}`;
 }
 function priceRate(price, name, seen = []) {
   if (price?.source !== "live" || price.currency !== "USD" || price.token_unit !== "per_million_tokens") return null;
@@ -640,7 +657,7 @@ function priceAge(price, now = Date.now()) {
 function priceText(price) {
   const input = priceRate(price, "input"), output = priceRate(price, "output");
   if (input === null && output === null) return "price unavailable";
-  return `input ${input === null ? "price unavailable" : `$${input}/Mtok`} · output ${output === null ? "price unavailable" : `$${output}/Mtok`}`;
+  return `input ${formatPrice(input)}${input === null ? "" : "/Mtok"} · output ${formatPrice(output)}${output === null ? "" : "/Mtok"}`;
 }
 function priceHTML(price) {
   const text = priceText(price);
@@ -688,17 +705,24 @@ function keyConfirmations(state, answering = new Set(), now = Date.now()) {
   return `<div class="key-prompts" aria-live="polite">${requests.map((r) => {
     const disabled = answering.has(r.id) ? " disabled" : "";
     const seat = state?.keys?.find((k) => k.id === r.key_seat?.id);
-    return `<section class="key-confirm set-card" aria-label="paid key confirmation">
-      <div class="add-method"><span class="set-t">a paid key is waiting for your okay</span>
-        <div class="add-hint">leave ${esc(r.from_seat?.label || r.from_seat?.id || "the current seat")} → use ${esc(r.key_seat?.label)} (${esc(providerName(r.key_seat || {}))})</div>
-        <div class="key-model mono">${esc(r.key_seat?.model)}</div>
-        ${seat ? keyProofStatus(seat) : ""}
-        ${priceHTML(r.price)}
-        <div class="add-hint">approve to continue this ${esc(r.tool)} session using your paid key. requests can spend real money; this app does not cap spend.</div>
-        <div class="key-decisions">
-          <button class="btn switch" data-action="key-answer" data-id="${esc(r.id)}" data-approved="false"${disabled}>decline</button>
-          <button class="btn switch" data-action="key-answer" data-id="${esc(r.id)}" data-approved="true"${disabled}>approve paid use</button>
-        </div>
+    const previous = state?.tools?.[r.tool]?.seats?.find((s) => s.email === r.from_seat?.id);
+    const reset = fmtClock(previous?.limited_until).replace(" ", "").toLowerCase();
+    const from = r.from_seat?.label || r.from_seat?.id || "the current seat";
+    const input = priceRate(r.price, "input"), output = priceRate(r.price, "output");
+    const fare = input === null && output === null ? "price unavailable"
+      : `${esc(formatPrice(input))}<span class="unit" style="font-size:13px"> / ${esc(formatPrice(output))}</span>`;
+    const priceHint = priceText(r.price) + (input === null && output === null ? "" : ` · ${priceAge(r.price)}`);
+    const accent = TOOL_META[r.tool]?.accent || TOOL_META.codex.accent;
+    return `<section class="key-confirm set-card" aria-label="paid key confirmation" style="--accent:${accent}">
+      <div class="k-q">use a paid key to keep going?</div>
+      <span class="fare" title="${esc(priceHint)}">${fare}</span>
+      <div class="unit">input / output per million tokens</div>
+      <div class="quiet-meta">${esc(r.key_seat?.label)} · ${esc(providerName(r.key_seat || {}))}<br><span class="k-model">${esc(r.key_seat?.model)}</span></div>
+      ${seat ? keyProofStatus(seat) : ""}
+      <div class="k-fine">${esc(from)} is resting${reset ? ` until ${esc(reset)}` : ""}. this app doesn't cap spend.</div>
+      <div class="k-acts">
+        <button class="k-no" data-action="key-answer" data-id="${esc(r.id)}" data-approved="false"${disabled}>not now</button>
+        <button class="k-go" data-action="key-answer" data-id="${esc(r.id)}" data-approved="true"${disabled}>use the key</button>
       </div></section>`;
   }).join("")}</div>`;
 }
@@ -1001,6 +1025,7 @@ document.addEventListener("click", (e) => {
       if (answering.has(el.dataset.id)) break;
       answering.add(el.dataset.id); refreshKeyPrompts();
       send("answer_key_switch", { id: el.dataset.id, approved: el.dataset.approved === "true" }); break;
+    case "key-stop": send("toggle", { key: "key_fallback", value: false }); break;
     case "key-validate": send("key_validate", { id: el.dataset.id }); break;
     case "key-prove":
       if (!proving.has(el.dataset.id)) {

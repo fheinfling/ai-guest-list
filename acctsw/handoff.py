@@ -27,6 +27,20 @@ from .util import iso, now, parse_iso
 DEFAULT_TIMEOUT = timedelta(minutes=2)
 
 
+def withdraw(state: State, *, at: datetime | None = None) -> bool:
+    """Withdraw unconsumed consent when paid use is switched off. Caller owns the flock/save.
+
+    Keep this terminal outcome even if the setting is enabled again before the launcher polls.
+    An approval still waiting to be consumed is not permission to outlive the kill switch.
+    """
+    changed = False
+    for record in state.data.get("handoffs", {}).values():
+        if record["status"] in ("pending", "approved"):
+            record.update(status="withdrawn", decision_source="setting", finished_at=iso(at or now()))
+            changed = True
+    return changed
+
+
 def _price(model: Model, at: datetime) -> dict[str, Any]:
     """Serialize only pricing fields, preserving Decimal strings, units and explicit unknowns.
 
@@ -58,7 +72,7 @@ def _refresh(state: State, at: datetime) -> bool:
     """Retire stale prompts under the same lock as answers, so a late click cannot win."""
     changed = False
     for record in state.data.get("handoffs", {}).values():
-        if record["status"] in ("dead", "expired"):
+        if record["status"] in ("dead", "expired", "withdrawn"):
             continue
         pid = record["pid"]
         alive = session._alive(pid)
@@ -158,15 +172,21 @@ def pending(ctx: Context, tool: str | None = None, *,
                       key=lambda r: (r["created_at"], r["id"]))
 
 
-def resolve(ctx: Context, id: str, *, at: datetime | None = None) -> dict[str, Any] | None:
+def resolve(ctx: Context, id: str, *, at: datetime | None = None,
+            require_enabled: bool = False) -> dict[str, Any] | None:
     """Poll without blocking: pending remains; a terminal record is returned and removed once.
 
     None means missing/already consumed, never approval. Only status='approved' permits the hop.
     Returned records belong to this read, so caller mutations cannot alter persisted state.
+    Launchers require the live fallback setting too; the consent protocol alone remains usable
+    independently of selection policy. This also catches settings written outside set_setting().
     """
     with ctx.locked():
         state = ctx.load_state()
-        changed = _refresh(state, at or now())
+        at = at or now()
+        changed = (withdraw(state, at=at) if require_enabled
+                   and not state.settings()["key_fallback"] else False)
+        changed = _refresh(state, at) or changed
         records = state.data.get("handoffs", {})
         record = records.get(id)
         if record is not None and record["status"] != "pending":
