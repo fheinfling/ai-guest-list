@@ -56,6 +56,10 @@ def build_parser() -> argparse.ArgumentParser:
     st = sub.add_parser("status", help="show seats, active account, usage")
     st.add_argument("--json", action="store_true", help="machine-readable output")
 
+    daemons = sub.add_parser("daemons", help="inspect per-seat Codex daemons and disk usage")
+    daemons.add_argument("--fix", action="store_true", help="heal sockets, reap orphans and prune releases")
+    daemons.add_argument("--json", action="store_true", help="machine-readable output")
+
     usage = sub.add_parser("usage", help="refresh/show live usage")
     usage.add_argument("action", choices=["refresh"], help="usage action")
     usage.add_argument("--tool", choices=TOOLS, help="limit to one tool")
@@ -118,6 +122,27 @@ def _cmd_status(ctx: Context, ns) -> int:
         for s in t["seats"]:
             tag = "active" if s["active"] else ("resting" if s["limited"] else "ready")
             print(f"  [{tag}] {s['email']}")
+    return EXIT_OK
+
+
+def _cmd_daemons(ctx: Context, ns) -> int:
+    from .codexhome import daemon_report
+    data = daemon_report(ctx, fix=ns.fix)
+    if ns.json:
+        print(json.dumps(data, indent=2))
+        return EXIT_OK
+    for row in data['seats']:
+        print(f"{row['address']}  {row['home_id']}  {row['state']}  "
+              f"packages={row['packages_bytes']} bytes")
+        if ns.fix:
+            print(f"  heal={row['heal']}  gc={row['gc']}  freed={row['bytes_freed']} bytes")
+    print("process inspection: " + data["process_inspection"])
+    print("orphan pids: " + (', '.join(map(str, data['orphan_pids'])) or 'none'))
+    print("wedged supervisors: " + (', '.join(map(str, data['wedged_supervisors'])) or 'none'))
+    if ns.fix:
+        print("signalled supervisors: " + (', '.join(map(str, data['signalled_supervisors'])) or 'none'))
+        print("reaper: " + data["reaper"])
+        print("reaped pids: " + (', '.join(map(str, data['reaped_pids'])) or 'none'))
     return EXIT_OK
 
 
@@ -246,6 +271,7 @@ HANDLERS = {
     "remove": _cmd_remove,
     "list": _cmd_list,
     "status": _cmd_status,
+    "daemons": _cmd_daemons,
     "switch": _cmd_switch,
     "usage": _cmd_usage,
     "run": _cmd_run,

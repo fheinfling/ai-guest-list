@@ -30,6 +30,7 @@ and never decide anything on their own when something better is available:
 from __future__ import annotations
 
 import fcntl
+import logging
 import os
 import pty
 import re
@@ -652,6 +653,8 @@ def pty_spawn(argv: list, on_output: Callable[[bytes], bool],
     prev_winch = None
     prev_term = None
     prev_hup = None
+    terminating = False
+    pending_signal = None
     watch = [master_fd] + ([stdin_fd] if stdin_fd is not None else [])
 
     def _restore_terminal() -> None:
@@ -671,7 +674,8 @@ def pty_spawn(argv: list, on_output: Callable[[bytes], bool],
         _set_winsize(master_fd, out_fd)
 
         def _winch(_sig, _frm):
-            _set_winsize(master_fd, out_fd)
+            if master_fd is not None:
+                _set_winsize(master_fd, out_fd)
         try:
             prev_winch = signal.signal(signal.SIGWINCH, _winch)
         except (ValueError, OSError):
@@ -680,12 +684,23 @@ def pty_spawn(argv: list, on_output: Callable[[bytes], bool],
         # If the supervisor itself is killed (tab closed → SIGHUP, `kill` → SIGTERM) the finally
         # below never runs, so the child's terminal modes would leak. Restore the terminal and
         # kill the child from a handler, then die with the signal's default disposition.
+        def _stop_child():
+            nonlocal terminating, master_fd
+            terminating = True
+            # Transfer ownership: _terminate closes it exactly once, even after a bounded timeout.
+            fd, master_fd = master_fd, None
+            return _terminate(pid, fd)
+
         def _on_term(sig, _frm):
-            _restore_terminal()
+            nonlocal pending_signal
+            pending_signal = sig
+            if terminating:
+                return  # Includes signals interrupting an auto-switch's shutdown/drain.
             try:
-                _terminate(pid)
+                _stop_child()
             except Exception:
                 pass
+            _restore_terminal()
             signal.signal(sig, signal.SIG_DFL)
             os.kill(os.getpid(), sig)
         try:
@@ -733,8 +748,13 @@ def pty_spawn(argv: list, on_output: Callable[[bytes], bool],
                     break
         if stop_requested:
             # Keep the PTY open while the child handles SIGTERM and saves its conversation.
-            # Closing the master first sends SIGHUP, killing it before its shutdown handler.
-            return _terminate(pid)
+            # Keep READING it too: tty close can wait for queued output to drain on macOS.
+            result = _stop_child()
+            if pending_signal is not None:
+                _restore_terminal()
+                signal.signal(pending_signal, signal.SIG_DFL)
+                os.kill(os.getpid(), pending_signal)
+            return result
     finally:
         # Re-assert the terminal's default private modes the child TUI may have left set (mouse
         # tracking especially) — on the kill path the child never got to do this itself.
@@ -748,7 +768,8 @@ def pty_spawn(argv: list, on_output: Callable[[bytes], bool],
                 except (ValueError, OSError):
                     pass
         try:
-            os.close(master_fd)
+            if master_fd is not None:
+                os.close(master_fd)
         except OSError:
             pass
 
@@ -760,40 +781,80 @@ def pty_spawn(argv: list, on_output: Callable[[bytes], bool],
         return 0
 
 
-def _terminate(pid: int) -> int:
+def _terminate(pid: int, master_fd: int | None = None) -> int:
     """Stop the child (SIGTERM→SIGKILL) and reap it. Returns its exit/signal status.
 
     We signal the child's whole PROCESS GROUP: ``pty.fork`` makes the child a session leader, so
     its children (e.g. a shell's subprocesses) share its pgid and must be killed too — otherwise
-    an orphan keeps the pty open and we'd hang.
+    an orphan keeps the pty open and we'd hang. Takes ownership of master_fd, if supplied.
+    Shutdown output is discarded: forwarding to a closed/stalled terminal can itself block.
     """
     def _signal(sig):
         try:
-            os.killpg(os.getpgid(pid), sig)
+            pgid = os.getpgid(pid)
+            if pgid == pid:
+                os.killpg(pgid, sig)
+            else:
+                os.kill(pid, sig)  # non-PTY callers may share our own process group
         except (ProcessLookupError, OSError):
             try:
                 os.kill(pid, sig)
             except ProcessLookupError:
                 pass
 
-    # A TUI may need several seconds to flush the session file that `resume --last` immediately
-    # consumes. Keep the 50ms fast-path polling, but give SIGTERM about five seconds before the
-    # same SIGKILL backstop used previously.
-    for sig, polls in ((signal.SIGTERM, 100), (signal.SIGKILL, 20)):
-        _signal(sig)
-        for _ in range(polls):
+    def _close_master():
+        nonlocal master_fd
+        if master_fd is not None:
+            fd, master_fd = master_fd, None
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def _wait(seconds):
+        deadline = time.monotonic() + seconds
+        while True:
             try:
                 wpid, status = os.waitpid(pid, os.WNOHANG)
             except ChildProcessError:
-                return -signal.SIGKILL  # already reaped elsewhere
+                return -signal.SIGKILL
             if wpid == pid:
                 return _exitcode(status)
-            time.sleep(0.05)
+            delay = min(0.05, max(0, deadline - time.monotonic()))
+            if not delay:
+                return None
+            if master_fd is None:
+                time.sleep(delay)
+                continue
+            try:
+                readable, _, _ = select.select([master_fd], [], [], delay)
+                if readable and not os.read(master_fd, 65536):
+                    # EOF; keep the fd until the grace ends but avoid spinning.
+                    time.sleep(delay)
+            except (BlockingIOError, InterruptedError):
+                continue
+            except OSError:
+                time.sleep(delay)
+
     try:
-        _, status = os.waitpid(pid, 0)
-        return _exitcode(status)
-    except ChildProcessError:
+        if master_fd is not None:
+            os.set_blocking(master_fd, False)
+        # About five seconds for the TUI to save its session, without an early SIGHUP.
+        for sig, grace in ((signal.SIGTERM, 5.0), (signal.SIGKILL, 1.0)):
+            _signal(sig)
+            result = _wait(grace)
+            if result is not None:
+                return result
+        # tty drain can wedge even an exiting SIGKILLed child. Closing releases that wait.
+        _close_master()
+        result = _wait(1.0)
+        if result is not None:
+            return result
+        logging.getLogger(__name__).warning(
+            'Child %s did not reap after SIGKILL and PTY close; leaving it for init', pid)
         return -signal.SIGKILL
+    finally:
+        _close_master()
 
 
 # --- orchestration ----------------------------------------------------------------------------

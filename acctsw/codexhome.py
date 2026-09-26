@@ -24,7 +24,7 @@ still resident, and it closes when the app restarts — which is what an upgrade
 
 INVARIANT: a home holds exactly ONE real file, ``auth.json`` — plus the daemon's own runtime state
 (rule 4). Everything else is shared state owned by the real ~/.codex and appears here only as a
-symlink. Four rules keep it that way:
+symlink. Five rules keep it that way:
 
 1. **SQLite sidecars are never linked.** Codex keeps databases at the top level of CODEX_HOME
    (logs_2.sqlite, goals_1.sqlite, memories_1.sqlite, queue_1.sqlite). When the database itself is a
@@ -46,7 +46,12 @@ symlink. Four rules keep it that way:
    per ``CODEX_HOME`` and keeps its socket, startup lock, pid and log under the names in
    ``DAEMON_RUNTIME``. One daemon serves ONE account's auth, so sharing that state would hand a seat
    another account's server: those names are never linked in from ~/.codex, never promoted out to
-   it, and any such link an older build left is removed on sight.
+   it, and any such link an older build left is removed on sight. Packages stay per-seat too:
+   sharing their independently updated current pointer has not been proven safe.
+5. **Dead control sockets are healed at launch.** Only ECONNREFUSED/ENOENT plus a missing, invalid,
+   dead or reused daemon PID permits cleanup, while a held startup flock vetoes it. Remove the
+   in-home socket and startup lock, and only our own dead socket in the daemon temp directory.
+   Leave PID/updater/package state alone; uncertain inspection must never disrupt a live daemon.
 
 Promotion MOVES files, so the launcher asks for it only when no supervised codex session is live;
 otherwise the heal simply waits for the next launch.
@@ -54,19 +59,28 @@ otherwise the heal simply waits for the next launch.
 from __future__ import annotations
 
 import contextlib
+import errno
+import fcntl
 import hashlib
+import json
 import os
 import shutil
+import signal
+import socket
+import stat
+import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
+from . import daemonprocs
 from . import paths as P
 from .util import atomic_write_text
 
 # Files SQLite creates beside a database. Never symlinked (see rule 1 above).
 SQLITE_SIDECARS = ("-wal", "-shm", "-journal")
-# The app-server daemon's per-home runtime state (see rule 4 above). Never shared between seats.
-DAEMON_RUNTIME = frozenset({"app-server-control", "app-server-daemon", "app-server-startup.lock"})
+# The app-server daemon's runtime and packages (rule 4). Never shared between seats.
+DAEMON_RUNTIME = frozenset({"app-server-control", "app-server-daemon", "app-server-startup.lock", "packages"})
 # Marks a parked divergent copy. Such entries are inert: never linked, moved, parked or followed.
 ORPHAN_MARK = ".orphaned-"
 
@@ -136,6 +150,386 @@ def daemon_socket_fits(home: Path) -> bool:
     condition to handle.
     """
     return len(str(socket_path(home).resolve()).encode("utf-8")) < SUN_LEN
+
+
+# --- per-home daemon maintenance --------------------------------------------------------------
+
+STARTUP_LOCK = 'app-server-control/app-server-startup.lock'
+TMP_DAEMONS = Path('/private/tmp' if sys.platform == 'darwin' else '/tmp') / f'codex-daemon-{os.getuid()}'
+
+
+def _inside(path: Path, home: Path) -> bool:
+    """Refuse escaped runtime/package parents as well as symlink loops."""
+    return path.resolve().is_relative_to(home.resolve())
+
+
+def _connect_errno(path: Path) -> int:
+    """Probe the resolved short target: never spend SUN_LEN on the long in-home alias."""
+    try:
+        with socket.socket(socket.AF_UNIX) as client:
+            client.settimeout(0.2)
+            client.connect(str(path.resolve()))
+        return 0
+    except OSError as exc:
+        return exc.errno or errno.EAGAIN    # timeout is uncertainty, not a dead server
+
+
+def _daemon_may_live(home: Path) -> bool:
+    """Malformed/missing pid records cannot protect a refusing socket; unknown live starts can.
+
+    Compare kernel epoch seconds, not processStartTime's locale-formatted ps string. Microseconds
+    tighten the reuse guard when supplied. A live PID with an older record lacking identity stays
+    protected: absence of an identity is not positive evidence that the PID was recycled.
+    """
+    try:
+        data = json.loads((home / 'app-server-daemon/daemon.pid').read_text())
+        pid = data['pid']
+        if type(pid) is not int or pid <= 0:
+            return False
+    except (FileNotFoundError, ValueError, TypeError, KeyError):
+        return False
+    except OSError:
+        return True                        # unreadable is not the same as missing/unparseable
+    if not daemonprocs.alive(pid):
+        return False
+    state = daemonprocs.process_state(pid)
+    if state is not None and state.dead:
+        return False  # P_WEXIT/SZOMB can still pass kill(pid, 0), but will never bind again.
+    identity = data.get('processIdentity')
+    start = daemonprocs.process_start(pid)
+    if not isinstance(identity, dict) or start is None:
+        return True
+    seconds = identity.get('startSeconds')
+    micros = identity.get('startMicroseconds')
+    return (type(seconds) is not int or
+            (seconds == start[0] and (type(micros) is not int or micros == start[1])))
+
+
+@contextlib.contextmanager
+def _try_lock(path: Path, *, create: bool = False):
+    """Hold the same inode throughout inspection/cleanup; an unavailable lock means defer.
+
+    O_NOFOLLOW prevents a replaced lock from opening something outside the seat. A missing lock
+    needs no creation for read-only diagnostics; maintenance creates one before its second probe.
+    """
+    fd = None
+    acquired = False
+    try:
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | (os.O_CREAT if create else 0), 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except FileNotFoundError:
+            acquired = not create
+        except OSError:
+            pass
+        yield acquired
+    finally:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
+def _daemon_state(home: Path) -> str:
+    link = socket_path(home)
+    if not link.exists() and not link.is_symlink():
+        if _daemon_may_live(home):
+            return 'busy'
+        pidfile = home / 'app-server-daemon/daemon.pid'
+        return 'stale' if pidfile.exists() or pidfile.is_symlink() else 'absent'
+    error = _connect_errno(socket_path(home))
+    if error == 0:
+        return 'live'
+    if error not in (errno.ENOENT, errno.ECONNREFUSED) or _daemon_may_live(home):
+        return 'busy'
+    link = socket_path(home)
+    return 'stale' if link.exists() or link.is_symlink() else 'absent'
+
+
+def daemon_state(home: Path) -> str:
+    """Read-only diagnostic: live/stale/absent/busy; busy also covers uncertain inspection."""
+    try:
+        if not _inside(home / 'app-server-control', home) or not _inside(home / 'app-server-daemon', home):
+            return 'busy'
+        with _try_lock(home / STARTUP_LOCK) as acquired:
+            return _daemon_state(home) if acquired else 'busy'
+    except (OSError, RuntimeError):
+        return 'busy'
+
+
+def _unlink_dead_tmp_socket(target: Path, *, lock: bool = False) -> None:
+    """Only the uid-owned socket named by this home is ours to reap, never arbitrary symlinks.
+
+    Orphan cleanup may remove its matching .lock too, but only while holding that lock. Do not
+    sweep the global temp directory: a refusing socket there can belong to an unrelated startup.
+    """
+    try:
+        if target.parent != TMP_DAEMONS.resolve() or target.is_symlink():
+            return
+        info = target.lstat()
+        if info.st_uid != os.getuid() or not stat.S_ISSOCK(info.st_mode):
+            return
+        if _connect_errno(target) not in (errno.ENOENT, errno.ECONNREFUSED):
+            return
+        if lock:
+            lockfile = target.with_name(target.name + '.lock')
+            with _try_lock(lockfile) as acquired:
+                if not acquired:
+                    return
+                _unlink_dead_tmp_socket(target)
+                if not target.exists() and lockfile.lstat().st_uid == os.getuid():
+                    if stat.S_ISREG(lockfile.lstat().st_mode):
+                        lockfile.unlink()
+        elif target.lstat() == info:
+            target.unlink()
+    except (OSError, RuntimeError):
+        pass
+
+
+def heal_daemon_socket(home: Path) -> str:
+    """Best-effort launch repair: absent/live/healed/busy (rule 5).
+
+    ECONNREFUSED/ENOENT alone is not enough: a matching live daemon or a startup lock holder may be
+    about to bind. Exiting/zombie records count as dead. Re-probe with the startup flock held,
+    archive daemon.pid, then remove the socket and startup lock. Unknown errno/identity defers.
+    """
+    try:
+        before = daemon_state(home)
+        if before != 'stale':
+            return before
+        lock = home / STARTUP_LOCK
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        with _try_lock(lock, create=True) as acquired:
+            if not acquired:
+                return 'busy'
+            state = _daemon_state(home)
+            if state != 'stale':
+                return state
+            link = socket_path(home)
+            target = link.resolve()
+            # Direct socket files are possible too; never unlink a regular file at this path.
+            if link.exists() and not link.is_symlink() and not stat.S_ISSOCK(link.lstat().st_mode):
+                return 'busy'
+            # Codex trusts a matching live PID even if the kernel says it is stuck exiting.
+            # Keep the original record for diagnosis, but stop feeding it back to stock startup.
+            pidfile = home / 'app-server-daemon/daemon.pid'
+            with contextlib.suppress(FileNotFoundError):
+                pidfile.rename(pidfile.with_name(f'daemon.pid.stale-{time.time_ns()}'))
+            _unlink_dead_tmp_socket(target)
+            with contextlib.suppress(FileNotFoundError):
+                link.unlink()
+            with contextlib.suppress(OSError):
+                lock.unlink()
+            return 'healed'
+    except (OSError, RuntimeError):
+        return 'busy'                       # the launcher owns the TTY; no maintenance stdout
+
+
+def _orphan_home(proc: daemonprocs.Process, root: Path, ids: set[str]) -> Path | None:
+    """Classify the ORIGINAL argv[0], normalising dots but never following the address index."""
+    if proc.uid != os.getuid() or not proc.argv or not Path(proc.argv[0]).is_absolute():
+        return None
+    path = Path(os.path.normpath(proc.argv[0]))
+    # Canonicalise only the store root (e.g. /tmp -> /private/tmp), never the legacy index itself.
+    for base, legacy in ((index_root(root), True), (root, False)):
+        for spelling in (base.absolute(), base.parent.resolve() / base.name):
+            if not path.is_relative_to(spelling):
+                continue
+            parts = path.relative_to(spelling).parts
+            if len(parts) >= 4 and parts[1:3] == ('packages', 'app-server-daemon'):
+                if legacy or parts[0] not in ids:
+                    return spelling / parts[0]
+    return None
+
+
+def _seat_ids(root: Path) -> set[str]:
+    # Directory existence is not seat membership: removed seats can leave homes behind. Refuse
+    # malformed state rather than letting State.load's recovery defaults classify every seat dead.
+    statefile = root.parent / 'state.json'
+    if statefile.exists():
+        data = json.loads(statefile.read_text())
+        accounts = data['tools']['codex']['accounts']
+        if not isinstance(accounts, dict):
+            raise ValueError('invalid seat registry')
+        return {_slug(email) for email in accounts}
+    return set()
+
+
+def orphan_daemons(root: Path | None = None, *, list_procs=daemonprocs.list_processes):
+    """A failed snapshot/registry read returns no candidates, never a wider kill set."""
+    root = root or P.CODEX_HOMES
+    try:
+        ids = _seat_ids(root)
+        return [(proc, home) for proc in list_procs()
+                if (home := _orphan_home(proc, root, ids)) is not None]
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+        return []
+
+
+def reap_orphan_daemons(root: Path | None = None, *, list_procs=daemonprocs.list_processes,
+                        kill=os.kill, sleep=time.sleep) -> list[int]:
+    """TERM orphan executables, give them a grace period, then KILL verified survivors.
+
+    Re-enumerate before EACH signal: a recycled PID must never inherit an old kill decision. The
+    live-seat registry is also read again, since adding a seat while maintenance waits is legal.
+    Darwin has no pidfd: start-time identity and a recheck right before the signal mitigate,
+    but cannot eliminate, the residual PID-reuse TOCTOU between identity recheck and kill.
+    Return only PIDs observed gone; signalling is not proof of exit. No process names/banners.
+    """
+    candidates = orphan_daemons(root, list_procs=list_procs)
+    if not candidates:
+        return []
+    targets = {}
+    for proc, home in candidates:
+        with contextlib.suppress(OSError, RuntimeError):
+            targets[proc.pid] = socket_path(home).resolve()
+
+    def current():
+        return {p.pid: p for p, _ in orphan_daemons(root, list_procs=list_procs)}
+
+    signalled = []
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for proc, _ in candidates:
+            fresh = current().get(proc.pid)
+            if (fresh is not None and
+                    (fresh.uid, fresh.start, fresh.argv) == (proc.uid, proc.start, proc.argv)):
+                try:
+                    kill(proc.pid, sig)
+                    if proc not in signalled:
+                        signalled.append(proc)
+                except OSError:
+                    pass
+        if signalled:
+            sleep(0.5 if sig == signal.SIGTERM else 0.1)
+    try:
+        remaining = {p.pid: p for p in list_procs()}
+    except OSError:
+        return []
+    reaped = [p.pid for p in signalled if p.pid not in remaining or remaining[p.pid].start != p.start]
+    for pid in reaped:
+        if pid in targets:
+            _unlink_dead_tmp_socket(targets[pid], lock=True)
+    return reaped
+
+
+def _tree_bytes(path: Path) -> int:
+    """Logical regular-file bytes, without following symlinks (including the root)."""
+    if path.is_symlink() or not path.is_dir():
+        return 0
+    total = 0
+    for base, _, files in os.walk(path, followlinks=False):
+        for name in files:
+            with contextlib.suppress(OSError):
+                info = (Path(base) / name).lstat()
+                if stat.S_ISREG(info.st_mode):
+                    total += info.st_size
+    return total
+
+
+def _gc_process_issue(processes) -> str | None:
+    unknown = sum(p.uid == os.getuid() and not p.dead and
+                  p.executable is None and not p.argv for p in processes)
+    if unknown:
+        return f'process-details-unavailable ({unknown} live records lack executable and argv)'
+    return None
+
+
+def gc_daemon_releases(home: Path, *, list_procs=daemonprocs.list_processes,
+                       on_skip=None) -> int:
+    """Keep current and all executing releases; a missing current/snapshot/lock defers GC.
+
+    Only explicit maintenance calls this, never ensure_home or polling. Callers must additionally
+    exclude live supervised sessions. Symlinks within a discarded tree are unlinked by rmtree,
+    never traversed; a release symlink or an escaped package/current parent aborts the whole pass.
+    Either executable or argv[0] pins a release. Live owned records missing both defer GC;
+    on_skip, if supplied, receives that reason from the fresh snapshot under the install lock.
+    """
+    freed = 0
+    try:
+        package = home / 'packages/app-server-daemon'
+        releases = package / 'releases'
+        if not _inside(releases, home) or not releases.is_dir():
+            return 0
+        with _try_lock(package / 'install.lock', create=True) as acquired:
+            if not acquired:
+                return 0
+            current = (package / 'current').resolve(strict=True)
+            if (current == releases.resolve() or not current.is_relative_to(releases.resolve())
+                    or not current.is_dir()):
+                return 0
+            entries = list(releases.iterdir())
+            if any(p.is_symlink() or not _inside(p, home) for p in entries):
+                return 0
+            processes = list_procs()
+            if reason := _gc_process_issue(processes):
+                if on_skip is not None:
+                    on_skip(reason)
+                return 0
+            executing = [p.executable.resolve() for p in processes
+                         if not p.dead and p.uid == os.getuid() and p.executable is not None]
+            # argv may retain a release's pre-migration spelling; resolved argv supplements the
+            # kernel executable path, and keeping extra versions is always the safe direction.
+            executing += [Path(p.argv[0]).resolve() for p in processes
+                          if not p.dead and p.uid == os.getuid() and p.argv and
+                          Path(p.argv[0]).is_absolute()]
+            for entry in entries:
+                resolved = entry.resolve()
+                if (not entry.is_dir() or current.is_relative_to(resolved) or
+                        any(p.is_relative_to(resolved) for p in executing)):
+                    continue
+                size = _tree_bytes(entry)
+                shutil.rmtree(entry)
+                freed += size
+    except (OSError, RuntimeError):
+        pass
+    return freed
+
+
+def daemon_report(ctx, *, fix: bool = False) -> dict:
+    """One maintenance boundary for CLI and app startup; all live terminals veto release GC.
+
+    The store lock serialises the snapshot with seat changes/launcher activation. Reaper sleeps
+    only on explicit maintenance, off the UI thread. Defer GC for ALL seats if any supervisor is
+    live, matching the launcher's conservative promote=True gate and covering concurrent terminals.
+    The same gate defers orphan reaping: an app restart must not disrupt an older live supervisor.
+    """
+    from .session import active_session
+    # Old builds can leave a supervisor holding a PTY after its terminal vanished. This rescue
+    # has its own strict kernel predicates and must run even if the stale session marker is live.
+    wedges, rescued = daemonprocs.wedged_supervisors(fix=fix)
+    with ctx.locked():
+        seats = list(ctx.load_state().accounts('codex'))
+        try:
+            snapshot = daemonprocs.list_processes()
+        except OSError:
+            snapshot = None
+        incomplete = sum(p.incomplete for p in snapshot or [])
+        inspection = ('unavailable' if snapshot is None else
+                      f'partial ({incomplete} records incomplete)' if incomplete else 'ok')
+        gc_issue = _gc_process_issue(snapshot) if snapshot is not None else 'processes-unavailable'
+        orphans = [p.pid for p, _ in orphan_daemons(
+            ctx._homes_root, list_procs=lambda: snapshot or [])]
+        busy = active_session(ctx.data_dir, 'codex') is not None if fix else False
+        reaper = ('read-only' if not fix else 'session-live' if busy else
+                  'processes-unavailable' if snapshot is None else 'checked')
+        reaped = reap_orphan_daemons(ctx._homes_root) if reaper == 'checked' else []
+        rows = []
+        for email in seats:
+            home = home_dir(email, ctx._homes_root)
+            row = {'address': email, 'home_id': home.name, 'state': daemon_state(home)}
+            if fix:
+                row['heal'] = heal_daemon_socket(home)
+                busy = active_session(ctx.data_dir, 'codex') is not None
+                row['gc'] = 'session-live' if busy else gc_issue or 'checked'
+                row['bytes_freed'] = (gc_daemon_releases(
+                    home, on_skip=lambda reason: row.update(gc=reason))
+                    if row['gc'] == 'checked' else 0)
+                row['state'] = daemon_state(home)
+            row['packages_bytes'] = _tree_bytes(home / 'packages')
+            rows.append(row)
+        return {'seats': rows, 'orphan_pids': orphans, 'reaped_pids': reaped,
+                'wedged_supervisors': wedges, 'signalled_supervisors': rescued,
+                'reaper': reaper, 'process_inspection': inspection}
 
 
 def _is_sidecar(name: str) -> bool:
@@ -298,6 +692,7 @@ def ensure_home(email: str, *, codex_home: Path | None = None, root: Path | None
                     link.symlink_to(entry)
                 except OSError:
                     pass
+    heal_daemon_socket(home)
     return home
 
 

@@ -123,3 +123,45 @@ def test_ctrl_c_exits_cleanly(isolated, monkeypatch, capsys):
     assert rc == 130
     err = capsys.readouterr().err
     assert "interrupted" in err and "Traceback" not in err
+
+
+def test_daemons_json_and_fix(isolated, monkeypatch, capsys):
+    from acctsw import codexhome
+    state = isolated.load_state()
+    state.upsert_seat('codex', 'a@x.com')
+    state.save()
+    home = isolated.codex_home('a@x.com')
+    package = home / 'packages/app-server-daemon'
+    for version in ['v1', 'v2']:
+        release = package / 'releases' / version
+        release.mkdir(parents=True)
+        (release / 'codex').write_bytes(b'123')
+    (package / 'current').symlink_to(package / 'releases/v2')
+    monkeypatch.setattr(codexhome, 'orphan_daemons', lambda *args, **kwargs: [])
+    monkeypatch.setattr(codexhome.daemonprocs, 'list_processes', lambda: [])
+    monkeypatch.setattr(codexhome, 'reap_orphan_daemons', lambda *args: [])
+    real_gc = codexhome.gc_daemon_releases
+    monkeypatch.setattr(codexhome, 'gc_daemon_releases',
+                        lambda home, **kw: real_gc(home, list_procs=lambda: [], **kw))
+    assert cli.main(['daemons', '--json']) == 0
+    report = json.loads(capsys.readouterr().out)
+    row = report['seats'][0]
+    assert row == {'address': 'a@x.com', 'home_id': home.name, 'state': 'absent', 'packages_bytes': 6}
+    assert (package / 'releases/v1').exists()
+    assert cli.main(['daemons', '--fix', '--json']) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report['seats'][0]['bytes_freed'] == 3
+    assert report['seats'][0]['packages_bytes'] == 3
+    assert not (package / 'releases/v1').exists()
+    assert cli.main(['daemons']) == 0
+    assert 'a@x.com' in capsys.readouterr().out
+
+
+def test_daemons_text_reports_partial_inspection(isolated, monkeypatch, capsys):
+    from acctsw import daemonprocs
+    from tests.test_daemonprocs import supervisor
+    monkeypatch.setattr(daemonprocs, 'list_processes', lambda: [supervisor(executable=None)])
+    assert cli.main(['daemons']) == 0
+    out = capsys.readouterr().out
+    assert 'process inspection: partial (1 records incomplete)' in out
+    assert 'unavailable' not in out
