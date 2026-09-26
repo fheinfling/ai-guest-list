@@ -13,7 +13,11 @@ from . import __version__, build_number
 from . import accounts as acct
 from . import identity as identity_mod
 from . import install as install_mod
+from . import handoff as handoff_mod
+from . import keyseats as keyseats_mod
 from . import paths as P
+from . import pricing as pricing_mod
+from . import providers as providers_mod
 from . import session as session_mod
 from . import usage as usage_mod
 from .context import Context
@@ -27,7 +31,10 @@ from .web_dot import dot_for, door_for
 # Settings the UI may toggle (boolean only) — a whitelist so a stray key can't clobber e.g. theme.
 TOGGLE_KEYS = {
     "auto_switch", "notify", "restart_app", "celebrations", "same_tool_only", "supervise_shell",
+    "confirm_key_switch", "key_fallback",
 }
+
+KEY_ACTIONS = {"key_add", "key_remove", "key_validate", "models_list", "answer_key_switch"}
 
 # Actions handled entirely by the native shell (app quit / run the chosen login in Terminal).
 # Everything else goes through the bridge; the shell then acts on result fields (login/command).
@@ -70,8 +77,146 @@ def snapshot_state(ctx: Context) -> dict[str, Any]:
     data["supervision"] = install_mod.supervision_status()
     # the signed-in-but-not-added codex account (if any) → drives the one-tap import affordance
     data["codex_live_unregistered"] = _codex_live_unregistered(ctx, state)
+    data["keys"] = list(state.data["keys"].values())  # metadata only; never open Keychain here
+    # Read prompts from THIS revision, not a second load via pending(). That helper takes its own
+    # flock, and snapshots are also used from already-locked error paths. The launcher/answer path
+    # retires dead requests; expired prompts need not remain visible while waiting for its next poll.
+    at = now()
+    data["pending_key_switches"] = sorted(
+        (record for record in state.data.get("handoffs", {}).values()
+         if record["status"] == "pending"
+         and (parse_iso(record.get("expires_at")) or at) > at),
+        key=lambda record: (record["created_at"], record["id"]),
+    )
     data["rev"] = int(state.data.get("rev", 0))  # monotonic; the UI drops a snapshot older than one it applied
     return data
+
+
+class _KeyRequestError(AcctswError):
+    """Only our own, credential-free messages may cross the key action boundary."""
+
+
+def _key_text(message: dict, field: str) -> str:
+    value = message.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise _KeyRequestError(f"a {field} is required")
+    return value
+
+
+def _key_provider(message: dict):
+    id = _key_text(message, "provider")
+    if id not in providers_mod.PROVIDERS:
+        raise _KeyRequestError("unknown key provider")
+    try:
+        return providers_mod.get_provider(id, region=message.get("region"),
+                                          base_url=message.get("base_url"))
+    except (ValueError, TypeError):
+        raise _KeyRequestError("check the provider's region or custom base_url") from None
+
+
+def _redact_key(value: Any, secret: str) -> Any:
+    """Provider-controlled names can echo a credential just as readily as error bodies can."""
+    if isinstance(value, str):
+        return value.replace(secret, "[redacted]") if secret else value
+    if isinstance(value, dict):
+        return {_redact_key(k, secret): _redact_key(v, secret) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_key(v, secret) for v in value]
+    return value
+
+
+def key_action(ctx: Context, message: dict) -> dict[str, Any]:
+    """Shared bridge/CLI key operations, without UI status probes.
+
+    CRUD owns its locks. In particular, never wrap add() or fetch_catalog() in the state flock:
+    a provider can take twenty seconds to answer while the launcher needs to save its heartbeat.
+    Raw exceptions are deliberately not forwarded: HTTP headers and Keychain errors can contain
+    the secret. Expected input errors below use only fixed field names and our own prose.
+    """
+    action = message.get("action")
+    secret = message.get("secret")
+    secret = secret if isinstance(secret, str) else ""
+    try:
+        if action in ("key_add", "models_list"):
+            provider = _key_provider(message)
+            secret = _key_text(message, "secret")
+            if len(secret) <= 4:
+                raise _KeyRequestError("an api key must contain more than four characters")
+            allow = message.get("allow_unverified", False)
+            if type(allow) is not bool:
+                raise _KeyRequestError("allow_unverified must be a boolean acknowledgement")
+            if provider.wire_api == "chat":
+                raise _KeyRequestError("this provider needs the Responses API for a codex key seat")
+            if provider.wire_api == "responses" and provider.responses_support != "verified" and not allow:
+                raise _KeyRequestError("Responses support is unverified; set allow_unverified to acknowledge it")
+            keyseats_mod.harness_for(provider, allow_unverified=allow)
+
+            def get(url, headers, timeout):
+                status, body = pricing_mod._default_get(url, headers, timeout)
+                # Scrub before catalog caching as well as before returning picker fields.
+                return status, body.replace(secret, "[redacted]")
+
+            if action == "key_add":
+                seat = keyseats_mod.add(ctx, provider, secret, label=_key_text(message, "label"),
+                                        model=_key_text(message, "model"), get=get,
+                                        allow_unverified=allow)
+                result = {"ok": True, "added": seat["id"], "seat": seat}
+            else:
+                catalog = pricing_mod.fetch_catalog(provider, secret, get=get,
+                                                     cache_path=ctx.data_dir / "pricing.json")
+                models = []
+                for model in pricing_mod.sort_models(catalog.models):
+                    item = {"id": model.id, "display_name": model.display_name,
+                            "context_window": model.context_window}
+                    # _price preserves Decimal strings, unknown dimensions, units and fetch age.
+                    # Unpriced models omit price entirely; discovery never manufactures a rate.
+                    if any(model.rate(name) is not None for name in pricing_mod.RATE_NAMES):
+                        item["price"] = handoff_mod._price(model, catalog.checked_at)
+                    models.append(item)
+                result = {"ok": catalog.source != "unavailable", "models": models,
+                          "sort_key": pricing_mod.model_sort_key(catalog.models),
+                          "source": catalog.source,
+                          "fetched_at": iso(catalog.fetched_at) if catalog.fetched_at else None,
+                          "potentially_stale": catalog.potentially_stale}
+                if catalog.error:
+                    result["error"] = "couldn't refresh the provider's model catalog"
+        elif action == "key_remove":
+            result = {"ok": True, "removed": keyseats_mod.remove(ctx, _key_text(message, "id"))}
+        elif action == "key_validate":
+            id = _key_text(message, "id")
+            with ctx.locked():
+                state = ctx.load_state()
+                seat = state.data["keys"].get(id)
+                if seat is None:
+                    raise _KeyRequestError("that key seat is no longer on the list")
+                secret = ctx.keychain.get(ctx.keychain_service, ctx.snapshot_key("key", id))
+            if not secret:
+                raise _KeyRequestError("couldn't read that key from Keychain")
+            validation = keyseats_mod.validate(ctx, _key_provider(seat), secret,
+                                               get=pricing_mod._default_get)
+            with ctx.locked():
+                state = ctx.load_state()
+                current_secret = ctx.keychain.get(ctx.keychain_service, ctx.snapshot_key("key", id))
+                if state.data["keys"].get(id) != seat or current_secret != secret:
+                    raise _KeyRequestError("that key seat changed while checking it; please try again")
+                state.data["keys"][id]["last_validation"] = validation
+                state.save()
+            result = {"ok": True, "validation": validation}
+        elif action == "answer_key_switch":
+            approved = message.get("approved")
+            if type(approved) is not bool:
+                raise _KeyRequestError("approved must be a boolean")
+            accepted = handoff_mod.answer(ctx, _key_text(message, "id"), approved)
+            result = {"ok": accepted, "answered": accepted}
+            if not accepted:
+                result["error"] = "that confirmation is no longer pending"
+        else:
+            raise _KeyRequestError("unknown key action")
+    except _KeyRequestError as exc:
+        result = {"ok": False, "error": str(exc)}
+    except Exception:
+        result = {"ok": False, "error": "couldn't complete that key request; please try again"}
+    return _redact_key(result, secret)
 
 
 def _stored_usage_is_fresh_and_healthy(seat: dict | None) -> bool:
@@ -257,6 +402,17 @@ def login_command(tool: str, method: str = "browser") -> str:
 def handle(ctx: Context, message: dict) -> dict[str, Any]:
     action = (message or {}).get("action")
     try:
+        if action in KEY_ACTIONS:
+            result = key_action(ctx, message)
+            try:
+                result["state"] = snapshot_state(ctx)
+            except Exception:
+                # No invented revision or partial snapshot when the store cannot be read. The
+                # envelope still returns, and the UI can retain its last successfully read state.
+                result.update(ok=False, state=None, error="couldn't refresh status after that key request")
+            secret = message.get("secret")
+            return _redact_key(result, secret if isinstance(secret, str) else "")
+
         if action in ("ready", "status", "dot"):
             return {"ok": True, "state": snapshot_state(ctx)}
 

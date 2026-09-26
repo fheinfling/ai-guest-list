@@ -6,11 +6,15 @@ Subcommands that touch usage / launching land in M3/M4; M2 wires up the credenti
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import sys
+import warnings
 
 from . import APP_NAME, TOOLS, __version__
 from . import accounts as acct
+from . import bridge
+from . import keyseats as keyseats_mod
 from . import paths as P
 from .context import Context
 from .errors import AcctswError
@@ -59,6 +63,24 @@ def build_parser() -> argparse.ArgumentParser:
     daemons = sub.add_parser("daemons", help="inspect per-seat Codex daemons and disk usage")
     daemons.add_argument("--fix", action="store_true", help="heal sockets, reap orphans and prune releases")
     daemons.add_argument("--json", action="store_true", help="machine-readable output")
+    keys = sub.add_parser("keys", help="manage metered api-key seats")
+    key_sub = keys.add_subparsers(dest="keys_command", required=True, metavar="<action>")
+    key_add = key_sub.add_parser("add", help="save a key seat (secret from prompt or stdin)")
+    key_add.add_argument("provider", help="billing provider id")
+    key_add.add_argument("--label", required=True, help="friendly name for this seat")
+    key_add.add_argument("--model", required=True, help="provider model id")
+    key_list = key_sub.add_parser("list", help="list key seats without revealing keys")
+    key_remove = key_sub.add_parser("remove", help="remove a key seat")
+    key_remove.add_argument("id", help="key seat id")
+    key_models = key_sub.add_parser("models", help="fetch models (secret from prompt or stdin)")
+    key_models.add_argument("provider", help="billing provider id")
+    for command in (key_add, key_models):
+        command.add_argument("--region", help="Langdock region: eu, us or global")
+        command.add_argument("--base-url", help="custom OpenAI-compatible base URL")
+        command.add_argument("--allow-unverified", action="store_true",
+                             help="acknowledge unverified Responses support")
+    for command in (key_add, key_list, key_remove, key_models):
+        command.add_argument("--json", action="store_true", help="machine-readable output")
 
     usage = sub.add_parser("usage", help="refresh/show live usage")
     usage.add_argument("action", choices=["refresh"], help="usage action")
@@ -77,6 +99,77 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 # --- command handlers -------------------------------------------------------------------------
+
+def _read_key_secret() -> str:
+    # argv is visible to other processes. Neither add nor models accepts a secret option, even
+    # for scripts; a pipe works there, while interactive entry must never fall back to echoing.
+    if sys.stdin.isatty():
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", getpass.GetPassWarning)
+            return getpass.getpass("api key: ")
+    return sys.stdin.read().rstrip("\r\n")
+
+
+def _cmd_keys(ctx: Context, ns) -> int:
+    try:
+        if ns.keys_command == "list":
+            result = {"ok": True, "keys": keyseats_mod.list(ctx)}
+        else:
+            message = {"action": {"add": "key_add", "remove": "key_remove",
+                                  "models": "models_list"}[ns.keys_command]}
+            if ns.keys_command == "remove":
+                message["id"] = ns.id
+            else:
+                message.update(provider=ns.provider, region=ns.region, base_url=ns.base_url,
+                               allow_unverified=ns.allow_unverified, secret=_read_key_secret())
+                if ns.keys_command == "add":
+                    message.update(label=ns.label, model=ns.model)
+            result = bridge.key_action(ctx, message)
+    except Exception:
+        # Input and Keychain backends can include sensitive bytes in their exception messages.
+        result = {"ok": False, "error": "couldn't read the key or key seats; please try again"}
+    if ns.json:
+        print(json.dumps(result, indent=2))
+    elif not result["ok"]:
+        print(f"acctsw: {result['error']}", file=sys.stderr)
+    elif ns.keys_command == "add":
+        seat = result["seat"]
+        print(f"✓ key seat saved — {seat['label']} ({seat['id']})")
+        if not seat["last_validation"]["operation_permitted"]:
+            print("· the validation check wasn't permitted; inference access is still unverified")
+    elif ns.keys_command == "remove":
+        print("✓ waved goodbye to that key seat")
+    elif ns.keys_command == "list":
+        if not result["keys"]:
+            print("(no key seats yet)")
+        for seat in result["keys"]:
+            print(f"  {seat['label']} — {seat['provider']} / {seat['model']} "
+                  f"[{seat['harness']}] ({seat['id']})")
+    else:
+        if result["sort_key"] == "id":
+            print("models sorted by id — this provider does not publish live prices in its catalog")
+        else:
+            print("models sorted by estimated input usd per million tokens")
+        if result["source"] == "cache":
+            age = " — may be stale" if result["potentially_stale"] else ""
+            print(f"· cached catalog from {result['fetched_at']}{age}")
+        if result.get("error"):
+            print(f"· {result['error']}")
+        for model in result["models"]:
+            detail = []
+            if model["context_window"] is not None:
+                detail.append(f"context {model['context_window']:,} tokens")
+            price = model.get("price")
+            if price:
+                for name in ("input", "output"):
+                    rate = price["rates"][name]
+                    value = rate["value"] if rate["status"] == "known" else "unavailable"
+                    detail.append(f"{name} {value} {price['currency']}/million tokens (estimate)")
+            else:
+                detail.append("price unavailable")
+            print(f"  {model['id']} — {model['display_name']} — {'; '.join(detail)}")
+    return EXIT_OK if result["ok"] else EXIT_ERR
+
 
 def _cmd_add(ctx: Context, ns) -> int:
     state = ctx.load_state()
@@ -267,6 +360,7 @@ def _not_impl(ctx: Context, ns) -> int:
 
 
 HANDLERS = {
+    "keys": _cmd_keys,
     "add": _cmd_add,
     "remove": _cmd_remove,
     "list": _cmd_list,
