@@ -72,7 +72,8 @@ def build_parser() -> argparse.ArgumentParser:
     key_list = key_sub.add_parser("list", help="list key seats without revealing keys")
     key_remove = key_sub.add_parser("remove", help="remove a key seat")
     key_remove.add_argument("id", help="key seat id")
-    key_prove = key_sub.add_parser("prove", help="check Responses with one real request (costs money)")
+    key_prove = key_sub.add_parser("prove", help="check a Codex seat's Responses endpoint with one "
+                                  "real request (costs money; Claude Code seats are unsupported)")
     key_prove.add_argument("id", help="key seat id")
     key_models = key_sub.add_parser("models", help="fetch models (secret from prompt or stdin)")
     key_models.add_argument("provider", help="billing provider id")

@@ -252,6 +252,10 @@ def parse_catalog(provider: Provider, text: str, *, wire_api: WireAPI | None = N
     else:
         rows = None
     if not isinstance(rows, list):
+        # UNVERIFIED against Langdock's docs: assume an Anthropic-style data list.
+        # A different schema means no discoverable models, not a parsing exception.
+        if id == "langdock_anthropic":
+            return []
         raise ValueError("Unexpected catalog envelope")
     models = []
     for row in rows:
@@ -293,7 +297,7 @@ def parse_catalog(provider: Provider, text: str, *, wire_api: WireAPI | None = N
                 long_rates = {}
             rates["cache_write"] = Rate("not_applicable")
         created = None
-        if id != "langdock" and row.get("created") is not None:
+        if id not in ("langdock", "langdock_anthropic") and row.get("created") is not None:
             try:
                 created = decimal(row["created"])
             except ValueError:
@@ -369,6 +373,8 @@ def fetch_catalog(provider: Provider, key: str = "", *, get: HttpGet = _default_
             raise ValueError(f"http_{status}")
         models = parse_catalog(provider, body, wire_api=wire, verified_at=at.isoformat())
         if not models:
+            if provider.id == "langdock_anthropic":
+                return Catalog([], "unavailable", None, at, "no_models")
             raise ValueError("empty_catalog")
     except (OSError, ValueError, TypeError) as e:
         error = str(e) if isinstance(e, ValueError) and str(e).startswith("http_") else "catalog_unavailable"

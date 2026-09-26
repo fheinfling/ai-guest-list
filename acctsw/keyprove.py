@@ -136,6 +136,11 @@ def prove(ctx: Context, id: str, *, spawn: appserver.Spawn | None = None,
     rotation invalidate the result, so a stale probe cannot certify a different configuration.
     """
     seat = keyseats.get(ctx, id)
+    if seat is not None and seat.get("harness") == "claude":
+        # A local refusal, not an endpoint verdict: no credential read, launch or state write.
+        return {"outcome": "refused", "error": "unsupported_harness",
+                "reason": "Responses checks use codex app-server, which cannot exercise a "
+                          "Messages endpoint for a Claude Code seat"}
     if seat is None or seat.get("harness") != "codex":
         raise ValueError("Responses checks require an existing Codex key seat")
     runtime = keyhome.prepare(ctx, id)
@@ -174,6 +179,9 @@ def describe(result: dict) -> str:
     if outcome == "incompatible":
         return "incompatible — this endpoint does not support this Responses request; this seat will not work"
     if outcome == "refused":
+        if result.get("error") == "unsupported_harness":
+            return ("refused — Responses checks use codex app-server, which cannot exercise "
+                    "a Messages endpoint for a Claude Code seat")
         reason = {"invalid_key": "authentication", "insufficient_quota": "quota",
                   "rate_limited": "rate limit"}.get(result.get("error"), "access or billing")
         return f"refused — provider rejected the request ({reason}); Responses support is undetermined"

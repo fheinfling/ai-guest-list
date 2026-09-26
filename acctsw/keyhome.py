@@ -135,7 +135,7 @@ def prepare(ctx: Context, id: str, *, pin: str | None = None) -> KeyHome:
         env_key = {"openai": "OPENAI_API_KEY", "langdock": "LANGDOCK_API_KEY",
                    "openrouter": "OPENROUTER_API_KEY"}.get(provider.id, "ACCTSW_API_KEY")
     else:
-        if provider.id == "langdock":
+        if provider.id in ("langdock", "langdock_anthropic"):
             base_url = f"https://api.langdock.com/anthropic/{provider.region}"
         elif provider.id == "anthropic":
             # The registry's catalog base includes /v1; Claude adds /v1/messages itself.

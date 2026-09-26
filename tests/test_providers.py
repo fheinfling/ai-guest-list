@@ -10,8 +10,12 @@ from acctsw import providers as P
 
 
 def test_registry_capabilities_and_validation_are_independent():
-    assert set(P.PROVIDERS) == {"openai", "anthropic", "openrouter", "langdock", "deepseek",
-                                "xai", "groq", "together", "mistral", "cerebras", "openai_compatible"}
+    # langdock appears twice on purpose: its OpenAI-compatible and Anthropic-compatible routes
+    # are different endpoints serving different model families, and they pair to different
+    # harnesses. One key reaches both; the registry entry is what picks the road.
+    assert set(P.PROVIDERS) == {"openai", "anthropic", "openrouter", "langdock",
+                                "langdock_anthropic", "deepseek", "xai", "groq", "together",
+                                "mistral", "cerebras", "openai_compatible"}
     assert P.get_provider("anthropic").responses_support == "unsupported"
     assert P.get_provider("anthropic").headers("secret") == {
         "x-api-key": "secret", "anthropic-version": "2023-06-01"}

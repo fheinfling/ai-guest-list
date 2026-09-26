@@ -631,7 +631,8 @@ const KEY_PROVIDERS = {
   openai: { name: "openai", harness: "codex", pricing: "https://openai.com/api/pricing/" },
   anthropic: { name: "anthropic", harness: "claude", pricing: "https://www.anthropic.com/pricing" },
   openrouter: { name: "openrouter", harness: "codex", priced: true, pricing: "https://openrouter.ai/models" },
-  langdock: { name: "langdock", harness: "codex", pricing: "https://www.langdock.com/pricing" },
+  langdock: { name: "langdock · openai models", harness: "codex", regional: true, pricing: "https://www.langdock.com/pricing" },
+  langdock_anthropic: { name: "langdock · claude models", harness: "claude", regional: true, pricing: "https://www.langdock.com/pricing" },
   deepseek: { name: "deepseek", harness: "codex", pricing: "https://api-docs.deepseek.com/quick_start/pricing" },
   xai: { name: "xai", harness: "codex", priced: true, pricing: "https://docs.x.ai/docs/models" },
   groq: { name: "groq", harness: "codex", unverified: true, pricing: "https://groq.com/pricing" },
@@ -771,7 +772,7 @@ function buildModelPicker(flow) {
 
 function keyRequest(flow) {
   return { provider: flow.provider, secret: flow.secret.trim(), allow_unverified: flow.allow_unverified === true,
-    ...(flow.provider === "langdock" ? { region: flow.region } : {}),
+    ...(KEY_PROVIDERS[flow.provider]?.regional ? { region: flow.region } : {}),
     ...(flow.provider === "openai_compatible" ? { base_url: flow.base_url.trim() } : {}) };
 }
 
@@ -799,10 +800,11 @@ function buildAddKey(state, flow) {
     body = `<section class="set-sec"><span class="set-label">who's bringing a key?</span><div class="set-card">${Object.entries(KEY_PROVIDERS).map(([id, p]) =>
       `<button class="add-prov" data-action="key-provider" data-provider="${id}"><span class="add-chip"><span class="add-chip-dot"></span></span>
       <span class="add-prov-tx"><span class="add-prov-name">${p.name}</span><span class="add-prov-sub">${p.harness === "claude" ? "claude code · messages" : "codex cli · responses"}${p.unverified ? " · unproven" : ""}</span></span><span class="add-chev">›</span></button>`).join("")}</div>
+      <div class="add-foot">the same langdock key works for both routes: openai models through codex, claude models through claude code.</div>
       <div class="add-foot">openrouter offers live model prices across providers. direct openai, anthropic and langdock catalogs don't publish prices.</div></section>`;
   } else if (flow.step === "details") {
     body = `<div class="add-provcard"><span class="add-prov-tx"><span class="add-provcard-t">new ${esc(provider.name)} key seat</span><span class="add-provcard-s">${provider.harness === "claude" ? "claude code" : "codex cli"} sessions</span></span><button class="add-change" data-action="key-back">change</button></div>
-      ${flow.provider === "langdock" ? `<section class="set-sec"><label class="set-label" for="key-region">region</label><div class="set-card"><select class="add-input" id="key-region">${["eu", "us", "global"].map((r) => `<option value="${r}"${flow.region === r ? " selected" : ""}>${r}</option>`).join("")}</select></div></section>` : ""}
+      ${provider.regional ? `<section class="set-sec"><label class="set-label" for="key-region">region</label><div class="set-card"><select class="add-input" id="key-region">${["eu", "us", "global"].map((r) => `<option value="${r}"${flow.region === r ? " selected" : ""}>${r}</option>`).join("")}</select></div></section>` : ""}
       ${flow.provider === "openai_compatible" ? `<section class="set-sec"><label class="set-label" for="key-base-url">your endpoint's base url</label><div class="set-card"><input class="add-input" id="key-base-url" type="url" placeholder="https://your-host/v1" value="${esc(flow.base_url)}"></div><div class="add-hint">must support responses; chat completions alone won't work.</div></section>` : ""}
       <section class="set-sec"><label class="set-label" for="key-label">name this seat</label><div class="set-card"><input class="add-input" id="key-label" placeholder="work · late-night" value="${esc(flow.label)}"></div></section>
       <section class="set-sec"><label class="set-label" for="key-secret">paste your api key</label><div class="set-card"><input class="add-input mono" id="key-secret" type="password" autocomplete="off" spellcheck="false" value="${esc(flow.secret)}"></div><div class="add-hint">sent only to the provider you chose; saved in your Mac's keychain.</div></section>

@@ -193,7 +193,9 @@ def key_action(ctx: Context, message: dict) -> dict[str, Any]:
                           "fetched_at": iso(catalog.fetched_at) if catalog.fetched_at else None,
                           "potentially_stale": catalog.potentially_stale}
                 if catalog.error:
-                    result["error"] = "couldn't refresh the provider's model catalog"
+                    result["error"] = ("no models returned; check this key and endpoint"
+                                       if catalog.error == "no_models" else
+                                       "couldn't refresh the provider's model catalog")
         elif action == "key_terminal":
             seat = keyseats_mod.get(ctx, _key_text(message, "id"))
             if seat is None:

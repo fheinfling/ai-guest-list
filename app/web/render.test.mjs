@@ -712,6 +712,47 @@ test("reduceReply: a tool-less add-op error falls back to the current flow", () 
 
 // Milestone 6: bridge-shaped key metadata/catalogs; all earlier tests above remain unchanged.
 import { buildAddKey, buildModelPicker, keySeatCard, keyConfirmations, keyRequest, reduceKeyReply, KEY_PROVIDERS, formatPrice } from "./render.mjs";
+
+test("Langdock routes visibly distinguish model families and harnesses, sharing one key", () => {
+  const html = buildAddKey({ settings: {} }, { step: "provider" });
+  const row = (id) => html.match(new RegExp(`<button[^>]*data-provider="${id}"[\\s\\S]*?</button>`))?.[0];
+  assert.match(row("langdock"), /langdock · openai models/);
+  assert.match(row("langdock"), /codex cli · responses/);
+  assert.match(row("langdock_anthropic"), /langdock · claude models/);
+  assert.match(row("langdock_anthropic"), /claude code · messages/);
+  assert.match(html, /same langdock key works for both routes/);
+  assert.equal(KEY_PROVIDERS.langdock.harness, "codex");
+  assert.equal(KEY_PROVIDERS.langdock_anthropic.harness, "claude");
+});
+
+test("both Langdock add-key routes retain eu, us and global in details and requests", () => {
+  for (const provider of ["langdock", "langdock_anthropic"]) {
+    for (const region of ["eu", "us", "global"]) {
+      const flow = { step: "details", provider, region, secret: " test-secret ", label: "work" };
+      const html = buildAddKey({ settings: {} }, flow);
+      assert.match(html, /id="key-region"/);
+      assert.ok(html.includes(`<option value="${region}" selected>`));
+      assert.deepEqual(keyRequest(flow), { provider, region, secret: "test-secret", allow_unverified: false });
+    }
+  }
+});
+
+test("Langdock Claude discovery carries its route and region through the shipped bundle", () => {
+  const app = keyApp();
+  app.click({ action: "key-start" });
+  app.click({ action: "key-provider", provider: "langdock_anthropic" });
+  app.input("key-label", "Claude work"); app.input("key-secret", "test-secret");
+  app.handlers.change({ target: { id: "key-region", value: "global", closest: () => null } });
+  app.click({ action: "key-discover" });
+  const request = app.sent.at(-1);
+  assert.equal(request.action, "models_list");
+  assert.equal(request.provider, "langdock_anthropic");
+  assert.equal(request.region, "global");
+  app.window.AGL.result({ key_action: "models_list", key_request_id: request.key_request_id,
+    ok: false, models: [], error: "no models returned; check this key and endpoint" });
+  assert.match(app.root.innerHTML, /no models returned/);
+  assert.match(app.root.innerHTML, /claude code sessions/);
+});
 import { runInNewContext } from "node:vm";
 
 const keySeat = (over = {}) => ({ id: "key-1", label: "late-night", provider: "openrouter",

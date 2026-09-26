@@ -35,7 +35,7 @@ class Provider:
 
     def headers(self, key: str) -> dict[str, str]:
         headers = {self.auth_header: self.auth_prefix + key}
-        if self.id == "anthropic":
+        if self.wire_api == "messages":
             headers["anthropic-version"] = "2023-06-01"
         return headers
 
@@ -57,6 +57,13 @@ PROVIDERS = {
                   catalog_public=True),
         _provider("langdock", "Langdock EU", "https://api.langdock.com/openai/eu/v1",
                   "responses", "verified", region="eu"),
+        # The Anthropic route's /v1/models endpoint and data-list schema are UNVERIFIED
+        # against Langdock's docs/live API; only the OpenAI route was verified live.
+        _provider("langdock_anthropic", "Langdock Claude EU",
+                  "https://api.langdock.com/anthropic/eu", "messages", "unsupported",
+                  auth_header="x-api-key", auth_prefix="", region="eu",
+                  models_endpoint="https://api.langdock.com/anthropic/eu/v1/models",
+                  validation_endpoint="https://api.langdock.com/anthropic/eu/v1/models"),
         _provider("deepseek", "DeepSeek", "https://api.deepseek.com", "responses", "verified",
                   validation_endpoint="https://api.deepseek.com/user/balance"),
         _provider("xai", "xAI", "https://api.x.ai/v1", "responses", "verified",
@@ -78,13 +85,20 @@ PROVIDERS = {
 def get_provider(id: str, *, region: str | None = None,
                  base_url: str | None = None) -> Provider:
     p = PROVIDERS[id]
-    if id == "langdock":
+    if id in ("langdock", "langdock_anthropic"):
         region = region or "eu"
         if region not in ("eu", "us", "global"):
             raise ValueError("Langdock region must be eu, us or global")
-        base = f"https://api.langdock.com/openai/{region}/v1"
-        return replace(p, base_url=base, region=region, display_name=f"Langdock {region.upper()}",
-                       models_endpoint=base + "/models", validation_endpoint=base + "/models")
+        if id == "langdock_anthropic":
+            base = f"https://api.langdock.com/anthropic/{region}"
+            models = base + "/v1/models"
+            name = f"Langdock Claude {region.upper()}"
+        else:
+            base = f"https://api.langdock.com/openai/{region}/v1"
+            models = base + "/models"
+            name = f"Langdock {region.upper()}"
+        return replace(p, base_url=base, region=region, display_name=name,
+                       models_endpoint=models, validation_endpoint=models)
     if id == "openai_compatible":
         parts = urlsplit(base_url or "")
         if (parts.scheme not in ("https", "http") or not parts.hostname or parts.username
