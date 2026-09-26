@@ -648,12 +648,9 @@ function priceHTML(price) {
 }
 
 function keySeatCard(seat) {
-  // 5b publishes metadata only. Do not infer spend from catalog rates, validation or elapsed time.
-  // Optional spend metadata can display a supplied total; absent totals stay explicitly unknown.
-  const spend = seat.spend;
-  const total = amount(spend?.amount);
-  const cost = total !== null && /^[A-Z]{3}$/.test(spend?.currency || "")
-    ? `${spend.currency} ${total} · running cost estimate` : "running cost estimate unavailable";
+  // No running cost is shown. A money figure needs a price, and only OpenRouter and xAI publish
+  // one for a provider that can actually be a key seat — so the card would read "unavailable" for
+  // OpenAI, Anthropic and Langdock, which is worse than not offering the number at all.
   const unproven = seat.responses_verified === false && seat.harness !== "claude";
   const validation = seat.last_validation;
   return `<div class="seat seat--key" data-card data-tool="${esc(seat.harness)}" data-email="key:${esc(seat.id)}">
@@ -661,8 +658,6 @@ function keySeatCard(seat) {
     <div class="key-detail">${esc(providerName(seat))} · ${seat.harness === "claude" ? "claude code" : "codex cli"}</div>
     <div class="key-model mono">${esc(seat.model)}</div>
     ${unproven ? `<div class="key-unproven">responses support unproven — this endpoint may not work</div>` : ""}
-    <div class="key-cost">${esc(cost)}</div>
-    ${total !== null && spend?.fetched_at ? `<div class="usage-age mono" data-usage-at="${esc(spend.fetched_at)}">${fmtUsageAge(spend.fetched_at)}</div>` : ""}
     ${validation?.operation_permitted === false ? `<div class="usage-error">key check wasn't permitted — inference access is still unproven</div>` : ""}
     <div class="expand"><div class="add-hint">paid per use · this app does not limit spend</div>
       <button class="btn switch" data-action="key-validate" data-id="${esc(seat.id)}">check key</button>

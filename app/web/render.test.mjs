@@ -726,13 +726,16 @@ const keyPrompt = (over = {}) => ({ id: "prompt-1", status: "pending", tool: "co
   expires_at: "2099-01-01T00:00:00Z", from_seat: { id: "work@x.com", label: "work" },
   key_seat: keySeat(), price: livePrice(), ...over });
 
-test("key seat card sits in its harness group, with model and cost instead of usage bars", () => {
+test("key seat card sits in its harness group, with model instead of usage bars", () => {
   const h = buildHTML(state({ keys: [keySeat()] }));
   assert.match(h, /seat--key/); assert.match(h, /late-night/); assert.match(h, /vendor\/model/);
-  assert.match(h, /openrouter · codex cli/); assert.match(h, /running cost estimate unavailable/);
+  assert.match(h, /openrouter · codex cli/);
   assert.doesNotMatch(h, /class="track"|\$0|USD 0/);
   assert.ok(h.indexOf("late-night") < h.indexOf('g-name">Claude'));
-  assert.match(keySeatCard(keySeat({ spend: { amount: "0.000012", currency: "USD" } })), /USD 0\.000012 · running cost estimate/);
+  // No running cost is shown at all: a money figure needs a price, and the providers most likely
+  // to be used as key seats publish none. Supplied spend metadata must not resurrect the display.
+  assert.doesNotMatch(keySeatCard(keySeat({ spend: { amount: "0.000012", currency: "USD" } })),
+    /0\.000012|running cost/);
 });
 
 test("unproven responses seats say so plainly; anthropic uses messages with claude", () => {
@@ -790,8 +793,7 @@ test("unknown amounts never become fabricated or bare zero prices in any key vie
     const price = livePrice(null, null);
     price.rates.input = price.rates.output = { status: "known", value };
     const catalog = { sort_key: "input_usd_per_million_tokens", models: [{ id: "model", price }] };
-    const views = [keySeatCard(keySeat({ spend: { amount: value, currency: "USD" } })),
-      buildModelPicker(keyFlow({ catalog })),
+    const views = [buildModelPicker(keyFlow({ catalog })),
       buildAddKey(state(), keyFlow({ step: "review", catalog, model: "model" })),
       keyConfirmations({ pending_key_switches: [keyPrompt({ price })] })];
     for (const h of views) {
