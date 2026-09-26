@@ -72,6 +72,8 @@ def build_parser() -> argparse.ArgumentParser:
     key_list = key_sub.add_parser("list", help="list key seats without revealing keys")
     key_remove = key_sub.add_parser("remove", help="remove a key seat")
     key_remove.add_argument("id", help="key seat id")
+    key_prove = key_sub.add_parser("prove", help="check Responses with one real request (costs money)")
+    key_prove.add_argument("id", help="key seat id")
     key_models = key_sub.add_parser("models", help="fetch models (secret from prompt or stdin)")
     key_models.add_argument("provider", help="billing provider id")
     for command in (key_add, key_models):
@@ -79,7 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--base-url", help="custom OpenAI-compatible base URL")
         command.add_argument("--allow-unverified", action="store_true",
                              help="acknowledge unverified Responses support")
-    for command in (key_add, key_list, key_remove, key_models):
+    for command in (key_add, key_list, key_remove, key_models, key_prove):
         command.add_argument("--json", action="store_true", help="machine-readable output")
 
     usage = sub.add_parser("usage", help="refresh/show live usage")
@@ -116,8 +118,9 @@ def _cmd_keys(ctx: Context, ns) -> int:
             result = {"ok": True, "keys": keyseats_mod.list(ctx)}
         else:
             message = {"action": {"add": "key_add", "remove": "key_remove",
+                                  "prove": "key_prove",
                                   "models": "models_list"}[ns.keys_command]}
-            if ns.keys_command == "remove":
+            if ns.keys_command in ("remove", "prove"):
                 message["id"] = ns.id
             else:
                 message.update(provider=ns.provider, region=ns.region, base_url=ns.base_url,
@@ -139,6 +142,8 @@ def _cmd_keys(ctx: Context, ns) -> int:
             print("· the validation check wasn't permitted; inference access is still unverified")
     elif ns.keys_command == "remove":
         print("✓ waved goodbye to that key seat")
+    elif ns.keys_command == "prove":
+        print("✓ proven — a Responses turn completed")
     elif ns.keys_command == "list":
         if not result["keys"]:
             print("(no key seats yet)")

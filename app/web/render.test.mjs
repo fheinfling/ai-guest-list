@@ -745,6 +745,48 @@ test("unproven responses seats say so plainly; anthropic uses messages with clau
   assert.match(h, /anthropic · claude code/); assert.doesNotMatch(h, /responses support unproven/);
 });
 
+test("endpoint proof renders four distinct outcomes and success removes the warning", () => {
+  const cases = [
+    ["proven", null, /proven — a Responses turn completed/],
+    ["incompatible", "request_rejected", /does not support Responses; this seat will not work/],
+    ["refused", "invalid_key", /refused.*authentication.*Responses support is undetermined/],
+    ["inconclusive", "timeout", /inconclusive.*timed out.*Responses support is undetermined/],
+  ];
+  for (const [outcome, error, expected] of cases) {
+    const h = keySeatCard(keySeat({ responses_verified: outcome === "proven", last_proof: {
+      outcome, error, model: "checked-model", checked_at: "2026-09-26T12:00:00Z",
+    } }));
+    assert.match(h, expected);
+    assert.match(h, /checked-model/); assert.match(h, /2026-09-26/);
+    if (outcome === "proven") assert.doesNotMatch(h, /key-unproven|may not work|data-action="key-prove"/);
+    else {
+      assert.match(h, /data-action="key-prove"/);
+      assert.match(h, /check this endpoint/);
+      assert.match(h, /one real request and costs a small amount of money/);
+    }
+    if (outcome === "refused" || outcome === "inconclusive") assert.doesNotMatch(h, /does not support|will not work/);
+  }
+  // A fresh negative verdict beats an old registry-derived positive flag.
+  const negative = keySeatCard(keySeat({ last_proof: { outcome: "incompatible" } }));
+  assert.match(negative, /will not work/); assert.match(negative, /data-action="key-prove"/);
+  const proven = keySeatCard(keySeat({ last_validation: { operation_permitted: false },
+    last_proof: { outcome: "proven" } }));
+  assert.doesNotMatch(proven, /unproven/);
+});
+
+test("proof rendering uses fixed refusal copy and escapes stored metadata", () => {
+  for (const [error, reason] of [["insufficient_quota", "quota"], ["rate_limited", "rate limit"],
+                                 ["<script>secret</script>", "access or billing"]]) {
+    const h = keySeatCard(keySeat({ responses_verified: false, last_proof: {
+      outcome: "refused", error, model: "<img>", checked_at: "<script>",
+    } }));
+    assert.ok(h.includes(`(${reason})`));
+    assert.doesNotMatch(h, /<img>|<script>|secret/);
+    assert.match(h, /&lt;img&gt;/);
+  }
+  assert.doesNotMatch(keySeatCard(keySeat({ harness: "claude", responses_verified: false })), /key-prove/);
+});
+
 test("priced picker orders by named input $/Mtok, retains both rates and cached age", () => {
   const models = [
     { id: "a-expensive", price: livePrice("9", "2") },
@@ -858,6 +900,23 @@ function keyApp() {
   const input = (id, value) => handlers.input({ target: { id, value } });
   return { window, root, sent, click, input, handlers };
 }
+
+test("endpoint proof is click-only and duplicate clicks remain blocked across polls", () => {
+  const app = keyApp();
+  const snapshot = { rev: 1, settings: {}, tools: {}, keys: [keySeat({ responses_verified: false })] };
+  app.window.AGL.result({ state: snapshot });
+  assert.equal(app.sent.filter((m) => m.action === "key_prove").length, 0);
+  app.click({ action: "key-prove", id: "key-1" });
+  app.click({ action: "key-prove", id: "key-1" });
+  app.window.AGL.result({ state: { ...snapshot, rev: 2 } });
+  app.click({ action: "key-prove", id: "key-1" });
+  const calls = app.sent.filter((m) => m.action === "key_prove");
+  assert.equal(calls.length, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(calls[0])), { action: "key_prove", id: "key-1" });
+  app.window.AGL.result({ key_action: "key_prove", key_target_id: "key-1", ok: true,
+    state: { ...snapshot, rev: 3, keys: [keySeat({ last_proof: { outcome: "proven", model: "model" } })] } });
+  assert.doesNotMatch(app.root.innerHTML, /responses support unproven|data-action="key-prove"/);
+});
 
 test("key glue calls models_list then key_add, preserves inputs across polls and answers both ways", () => {
   const app = keyApp();

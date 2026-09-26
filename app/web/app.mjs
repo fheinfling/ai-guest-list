@@ -33,11 +33,12 @@ window.AGL = {
     screen = out.screen; add = out.add; lastRev = out.lastRev; state = out.state;
     const keyChanged = reduceKeyReply(keyFlow, res);
     if (res.key_action === "answer_key_switch") answering.delete(res.key_target_id);
+    if (res.key_action === "key_prove") proving.delete(res.key_target_id);
     if (keyChanged || (out.render && !inKeyFlow)) render();
     else refreshKeyPrompts(); // surface consent without replacing inputs or stealing focus
     if (out.flash && !res.key_request_id) flash(out.flash);
     if (res.key_action === "key_validate" && res.ok) flash(res.validation?.operation_permitted
-      ? "key check passed — inference access is still unproven" : "key check wasn't permitted — check access with your provider");
+      ? "key check passed — this checks account access only" : "key check wasn't permitted — check access with your provider");
     if (out.celebrate) celebrate();
     if (out.closeFlow) setTimeout(() => {      // auto-close this flow's "done" screen; scoped by
       if (screen === "add" && add === out.closeFlow && add.step === "done") {   // object identity so
@@ -73,6 +74,7 @@ let add = null;
 let keyFlow = null;
 let keySequence = 0;
 const answering = new Set();
+const proving = new Set();
 let clockTimer = null;
 
 function setPopoverVisible(visible) {
@@ -107,6 +109,11 @@ function render() {
     root.querySelector(".set-head")?.insertAdjacentHTML("afterend", keyConfirmations(state, answering));
   }
   refreshKeyPrompts();
+  for (const button of root.querySelectorAll('[data-action="key-prove"]')) {
+    if (proving.has(button.dataset.id)) {
+      button.disabled = true; button.textContent = "checking endpoint…";
+    }
+  }
   renderedScreen = screen;
   if (scrollTop) {
     const nextBody = root.querySelector(".main-body, .set-body");
@@ -205,6 +212,12 @@ document.addEventListener("click", (e) => {
       answering.add(el.dataset.id); refreshKeyPrompts();
       send("answer_key_switch", { id: el.dataset.id, approved: el.dataset.approved === "true" }); break;
     case "key-validate": send("key_validate", { id: el.dataset.id }); break;
+    case "key-prove":
+      if (!proving.has(el.dataset.id)) {
+        proving.add(el.dataset.id); render();
+        send("key_prove", { id: el.dataset.id });
+      }
+      break;
     case "key-remove":
       el.textContent = "remove this key from the list?"; el.dataset.action = "key-remove-confirm"; break;
     case "key-remove-confirm": send("key_remove", { id: el.dataset.id }); break;

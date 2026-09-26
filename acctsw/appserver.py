@@ -11,10 +11,12 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 from queue import Empty, Queue
+import signal
 import subprocess
-from threading import Thread
+from threading import Thread, Timer
 from time import monotonic
 from typing import Any, Callable, Protocol, TextIO
 
@@ -43,6 +45,15 @@ MAX_PLAIN_EVENTS = 512
 
 def _spawn(argv: list[str], **kwargs: Any) -> Child:
     return subprocess.Popen(argv, **kwargs)
+
+
+def _kill_group(pid: int) -> None:
+    # start_new_session makes pid the group id. Do not look it up via getpgid: the leader
+    # may already have exited while a descendant still holds stdout open.
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
 
 
 def classify_codex_error(provider: Provider, info: Any) -> str:
@@ -132,12 +143,17 @@ class AppServer:
     handle_request returns the server request's result, or raises RpcError with an error object.
     Without a handler, requests receive method-not-found; approvals are never silently accepted.
     The future launcher owns the key seat's env/CODEX_HOME; this client does not construct homes.
+    lifetime opts into a hard watchdog and unconditional group cleanup for short-lived probes;
+    its kill_group callback only signals, leaving child.wait to reap the process during close.
     """
 
     def __init__(self, ctx: Context, provider: Provider, *, spawn: Spawn = _spawn,
                  terminate: Callable[[int], int] = _terminate,
                  handle_request: RequestHandler | None = None, env: dict[str, str] | None = None,
-                 cwd: Path | None = None, timeout: float = 30):
+                 cwd: Path | None = None, timeout: float = 30,
+                 lifetime: float | None = None,
+                 kill_group: Callable[[int], None] = _kill_group,
+                 config_overrides: dict[str, Any] | None = None):
         self.provider = provider
         self.timeout = timeout
         self._terminate = terminate
@@ -152,12 +168,32 @@ class AppServer:
         self._closed = False
         self._ended = False
         self._initialized = False
-        self.child = spawn([ctx.codex_bin or "codex", "app-server"], stdin=subprocess.PIPE,
+        self.expired = False
+        self._kill_group = kill_group
+        self._watchdog = None
+        argv = [ctx.codex_bin or "codex", "app-server"]
+        for key, value in (config_overrides or {}).items():
+            argv += ["-c", key + "=" + json.dumps(value, ensure_ascii=False)]
+        self.child = spawn(argv, stdin=subprocess.PIPE,
                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
                            encoding="utf-8", bufsize=1, start_new_session=True, env=env, cwd=cwd)
         # Stderr is not part of JSON-RPC, and an unread stderr pipe could stall the child.
         self._reader = Thread(target=self._read, name="acctsw-appserver", daemon=True)
-        self._reader.start()
+        try:
+            self._reader.start()
+            if lifetime is not None:
+                # Unlike a per-response timeout this also bounds chatter and a blocked write.
+                self._watchdog = Timer(lifetime, self._expire)
+                self._watchdog.daemon = True
+                self._watchdog.start()
+        except BaseException:
+            self._kill_group(self.child.pid)
+            self.child.wait(timeout=2)
+            raise
+
+    def _expire(self) -> None:
+        self.expired = True
+        self._kill_group(self.child.pid)
 
     def _read(self) -> None:
         try:
@@ -187,6 +223,8 @@ class AppServer:
         return id
 
     def _pump(self, deadline: float) -> None:
+        if self.expired:
+            raise TimeoutError("App-server lifetime expired")
         if self._closed or self._ended:
             raise EOFError("App-server stream closed")
         remaining = deadline - monotonic()
@@ -198,6 +236,8 @@ class AppServer:
             raise TimeoutError("App-server response timed out") from None
         if line is None:
             self._ended = True
+            if self.expired:
+                raise TimeoutError("App-server lifetime expired")
             raise EOFError("App-server stream closed")
         try:
             message = json.loads(line)
@@ -323,6 +363,12 @@ class AppServer:
         if self._closed:
             return
         self._closed = True
+        if self._watchdog is not None:
+            # Probes own the entire group, even after a successful turn or a leader's exit.
+            # Kill before closing buffered pipes: a blocked writer can hold their lock.
+            self._watchdog.cancel()
+            self._watchdog.join()
+            self._kill_group(self.child.pid)
         try:
             self.child.stdin.close()
         except (OSError, ValueError):
@@ -330,6 +376,11 @@ class AppServer:
         try:
             self.child.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
+            if self._watchdog is not None:
+                # No unbounded launcher wait in the hard-deadline path.
+                self._kill_group(self.child.pid)
+                self.child.wait(timeout=timeout)
+                return
             # launcher._terminate already signals the group and reaps with waitpid. Inform
             # Popen of the result so it doesn't try to reap the same child a second time.
             self.child.returncode = self._terminate(self.child.pid)

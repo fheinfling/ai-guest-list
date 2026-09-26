@@ -647,19 +647,37 @@ function priceHTML(price) {
   return `<div class="key-price mono">${esc(text)}</div>${text === "price unavailable" ? "" : `<div class="add-hint">${esc(priceAge(price))}</div>`}`;
 }
 
+function keyProofStatus(seat) {
+  if (seat.harness === "claude") return "";
+  const proof = seat.last_proof;
+  let text = "";
+  if (proof?.outcome === "proven") text = "proven — a Responses turn completed";
+  else if (proof?.outcome === "incompatible") text = "incompatible — this endpoint does not support Responses; this seat will not work";
+  else if (proof?.outcome === "refused") {
+    const reason = { invalid_key: "authentication", insufficient_quota: "quota", rate_limited: "rate limit" }[proof.error] || "access or billing";
+    text = `refused — provider rejected the request (${reason}); Responses support is undetermined`;
+  } else if (proof?.outcome === "inconclusive") {
+    text = `inconclusive — ${proof.error === "timeout" ? "check timed out" : "no completed turn or definitive provider reply"}; Responses support is undetermined`;
+  }
+  return `${text ? `<div class="key-proof" role="status">${text}</div><div class="add-hint">checked ${esc(proof.checked_at)} · ${esc(proof.model)}</div>` : ""}
+    ${seat.responses_verified === false && proof?.outcome !== "incompatible" && proof?.outcome !== "proven" ? `<div class="key-unproven">responses support unproven — this endpoint may not work</div>` : ""}`;
+}
+
 function keySeatCard(seat) {
   // No running cost is shown. A money figure needs a price, and only OpenRouter and xAI publish
   // one for a provider that can actually be a key seat — so the card would read "unavailable" for
   // OpenAI, Anthropic and Langdock, which is worse than not offering the number at all.
-  const unproven = seat.responses_verified === false && seat.harness !== "claude";
+  const unproven = (seat.responses_verified === false || seat.last_proof?.outcome === "incompatible") && seat.harness !== "claude";
   const validation = seat.last_validation;
   return `<div class="seat seat--key" data-card data-tool="${esc(seat.harness)}" data-email="key:${esc(seat.id)}">
     <div class="seat-row"><span class="dot dot--accent"></span><span class="seat-name">${esc(seat.label)}</span><span class="mono chip">api key</span></div>
     <div class="key-detail">${esc(providerName(seat))} · ${seat.harness === "claude" ? "claude code" : "codex cli"}</div>
     <div class="key-model mono">${esc(seat.model)}</div>
-    ${unproven ? `<div class="key-unproven">responses support unproven — this endpoint may not work</div>` : ""}
-    ${validation?.operation_permitted === false ? `<div class="usage-error">key check wasn't permitted — inference access is still unproven</div>` : ""}
+    ${keyProofStatus(seat)}
+    ${validation?.operation_permitted === false ? `<div class="usage-error">key check wasn't permitted${seat.responses_verified ? "" : " — inference access is still unproven"}</div>` : ""}
     <div class="expand"><div class="add-hint">paid per use · this app does not limit spend</div>
+      ${unproven ? `<div class="add-hint">checking this endpoint sends one real request and costs a small amount of money.</div>
+      <button class="btn switch" data-action="key-prove" data-id="${esc(seat.id)}">check this endpoint</button>` : ""}
       <button class="btn switch" data-action="key-validate" data-id="${esc(seat.id)}">check key</button>
       <button class="logout" data-action="key-remove" data-id="${esc(seat.id)}">remove key ↗</button>
     </div></div>`;
@@ -674,7 +692,7 @@ function keyConfirmations(state, answering = new Set(), now = Date.now()) {
       <div class="add-method"><span class="set-t">a paid key is waiting for your okay</span>
         <div class="add-hint">leave ${esc(r.from_seat?.label || r.from_seat?.id || "the current seat")} → use ${esc(r.key_seat?.label)} (${esc(providerName(r.key_seat || {}))})</div>
         <div class="key-model mono">${esc(r.key_seat?.model)}</div>
-        ${seat?.responses_verified === false && seat.harness !== "claude" ? `<div class="key-unproven">responses support unproven — this endpoint may not work</div>` : ""}
+        ${seat ? keyProofStatus(seat) : ""}
         ${priceHTML(r.price)}
         <div class="add-hint">approve to continue this ${esc(r.tool)} session using your paid key. requests can spend real money; this app does not cap spend.</div>
         <div class="key-decisions">
@@ -805,11 +823,12 @@ window.AGL = {
     screen = out.screen; add = out.add; lastRev = out.lastRev; state = out.state;
     const keyChanged = reduceKeyReply(keyFlow, res);
     if (res.key_action === "answer_key_switch") answering.delete(res.key_target_id);
+    if (res.key_action === "key_prove") proving.delete(res.key_target_id);
     if (keyChanged || (out.render && !inKeyFlow)) render();
     else refreshKeyPrompts(); // surface consent without replacing inputs or stealing focus
     if (out.flash && !res.key_request_id) flash(out.flash);
     if (res.key_action === "key_validate" && res.ok) flash(res.validation?.operation_permitted
-      ? "key check passed — inference access is still unproven" : "key check wasn't permitted — check access with your provider");
+      ? "key check passed — this checks account access only" : "key check wasn't permitted — check access with your provider");
     if (out.celebrate) celebrate();
     if (out.closeFlow) setTimeout(() => {      // auto-close this flow's "done" screen; scoped by
       if (screen === "add" && add === out.closeFlow && add.step === "done") {   // object identity so
@@ -845,6 +864,7 @@ let add = null;
 let keyFlow = null;
 let keySequence = 0;
 const answering = new Set();
+const proving = new Set();
 let clockTimer = null;
 
 function setPopoverVisible(visible) {
@@ -879,6 +899,11 @@ function render() {
     root.querySelector(".set-head")?.insertAdjacentHTML("afterend", keyConfirmations(state, answering));
   }
   refreshKeyPrompts();
+  for (const button of root.querySelectorAll('[data-action="key-prove"]')) {
+    if (proving.has(button.dataset.id)) {
+      button.disabled = true; button.textContent = "checking endpoint…";
+    }
+  }
   renderedScreen = screen;
   if (scrollTop) {
     const nextBody = root.querySelector(".main-body, .set-body");
@@ -977,6 +1002,12 @@ document.addEventListener("click", (e) => {
       answering.add(el.dataset.id); refreshKeyPrompts();
       send("answer_key_switch", { id: el.dataset.id, approved: el.dataset.approved === "true" }); break;
     case "key-validate": send("key_validate", { id: el.dataset.id }); break;
+    case "key-prove":
+      if (!proving.has(el.dataset.id)) {
+        proving.add(el.dataset.id); render();
+        send("key_prove", { id: el.dataset.id });
+      }
+      break;
     case "key-remove":
       el.textContent = "remove this key from the list?"; el.dataset.action = "key-remove-confirm"; break;
     case "key-remove-confirm": send("key_remove", { id: el.dataset.id }); break;

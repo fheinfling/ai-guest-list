@@ -644,19 +644,37 @@ function priceHTML(price) {
   return `<div class="key-price mono">${esc(text)}</div>${text === "price unavailable" ? "" : `<div class="add-hint">${esc(priceAge(price))}</div>`}`;
 }
 
+export function keyProofStatus(seat) {
+  if (seat.harness === "claude") return "";
+  const proof = seat.last_proof;
+  let text = "";
+  if (proof?.outcome === "proven") text = "proven — a Responses turn completed";
+  else if (proof?.outcome === "incompatible") text = "incompatible — this endpoint does not support Responses; this seat will not work";
+  else if (proof?.outcome === "refused") {
+    const reason = { invalid_key: "authentication", insufficient_quota: "quota", rate_limited: "rate limit" }[proof.error] || "access or billing";
+    text = `refused — provider rejected the request (${reason}); Responses support is undetermined`;
+  } else if (proof?.outcome === "inconclusive") {
+    text = `inconclusive — ${proof.error === "timeout" ? "check timed out" : "no completed turn or definitive provider reply"}; Responses support is undetermined`;
+  }
+  return `${text ? `<div class="key-proof" role="status">${text}</div><div class="add-hint">checked ${esc(proof.checked_at)} · ${esc(proof.model)}</div>` : ""}
+    ${seat.responses_verified === false && proof?.outcome !== "incompatible" && proof?.outcome !== "proven" ? `<div class="key-unproven">responses support unproven — this endpoint may not work</div>` : ""}`;
+}
+
 export function keySeatCard(seat) {
   // No running cost is shown. A money figure needs a price, and only OpenRouter and xAI publish
   // one for a provider that can actually be a key seat — so the card would read "unavailable" for
   // OpenAI, Anthropic and Langdock, which is worse than not offering the number at all.
-  const unproven = seat.responses_verified === false && seat.harness !== "claude";
+  const unproven = (seat.responses_verified === false || seat.last_proof?.outcome === "incompatible") && seat.harness !== "claude";
   const validation = seat.last_validation;
   return `<div class="seat seat--key" data-card data-tool="${esc(seat.harness)}" data-email="key:${esc(seat.id)}">
     <div class="seat-row"><span class="dot dot--accent"></span><span class="seat-name">${esc(seat.label)}</span><span class="mono chip">api key</span></div>
     <div class="key-detail">${esc(providerName(seat))} · ${seat.harness === "claude" ? "claude code" : "codex cli"}</div>
     <div class="key-model mono">${esc(seat.model)}</div>
-    ${unproven ? `<div class="key-unproven">responses support unproven — this endpoint may not work</div>` : ""}
-    ${validation?.operation_permitted === false ? `<div class="usage-error">key check wasn't permitted — inference access is still unproven</div>` : ""}
+    ${keyProofStatus(seat)}
+    ${validation?.operation_permitted === false ? `<div class="usage-error">key check wasn't permitted${seat.responses_verified ? "" : " — inference access is still unproven"}</div>` : ""}
     <div class="expand"><div class="add-hint">paid per use · this app does not limit spend</div>
+      ${unproven ? `<div class="add-hint">checking this endpoint sends one real request and costs a small amount of money.</div>
+      <button class="btn switch" data-action="key-prove" data-id="${esc(seat.id)}">check this endpoint</button>` : ""}
       <button class="btn switch" data-action="key-validate" data-id="${esc(seat.id)}">check key</button>
       <button class="logout" data-action="key-remove" data-id="${esc(seat.id)}">remove key ↗</button>
     </div></div>`;
@@ -671,7 +689,7 @@ export function keyConfirmations(state, answering = new Set(), now = Date.now())
       <div class="add-method"><span class="set-t">a paid key is waiting for your okay</span>
         <div class="add-hint">leave ${esc(r.from_seat?.label || r.from_seat?.id || "the current seat")} → use ${esc(r.key_seat?.label)} (${esc(providerName(r.key_seat || {}))})</div>
         <div class="key-model mono">${esc(r.key_seat?.model)}</div>
-        ${seat?.responses_verified === false && seat.harness !== "claude" ? `<div class="key-unproven">responses support unproven — this endpoint may not work</div>` : ""}
+        ${seat ? keyProofStatus(seat) : ""}
         ${priceHTML(r.price)}
         <div class="add-hint">approve to continue this ${esc(r.tool)} session using your paid key. requests can spend real money; this app does not cap spend.</div>
         <div class="key-decisions">

@@ -15,6 +15,7 @@ from . import identity as identity_mod
 from . import install as install_mod
 from . import handoff as handoff_mod
 from . import keyseats as keyseats_mod
+from . import keyprove as keyprove_mod
 from . import paths as P
 from . import pricing as pricing_mod
 from . import providers as providers_mod
@@ -34,7 +35,7 @@ TOGGLE_KEYS = {
     "confirm_key_switch", "key_fallback",
 }
 
-KEY_ACTIONS = {"key_add", "key_remove", "key_validate", "models_list", "answer_key_switch"}
+KEY_ACTIONS = {"key_add", "key_remove", "key_validate", "key_prove", "models_list", "answer_key_switch"}
 
 # Actions handled entirely by the native shell (app quit / run the chosen login in Terminal).
 # Everything else goes through the bridge; the shell then acts on result fields (login/command).
@@ -182,6 +183,11 @@ def key_action(ctx: Context, message: dict) -> dict[str, Any]:
                     result["error"] = "couldn't refresh the provider's model catalog"
         elif action == "key_remove":
             result = {"ok": True, "removed": keyseats_mod.remove(ctx, _key_text(message, "id"))}
+        elif action == "key_prove":
+            proof = keyprove_mod.prove(ctx, _key_text(message, "id"))
+            result = {"ok": proof["outcome"] == "proven", "proof": proof}
+            if not result["ok"]:
+                result["error"] = keyprove_mod.describe(proof)
         elif action == "key_validate":
             id = _key_text(message, "id")
             with ctx.locked():
