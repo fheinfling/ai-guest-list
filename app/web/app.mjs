@@ -1,6 +1,6 @@
 // Live glue: render state into the DOM and forward user actions to the Python bridge.
 // All rendering logic lives in render.mjs (pure, unit-tested); this file is the thin wiring.
-import { buildHTML, buildSettings, buildAddSeat, addUsesPaste, reduceReply, updateClockText } from "./render.mjs";
+import { buildHTML, buildSettings, buildAddSeat, addUsesPaste, reduceReply, updateClockText, buildAddKey, KEY_PROVIDERS, keyRequest, reduceKeyReply, keyConfirmations } from "./render.mjs";
 
 const root = document.getElementById("root");
 const overlay = document.createElement("div");   // toast surface only (siblings of #root)
@@ -15,7 +15,7 @@ function send(action, payload = {}) {
   try {
     window.webkit.messageHandlers.agl.postMessage(msg);
   } catch (_e) {
-    console.log("[agl] (no bridge)", msg);
+    console.log("[agl] (no bridge)", action); // never log a pasted key or auth blob
   }
 }
 
@@ -28,9 +28,16 @@ window.AGL = {
     // so a pure state push (the 180s poll) updates `state` but the reducer returns render=false —
     // no DOM swap, no focus/caret theft.
     const out = reduceReply({ screen, add, lastRev, state }, res);
+    const inKeyFlow = screen === "add-key";
+    if (inKeyFlow) out.screen = screen; // native settings requests must not discard a pasted key
     screen = out.screen; add = out.add; lastRev = out.lastRev; state = out.state;
-    if (out.render) render();
-    if (out.flash) flash(out.flash);
+    const keyChanged = reduceKeyReply(keyFlow, res);
+    if (res.key_action === "answer_key_switch") answering.delete(res.key_target_id);
+    if (keyChanged || (out.render && !inKeyFlow)) render();
+    else refreshKeyPrompts(); // surface consent without replacing inputs or stealing focus
+    if (out.flash && !res.key_request_id) flash(out.flash);
+    if (res.key_action === "key_validate" && res.ok) flash(res.validation?.operation_permitted
+      ? "key check passed — inference access is still unproven" : "key check wasn't permitted — check access with your provider");
     if (out.celebrate) celebrate();
     if (out.closeFlow) setTimeout(() => {      // auto-close this flow's "done" screen; scoped by
       if (screen === "add" && add === out.closeFlow && add.step === "done") {   // object identity so
@@ -51,7 +58,8 @@ function celebrate() {
   setTimeout(() => root.firstElementChild?.classList.remove("celebrate"), 600);
 }
 function flash(text) {
-  overlay.innerHTML = `<div class="toast">${text}</div>`;
+  overlay.innerHTML = '<div class="toast"></div>';
+  overlay.firstElementChild.textContent = text;
   setTimeout(() => { if (overlay.querySelector(".toast")) overlay.innerHTML = ""; }, 3000);
 }
 
@@ -62,6 +70,9 @@ let renderedScreen = null;  // what the last render() actually drew — gates sc
 // transient add-a-seat flow state; non-null only while screen === "add". Held here (not in `state`,
 // which the poll overwrites) so typed name/token survive a background re-render.
 let add = null;
+let keyFlow = null;
+let keySequence = 0;
+const answering = new Set();
 let clockTimer = null;
 
 function setPopoverVisible(visible) {
@@ -69,6 +80,8 @@ function setPopoverVisible(visible) {
     clockTimer = setInterval(() => {
       // Tick text without rebuilding the DOM or disturbing keyboard focus.
       if (screen === "main") updateClockText(root);
+      // Expired consent is never left looking actionable, even without a state revision.
+      refreshKeyPrompts();
     }, 1000);
   } else if (!visible && clockTimer !== null) {
     clearInterval(clockTimer);
@@ -88,7 +101,12 @@ function render() {
     : [];
   root.innerHTML = screen === "settings" ? buildSettings(state)
     : screen === "add" ? buildAddSeat(state, add)
+    : screen === "add-key" ? buildAddKey(state, keyFlow)
     : buildHTML(state);
+  if (!root.querySelector(".key-prompts")) {
+    root.querySelector(".set-head")?.insertAdjacentHTML("afterend", keyConfirmations(state, answering));
+  }
+  refreshKeyPrompts();
   renderedScreen = screen;
   if (scrollTop) {
     const nextBody = root.querySelector(".main-body, .set-body");
@@ -106,6 +124,38 @@ function render() {
   document.body.className = "theme-" + theme;
 }
 
+function refreshKeyPrompts() {
+  const prompts = root.querySelector(".key-prompts");
+  if (!prompts) return;
+  const pending = (state.pending_key_switches || []).filter((r) => r.status === "pending" && Date.parse(r.expires_at) > Date.now());
+  const signature = JSON.stringify([pending, [...answering]]);
+  // Time passing must not rebuild focused approval buttons just to update a price's age.
+  if (prompts.dataset.signature !== signature) {
+    const temp = document.createElement("div");
+    temp.innerHTML = keyConfirmations(state, answering);
+    prompts.innerHTML = temp.firstElementChild.innerHTML;
+    prompts.dataset.signature = signature;
+  }
+}
+
+function keyBack() {
+  if (keyFlow?.pending) return;
+  if (keyFlow.step === "review") keyFlow.step = "models";
+  else if (keyFlow.step === "models") keyFlow.step = "details";
+  else if (keyFlow.step === "details") { keyFlow.step = "provider"; keyFlow.secret = ""; }
+  else { keyFlow = null; screen = "main"; }
+  if (keyFlow) keyFlow.error = null;
+  render();
+}
+
+function sendKeyFlow(action, extra = {}) {
+  const payload = keyRequest(keyFlow);
+  keyFlow.pending = `key-${++keySequence}`;
+  keyFlow.operation = action; keyFlow.step = "connecting"; keyFlow.error = null;
+  send(action, { ...payload, ...extra, key_request_id: keyFlow.pending });
+  render();
+}
+
 // --- event delegation (whole document, so overlay buttons work too) ---------------------------
 document.addEventListener("click", (e) => {
   const el = e.target.closest("[data-action]");
@@ -116,7 +166,50 @@ document.addEventListener("click", (e) => {
     return;
   }
   const { action, tool, email, value } = el.dataset;
+  if (el.disabled) return;
   switch (action) {
+    case "key-start":
+      add = null;
+      keyFlow = { step: "provider", label: "", secret: "", region: "eu", base_url: "", allow_unverified: false };
+      screen = "add-key"; render(); break;
+    case "key-provider":
+      keyFlow = { step: "details", provider: el.dataset.provider, label: "", secret: "", region: "eu", base_url: "", allow_unverified: false };
+      render(); break;
+    case "key-back": keyBack(); break;
+    case "key-cancel":
+      if (!keyFlow.pending) { keyFlow = null; screen = "main"; render(); }
+      break;
+    case "key-discover": {
+      if (!keyFlow.label.trim() || keyFlow.secret.trim().length <= 4) {
+        keyFlow.error = "give this seat a name and paste your api key"; render(); break;
+      }
+      if (KEY_PROVIDERS[keyFlow.provider].unverified && !keyFlow.allow_unverified) {
+        keyFlow.error = "please choose whether you're happy to try an endpoint we cannot promise works"; render(); break;
+      }
+      if (keyFlow.provider === "openai_compatible") {
+        try {
+          const url = new URL(keyFlow.base_url.trim());
+          if (!["https:", "http:"].includes(url.protocol) || !url.hostname || url.username || url.password || url.search || url.hash) throw Error();
+        } catch {
+          keyFlow.error = "enter an http or https base url without credentials, a query or a fragment"; render(); break;
+        }
+      }
+      sendKeyFlow("models_list"); break;
+    }
+    case "key-model": keyFlow.model = el.dataset.model; keyFlow.step = "review"; render(); break;
+    case "key-save":
+      if (!keyFlow.pending) sendKeyFlow("key_add", { label: keyFlow.label.trim(), model: keyFlow.model });
+      break;
+    case "key-answer":
+      if (answering.has(el.dataset.id)) break;
+      answering.add(el.dataset.id); refreshKeyPrompts();
+      send("answer_key_switch", { id: el.dataset.id, approved: el.dataset.approved === "true" }); break;
+    case "key-validate": send("key_validate", { id: el.dataset.id }); break;
+    case "key-remove":
+      el.textContent = "remove this key from the list?"; el.dataset.action = "key-remove-confirm"; break;
+    case "key-remove-confirm": send("key_remove", { id: el.dataset.id }); break;
+    case "key-pricing":
+      e.preventDefault(); send("key_pricing", { provider: el.dataset.provider }); break;
     case "switch": send("switch", { tool, email }); break;
     case "remove": if (confirm(`wave goodbye to ${email}?`)) send("remove", { tool, email }); break;
     // add-a-seat sub-view (spec §9). Header ＋ (no tool) → provider step; per-provider add-row and
@@ -188,6 +281,8 @@ function addBack() {
 // Controlled inputs: mirror the add-seat fields into `add` on each keystroke so a background poll
 // re-render (which re-emits value="${...}") reproduces exactly what's typed — no lost text.
 document.addEventListener("input", (e) => {
+  const fields = { "key-label": "label", "key-secret": "secret", "key-base-url": "base_url" };
+  if (keyFlow && fields[e.target.id]) keyFlow[fields[e.target.id]] = e.target.value;
   if (!add) return;
   if (e.target.id === "add-name") add.name = e.target.value;
   else if (e.target.id === "add-token") add.token = e.target.value;
@@ -195,6 +290,8 @@ document.addEventListener("input", (e) => {
 
 // toggles fire 'change' (clicking the switch graphic doesn't bubble a data-action click)
 document.addEventListener("change", (e) => {
+  if (keyFlow && e.target.id === "key-ack") keyFlow.allow_unverified = e.target.checked;
+  if (keyFlow && e.target.id === "key-region") keyFlow.region = e.target.value;
   const inp = e.target.closest('input[data-action="toggle"]');
   if (inp) send("toggle", { key: inp.dataset.key, value: inp.checked });
 });
@@ -204,6 +301,7 @@ document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
   if (screen === "settings") { screen = "main"; render(); }
   else if (screen === "add") addBack();
+  else if (screen === "add-key") keyBack();
 });
 
 // WKWebView normally reflects popover visibility here; the native shell also calls setVisible()

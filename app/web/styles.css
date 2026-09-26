@@ -303,3 +303,27 @@ html, body { background:transparent; width:100%; overflow:hidden; }
 
 .celebrate { animation:pop .5s ease; }
 @keyframes pop { 0%{transform:scale(.99)} 50%{transform:scale(1.01)} 100%{transform:scale(1)} }
+
+/* Key seats share the existing cards, accents and pushed-screen chrome. */
+.key-detail, .key-cost { color:var(--t2); font-size:11.5px; margin-top:6px; }
+.key-model, .key-price { overflow-wrap:anywhere; font-size:10.5px; line-height:1.5; }
+.key-model { color:var(--t1); margin:4px 0; }
+.key-price { color:var(--t2); }
+.key-unproven { color:var(--amber); font-size:11px; margin:7px 0; padding:6px 8px;
+  border:1px solid var(--amber); border-radius:8px; }
+.key-prompts:empty { display:none; }
+.key-prompts { --accent:var(--codex); flex:none; }
+.app > .key-prompts { max-height:45%; overflow-y:auto; padding-top:10px; }
+.set-app > .key-prompts { padding:10px 14px 0; }
+.key-confirm { border-color:var(--gold); margin-bottom:10px; }
+.key-decisions { display:flex; gap:8px; }
+.key-decisions .btn { flex:1; min-height:36px; padding:6px; border-radius:10px; }
+.key-ack { display:flex; align-items:flex-start; gap:10px; font-size:12px; color:var(--t1);
+  padding:12px; background:var(--card); border:1px solid var(--amber); border-radius:12px; cursor:pointer; }
+.key-ack input { flex:none; margin-top:2px; accent-color:var(--accent); }
+.key-model-option + .key-model-option { border-top:1px solid var(--line); }
+.seat--key .logout { margin-left:12px; }
+.add-cta { flex-shrink:0; }
+button:disabled { opacity:.55; cursor:default; }
+.add-input:focus-visible, .key-ack input:focus-visible, button:focus-visible, a:focus-visible {
+  outline:2px solid var(--accent, var(--codex)); outline-offset:-2px; }

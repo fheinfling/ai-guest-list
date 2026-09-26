@@ -27,6 +27,7 @@ except ImportError:  # allows importing this module's pure helpers without pyobj
 
 from acctsw import TOOLS, appalive, bridge, session
 from acctsw.context import Context, hydrate_path
+from acctsw.util import now, parse_iso
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 # The open popover is the one place where a person is actively making a decision from the
@@ -41,6 +42,43 @@ STATE_POLL_SECONDS = 3.0
 DOOR_SYMBOL = {"open": "door.left.hand.open", "shut": "door.left.hand.closed"}
 DOOR_EMOJI = {"open": "🪩", "shut": "🚪"}
 NS_TERMINATE_NOW = 1      # NSApplicationTerminateReply.terminateNow
+
+# Open provider help in the default browser, never inside the credential-bearing WKWebView.
+KEY_PRICING_URLS = {
+    "openai": "https://openai.com/api/pricing/",
+    "anthropic": "https://www.anthropic.com/pricing",
+    "openrouter": "https://openrouter.ai/models",
+    "langdock": "https://www.langdock.com/pricing",
+    "deepseek": "https://api-docs.deepseek.com/quick_start/pricing",
+    "xai": "https://docs.x.ai/docs/models",
+    "groq": "https://groq.com/pricing",
+}
+
+
+class KeySwitchNotices:
+    """Deduplicate consent nudges across local polls and action replies, including hidden polls."""
+    def __init__(self):
+        self.seen = set()
+        self.rev = -1
+
+    def deliver(self, state, notify):
+        if not state or state.get("rev", 0) < self.rev:
+            return
+        self.rev = state.get("rev", 0)
+        enabled = state.get("settings", {}).get("notify", True)
+        for request in state.get("pending_key_switches", []):
+            expires = parse_iso(request.get("expires_at"))
+            if (request.get("status") != "pending" or expires is None or expires <= now()
+                    or request["id"] in self.seen):
+                continue
+            self.seen.add(request["id"])
+            if enabled and request.get("notify", True):
+                seat = request.get("key_seat") or {}
+                previous = request.get("from_seat") or {}
+                notify("a paid key needs your okay",
+                       f"leave {previous.get('label') or 'the current seat'} for "
+                       f"{seat.get('label')} · {seat.get('model')}? "
+                       "open ai guest list to approve paid use or decline")
 
 
 def usage_poll_interval(popover_visible: bool) -> float:
@@ -198,6 +236,7 @@ if objc is not None:
             self._acctWarned = set()              # shared-account warnings already toasted this session
             self._login_baseline = {}             # tool → (op, digest of live creds at that login launch)
             self._login_seq = 0                   # monotonic login op id (see the login handler)
+            self._key_notices = KeySwitchNotices()
             return self
 
         # --- lifecycle ----------------------------------------------------------------------
@@ -211,6 +250,7 @@ if objc is not None:
             # + auto-switch; when it's closed they run stock. Heartbeat is refreshed each usage poll.
             appalive.mark_alive(self.ctx.data_dir)
             self._buildPopover()
+            self._startStateTimer()  # consent expires in 2m; the hidden usage poll takes 3m
             self._startUsageTimer()
             # One-time cleanup of the retired "save credit" Headroom feature — off the main thread so a
             # config restore never blocks the menubar on launch. No-op once nothing remains.
@@ -308,7 +348,6 @@ if objc is not None:
         # --- actions ------------------------------------------------------------------------
         def togglePopover_(self, sender):
             if self.popover.isShown():
-                self._stopStateTimer()
                 self._setWebVisible(False)
                 self.popover.performClose_(sender)
             else:
@@ -321,7 +360,6 @@ if objc is not None:
 
         def popoverDidClose_(self, _notification):
             # Transient popovers also close when the user clicks elsewhere, bypassing togglePopover_.
-            self._stopStateTimer()
             self._setWebVisible(False)
             self._setUsagePollInterval(usage_poll_interval(False))
 
@@ -362,7 +400,7 @@ if objc is not None:
             return (rev, tuple(beats))
 
         def pollState_(self, _timer):
-            """While open, notice state.json / session writes from supervised cx/cl sessions.
+            """Notice state.json / session writes even when the popover is hidden.
 
             Deliberately network-free: the "status" action only re-reads local state, so the
             engine's per-seat usage cache still governs every endpoint call."""
@@ -634,6 +672,16 @@ if objc is not None:
                 return
             if action == "settings":
                 return  # reserved
+            if action == "key_pricing":
+                url = KEY_PRICING_URLS.get(msg.get("provider"))
+                if url:
+                    NSWorkspace.sharedWorkspace().openURL_(NSURL.URLWithString_(url))
+                return
+            if action in bridge.KEY_ACTIONS:
+                # Catalog fetches, validation, Keychain and flock waits belong off AppKit's thread.
+                self.performSelectorInBackground_withObject_(
+                    objc.selector(self.keyBg_, signature=b"v@:@"), msg)
+                return
             if action == "login":
                 # Give each login an op id so a late failure from an abandoned attempt can only drop
                 # ITS OWN baseline, not a newer one for the same tool.
@@ -676,6 +724,18 @@ if objc is not None:
             self._pushResult(result)
             self._updateDot(result.get("state"))
 
+        def keyBg_(self, msg):
+            try:
+                result = dict(bridge.handle(self.ctx, dict(msg)))
+            except Exception:
+                # Provider exceptions can echo a credential; never forward raw exception text.
+                result = {"ok": False, "error": "couldn't complete that key request; please try again"}
+            result["key_action"] = msg.get("action")
+            result["key_request_id"] = msg.get("key_request_id")
+            result["key_target_id"] = msg.get("id")
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
+
         def switchBg_(self, msg):
             try:
                 result = dict(bridge.handle(self.ctx, msg))
@@ -699,6 +759,7 @@ if objc is not None:
         # --- helpers ------------------------------------------------------------------------
         @objc.python_method
         def _pushResult(self, result):
+            self._key_notices.deliver(result.get("state"), self._notify)
             # Deliberately does NOT stamp _last_state_sig: this runs for pushes from other paths
             # (the usage poll, a user action) whose state may already be older than what is on disk.
             # Stamping here could swallow a change; the state timer records its OWN signature before
