@@ -46,7 +46,8 @@ def test_secret_roundtrip_and_metadata_only(ctx, monkeypatch, caplog):
     assert K.get_secret(ctx, id, harness="codex") == SECRET
     assert seat["fingerprint"] == "9876"
     assert set(seat) == {"id", "label", "provider", "harness", "model", "fingerprint",
-                         "created_at", "last_validation"}
+                         "responses_verified", "created_at", "last_validation"}
+    assert seat["responses_verified"] is True  # openai's Responses support is documented
     assert ctx.load_state().data["keys"][id] == seat
     assert set(TOOLS) == {"codex", "claude"}
     assert not ctx._homes_root.exists()
@@ -76,16 +77,39 @@ def test_harness_pairing(ctx, provider):
     assert K.get_secret(ctx, seat["id"], harness=harness) == SECRET
 
 
-@pytest.mark.parametrize("provider", ["together", "mistral", "cerebras", "openai_compatible", "groq"])
-def test_refuse_unverified_and_beta_before_validation_or_storage(ctx, provider):
-    p = P.get_provider(provider, **({"base_url": "https://custom.test/v1"}
-                                  if provider == "openai_compatible" else {}))
+@pytest.mark.parametrize("provider", ["together", "mistral", "cerebras"])
+def test_chat_only_providers_are_refused_even_when_acknowledged(ctx, provider):
+    """No acknowledgement can help: Codex custom providers require the Responses wire API."""
     def forbidden(*args):
         pytest.fail("Unsupported harness must be refused before testing a key")
-    with pytest.raises(ValueError, match="Responses support is not verified"):
-        K.add(ctx, p, SECRET, label="Work", model="m", get=forbidden)
+    for acknowledged in (False, True):
+        with pytest.raises(ValueError, match="only Chat Completions"):
+            K.add(ctx, P.get_provider(provider), SECRET, label="Work", model="m",
+                  get=forbidden, allow_unverified=acknowledged)
     assert K.list(ctx) == []
     assert ctx.keychain._store == {}
+
+
+@pytest.mark.parametrize("provider", ["openai_compatible", "groq"])
+def test_unproven_responses_endpoint_needs_an_explicit_acknowledgement(ctx, provider):
+    """A custom or beta Responses endpoint may well work; we just cannot promise it.
+
+    Refusing outright would drop every self-hosted and compatible endpoint, which is most of the
+    reason to accept pasted keys. So it is addable on purpose, and recorded as unproven.
+    """
+    p = P.get_provider(provider, **({"base_url": "https://custom.test/v1"}
+                                    if provider == "openai_compatible" else {}))
+
+    def forbidden(*args):
+        pytest.fail("An unacknowledged provider must be refused before testing a key")
+    with pytest.raises(ValueError, match="Responses support is not verified"):
+        K.add(ctx, p, SECRET, label="Work", model="m", get=forbidden)
+    assert K.list(ctx) == [] and ctx.keychain._store == {}
+
+    seat = K.add(ctx, p, SECRET, label="Work", model="m", get=ok, allow_unverified=True)
+    assert seat["harness"] == "codex"
+    assert seat["responses_verified"] is False  # the UI must be able to say so
+    assert K.get_secret(ctx, seat["id"], harness="codex") == SECRET
 
 
 def test_region_and_verified_custom_metadata(ctx):

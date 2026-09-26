@@ -21,13 +21,25 @@ from .util import iso, now
 Harness = Literal["codex", "claude"]
 
 
-def harness_for(provider: Provider) -> Harness:
+def harness_for(provider: Provider, *, allow_unverified: bool = False) -> Harness:
+    """Pair a provider with the harness that can drive it, or refuse it.
+
+    Chat-Completions-only providers are refused outright: Codex custom providers require the
+    Responses wire API, so no acknowledgement can make one work. A Responses endpoint we have not
+    confirmed — a custom base_url, or a beta implementation — is a different case: it may well
+    work, we simply cannot promise it, so the caller may opt in and the seat records that the
+    promise is missing. Refusing those outright would drop every self-hosted and compatible
+    endpoint, which is most of the reason to support pasted keys at all.
+    """
     if provider.wire_api == "messages":
         return "claude"
-    if provider.wire_api == "responses" and provider.responses_support == "verified":
+    if provider.wire_api != "responses":
+        raise ValueError("This provider offers only Chat Completions; a Codex key seat requires "
+                         "the Responses API, so no acknowledgement can make this work")
+    if provider.responses_support == "verified" or allow_unverified:
         return "codex"
-    raise ValueError("This provider's Responses support is not verified; a Codex key seat "
-                     "requires verified Responses support, not just a model catalog")
+    raise ValueError("This provider's Responses support is not verified; pass allow_unverified to "
+                     "add it anyway, and the seat will be marked as unproven")
 
 
 def _keys(state: State) -> dict[str, dict[str, Any]]:
@@ -56,19 +68,21 @@ def validate(ctx: Context, provider: Provider, secret: str, *,
 
 
 def add(ctx: Context, provider: Provider, secret: str, *, label: str, model: str,
-        get: HttpGet = _default_get) -> dict[str, Any]:
+        get: HttpGet = _default_get, allow_unverified: bool = False) -> dict[str, Any]:
     """Store a new seat, retaining failed validation because operation scopes can differ.
 
     Validate outside the state lock, then write the secret before publishing its metadata.
     No secret-bearing Codex home or config is created by this module.
     """
-    harness = harness_for(provider)  # Refuse unsupported providers before transmitting any key.
+    harness = harness_for(provider, allow_unverified=allow_unverified)  # Before sending any key.
     if not isinstance(secret, str) or len(secret) <= 4 or not secret.strip():
         raise ValueError("API key must contain more than four characters")
     if not label.strip() or not model.strip():
         raise ValueError("A label and model id are required")
     seat = {"id": uuid4().hex, "label": label, "provider": provider.id,
             "harness": harness, "model": model, "fingerprint": secret[-4:],
+            # Recorded so the UI can say the endpoint is unproven rather than implying it works.
+            "responses_verified": provider.responses_support == "verified",
             "created_at": iso(now())}
     if provider.region is not None:
         seat["region"] = provider.region
