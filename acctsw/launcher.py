@@ -1037,7 +1037,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                       if tool == "codex" else _claude_transcripts())
         # A stopped paid session lives in its private home. Include it in an explicit/last resume
         # so enabling paid use later cannot replace its newer turns with the subscription copy.
-        home = ctx.codex_home(f"key:{tool}:{key_seat['id']}")
+        from . import codexhome
+        home = ctx.codex_home(codexhome.key_home_identity(tool, key_seat['id']))
         if tool == "codex":
             candidates.update(rollout.scan_rollouts([home / "sessions"]))
         else:

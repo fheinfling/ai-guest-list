@@ -118,7 +118,7 @@ def prepare(ctx: Context, id: str, *, pin: str | None = None) -> KeyHome:
     # Namespace the identity, not the path: key IDs cannot alias subscription email identities.
     # Pinned terminals can share a key, but not a daemon or transcript tree. Hash the identity
     # through the existing short-home layout so the app-server socket still fits on macOS.
-    identity = f"key:{harness}:{id}" + (f":{pin}" if pin else "")
+    identity = codexhome.key_home_identity(harness, id, pin)
     home = codexhome.home_dir(identity, ctx._homes_root)
     model_provider = None
     base_url = provider.base_url

@@ -119,6 +119,15 @@ def home_dir(email: str, root: Path | None = None) -> Path:
     return (root or P.CODEX_HOMES) / _slug(email)
 
 
+def key_home_identity(harness: str, seat_id: str, pin: str | None = None) -> str:
+    """Namespace key seats and terminal pins without spending the socket path budget."""
+    from . import TOOLS
+    if (harness not in TOOLS or not isinstance(seat_id, str) or not seat_id or
+            (pin is not None and (not isinstance(pin, str) or not pin))):
+        raise ValueError('invalid key home identity')
+    return f"key:{harness}:{seat_id}" + (f":{pin}" if pin else "")
+
+
 def index_root(root: Path | None = None) -> Path:
     """Where the by-address symlinks live: ``<store>/codex-homes``, the pre-1.0.2 homes root."""
     return (root or P.CODEX_HOMES).parent / P.CODEX_HOMES_LEGACY.name
@@ -342,17 +351,41 @@ def _orphan_home(proc: daemonprocs.Process, root: Path, ids: set[str]) -> Path |
     return None
 
 
+def _seat_homes(data: dict, data_dir: Path) -> dict[str, str]:
+    """Known home IDs and display identities, including every live terminal pin.
+
+    Read raw registries strictly: recovery defaults or skipped unreadable heartbeats could
+    turn a live home into an orphan. Missing keys is valid for pre-BYOK state files.
+    """
+    from . import TOOLS
+    from .session import active_sessions
+    accounts = data['tools']['codex']['accounts']
+    keys = data.get('keys', {})
+    if not isinstance(accounts, dict) or not isinstance(keys, dict):
+        raise ValueError('invalid seat registry')
+    homes = {_slug(email): email for email in accounts}
+    for seat_id, seat in keys.items():
+        if not isinstance(seat, dict) or seat.get('id') != seat_id:
+            raise ValueError('invalid key seat registry')
+        identity = key_home_identity(seat['harness'], seat['id'])
+        homes[_slug(identity)] = identity
+    for harness in TOOLS:
+        for record in active_sessions(data_dir, harness, strict=True):
+            if 'pin' in record:
+                identity = key_home_identity(harness, record['key_seat']['id'], record['pin'])
+                homes[_slug(identity)] = identity
+    return homes
+
+
 def _seat_ids(root: Path) -> set[str]:
     # Directory existence is not seat membership: removed seats can leave homes behind. Refuse
     # malformed state rather than letting State.load's recovery defaults classify every seat dead.
     statefile = root.parent / 'state.json'
-    if statefile.exists():
+    try:
         data = json.loads(statefile.read_text())
-        accounts = data['tools']['codex']['accounts']
-        if not isinstance(accounts, dict):
-            raise ValueError('invalid seat registry')
-        return {_slug(email) for email in accounts}
-    return set()
+    except FileNotFoundError:
+        data = {'tools': {'codex': {'accounts': {}}}}
+    return set(_seat_homes(data, root.parent))
 
 
 def orphan_daemons(root: Path | None = None, *, list_procs=daemonprocs.list_processes):
@@ -493,12 +526,19 @@ def daemon_report(ctx, *, fix: bool = False) -> dict:
     live, matching the launcher's conservative promote=True gate and covering concurrent terminals.
     The same gate defers orphan reaping: an app restart must not disrupt an older live supervisor.
     """
+    from . import TOOLS
     from .session import active_session
     # Old builds can leave a supervisor holding a PTY after its terminal vanished. This rescue
     # has its own strict kernel predicates and must run even if the stale session marker is live.
     wedges, rescued = daemonprocs.wedged_supervisors(fix=fix)
     with ctx.locked():
-        seats = list(ctx.load_state().accounts('codex'))
+        seats = _seat_homes(ctx.load_state().data, ctx.data_dir)
+        # Pins outlive their heartbeat files on disk. Include retained homes for diagnostics
+        # and release GC, but NEVER use directory existence as membership for the reaper.
+        if ctx._homes_root.exists():
+            for home in sorted(ctx._homes_root.iterdir()):
+                if not home.is_symlink() and home.is_dir():
+                    seats.setdefault(home.name, home.name)
         try:
             snapshot = daemonprocs.list_processes()
         except OSError:
@@ -509,17 +549,17 @@ def daemon_report(ctx, *, fix: bool = False) -> dict:
         gc_issue = _gc_process_issue(snapshot) if snapshot is not None else 'processes-unavailable'
         orphans = [p.pid for p, _ in orphan_daemons(
             ctx._homes_root, list_procs=lambda: snapshot or [])]
-        busy = active_session(ctx.data_dir, 'codex') is not None if fix else False
+        busy = any(active_session(ctx.data_dir, t) is not None for t in TOOLS) if fix else False
         reaper = ('read-only' if not fix else 'session-live' if busy else
                   'processes-unavailable' if snapshot is None else 'checked')
         reaped = reap_orphan_daemons(ctx._homes_root) if reaper == 'checked' else []
         rows = []
-        for email in seats:
-            home = home_dir(email, ctx._homes_root)
-            row = {'address': email, 'home_id': home.name, 'state': daemon_state(home)}
+        for home_id, identity in seats.items():
+            home = ctx._homes_root / home_id
+            row = {'address': identity, 'home_id': home.name, 'state': daemon_state(home)}
             if fix:
                 row['heal'] = heal_daemon_socket(home)
-                busy = active_session(ctx.data_dir, 'codex') is not None
+                busy = any(active_session(ctx.data_dir, t) is not None for t in TOOLS)
                 row['gc'] = 'session-live' if busy else gc_issue or 'checked'
                 row['bytes_freed'] = (gc_daemon_releases(
                     home, on_skip=lambda reason: row.update(gc=reason))

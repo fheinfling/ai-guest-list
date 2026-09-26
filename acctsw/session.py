@@ -28,7 +28,16 @@ def _process_file(data_dir: Path, tool: str, pid: int) -> Path:
     return Path(data_dir) / f"session-{tool}-{pid}.json"
 
 
-def _session_files(data_dir: Path, tool: str) -> list[Path]:
+def _session_files(data_dir: Path, tool: str, *, strict: bool = False) -> list[Path]:
+    if strict:
+        # glob can silently suppress directory-read errors. Destructive maintenance needs
+        # an explicit failure instead of a smaller set of protected live homes.
+        try:
+            paths = list(Path(data_dir).iterdir())
+        except FileNotFoundError:
+            paths = []
+        return [_session_file(data_dir, tool), *(p for p in paths
+                if p.name.startswith(f"session-{tool}-") and p.name.endswith('.json'))]
     return [_session_file(data_dir, tool), *Path(data_dir).glob(f"session-{tool}-*.json")]
 
 
@@ -135,11 +144,11 @@ def active_session(data_dir: Path, tool: str, *, email: str | None = None) -> di
     return newest_session(sessions)
 
 
-def active_sessions(data_dir: Path, tool: str) -> list[dict]:
-    """Every live terminal, deduplicating the backwards-compatible legacy mirror."""
+def active_sessions(data_dir: Path, tool: str, *, strict: bool = False) -> list[dict]:
+    """Every live terminal; strict maintenance reads raise on uncertain/malformed records."""
     sessions = {}
-    for path in _session_files(data_dir, tool):
-        data = _read_session(path)
+    for path in _session_files(data_dir, tool, strict=strict):
+        data = _read_session(path, strict=strict)
         if data is not None:
             previous = sessions.get(data["pid"])
             sessions[data["pid"]] = (newest_session([data, previous])
@@ -147,7 +156,7 @@ def active_sessions(data_dir: Path, tool: str) -> list[dict]:
     return list(sessions.values())
 
 
-def _read_session(path: Path) -> dict | None:
+def _read_session(path: Path, *, strict: bool = False) -> dict | None:
     record = None
 
     def discard() -> None:
@@ -164,15 +173,35 @@ def _read_session(path: Path) -> dict | None:
         with path.open(encoding="utf-8") as source:
             record = os.fstat(source.fileno())
             data = json.load(source)
+        if strict and (not isinstance(data, dict) or type(data.get('pid')) is not int or
+                       data['pid'] <= 0):
+            raise ValueError('invalid session PID')
         email = data["email"]
         pid = int(data["pid"])
         started_at = data["started_at"]
         if not isinstance(email, str) or not isinstance(started_at, str):
+            if strict:
+                raise ValueError('invalid session record')
             discard()
             return None
+        if strict:
+            if not isinstance(data.get('process_start', ''), str):
+                raise ValueError('invalid session process identity')
+            if 'pin' in data:
+                seat = data.get('key_seat')
+                if (not isinstance(data['pin'], str) or not data['pin'] or
+                        not isinstance(seat, dict) or not isinstance(seat.get('id'), str) or
+                        not seat['id']):
+                    raise ValueError('invalid pinned session record')
+    except FileNotFoundError:
+        return None
     except OSError:
+        if strict:
+            raise
         return None  # an unreadable record is not evidence of a dead session
     except (ValueError, TypeError, KeyError):
+        if strict:
+            raise
         # write_json uses atomic temp+rename, so a parse failure cannot be a partial heartbeat
         # from a concurrent writer. This inode is junk; a replacement is left alone.
         discard()
