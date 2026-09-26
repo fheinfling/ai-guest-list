@@ -533,7 +533,7 @@ export function buildSettings(state) {
       ${segBlock("when a seat runs out", strategyHint(strat), "set_strategy", strat, STRATEGY_OPTS)}
       ${toggleRow("supervise_shell", "supervise terminal commands", "codex/claude auto-switch seats · off: only cx/cl do", s.supervise_shell !== false)}
       ${toggleRow("same_tool_only", "keep me on the same tool", "a Codex limit hops to your other Codex seat, never to Claude", s.same_tool_only)}
-      ${toggleRow("key_fallback", "let a key take the floor", "off by default. on allows keys when subscription seats rest — real money can be spent. off prevents new paid use and stops a running paid session; the turn already sent may still bill", s.key_fallback === true)}
+      ${toggleRow("key_fallback", "let a key take the floor", "off by default. on allows pinned key terminals and keys when subscription seats rest — real money can be spent. off prevents new paid use and stops a running paid session; the turn already sent may still bill", s.key_fallback === true)}
       ${toggleRow("confirm_key_switch", "ask before using a paid key", "ask me to approve each hop onto a key. turning this off lets eligible keys spend money without asking again", s.confirm_key_switch !== false)}
       ${toggleRow("notify", "tell me when it switches", "a gentle notification with who's on now", s.notify)}
       ${toggleRow("restart_app", "restart the Codex app after a swap", "the desktop app keeps the old account until it relaunches · terminals switch on their own", s.restart_app)}
@@ -589,6 +589,7 @@ export function buildHTML(state) {
       ${controlBar({ icon: REFRESH, title: "auto-switch", sub: "next ready seat · soonest-reset wins",
                      key: "auto_switch", on: s.auto_switch, accentClass: "ic-auto" })}
       ${moved}
+      ${pinnedSessions(state)}
       ${toolGroup("codex", state?.tools?.codex, (state?.keys || []).filter((k) => k.harness === "codex"))}
       ${toolGroup("claude", state?.tools?.claude, (state?.keys || []).filter((k) => k.harness === "claude"))}
       <button class="add-row" data-action="key-start">＋ add a key</button>
@@ -606,6 +607,19 @@ function paidUseControl(state) {
     <div class="k-fine">stop new paid requests and the running session. the turn already sent may still bill.</div>
     <div class="k-acts"><button class="k-go" data-action="key-stop"${stopping ? " disabled" : ""}>stop paid use</button></div>
   </section>`;
+}
+
+export function pinnedSessions(state) {
+  return (state?.pinned_sessions || []).map((s) => {
+    const seat = s.key_seat || {};
+    return `<section class="seat seat--key pinned-session" aria-label="pinned paid session">
+      <div class="seat-row"><span class="seat-name">${esc(seat.label)}</span><span class="mono chip">pinned · paid</span></div>
+      <div class="key-detail">${esc(providerName(seat))} · ${esc(s.tool)} · terminal ${esc(s.pid)}</div>
+      <div class="key-model mono">${esc(seat.model)}</div>
+      <div class="add-hint">metered · paid per token. end here, then resume on a subscription seat.</div>
+      <button class="btn switch" data-action="end-pinned-session" data-tool="${esc(s.tool)}" data-pin="${esc(s.pin)}"${s.end_requested ? " disabled" : ""}>${s.end_requested ? "ending…" : "end"}</button>
+    </section>`;
+  }).join("");
 }
 
 // Key providers mirror providers.py's harness gate: chat-only catalogs are not usable seats.
@@ -687,6 +701,7 @@ export function keySeatCard(seat) {
     <div class="seat-row"><span class="dot dot--accent"></span><span class="seat-name">${esc(seat.label)}</span><span class="mono chip">api key</span></div>
     <div class="key-detail">${esc(providerName(seat))} · ${seat.harness === "claude" ? "claude code" : "codex cli"}</div>
     <div class="key-model mono">${esc(seat.model)}</div>
+    <button class="btn switch" data-action="key-terminal" data-id="${esc(seat.id)}">use in new terminal</button>
     ${keyProofStatus(seat)}
     ${validation?.operation_permitted === false ? `<div class="usage-error">key check wasn't permitted${seat.responses_verified ? "" : " — inference access is still unproven"}</div>` : ""}
     <div class="expand"><div class="add-hint">paid per use · this app does not limit spend</div>
@@ -711,12 +726,12 @@ export function keyConfirmations(state, answering = new Set(), now = Date.now())
     const priceHint = priceText(r.price) + (input === null && output === null ? "" : ` · ${priceAge(r.price)}`);
     const accent = TOOL_META[r.tool]?.accent || TOOL_META.codex.accent;
     return `<section class="key-confirm set-card" aria-label="paid key confirmation" style="--accent:${accent}">
-      <div class="k-q">use a paid key to keep going?</div>
+      <div class="k-q">${r.pinned ? "pin this terminal to a paid key?" : "use a paid key to keep going?"}</div>
       <span class="fare" title="${esc(priceHint)}">${fare}</span>
       <div class="unit">input / output per million tokens</div>
       <div class="quiet-meta">${esc(r.key_seat?.label)} · ${esc(providerName(r.key_seat || {}))}<br><span class="k-model">${esc(r.key_seat?.model)}</span></div>
       ${seat ? keyProofStatus(seat) : ""}
-      <div class="k-fine">${esc(from)} is resting${reset ? ` until ${esc(reset)}` : ""}. this app doesn't cap spend.</div>
+      <div class="k-fine">${r.pinned ? "only this terminal will use the key" : `${esc(from)} is resting${reset ? ` until ${esc(reset)}` : ""}`}. this app doesn't cap spend.</div>
       <div class="k-acts">
         <button class="k-no" data-action="key-answer" data-id="${esc(r.id)}" data-approved="false"${disabled}>not now</button>
         <button class="k-go" data-action="key-answer" data-id="${esc(r.id)}" data-approved="true"${disabled}>use the key</button>

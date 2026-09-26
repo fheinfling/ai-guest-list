@@ -113,6 +113,7 @@ def _read_key_secret() -> str:
 
 
 def _cmd_keys(ctx: Context, ns) -> int:
+    from . import pricing
     try:
         if ns.keys_command == "list":
             result = {"ok": True, "keys": keyseats_mod.list(ctx)}
@@ -168,7 +169,8 @@ def _cmd_keys(ctx: Context, ns) -> int:
             if price:
                 for name in ("input", "output"):
                     rate = price["rates"][name]
-                    value = rate["value"] if rate["status"] == "known" else "unavailable"
+                    shown = pricing.format_rate(rate["value"]) if rate["status"] == "known" else None
+                    value = shown if shown is not None else "unavailable"
                     detail.append(f"{name} {value} {price['currency']}/million tokens (estimate)")
             else:
                 detail.append("price unavailable")
@@ -296,6 +298,36 @@ def _cmd_run(ctx: Context, ns) -> int:
     args = list(ns.args or [])
     if args and args[0] == "--":  # argparse REMAINDER keeps a leading separator
         args = args[1:]
+    # A launcher option precedes agent arguments. Leave later --key text (including prompts
+    # after --) alone; it is not permission to spend. Never forward our option to stock codex.
+    key = None
+    if args and (args[0] == "--key" or args[0].startswith("--key=")):
+        option = args.pop(0)
+        key = option.partition("=")[2] if "=" in option else (args.pop(0) if args else "")
+        if not key or key.startswith("--"):
+            raise AcctswError("--key needs a key seat id or label")
+    if key is not None:
+        from . import pricing
+
+        def confirm(record):
+            # The same persisted request the popover answers. Unknown prices stay unknown;
+            # an EOF/noninteractive launch is never implicit consent.
+            seat, price = record["key_seat"], record["price"]
+            notify(f"{seat['label']} · {seat['provider']} · {seat['model']} — paid per token")
+            for name in ("input", "output"):
+                rate = price["rates"][name]
+                shown = pricing.format_rate(rate["value"]) if rate["status"] == "known" else None
+                value = shown if shown is not None else "unavailable"
+                notify(f"estimated {name}: {value} {price['currency']} per million tokens")
+            notify("this app does not cap spend")
+            try:
+                return input("use this paid key for this terminal? [y/N] ").strip().lower() in ("y", "yes")
+            except EOFError:
+                return False
+        # Explicit pins also work without the app. Ordinary invocations retain the app master
+        # switch; a closed app cannot silently turn --key into an unpinned stock invocation.
+        return launch(ctx, ns.tool, args, notify=notify, key=key,
+                      confirm=None if appalive.app_running(ctx.data_dir) else confirm)
     # The "save credit" Headroom proxy was removed. An older build (or a hard-killed app) can leave
     # provider routing injected in ~/.codex/~/.claude pointing at a now-dead proxy, which would crash
     # stock codex/claude with ConnectionRefused. Clean it BEFORE the app-running split so every route

@@ -212,6 +212,9 @@ document.addEventListener("click", (e) => {
       answering.add(el.dataset.id); refreshKeyPrompts();
       send("answer_key_switch", { id: el.dataset.id, approved: el.dataset.approved === "true" }); break;
     case "key-stop": send("toggle", { key: "key_fallback", value: false }); break;
+    case "key-terminal": send("key_terminal", { id: el.dataset.id }); break;
+    case "end-pinned-session":
+      send("end_pinned_session", { tool, pin: el.dataset.pin }); break;
     case "key-validate": send("key_validate", { id: el.dataset.id }); break;
     case "key-prove":
       if (!proving.has(el.dataset.id)) {

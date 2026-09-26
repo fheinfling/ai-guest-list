@@ -132,3 +132,15 @@ def prepare_then_login(ctx: Context, tool: str, command: str | None = None) -> N
 
 def shell_quote(args: list[str]) -> str:
     return " ".join(shlex.quote(a) for a in args)
+
+
+def open_key_terminal(ctx: Context, seat_id: str) -> None:
+    """Open a pinned wrapper, with no OAuth sync-back and no credential in the script."""
+    from acctsw import install, keyseats
+    seat = keyseats.get(ctx, seat_id)
+    if seat is None:
+        raise ValueError("that key seat is no longer on the list")
+    wrapper = "cx" if seat["harness"] == "codex" else "cl"
+    installed = install.BIN_DIR / wrapper
+    open_in_terminal(shell_quote([str(installed) if installed.is_file() else wrapper,
+                                   "--key", seat["id"]]))

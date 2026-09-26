@@ -12,6 +12,7 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from .context import Context
+from .errors import AcctswError
 from .keychain import KeychainError
 from .pricing import HttpGet, _default_get
 from .providers import Provider, classify_error
@@ -121,6 +122,21 @@ def get(ctx: Context, id: str, *, harness: Harness | None = None) -> dict[str, A
     if seat is not None and harness is not None and seat["harness"] != harness:
         raise ValueError("Key seat cannot take over a session of another harness")
     return deepcopy(seat)
+
+
+def resolve(ctx: Context, value: str, *, harness: Harness) -> dict[str, Any]:
+    """An exact id wins; labels must identify exactly one seat, never store-order roulette."""
+    keys = _keys(ctx.load_state())
+    matches = [keys[value]] if value in keys else [s for s in keys.values() if s["label"] == value]
+    if not matches:
+        raise AcctswError(f"no key seat named {value!r}")
+    if len(matches) > 1:
+        candidates = ", ".join(f"{s['id']} ({s['harness']}, {s['provider']}, {s['model']})"
+                               for s in matches)
+        raise AcctswError(f"ambiguous key label {value!r} — choose an id: {candidates}")
+    if matches[0]["harness"] != harness:
+        raise AcctswError(f"that key seat needs {matches[0]['harness']}, not {harness}")
+    return deepcopy(matches[0])
 
 
 def list(ctx: Context, *, harness: Harness | None = None) -> builtins.list[dict[str, Any]]:

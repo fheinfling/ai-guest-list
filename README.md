@@ -115,6 +115,22 @@ acctsw path                  # wire cx/cl into your shell (PATH + codex/claude a
 ```
 Then a plain `codex` / `claude` is supervised whenever the app is running.
 
+To dedicate one terminal to a saved API-key seat, enable **let a key take the floor** in settings,
+then run `cx --key <seat-id>` or `cx --key "seat label"` (`cl --key` for Claude keys). Put `--key`
+before agent arguments; for example, `cx --key "late-night" resume --last`. Labels match exactly;
+an ambiguous label lists the ids to choose from. Each key card also offers **use in new terminal**.
+
+The usual price estimate and paid-key confirmation still apply. Approval happens in the popover
+when the app is open, or in the terminal when it is closed. Turning off confirmation records an
+automatic approval; turning off paid use refuses new pins and stops running paid children.
+Pins never change the selected subscription seat or hop back when a subscription frees up.
+A currently pinned key is excluded from automatic fallback; additional explicit pins are allowed.
+
+Each pinned terminal has its own **pinned · paid** row and **end** button. Ending one asks its child
+to stop and flush, then copies only its conversation into the shared session history so you can
+continue with `codex resume` on a subscription. Private originals are retained. **stop paid use**
+ends all paid sessions; a turn already sent may still bill. Subscription children keep running.
+
 ## How it works
 
 - `acctsw/` — the engine (Python, stdlib + the `security` CLI): credential swap, usage reading,
@@ -122,7 +138,8 @@ Then a plain `codex` / `claude` is supervised whenever the app is running.
   PTY launcher, install/uninstall.
 - `app/` — the menubar app (`pyobjc` `NSStatusItem` + a `WKWebView` popover) — a thin UI over the engine.
 - `cx` / `cl` — supervised launchers for `codex` / `claude`. **Stock binaries are never renamed or
-  shadowed**; the app is the master switch — closed app ⇒ `cx`/`cl` run the real tool.
+  shadowed**; the app is the master switch for ordinary invocations — closed app ⇒ `cx`/`cl` run
+  the real tool. An explicit `--key` pin stays supervised, including when the app is closed.
 
 See [`docs/PLAN.md`](docs/PLAN.md) for the full design and [`docs/RELEASING.md`](docs/RELEASING.md) for
 the release flow.

@@ -94,6 +94,7 @@ def _refresh(state: State, at: datetime) -> bool:
 
 def request(ctx: Context, tool: str, from_seat: str | None, key_seat_id: str, *,
             model: Model | None = None, session_id: str | None = None,
+            pinned: bool = False,
             timeout: timedelta = DEFAULT_TIMEOUT, at: datetime | None = None) -> str:
     """Record one hop and return its id. Caller supplies a Model obtained from pricing.
 
@@ -136,6 +137,8 @@ def request(ctx: Context, tool: str, from_seat: str | None, key_seat_id: str, *,
                   "status": "approved" if auto else "pending",
                   "decision_source": "setting" if auto else None,
                   "answered_at": iso(at) if auto else None}
+        if pinned:
+            record["pinned"] = True  # copy differs; the consent/withdrawal protocol does not
         _refresh(state, at)
         state.data.setdefault("handoffs", {})[id] = record
         state.save()

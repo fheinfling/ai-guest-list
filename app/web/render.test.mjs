@@ -1077,3 +1077,81 @@ test("paid-use settings subtitle explains prevention, session stopping, and in-f
   assert.match(row, /class="set-s">[^<]*off prevents new paid use and stops a running paid session/);
   assert.match(row, /the turn already sent may still bill/);
 });
+
+test("each key seat offers use in new terminal with its exact id", () => {
+  const keys = [
+    { id: 'paid-1', label: 'late shift', harness: 'codex', provider: 'openrouter', model: 'guest/model' },
+    { id: 'paid-2', label: 'writing', harness: 'claude', provider: 'anthropic', model: 'claude-model' },
+  ];
+  const html = buildHTML(state({ keys }));
+  for (const key of keys) {
+    assert.ok(html.includes(`data-action="key-terminal" data-id="${key.id}">use in new terminal</button>`));
+  }
+  const app = readFileSync(new URL('./app.mjs', import.meta.url), 'utf8');
+  assert.match(app, /case "key-terminal": send\("key_terminal", \{ id: el.dataset.id \}\)/);
+});
+
+test("pinned paid terminals have independent rows and end controls", () => {
+  const key = { id: 'paid-1', label: 'late <shift>', provider: 'openrouter', model: 'guest/model' };
+  const pinned_sessions = [
+    { pin: 'first-pin', pid: 202, tool: 'codex', key_seat: key },
+    { pin: 'second-pin', pid: 303, tool: 'codex', key_seat: key, end_requested: true },
+  ];
+  const html = buildHTML(state({ pinned_sessions }));
+  assert.equal((html.match(/aria-label="pinned paid session"/g) || []).length, 2);
+  assert.equal((html.match(/pinned · paid/g) || []).length, 2);
+  assert.match(html, /late &lt;shift&gt;/);
+  assert.match(html, /openrouter · codex · terminal 202/);
+  assert.match(html, /guest\/model/);
+  assert.match(html, /metered · paid per token/);
+  assert.match(html, /data-action="end-pinned-session" data-tool="codex" data-pin="first-pin">end<\/button>/);
+  assert.match(html, /data-pin="second-pin" disabled>ending…<\/button>/);
+  const app = readFileSync(new URL('./app.mjs', import.meta.url), 'utf8');
+  assert.match(app, /send\("end_pinned_session", \{ tool, pin: el.dataset.pin \}\)/);
+});
+
+test("pin confirmation describes one terminal without claiming subscriptions are resting", () => {
+  const html = buildHTML(state({ pending_key_switches: [{
+    id: 'consent-pin', pinned: true, status: 'pending', tool: 'codex',
+    expires_at: '2999-01-01T00:00:00Z',
+    key_seat: { id: 'key', label: 'work', provider: 'openrouter', model: 'guest/model' },
+  }] }));
+  assert.match(html, /pin this terminal to a paid key\?/);
+  assert.match(html, /only this terminal will use the key/);
+  assert.doesNotMatch(html, /the current seat is resting/);
+  assert.match(html, /data-action="key-answer" data-id="consent-pin" data-approved="false"/);
+  assert.match(html, /price unavailable/);
+});
+
+test("shipped pin controls send separate launch and per-terminal end actions", () => {
+  const app = keyApp();
+  app.click({ action: 'key-terminal', id: 'key-1' });
+  assert.deepEqual(JSON.parse(JSON.stringify(app.sent.at(-1))), { action: 'key_terminal', id: 'key-1' });
+  app.click({ action: 'end-pinned-session', tool: 'codex', pin: 'only-this-terminal' });
+  assert.deepEqual(JSON.parse(JSON.stringify(app.sent.at(-1))),
+    { action: 'end_pinned_session', tool: 'codex', pin: 'only-this-terminal' });
+  assert.equal(app.sent.filter((m) => m.action === 'toggle').length, 0);
+});
+
+// The table below is duplicated verbatim in tests/test_price_format.py. Two languages format
+// prices — Python for the CLI and terminal consent, JS for the popover — and they must never
+// print different numbers for the same model. Changing one side fails the other.
+test("prices read the same here as they do in the CLI", () => {
+  const TABLE = {
+    "3.000000": "3",
+    "15": "15",
+    "150": "150",
+    "0.5": "0.5",
+    "0.075": "0.075",
+    "0.0002": "0.0002",
+    "0.00000025": "0.00000025",
+    "0": "0",
+    "0.3125": "0.313",
+    "1.005": "1.01",
+    "0.6496": "0.65",
+    "1.027": "1.03",
+  };
+  for (const [raw, shown] of Object.entries(TABLE)) {
+    assert.equal(formatPrice(raw), `$${shown}`, `formatPrice(${raw})`);
+  }
+});

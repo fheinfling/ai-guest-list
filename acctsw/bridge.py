@@ -35,7 +35,8 @@ TOGGLE_KEYS = {
     "confirm_key_switch", "key_fallback",
 }
 
-KEY_ACTIONS = {"key_add", "key_remove", "key_validate", "key_prove", "models_list", "answer_key_switch"}
+KEY_ACTIONS = {"key_add", "key_remove", "key_validate", "key_prove", "models_list", "answer_key_switch",
+               "key_terminal", "end_pinned_session"}
 
 # Actions handled entirely by the native shell (app quit / run the chosen login in Terminal).
 # Everything else goes through the bridge; the shell then acts on result fields (login/command).
@@ -83,6 +84,14 @@ def snapshot_state(ctx: Context) -> dict[str, Any]:
         seat["id"] for seat in data["keys"]
         if session_mod.active_session(ctx.data_dir, seat["harness"], email=seat["id"]) is not None
     ]
+    data["pinned_sessions"] = [
+        {**record, "tool": tool}
+        for tool in ("codex", "claude")
+        for record in session_mod.active_sessions(ctx.data_dir, tool) if record.get("pin")
+    ]
+    # A removed key's live pin is still paid, visible and stoppable until its child exits.
+    data["running_key_seats"] = list(dict.fromkeys([
+        *data["running_key_seats"], *(r["email"] for r in data["pinned_sessions"])]))
     # Read prompts from THIS revision, not a second load via pending(). That helper takes its own
     # flock, and snapshots are also used from already-locked error paths. The launcher/answer path
     # retires dead requests; expired prompts need not remain visible while waiting for its next poll.
@@ -185,6 +194,21 @@ def key_action(ctx: Context, message: dict) -> dict[str, Any]:
                           "potentially_stale": catalog.potentially_stale}
                 if catalog.error:
                     result["error"] = "couldn't refresh the provider's model catalog"
+        elif action == "key_terminal":
+            seat = keyseats_mod.get(ctx, _key_text(message, "id"))
+            if seat is None:
+                raise _KeyRequestError("that key seat is no longer on the list")
+            if not ctx.load_state().settings()["key_fallback"]:
+                raise _KeyRequestError("paid use is off — allow keys to take the floor in settings first")
+            # The native shell opens only this wrapper command. Consent and prices belong to
+            # the launcher; opening a terminal is not approval to start its paid child.
+            result = {"ok": True, "key_terminal": seat["id"]}
+        elif action == "end_pinned_session":
+            accepted = session_mod.request_end(ctx, _key_text(message, "tool"),
+                                               _key_text(message, "pin"))
+            result = {"ok": accepted}
+            if not accepted:
+                result["error"] = "that pinned session has already ended"
         elif action == "key_remove":
             result = {"ok": True, "removed": keyseats_mod.remove(ctx, _key_text(message, "id"))}
         elif action == "key_prove":

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 
 from . import codexhome, keyseats, procenv, providers
@@ -98,7 +99,7 @@ def _config(runtime: KeyHome, name: str, *, stateless: bool) -> str:
     return "\n".join(lines)
 
 
-def prepare(ctx: Context, id: str) -> KeyHome:
+def prepare(ctx: Context, id: str, *, pin: str | None = None) -> KeyHome:
     """Write private configuration and return metadata; never launch or persist a credential.
 
     Existing seats have already passed keyseats' harness admission check. Custom Responses
@@ -115,7 +116,10 @@ def prepare(ctx: Context, id: str) -> KeyHome:
     provider = providers.get_provider(seat["provider"], region=seat.get("region"),
                                       base_url=seat.get("base_url"))
     # Namespace the identity, not the path: key IDs cannot alias subscription email identities.
-    home = codexhome.home_dir(f"key:{harness}:{id}", ctx._homes_root)
+    # Pinned terminals can share a key, but not a daemon or transcript tree. Hash the identity
+    # through the existing short-home layout so the app-server socket still fits on macOS.
+    identity = f"key:{harness}:{id}" + (f":{pin}" if pin else "")
+    home = codexhome.home_dir(identity, ctx._homes_root)
     model_provider = None
     base_url = provider.base_url
     name = provider.display_name
@@ -183,3 +187,37 @@ def build_env(ctx: Context, runtime: KeyHome, *, env: dict[str, str] | None = No
                      DISABLE_TELEMETRY="1", DISABLE_ERROR_REPORTING="1", DISABLE_AUTOUPDATER="1")
     child[runtime.env_key] = secret
     return child
+
+
+def publish_resume(ctx: Context, runtime: KeyHome) -> None:
+    """After a pinned child flushes, make its conversations discoverable by subscription resume.
+
+    Only transcripts travel. Keep the private originals, and never copy auth, configuration or
+    live databases. A pin owns its home, so another terminal's unfinished turns cannot be copied.
+    Codex's normal resume picker filters by provider: the shared copy belongs to the subscription
+    provider, while the private original retains its metered provenance.
+    """
+    from . import paths
+    if runtime.harness == "codex":
+        source = runtime.home / "sessions"
+        target = ctx._codex_real / "sessions"
+        files = source.rglob("rollout-*.jsonl")
+    else:
+        source = runtime.home / "projects"
+        target = Path(os.environ.get("CLAUDE_CONFIG_DIR", paths.CLAUDE_CONFIG_DIR)) / "projects"
+        files = source.glob("*/*.jsonl")
+    for path in files:
+        text = path.read_text(encoding="utf-8")
+        if runtime.harness == "codex":
+            lines = text.splitlines(keepends=True)
+            for i, line in enumerate(lines):
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue  # retain an incomplete final record exactly as the child left it
+                if row.get("type") == "session_meta":
+                    row["payload"]["model_provider"] = "openai"
+                    lines[i] = json.dumps(row, ensure_ascii=False) + "\n"
+                    break
+            text = "".join(lines)
+        atomic_write_text(target / path.relative_to(source), text, mode=0o600)

@@ -48,15 +48,17 @@ from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 from typing import Callable
+from uuid import uuid4
 
 from . import handoff, keyhome, keyseats, pricing, providers
 from . import identity as identity_mod
 from . import rollout
+from . import session as session_mod
 from . import usage as usage_mod
 from .context import Context
 from .errors import AcctswError
 from .procenv import harden_env
-from .selection import Selection, choose, choose_key
+from .selection import Selection, choose, choose_key, pinned_key_eligible
 from .session import active_session, clear_session, mark_session
 from .switch import switch, sync_back
 from .util import iso, now, parse_iso
@@ -915,14 +917,23 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         notify: Notifier = _noop, get=usage_mod._default_get,
         price_get=pricing._default_get,
         max_switches: int = MAX_SWITCHES,
-        sleep: Callable[[float], None] = time.sleep) -> int:
+        sleep: Callable[[float], None] = time.sleep,
+        key: str | None = None, confirm: Callable[[dict], bool] | None = None) -> int:
     """Launch ``tool`` with the best seat, auto-switching + resuming on limits. Returns exit code."""
+    if key is not None and args and args[0] in _PASSTHROUGH_CMDS:
+        raise AcctswError("a pinned key is for a work session, not a sign-in command")
     if args and args[0] in _PASSTHROUGH_CMDS:
         # Credential flow (e.g. `claude auth login`): run stock, unsupervised, so the OAuth
         # localhost-callback + interactive prompts work exactly as they do for a plain invocation.
         return exec_stock(ctx, tool, args)
     state = ctx.load_state()
-    if not state.accounts(tool):
+    pinned_seat = keyseats.resolve(ctx, key, harness=tool) if key is not None else None
+    pin = uuid4().hex if pinned_seat is not None else None
+    if pin and not state.settings()["key_fallback"]:
+        raise AcctswError("paid use is off — turn on 'let a key take the floor' before using --key")
+    if pin and not pinned_key_eligible(state, tool, pinned_seat["id"]):
+        raise AcctswError("that key seat failed its key or quota check — check it before using --key")
+    if not pin and not state.accounts(tool):
         raise NoSeats(f"no {tool} seats yet — add one first")
     seen_manual_switch = state.data["tools"][tool].get("manual_switch")
 
@@ -976,7 +987,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
     key_runtime = None
     key_env = None
     key_request = None
-    key_seat = None
+    key_seat = pinned_seat
     key_answer = None
     key_attempted = False
     key_session = None              # (thread id, source transcript, relative destination)
@@ -1052,8 +1063,20 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         _remember_key_session(thread, path)
         return True
 
+    def _fallback_key(st):
+        # Pins never become a global active seat. Nor may a subscription child join one by
+        # accident: only another explicit --key invocation can share that metered seat.
+        selected = choose_key(st, tool)
+        if not selected.seat_id:
+            return selected  # disabled/healthy/no-key paths need no extra session liveness probe
+        pinned = {s["email"] for s in session_mod.active_sessions(ctx.data_dir, tool)
+                  if s.get("pin")}
+        return choose_key(st, tool, pinned=pinned)
+
     def _key_eligible(st, *, cold_start=False) -> bool:
-        selected = choose_key(st, tool)  # deliberately NO auth-failure exclusion list
+        if pin:
+            return pinned_key_eligible(st, tool, key_seat["id"])
+        selected = _fallback_key(st)  # deliberately NO auth-failure exclusion list
         if not selected.seat_id or (key_seat and selected.seat_id != key_seat["id"]):
             return False
         if not cold_start and not st.settings().get("auto_switch", True):
@@ -1076,13 +1099,18 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             st = ctx.load_state()
             if not _key_eligible(st, cold_start=cold_start):
                 return False
-            key_seat = dict(st.data["keys"][choose_key(st, tool).seat_id])
-            from_seat = st.active(tool)
+            if not pin:
+                selected = _fallback_key(st)
+                if not selected.seat_id:
+                    return False  # another terminal pinned the last candidate during the probe
+                key_seat = dict(st.data["keys"][selected.seat_id])
+            from_seat = None if pin else st.active(tool)
         key_attempted = True  # declining or timing out must not prompt again on every TUI redraw
         if not _capture_key_session():
             notify(f"{tool}: couldn't pin down this session — keeping the paid-per-token seat waiting")
             return False
-        notify(f"all {tool} seats are resting 💤 — checking the price estimate for {key_seat['model']}")
+        notify((f"{tool}: pinning this terminal — " if pin else f"all {tool} seats are resting 💤 — ")
+               + f"checking the price estimate for {key_seat['model']}")
         try:
             provider = providers.get_provider(key_seat["provider"], region=key_seat.get("region"),
                                               base_url=key_seat.get("base_url"))
@@ -1101,7 +1129,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                         or st.data["keys"].get(key_seat["id"]) != key_seat):
                     return False
             key_request = handoff.request(ctx, tool, from_seat, key_seat["id"], model=model,
-                                          session_id=key_session[0] if key_session else None)
+                                          session_id=key_session[0] if key_session else None,
+                                          **({"pinned": True} if pin else {}))
         except Exception:
             # A provider/Keychain exception can echo the key. Report the step, never its payload.
             notify(f"{tool}: couldn't ready the paid-per-token seat — staying with the guest list")
@@ -1130,9 +1159,17 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         return key_answer
 
     def _wait_key() -> str | None:
+        nonlocal key_answer, key_request
         # No child is alive on the cold/post-exit paths. Use the SAME heartbeat, with the wait's
         # virtual-clock convention so an injected sleep can exercise real expiry without minutes.
         virtual = now()
+        if confirm is not None and key_request is not None:
+            record = handoff.resolve(ctx, key_request, require_enabled=True)
+            if record is not None and record["status"] == "pending":
+                handoff.answer(ctx, key_request, confirm(record))
+            elif record is not None:
+                # Terminal outcomes are consumed once; let the common poll process this one.
+                key_answer, key_request = record["status"], None
         while _poll_key(at=max(now(), virtual)) == "pending":
             base = max(now(), virtual)
             sleep(TICK_INTERVAL_S)
@@ -1147,7 +1184,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         if not _key_approval_current(cold_start=cold_start):
             return False
         try:
-            key_runtime = keyhome.prepare(ctx, key_seat["id"])
+            key_runtime = keyhome.prepare(ctx, key_seat["id"], **({"pin": pin} if pin else {}))
             key_env = keyhome.build_env(ctx, key_runtime)
             if key_session:
                 _, source, relative = key_session
@@ -1290,43 +1327,50 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
 
     try:
         initial_resting: Decision | None = None
-        # Initial selection is cheap. If Claude actually needs a switch, resolve its slow identity
-        # between two lock acquisitions and re-run selection before committing.
-        claude_switch_needed = False
-        with ctx.locked():
-            state = ctx.load_state()
-            if tool == "codex":
-                from . import accounts as _acct
-                if active_session(ctx.data_dir, tool) is None:
-                    # A live supervisor owns its private tokens; its shared mirror can be older.
-                    _acct.reconcile_codex(ctx, state)
-            sel = choose(state, tool)
-            if not sel.email and all(s.get("auth_error") for s in state.accounts(tool).values()):
-                notify(f"all {tool} seats need you to sign in again — re-add them via the app")
+        if pin:
+            # Explicit paid intent bypasses subscription selection/reconciliation entirely. It
+            # still enters the SAME offer, recorded consent, preparation and pre-spawn recheck.
+            if not (_offer_key(cold_start=True) and _wait_key() == "approved"
+                    and _activate_key(cold_start=True)):
                 return EXIT_GAVE_UP
-            claude_switch_needed = (
-                tool == "claude"
-                and sel.available
-                and bool(sel.email)
-                and sel.email != state.active(tool)
-            )
-            if (sel.available and sel.email and sel.email != state.active(tool)
-                    and not claude_switch_needed):
-                switch(ctx, state, tool, sel.email, sync=(tool != "codex"),
-                       live_identity=None)
-            _activate_codex_home(state.active(tool))
-        if claude_switch_needed:
-            live_identity = _claude_live_identity()  # subprocess — no state flock held
+        else:
+            # Initial selection is cheap. If Claude actually needs a switch, resolve its slow identity
+            # between two lock acquisitions and re-run selection before committing.
+            claude_switch_needed = False
             with ctx.locked():
                 state = ctx.load_state()
-                sel = choose(state, tool)  # selection may have changed while identity resolved
-                if sel.available and sel.email and sel.email != state.active(tool):
-                    switch(ctx, state, tool, sel.email, live_identity=live_identity)
-        if sel.all_limited:
-            # The wait verifies against the live endpoint and recomputes targets from state, so it
-            # does not need a pre-known unlock time (unlocks_at may be None for reactive marks).
-            initial_resting = Decision("give_up", sel.email,
-                                       sel.unlocks_at.isoformat() if sel.unlocks_at else None)
+                if tool == "codex":
+                    from . import accounts as _acct
+                    if active_session(ctx.data_dir, tool) is None:
+                        # A live supervisor owns its private tokens; its shared mirror can be older.
+                        _acct.reconcile_codex(ctx, state)
+                sel = choose(state, tool)
+                if not sel.email and all(s.get("auth_error") for s in state.accounts(tool).values()):
+                    notify(f"all {tool} seats need you to sign in again — re-add them via the app")
+                    return EXIT_GAVE_UP
+                claude_switch_needed = (
+                    tool == "claude"
+                    and sel.available
+                    and bool(sel.email)
+                    and sel.email != state.active(tool)
+                )
+                if (sel.available and sel.email and sel.email != state.active(tool)
+                        and not claude_switch_needed):
+                    switch(ctx, state, tool, sel.email, sync=(tool != "codex"),
+                           live_identity=None)
+                _activate_codex_home(state.active(tool))
+            if claude_switch_needed:
+                live_identity = _claude_live_identity()  # subprocess — no state flock held
+                with ctx.locked():
+                    state = ctx.load_state()
+                    sel = choose(state, tool)  # selection may have changed while identity resolved
+                    if sel.available and sel.email and sel.email != state.active(tool):
+                        switch(ctx, state, tool, sel.email, live_identity=live_identity)
+            if sel.all_limited:
+                # The wait verifies against the live endpoint and recomputes targets from state, so it
+                # does not need a pre-known unlock time (unlocks_at may be None for reactive marks).
+                initial_resting = Decision("give_up", sel.email,
+                                           sel.unlocks_at.isoformat() if sel.unlocks_at else None)
 
         switches = 0
         resuming = False
@@ -1588,7 +1632,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 argv = _key_command()
                 notify(f"{key_seat['label']} is taking the floor ✨ — {key_runtime.model}, paid per token; "
                        + ("your work's coming with you" if key_session else "ready for your work"))
-                mark_session(ctx.data_dir, tool, key_runtime.seat_id)
+                mark_session(ctx.data_dir, tool, key_runtime.seat_id,
+                             **({"pin": pin, "key_seat": key_seat} if pin else {}))
                 source = None
                 if tool == "codex":
                     roots = [key_runtime.home / "sessions"]
@@ -1604,6 +1649,11 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                         notify(f"{tool}: paid use is off — stopping the session and new requests; "
                                "the turn already sent may still bill. your session is saved for later")
                         return True
+                    if pin and session_mod.end_requested(ctx.data_dir, tool, pin):
+                        notify(f"{tool}: ending this pinned session — your work is saved for resume")
+                        return True
+                    # Paid children (including pins) never enter subscription recovery or manual
+                    # switch decisions. Freeing or selecting a subscription cannot move this child.
                     signals = source.poll() if source is not None else ()
                     if not reported and any(sig.kind == "limit" for sig in signals):
                         notify(f"{tool}: {key_runtime.model}'s paid-per-token seat reported a limit "
@@ -1620,6 +1670,12 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 finally:
                     if source is not None:
                         source.close()
+                    if pin:
+                        try:
+                            keyhome.publish_resume(ctx, key_runtime)
+                        except Exception:
+                            notify(f"{tool}: couldn't make the resume copy; your work is still saved "
+                                   f"in {key_runtime.home}")
             argv = resume_cmd(ctx, tool) if resuming else build_cmd(ctx, tool, args)
             if resuming and tool == "codex" and resume_thread:
                 argv = [argv[0], "resume", resume_thread]
@@ -2065,7 +2121,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         # byte-identical to the stored snapshot there is nothing to preserve, so the common
         # no-rotation launch never pays for `claude auth status`.
         try:
-            if key_runtime is not None:
+            if key_runtime is not None or pin:
                 pass  # no OAuth blob belongs to a key child, including failed spawn/prepare paths
             elif tool == "codex":
                 with ctx.locked():

@@ -77,10 +77,11 @@ class KeySelection:
     seat_id: str | None
     reason: Literal["selected", "key_fallback_disabled", "subscription_available",
                     "subscriptions_not_resting", "no_key_seats", "harness_mismatch",
-                    "ineligible_validation"]
+                    "ineligible_validation", "keys_pinned"]
 
 
-def choose_key(state: State, tool: str, at: datetime | None = None) -> KeySelection:
+def choose_key(state: State, tool: str, at: datetime | None = None, *,
+               pinned: frozenset | set = frozenset()) -> KeySelection:
     """Offer metered fallback only after the subscription rule has yielded the floor.
 
     Deliberately accepts no exclusion list: a caller excluding a healthy subscription must not
@@ -100,9 +101,24 @@ def choose_key(state: State, tool: str, at: datetime | None = None) -> KeySelect
     matching = {id: seat for id, seat in keys.items() if seat.get("harness") == tool}
     if not matching:
         return KeySelection(None, "harness_mismatch")
+    matching = {id: seat for id, seat in matching.items() if id not in pinned}
+    if not matching:
+        return KeySelection(None, "keys_pinned")
     for id, seat in matching.items():
         # Preserve store order, just as choose() does for equally eligible subscriptions.
         if (seat.get("last_validation") or {}).get("error") not in (
                 "invalid_key", "insufficient_quota"):
             return KeySelection(id, "selected")
     return KeySelection(None, "ineligible_validation")
+
+
+def pinned_key_eligible(state: State, tool: str, seat_id: str) -> bool:
+    """Explicit choice skips subscription exhaustion, never the paid-use or validation gates.
+
+    A pin is a launcher's local choice. choose() never sees it; automatic key fallback also
+    excludes seats already pinned in another terminal, using that terminal's session record.
+    """
+    seat = state.data["keys"].get(seat_id) or {}
+    return bool(state.settings()["key_fallback"] and seat.get("harness") == tool
+                and (seat.get("last_validation") or {}).get("error") not in (
+                    "invalid_key", "insufficient_quota"))

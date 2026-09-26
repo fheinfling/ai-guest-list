@@ -56,7 +56,8 @@ _proc_start = proc_start
 _START_CACHE: dict[int, str] = {}
 
 
-def mark_session(data_dir: Path, tool: str, email: str) -> None:
+def mark_session(data_dir: Path, tool: str, email: str, *, pin: str | None = None,
+                 key_seat: dict | None = None) -> None:
     """Record this supervisor and its active seat at launch and after every successful hop.
 
     A process's ``ps`` start-time never changes, so cache it instead of spawning ``ps`` for every
@@ -73,6 +74,9 @@ def mark_session(data_dir: Path, tool: str, email: str) -> None:
         "process_start": process_start,
         "started_at": iso(now()),
     }
+    if pin is not None:
+        data.update(pin=pin, paid=True, end_requested=False,
+                    key_seat={k: key_seat[k] for k in ("id", "label", "provider", "model")})
     # Keep each terminal's record independently. Retain the legacy mirror for older apps,
     # preserving its existing owner before another terminal replaces it during an upgrade.
     legacy = _session_file(data_dir, tool)
@@ -138,7 +142,7 @@ def active_sessions(data_dir: Path, tool: str) -> list[dict]:
         data = _read_session(path)
         if data is not None:
             previous = sessions.get(data["pid"])
-            sessions[data["pid"]] = (newest_session([previous, data])
+            sessions[data["pid"]] = (newest_session([data, previous])
                                      if previous is not None else data)
     return list(sessions.values())
 
@@ -187,4 +191,42 @@ def _read_session(path: Path) -> dict | None:
         # formatting until that supervisor exits, so raw inequality is not proof of PID reuse.
         discard()
         return None
-    return {"email": email, "pid": pid, "started_at": started_at}
+    public = {"email": email, "pid": pid, "started_at": started_at}
+    if isinstance(data.get("pin"), str):
+        public.update({k: data.get(k) for k in ("pin", "paid", "key_seat", "end_requested")})
+    return public
+
+
+def request_end(ctx, tool: str, pin: str) -> bool:
+    """Ask ONE live pinned supervisor to stop on its heartbeat, never signal a bare PID.
+
+    The random pin identifies this launch even if a PID gets reused. Updating the existing
+    per-process record keeps start/end/liveness in one registry; no separate stop-file protocol.
+    """
+    from . import TOOLS
+    if tool not in TOOLS or not isinstance(pin, str) or not pin:
+        return False
+    with ctx.locked():
+        for record in active_sessions(ctx.data_dir, tool):
+            if record.get("pin") != pin:
+                continue
+            path = _process_file(ctx.data_dir, tool, record["pid"])
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                return False
+            if data.get("pin") != pin:
+                return False
+            data["end_requested"] = True
+            write_json(path, data, mode=0o600)
+            return True
+    return False
+
+
+def end_requested(data_dir: Path, tool: str, pin: str) -> bool:
+    """The supervisor reads only its own record; no ps subprocess on the heartbeat."""
+    try:
+        data = json.loads(_process_file(data_dir, tool, os.getpid()).read_text(encoding="utf-8"))
+        return data.get("pin") == pin and data.get("end_requested") is True
+    except (OSError, ValueError):
+        return False

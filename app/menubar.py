@@ -76,7 +76,8 @@ class KeySwitchNotices:
                 seat = request.get("key_seat") or {}
                 previous = request.get("from_seat") or {}
                 notify("a paid key needs your okay",
-                       f"leave {previous.get('label') or 'the current seat'} for "
+                       ("pin this terminal to " if request.get("pinned") else
+                        f"leave {previous.get('label') or 'the current seat'} for ") +
                        f"{seat.get('label')} · {seat.get('model')}? "
                        "open ai guest list to approve paid use or decline")
 
@@ -727,6 +728,10 @@ if objc is not None:
         def keyBg_(self, msg):
             try:
                 result = dict(bridge.handle(self.ctx, dict(msg)))
+                if result.get("ok") and result.get("key_terminal"):
+                    from app.terminal import open_key_terminal
+                    open_key_terminal(self.ctx, result["key_terminal"])
+                    result["message"] = "your key terminal is opening — approval happens before paid use"
             except Exception:
                 # Provider exceptions can echo a credential; never forward raw exception text.
                 result = {"ok": False, "error": "couldn't complete that key request; please try again"}

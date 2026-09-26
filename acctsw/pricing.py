@@ -15,7 +15,7 @@ import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Literal
 
@@ -23,6 +23,44 @@ from .providers import Provider, WireAPI
 
 HttpGet = Callable[[str, dict, float], tuple[int, str]]
 MILLION = Decimal(1_000_000)
+
+
+def format_rate(value: Decimal | str | None) -> str | None:
+    """Render a rate the way a person reads a price, not the way a catalog stores one.
+
+    Providers publish full precision — "3.000000", "0.00000025" — and printing that raw makes a
+    decision surface look like machine output. Values of a dollar or more carry at most two
+    decimals, since a third never changes a judgement at that scale. Smaller ones keep three
+    significant figures instead of a fixed place count, because per-million-token rates run down to
+    fractions of a cent and a fixed two decimals would collapse most of a catalog to "$0.00".
+    Trailing zeros go in both cases. None stays None: an unknown price is never a formatted zero.
+
+    Mirrors formatPrice in app/web/render.mjs; the two must agree, and tests compare them against
+    the same real catalog.
+    """
+    if value is None:
+        return None
+    try:
+        amount = Decimal(value)
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not amount.is_finite() or amount < 0:
+        return None
+    if amount == 0:
+        return "0"
+    # Half-UP, not Python's default half-even: a price ending exactly on a half should read the way
+    # money is normally rounded, and the web formatter (toPrecision) already rounds that way. The
+    # two surfaces must never print different numbers for the same model — 0.3125 is $0.313 in both.
+    if amount >= 1:
+        quantized = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    else:
+        # Three significant figures: quantize at the decade two below the leading digit.
+        quantized = amount.quantize(Decimal(1).scaleb(amount.adjusted() - 2),
+                                    rounding=ROUND_HALF_UP)
+    text = format(quantized.normalize(), "f")
+    return text
+
+
 CACHE_TTL = timedelta(hours=6)
 CACHED_STALE_AFTER = timedelta(hours=24)
 RATE_NAMES = ("input", "output", "cached_input", "cache_write", "cache_write_5m",
