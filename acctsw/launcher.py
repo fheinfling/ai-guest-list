@@ -30,11 +30,13 @@ and never decide anything on their own when something better is available:
 from __future__ import annotations
 
 import fcntl
+import json
 import logging
 import os
 import pty
 import re
 import select
+import shutil
 import signal
 import struct
 import sys
@@ -44,20 +46,23 @@ import time
 import tty
 from dataclasses import dataclass
 from datetime import timedelta
+from pathlib import Path
 from typing import Callable
 
+from . import handoff, keyhome, keyseats, pricing, providers
 from . import identity as identity_mod
 from . import rollout
 from . import usage as usage_mod
 from .context import Context
 from .errors import AcctswError
 from .procenv import harden_env
-from .selection import Selection, choose
+from .selection import Selection, choose, choose_key
 from .session import active_session, clear_session, mark_session
 from .switch import switch, sync_back
 from .util import iso, now, parse_iso
 
-# A spawn function: (argv, on_output, on_tick=None) -> exit_status.
+# A spawn function: (argv, on_output, on_tick=None, *, env=None) -> exit_status.
+# ``env`` is passed ONLY for key children; existing subscription spawns keep their call contract.
 #   on_output(chunk: bytes) -> bool ; returning True asks the supervisor to stop the child.
 #   on_tick() -> bool           ; called about every TICK_INTERVAL_S, INDEPENDENTLY of output (a
 #                                 silent child still has to be supervised); True also stops it.
@@ -307,7 +312,8 @@ def _verify_capacity(ctx: Context, tool: str, get, *, at, force: bool,
 
 def _wait_for_unlock(ctx: Context, tool: str, notify: Notifier,
                      sleep: Callable[[float], None], get=usage_mod._default_get,
-                     exclude: set | frozenset = frozenset(), cold_start: bool = False) -> str | None:
+                     exclude: set | frozenset = frozenset(), cold_start: bool = False,
+                     on_all_resting: Callable[[], bool] | None = None) -> str | None:
     """Verify-then-poll until a seat is actually usable. Returns the seat's email, or None to give up.
 
     Never sleeps on stored flags alone: a FORCED verify sweep runs first, so a launch against stale
@@ -346,6 +352,10 @@ def _wait_for_unlock(ctx: Context, tool: str, notify: Notifier,
     # just-stamped reactive rest isn't cleared into a same-seat resume busy-loop.
     sel = _verify_capacity(ctx, tool, get, at=vnow(), force=True, exclude=exclude, ua=ua,
                            trust_reactive_lag=not cold_start)
+    # This is the existing verified all-resting boundary, including wait-disabled launches.
+    # The callback can finish a metered confirmation; False retains the subscription wait verbatim.
+    if sel.all_limited and on_all_resting is not None and on_all_resting():
+        return None
     if not _wait_on_all_resting_enabled():
         # Waiting disabled: don't poll, but the forced verify above still self-heals a stale reactive
         # flag — start immediately if capacity actually exists now, else give up as before.
@@ -622,7 +632,7 @@ def _exitcode(raw_status: int) -> int:
 
 def pty_spawn(argv: list, on_output: Callable[[bytes], bool],
               on_tick: Callable[[], bool] | None = None,
-              tick_interval: float = TICK_INTERVAL_S) -> int:
+              tick_interval: float = TICK_INTERVAL_S, *, env: dict | None = None) -> int:
     """Run ``argv`` in a PTY, copying I/O to the real terminal and teeing output to ``on_output``.
 
     If ``on_output`` returns True, the child is terminated (SIGTERM→SIGKILL) so the caller can
@@ -634,6 +644,9 @@ def pty_spawn(argv: list, on_output: Callable[[bytes], bool],
     fast that select() never times out. It is therefore driven from BOTH ends of the loop: a timeout
     when there is nothing to copy, and an elapsed-time check after each copy. True stops the child
     exactly like ``on_output`` does.
+
+    ``env`` is child-only: a metered credential must never enter argv or os.environ, where another
+    supervisor/helper could inherit it. None preserves the stock subscription environment.
     """
     # Resolve real fds up front; under test capture / non-tty these may be missing — guard them
     # so we never pass an object with a raising fileno() into select() (which would busy-loop).
@@ -645,7 +658,7 @@ def pty_spawn(argv: list, on_output: Callable[[bytes], bool],
 
     pid, master_fd = pty.fork()
     if pid == 0:
-        os.execvpe(argv[0], argv, harden_env())
+        os.execvpe(argv[0], argv, harden_env(env))
         os._exit(127)
 
     stop_requested = False
@@ -863,6 +876,32 @@ def _noop(_msg: str) -> None:
     pass
 
 
+def _claude_transcripts() -> dict[Path, int]:
+    from . import paths
+    root = Path(os.environ.get("CLAUDE_CONFIG_DIR", paths.CLAUDE_CONFIG_DIR)) / "projects"
+    found = {}
+    for path in root.glob("*/*.jsonl"):
+        try:
+            found[path] = path.stat().st_mtime_ns
+        except OSError:
+            pass
+    return found
+
+
+def _claude_transcript_meta(path: Path) -> dict:
+    # Read records, not the encoded project-directory name: different cwd spellings can collapse
+    # to the same name. Queue/snapshot records before the first message may have no session id.
+    try:
+        with path.open() as source:
+            for line in source:
+                row = json.loads(line)
+                if row.get("sessionId") and row.get("cwd"):
+                    return row
+    except (OSError, ValueError, AttributeError):
+        pass
+    return {}
+
+
 # Sub-commands that establish/replace credentials rather than run an agent session: codex login,
 # claude auth login / auth status / setup-token, logout. They must NOT be supervised — there is no
 # seat to pick, switch, or auto-switch, and the interactive OAuth flow needs the tool to fully own the
@@ -874,6 +913,7 @@ _PASSTHROUGH_CMDS = frozenset({"login", "logout", "auth", "setup-token"})
 
 def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         notify: Notifier = _noop, get=usage_mod._default_get,
+        price_get=pricing._default_get,
         max_switches: int = MAX_SWITCHES,
         sleep: Callable[[float], None] = time.sleep) -> int:
     """Launch ``tool`` with the best seat, auto-switching + resuming on limits. Returns exit code."""
@@ -931,6 +971,219 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
 
     auth_failed: set = set()   # seats whose token died THIS run — skip them for the rest of it
 
+    # A key is a separate runtime, NEVER an OAuth account installed behind state.active(). Keep
+    # the pending consent separate from the runtime too: neither config nor env exists pre-approval.
+    key_runtime = None
+    key_env = None
+    key_request = None
+    key_seat = None
+    key_answer = None
+    key_attempted = False
+    key_session = None              # (thread id, source transcript, relative destination)
+    rollout_source = None
+    claude_before = None
+    child_started = False
+    key_cold_start = False
+
+    def _remember_key_session(thread, path):
+        nonlocal key_session
+        relative = Path("projects") / path.parent.name / path.name
+        if tool == "codex":
+            # Retain the dated rollout layout expected by resume discovery. Homes may share the
+            # source sessions tree, but the destination is always an ordinary private copy.
+            root = next((p for p in path.parents if p.name == "sessions"), path.parent)
+            relative = Path("sessions") / path.relative_to(root)
+        key_session = (thread, path, relative)
+
+    def _capture_key_session() -> bool:
+        if tool == "codex" and rollout_source is not None:
+            rollout_source.poll(force_attach=True)
+            path = rollout_source.attached
+            if path is not None and rollout_source.unambiguous:
+                meta = rollout.session_meta(path) or {}
+                if isinstance(meta.get("id"), str) and meta["id"]:
+                    _remember_key_session(meta["id"], path)
+                    return True
+            return False
+        if tool == "claude" and child_started:
+            candidates = [(path, _claude_transcript_meta(path))
+                          for path, stamp in _claude_transcripts().items()
+                          if (claude_before or {}).get(path) != stamp]
+            candidates = [(path, meta) for path, meta in candidates
+                          if meta.get("cwd") == os.getcwd()]
+            if len(candidates) == 1:
+                path, meta = candidates[0]
+                _remember_key_session(meta["sessionId"], path)
+                return True
+            return False
+        # A cold launch can start fresh. A resume must resolve to a transcript BEFORE asking for
+        # money; --last in an empty private home would silently lose the work we promised to carry.
+        wants_resume = (bool(args) and args[0] == "resume" if tool == "codex"
+                        else any(a in ("--resume", "-r", "--continue", "-c") for a in args))
+        if not wants_resume:
+            return not child_started
+        candidates = (rollout.scan_rollouts(rollout.sessions_roots(ctx, state.active(tool)))
+                      if tool == "codex" else _claude_transcripts())
+        matches = []
+        for path, stamp in candidates.items():
+            meta = (rollout.session_meta(path) or {} if tool == "codex"
+                    else _claude_transcript_meta(path))
+            thread = meta.get("id" if tool == "codex" else "sessionId")
+            if thread and (thread in args or meta.get("cwd") == os.getcwd()):
+                matches.append((thread in args, stamp, thread, path))
+        explicit = [m for m in matches if m[0]]
+        latest = "--last" in args or "--continue" in args or "-c" in args
+        if not explicit and not latest:
+            return False  # an interactive picker has not selected a conversation yet
+        if not matches:
+            return False
+        _, _, thread, path = max(explicit or matches)
+        _remember_key_session(thread, path)
+        return True
+
+    def _key_eligible(st, *, cold_start=False) -> bool:
+        selected = choose_key(st, tool)  # deliberately NO auth-failure exclusion list
+        if not selected.seat_id or (key_seat and selected.seat_id != key_seat["id"]):
+            return False
+        if not cold_start and not st.settings().get("auto_switch", True):
+            return False
+        # The legacy stdout handler conservatively rests the 90–100% band. Preserve that rule for
+        # subscriptions, but it is not permission to spend: a merely near-full reading cannot buy
+        # a key hop. Hard/usage evidence remains authoritative, including null-window credit stops.
+        for seat in st.accounts(tool).values():
+            u = seat.get("usage") or {}
+            if (seat.get("limit_source") == "reactive" and u.get("ok")
+                    and not usage_mod.snapshot_says_out(u)):
+                return False
+        return True
+
+    def _offer_key(*, cold_start=False) -> bool:
+        nonlocal key_request, key_seat, key_attempted
+        if key_attempted:
+            return key_request is not None
+        with ctx.locked():
+            st = ctx.load_state()
+            if not _key_eligible(st, cold_start=cold_start):
+                return False
+            key_seat = dict(st.data["keys"][choose_key(st, tool).seat_id])
+            from_seat = st.active(tool)
+        key_attempted = True  # declining or timing out must not prompt again on every TUI redraw
+        if not _capture_key_session():
+            notify(f"{tool}: couldn't pin down this session — keeping the paid-per-token seat waiting")
+            return False
+        notify(f"all {tool} seats are resting 💤 — checking the price estimate for {key_seat['model']}")
+        try:
+            provider = providers.get_provider(key_seat["provider"], region=key_seat.get("region"),
+                                              base_url=key_seat.get("base_url"))
+            secret = keyseats.get_secret(ctx, key_seat["id"], harness=tool)
+            if not secret:
+                raise ValueError("missing key")
+            # Dedicated redirect-disabled transport: the subscription usage getter follows a
+            # different contract. Neither catalog I/O nor its cache write holds the state flock.
+            catalog = pricing.fetch_catalog(provider, secret, get=price_get,
+                                             cache_path=ctx.data_dir / "pricing.json",
+                                             wire_api="responses" if tool == "codex" else "messages")
+            model = next((m for m in catalog.models if m.id == key_seat["model"]), None)
+            with ctx.locked():
+                st = ctx.load_state()
+                if (not _key_eligible(st, cold_start=cold_start)
+                        or st.data["keys"].get(key_seat["id"]) != key_seat):
+                    return False
+            key_request = handoff.request(ctx, tool, from_seat, key_seat["id"], model=model,
+                                          session_id=key_session[0] if key_session else None)
+        except Exception:
+            # A provider/Keychain exception can echo the key. Report the step, never its payload.
+            notify(f"{tool}: couldn't ready the paid-per-token seat — staying with the guest list")
+            return False
+        notify(f"{key_seat['label']} can take the floor with {key_seat['model']} (paid per token) "
+               f"— waiting for your approval in the app; the invitation expires in two minutes")
+        return True
+
+    def _poll_key(*, at=None) -> str | None:
+        nonlocal key_request, key_answer
+        if key_request is None:
+            return key_answer
+        record = handoff.resolve(ctx, key_request, at=at)
+        if record is not None and record["status"] == "pending":
+            return "pending"
+        key_request = None
+        key_answer = record["status"] if record else "expired"
+        if key_answer == "approved":
+            notify(f"{tool}: invitation accepted — getting {key_seat['model']} ready, paid per token")
+        elif key_answer == "declined":
+            notify(f"{tool}: paid-per-token invitation declined — keeping your subscription seats")
+        else:
+            notify(f"{tool}: paid-per-token invitation expired — freeing your terminal")
+        return key_answer
+
+    def _wait_key() -> str | None:
+        # No child is alive on the cold/post-exit paths. Use the SAME heartbeat, with the wait's
+        # virtual-clock convention so an injected sleep can exercise real expiry without minutes.
+        virtual = now()
+        while _poll_key(at=max(now(), virtual)) == "pending":
+            base = max(now(), virtual)
+            sleep(TICK_INTERVAL_S)
+            virtual = base + timedelta(seconds=TICK_INTERVAL_S)
+        return key_answer
+
+    def _activate_key(*, cold_start=False) -> bool:
+        nonlocal key_runtime, key_env, key_cold_start
+        if key_answer != "approved":
+            return False
+        key_cold_start = cold_start
+        if not _key_approval_current(cold_start=cold_start):
+            return False
+        try:
+            key_runtime = keyhome.prepare(ctx, key_seat["id"])
+            key_env = keyhome.build_env(ctx, key_runtime)
+            if key_session:
+                _, source, relative = key_session
+                destination = key_runtime.home / relative
+                destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                # Copy AFTER shutdown so the last turn is flushed. No auth/config/SQLite files
+                # and no links back into a subscription home: only this conversation travels.
+                shutil.copyfile(source, destination)
+                destination.chmod(0o600)
+        except Exception:
+            notify(f"{tool}: couldn't prepare the paid-per-token seat — your saved session is safe")
+            return False
+        return True
+
+    def _key_approval_current(*, cold_start=False) -> bool:
+        nonlocal key_answer
+        with ctx.locked():
+            st = ctx.load_state()
+            eligible = (_key_eligible(st, cold_start=cold_start)
+                        and st.data["keys"].get(key_seat["id"]) == key_seat)
+        if not eligible:
+            key_answer = "cancelled"  # a later settings change cannot resurrect consumed consent
+            notify(f"{tool}: the guest list changed before the paid-per-token handoff — please try again")
+        return eligible
+
+    def _key_command() -> list:
+        argv = build_cmd(ctx, tool, [])
+        if key_session:
+            argv += ["resume" if tool == "codex" else "--resume", key_session[0]]
+        else:
+            # A cold invocation may already name a model. The confirmation names the model we
+            # are buying, so replace that option rather than sending conflicting flags to the CLI.
+            # Respect --: words in a prompt are not options, and our flags must precede it.
+            rest = iter(args)
+            for arg in rest:
+                if arg == "--":
+                    argv += [arg, *rest]
+                    break
+                if arg == "--model" or (tool == "codex" and arg == "-m"):
+                    next(rest, None)
+                elif not arg.startswith("--model="):
+                    argv.append(arg)
+        options = ["--model", key_runtime.model]
+        if tool == "codex":
+            options += ["-c", "model_provider=" + json.dumps(key_runtime.model_provider)]
+        boundary = argv.index("--") if "--" in argv else len(argv)
+        argv[boundary:boundary] = options
+        return argv
+
     def _auto_switch_is_on() -> bool:
         """Read the live preference at an unlocked decision boundary.
 
@@ -944,8 +1197,15 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
     def _wait_and_activate(cold_start: bool = False) -> bool:
         if not cold_start and not _auto_switch_is_on():
             return False
+        def all_resting():
+            if not _offer_key(cold_start=cold_start):
+                return False
+            return _wait_key() != "declined"
+
         email = _wait_for_unlock(ctx, tool, notify, sleep, get, exclude=auth_failed,
-                                 cold_start=cold_start)
+                                 cold_start=cold_start, on_all_resting=all_resting)
+        if key_answer == "approved":
+            return _activate_key(cold_start=cold_start)
         if email is None or (not cold_start and not _auto_switch_is_on()):
             return False
         hopped = False
@@ -1156,6 +1416,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             """
             # ``hit`` is rebound per loop iteration; the closure reads the current one.
             hit["handled"] = True   # recognized — the exit-time net must not re-derive this signal
+            if key_request is not None:
+                return False  # the heartbeat owns consent; TUI redraws cannot create more prompts
             with ctx.locked():
                 state = ctx.load_state()
                 active = state.active(tool)
@@ -1224,6 +1486,9 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                         landing = sel.email   # the fresh sweep may name a different seat than choose
                     else:
                         _undo_realign()   # the pre-flight refused: this is a no-hop after all
+                        if switches < max_switches and _offer_key():
+                            clear()
+                            return False
                         if not scan["limit_stay_notified"]:
                             notify(f"{active} hit a hard billing limit and no other {tool} seat is "
                                    f"usable right now (the whole workspace may be out of credits) "
@@ -1270,6 +1535,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     notify(f"hit the switch limit ({max_switches}){suffix} — staying on this seat")
                     scan["budget_notified"] = True
                 return False
+            if dec.action == "give_up" and switches < max_switches and _offer_key():
+                return False  # leave the PTY responsive until the heartbeat sees an answer
             if reason == "auth":
                 if not scan["auth_stay_notified"]:
                     if dec.unlocks_at:
@@ -1296,6 +1563,36 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             return False
 
         while True:
+            if key_runtime is not None:
+                # Interactive key sessions remain PTY sessions. app-server cannot own a TUI, and
+                # subscription probes/credential reconciliation have no meaning for this child.
+                if not _key_approval_current(cold_start=key_cold_start):
+                    return EXIT_GAVE_UP
+                argv = _key_command()
+                notify(f"{key_seat['label']} is taking the floor ✨ — {key_runtime.model}, paid per token; "
+                       + ("your work's coming with you" if key_session else "ready for your work"))
+                mark_session(ctx.data_dir, tool, key_runtime.seat_id)
+                source = None
+                if tool == "codex":
+                    roots = [key_runtime.home / "sessions"]
+                    source = rollout.RolloutWatcher(roots, cwd=os.getcwd(), started_at=now(),
+                                                    before=rollout.scan_rollouts(roots))
+                reported = False
+
+                def key_tick():
+                    nonlocal reported
+                    signals = source.poll() if source is not None else ()
+                    if not reported and any(sig.kind == "limit" for sig in signals):
+                        notify(f"{tool}: {key_runtime.model}'s paid-per-token seat reported a limit "
+                               f"— your session is still here")
+                        reported = True
+                    return False
+
+                try:
+                    return spawn(argv, lambda chunk: False, on_tick=key_tick, env=key_env)
+                finally:
+                    if source is not None:
+                        source.close()
             argv = resume_cmd(ctx, tool) if resuming else build_cmd(ctx, tool, args)
             if resuming and tool == "codex" and resume_thread:
                 argv = [argv[0], "resume", resume_thread]
@@ -1440,6 +1737,18 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                                     detail=seat.get("limit_detail"))
 
             def _tick() -> bool:
+                if key_request is not None:
+                    answer = _poll_key()
+                    if answer == "approved":
+                        if not _key_approval_current():
+                            return False  # settings/recovery raced the answer: do not kill the TUI
+                        hit.update(reason="key", handled=True)
+                        return True
+                    if answer not in ("pending", "declined"):
+                        hit.update(reason="key_expired", handled=True)
+                        return True
+                    if answer == "pending":
+                        return False
                 for sig in (rollout_source.poll() if rollout_source is not None else ()):
                     if sig.kind == "healthy":
                         tick["healthy_at"] = time.monotonic()
@@ -1468,6 +1777,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 return _tick_state() or _tick_recover()
 
             def on_output(chunk: bytes) -> bool:
+                if key_request is not None:
+                    return False  # consent is polled by the heartbeat, not by redrawn banners
                 buf.extend(chunk)
                 del buf[:-4096]  # keep a rolling tail
                 text = buf.decode("utf-8", "replace")
@@ -1533,6 +1844,11 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 decision_reason = "revoked" if verdict == "revoked" else reason
                 return _decide_and_maybe_stop(reason=decision_reason, hard=hard, clear=buf.clear)
 
+            # Claude has no rollout watcher. Only inspect its transcript tree when key fallback
+            # is enabled; ordinary subscription launches keep their original filesystem work.
+            if tool == "claude" and ctx.load_state().settings().get("key_fallback"):
+                claude_before = _claude_transcripts()
+            child_started = True
             status = spawn(argv, on_output, on_tick=_tick)  # NO lock held here
             if rollout_source is not None:
                 if hit["reason"] == "manual":
@@ -1544,6 +1860,23 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     if isinstance(thread, str) and thread:
                         resume_thread = thread
                 rollout_source.close()
+
+            if key_request is not None:
+                if status < 0 or status in _ABORT_EXITS:
+                    return status  # a user abort cancels the invitation along with the session
+                # Some tools exit while their invitation is pending. The consent still has a
+                # deadline; wait on the heartbeat without a PTY, never the hours-long rest timer.
+                answer = _wait_key()
+                if answer == "approved":
+                    hit.update(reason="key", handled=True)
+                elif answer != "declined":
+                    hit.update(reason="key_expired", handled=True)
+            if hit["reason"] == "key_expired":
+                return EXIT_GAVE_UP
+            if hit["reason"] == "key":
+                if _activate_key():
+                    continue
+                return EXIT_GAVE_UP
 
             if hit["reason"] == "manual":
                 # The child has flushed its session. Re-read the selection so rapid clicks
@@ -1576,6 +1909,11 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     and status > 0 and status not in _ABORT_EXITS):
                 _decide_and_maybe_stop(reason="limit", hard=sig.hard, reset_at=sig.reset_at,
                                        source=("hard" if sig.hard else "usage"), detail=sig.detail)
+                if key_request is not None:
+                    if _wait_key() == "approved" and _activate_key():
+                        continue
+                    if key_answer != "declined":
+                        return EXIT_GAVE_UP
 
             if hit["reason"] is None:
                 if hit["handled"]:
@@ -1676,6 +2014,14 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         # Clear before credential reconciliation so observers never report a session whose child has
         # already exited merely because sync-back is waiting on the state lock or filesystem.
         clear_session(ctx.data_dir, tool)
+        if key_request is not None:
+            try:
+                # Ctrl-C or an exceptional spawn must not leave a live invitation behind. Use the
+                # protocol so a concurrent answer/expiry still wins; consume either terminal result.
+                handoff.answer(ctx, key_request, False)
+                handoff.resolve(ctx, key_request)
+            except Exception:
+                pass
         # On exit, reconcile the active account's creds (the just-run seat may carry a rotated token).
         #  - codex: it maintained its own home via CODEX_HOME → mirror the home into ~/.codex so
         #    plain codex / the GUI follow the active account.
@@ -1688,7 +2034,9 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         # byte-identical to the stored snapshot there is nothing to preserve, so the common
         # no-rotation launch never pays for `claude auth status`.
         try:
-            if tool == "codex":
+            if key_runtime is not None:
+                pass  # no OAuth blob belongs to a key child, including failed spawn/prepare paths
+            elif tool == "codex":
                 with ctx.locked():
                     st = ctx.load_state()
                     active = st.active(tool)
