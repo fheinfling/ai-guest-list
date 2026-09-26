@@ -68,7 +68,7 @@ anywhere.
   refresh every 30 seconds while the popover is open; background and parked-seat refreshes run
   every three minutes. Provider throttling backs off and keeps the last reading visibly stale.
 - **Desktop switching** — the menubar moves a confirmed-limited seat to a verified healthy seat of
-  the same tool when auto-switch is enabled. With “restart Codex after a swap” enabled, a running
+  the same tool when auto-switch is enabled. With “restart the Codex app after a swap” enabled, a running
   Codex desktop app quits gracefully and reopens; continue in your existing thread. Supervised
   terminal sessions resume automatically. Nearly full seats stay active until a confirmed limit.
 - **Zero-touch setup** — installing the app wires `codex` / `claude` to the supervised launchers; when

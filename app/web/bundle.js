@@ -536,7 +536,7 @@ function buildSettings(state) {
       ${toggleRow("supervise_shell", "supervise terminal commands", "route codex/claude through the auto-switching launchers", s.supervise_shell !== false)}
       ${toggleRow("same_tool_only", "keep me on the same tool", "a Codex limit hops to your other Codex seat, never to Claude", s.same_tool_only)}
       ${toggleRow("notify", "tell me when it switches", "a gentle notification with who's on now", s.notify)}
-      ${toggleRow("restart_app", "restart Codex after a swap", "Codex needs a fresh start · Claude picks it up live", s.restart_app)}
+      ${toggleRow("restart_app", "restart the Codex app after a swap", "Codex needs a fresh start · Claude picks it up live", s.restart_app)}
     </div></section>`;
 
   const appearance = `<section class="set-sec"><span class="set-label">appearance</span>

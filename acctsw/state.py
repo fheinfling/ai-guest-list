@@ -49,7 +49,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "auto_switch": True,
     "same_tool_only": True,   # "keep me on the same tool"
     "notify": True,           # "tell me when it switches"
-    "restart_app": False,     # "restart Codex after a swap"
+    "restart_app": False,     # "restart the Codex app after a swap"
     "celebrations": True,     # "little celebrations"
     "supervise_shell": True,  # wire terminal codex/claude through the supervised cx/cl launchers
     "strategy": "soonest_back",  # "soonest_back" | "most_headroom"
