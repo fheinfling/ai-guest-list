@@ -533,10 +533,10 @@ function buildSettings(state) {
   const autoSwitch = `<section class="set-sec"><span class="set-label">auto-switch</span>
     <div class="set-card">
       ${segBlock("when a seat runs out", strategyHint(strat), "set_strategy", strat, STRATEGY_OPTS)}
-      ${toggleRow("supervise_shell", "supervise terminal commands", "route codex/claude through the auto-switching launchers", s.supervise_shell !== false)}
+      ${toggleRow("supervise_shell", "supervise terminal commands", "codex/claude auto-switch seats · off: only cx/cl do", s.supervise_shell !== false)}
       ${toggleRow("same_tool_only", "keep me on the same tool", "a Codex limit hops to your other Codex seat, never to Claude", s.same_tool_only)}
       ${toggleRow("notify", "tell me when it switches", "a gentle notification with who's on now", s.notify)}
-      ${toggleRow("restart_app", "restart Codex after a swap", "Codex needs a fresh start · Claude picks it up live", s.restart_app)}
+      ${toggleRow("restart_app", "restart the Codex app after a swap", "the desktop app keeps the old account until it relaunches · terminals switch on their own", s.restart_app)}
     </div></section>`;
 
   const appearance = `<section class="set-sec"><span class="set-label">appearance</span>
