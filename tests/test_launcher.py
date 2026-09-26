@@ -1447,21 +1447,26 @@ def test_pty_spawn_stop_path_terminates_without_error():
 def test_terminate_gives_sigterm_five_seconds_before_sigkill(monkeypatch):
     """The legitimate hop path gives a TUI 100×50ms to flush its resume file before SIGKILL."""
     signals = []
-    waits = {"n": 0}
     sleeps = []
+    clock = [0.0]
     monkeypatch.setattr(L.os, "getpgid", lambda pid: pid)
     monkeypatch.setattr(L.os, "killpg", lambda pgid, sig: signals.append(sig))
 
     def waitpid(pid, options):
-        waits["n"] += 1
-        return (0, 0) if waits["n"] <= 100 else (pid, 0)
+        assert options == L.os.WNOHANG
+        return (pid, 0) if L.signal.SIGKILL in signals else (0, 0)
+
+    def sleep(delay):
+        sleeps.append(delay)
+        clock[0] += delay
 
     monkeypatch.setattr(L.os, "waitpid", waitpid)
-    monkeypatch.setattr(L.time, "sleep", sleeps.append)
+    monkeypatch.setattr(L.time, "sleep", sleep)
+    monkeypatch.setattr(L.time, "monotonic", lambda: clock[0])
 
     assert L._terminate(4242) == 0
     assert signals == [L.signal.SIGTERM, L.signal.SIGKILL]
-    assert sleeps == [0.05] * 100
+    assert sum(sleeps) == pytest.approx(5.0)
 
 
 def test_pty_spawn_nonzero_exit_propagates():
@@ -2600,3 +2605,127 @@ def test_tick_ambiguous_limit_lines_share_one_probe_cooldown(ctx, monkeypatch, t
     assert state.active("codex") == "a@x.com"
     assert state.get_seat("codex", "a@x.com").get("limited_until") is None
     assert msgs == []
+
+
+@pytest.mark.parametrize('with_pty', [True, False])
+def test_terminate_output_backpressure_returns_under_timeout(with_pty):
+    """The macOS tty-close repro: fill an unread PTY, then terminate in a bounded thread."""
+    import contextlib
+    import subprocess
+    master = None
+    child = None
+    if with_pty:
+        pid, master = L.pty.fork()
+        if pid == 0:
+            os.execl('/bin/sh', 'sh', '-c', 'exec yes aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
+        time.sleep(0.2)  # deliberately do not read the master before shutdown
+    else:
+        # Also exercise a caller without a separate process group: never signal pytest's group.
+        child = subprocess.Popen(['/bin/sleep', '30'])
+        pid = child.pid
+    result = []
+    worker = threading.Thread(target=lambda: result.append(L._terminate(pid, master)), daemon=True)
+    try:
+        started = time.monotonic()
+        worker.start()
+        worker.join(3)
+        assert not worker.is_alive(), 'shutdown stopped draining the PTY'
+        assert time.monotonic() - started < 3
+        assert result and result[0] < 0
+        if child is not None:
+            child.returncode = result[0]  # _terminate already reaped it
+        if master is not None:
+            with pytest.raises(OSError):
+                os.fstat(master)  # ownership was transferred, so it must be closed
+    finally:
+        if worker.is_alive():
+            if master is not None:
+                with contextlib.suppress(OSError):
+                    os.close(master)  # releases the original buggy wait4 on macOS
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, L.signal.SIGKILL)  # only our own still-unreaped child
+            worker.join(3)
+        if child is not None:
+            child.wait(timeout=3)
+
+
+@pytest.mark.parametrize('master', [123, None])
+def test_terminate_unreapable_child_closes_master_and_bounds_final_wait(monkeypatch, caplog, master):
+    clock, events = [0.0], []
+    monkeypatch.setattr(L.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(L.time, 'sleep', lambda n: clock.__setitem__(0, clock[0] + n))
+    monkeypatch.setattr(L.os, 'getpgid', lambda pid: pid)
+    monkeypatch.setattr(L.os, 'killpg', lambda pid, sig: events.append(('signal', sig, clock[0])))
+    monkeypatch.setattr(L.os, 'set_blocking', lambda *args: None)
+    monkeypatch.setattr(L.os, 'close', lambda fd: events.append(('close', fd, clock[0])))
+    def waitpid(pid, flags):
+        assert flags == os.WNOHANG
+        return 0, 0
+    def select(read, write, exc, delay):
+        clock[0] += delay
+        return [], [], []
+    monkeypatch.setattr(L.os, 'waitpid', waitpid)
+    monkeypatch.setattr(L.select, 'select', select)
+    assert L._terminate(4242, master) == -L.signal.SIGKILL
+    expected = [('signal', L.signal.SIGTERM, 0), ('signal', L.signal.SIGKILL, 5)]
+    if master is not None:
+        expected.append(('close', master, 6))
+    assert events == expected
+    assert clock[0] == pytest.approx(7)
+    assert 'leaving it for init' in caplog.text
+
+
+def test_pty_stop_drains_sigterm_session_save(tmp_path):
+    import sys
+    saved = tmp_path / 'saved'
+    script = tmp_path / 'chatty.py'
+    script.write_text('''import os, signal, sys, time
+from pathlib import Path
+def stop(sig, frame):
+    data = b'a' * (2 * 1024 * 1024)
+    while data:
+        data = data[os.write(1, data):]
+    Path(sys.argv[1]).write_text('saved')
+    sys.exit(0)
+signal.signal(signal.SIGTERM, stop)
+print('ready', flush=True)
+while True: time.sleep(1)
+''')
+    assert L.pty_spawn([sys.executable, str(script), str(saved)], lambda data: b'ready' in data) == 0
+    assert saved.read_text() == 'saved'
+
+
+@pytest.mark.parametrize('via_signal', [True, False])
+def test_pty_shutdown_handler_is_not_reentrant(monkeypatch, via_signal):
+    handlers, calls, deaths = {}, [], []
+    real_terminate = L._terminate
+    real_kill = os.kill
+    def install(sig, handler):
+        handlers[sig] = handler
+        return L.signal.SIG_DFL
+    def terminate(pid, master_fd=None):
+        calls.append(pid)
+        handlers[L.signal.SIGWINCH](L.signal.SIGWINCH, None)
+        handlers[L.signal.SIGHUP](L.signal.SIGHUP, None)
+        handlers[L.signal.SIGTERM](L.signal.SIGTERM, None)
+        return real_terminate(pid, master_fd)
+    def kill(pid, sig):
+        if pid == os.getpid():
+            deaths.append(sig)  # never signal the pytest runner
+        else:
+            real_kill(pid, sig)
+    def output(data):
+        if via_signal:
+            handlers[L.signal.SIGTERM](L.signal.SIGTERM, None)
+            raise RuntimeError('simulated supervisor exit')
+        return True
+    monkeypatch.setattr(L.signal, 'signal', install)
+    monkeypatch.setattr(L, '_terminate', terminate)
+    monkeypatch.setattr(L.os, 'kill', kill)
+    if via_signal:
+        with pytest.raises(RuntimeError, match='simulated supervisor exit'):
+            L.pty_spawn(['/bin/sh', '-c', 'echo ready; exec sleep 30'], output)
+    else:
+        L.pty_spawn(['/bin/sh', '-c', 'echo ready; exec sleep 30'], output)
+    assert len(calls) == 1
+    assert deaths == [L.signal.SIGTERM]

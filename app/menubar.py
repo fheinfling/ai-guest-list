@@ -256,6 +256,13 @@ if objc is not None:
             older build left provider routing injected in ~/.codex/~/.claude (or an orphaned proxy),
             strip/restore it once so plain codex/claude run directly. Idempotent; a no-op once nothing
             remains."""
+            # Startup only: process grace waits and release walks belong off the main thread.
+            # daemon_report gates GC on the same supervised-session check as launch promotion.
+            try:
+                from acctsw.codexhome import daemon_report
+                daemon_report(self.ctx, fix=True)
+            except Exception:
+                pass                    # maintenance must never prevent the menubar from opening
             try:
                 from acctsw import headroom
                 if headroom.legacy_present(self.ctx):
