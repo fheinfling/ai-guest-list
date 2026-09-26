@@ -110,6 +110,13 @@ def classify_error(provider: str | Provider, status: int, body: str | dict) -> s
         data = json.loads(body, parse_float=Decimal) if isinstance(body, str) else body
     except (ValueError, TypeError):
         return "unknown"
+    if id == "langdock" and status == 401:
+        # Observed 2026-09-26 against the live EU endpoint: a rejected key returns a bare
+        # {"message": "The provided API key is invalid."} with no error object at all, so the
+        # guard below would drop it. The message text is not evidence and is not read; the
+        # status is — a 401 from an authenticated models list means the credential was refused,
+        # which is all `invalid_key` claims. `revoked` stays unclaimed here as everywhere else.
+        return "invalid_key"
     error = data.get("error") if isinstance(data, dict) else None
     if not isinstance(error, dict):
         return "unknown"

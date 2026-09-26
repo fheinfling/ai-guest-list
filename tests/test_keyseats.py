@@ -158,7 +158,10 @@ def test_validation_is_exactly_one_authenticated_get(ctx, provider):
                                ("openrouter_in_flight_budget", "rate_limited"), ("future", "unknown"))],
     ("groq", 400, {"code": "blocked_api_access"}, "insufficient_quota"),
     *[(provider, 401, {"code": "invalid_api_key"}, "unknown") for provider in
-      ("langdock", "deepseek", "xai", "together", "mistral", "cerebras", "openai_compatible")],
+      ("deepseek", "xai", "together", "mistral", "cerebras", "openai_compatible")],
+    # Langdock sends no structured fields, so its 401 is classified from the status alone —
+    # an OpenAI-shaped code in the body neither helps nor changes the verdict.
+    ("langdock", 401, {"code": "invalid_api_key"}, "invalid_key"),
 ])
 def test_validation_uses_documented_taxonomy(ctx, provider, status, error, category):
     p = P.get_provider(provider, **({"base_url": "https://custom.test/v1"}
