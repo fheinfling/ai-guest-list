@@ -261,18 +261,23 @@ def test_snapshot_still_fails_closed_on_kernel_errors(monkeypatch, failure):
 
 @pytest.mark.skipif(sys.platform not in ('darwin', 'linux'), reason='native process inspection')
 def test_live_snapshot_retains_child_with_deleted_executable(tmp_path):
+    # Build our own sleeper: a copied Apple platform binary (/bin/sleep) is SIGKILLed at launch on
+    # macOS 14/15 even when re-signed, and the test must hold a genuinely running process.
+    cc = shutil.which('cc')
+    if cc is None:
+        pytest.skip('needs a C compiler to build a non-platform executable')
     executable = tmp_path / 'sleep with spaces'
-    shutil.copy('/bin/sleep', executable)
-    if sys.platform == 'darwin':
-        # A relocated Apple platform binary can be killed at launch; sign only our tmp copy.
-        subprocess.run(['/usr/bin/codesign', '--force', '--sign', '-', str(executable)],
-                       check=True, capture_output=True)
+    subprocess.run([cc, '-x', 'c', '-o', str(executable), '-'], check=True, capture_output=True,
+                   input=b'#include <unistd.h>\nint main(void) { sleep(60); return 0; }\n')
     process = subprocess.Popen([str(executable), '60'])
     try:
-        # Popen returns after exec, before dyld finishes opening the Mach-O. Allow startup
-        # before removing its pathname so this tests a deleted *running* executable.
-        time.sleep(0.1)
-        assert process.poll() is None
+        # Popen returns after exec, before dyld finishes opening the Mach-O. Wait until the kernel
+        # has a full argv for it, so this tests a deleted *running* executable.
+        deadline = time.monotonic() + 5
+        while not any(p.pid == process.pid and p.argv == (str(executable), '60')
+                      for p in D.list_processes()):
+            assert process.poll() is None and time.monotonic() < deadline
+            time.sleep(0.02)
         executable.unlink()
         record = next(p for p in D.list_processes() if p.pid == process.pid)
         assert record.executable is None
