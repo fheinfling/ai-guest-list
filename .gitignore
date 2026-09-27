@@ -36,3 +36,9 @@ auth.json
 
 # Claude Code local scratch (agent worktrees, plans)
 .claude/
+
+# Design-variant exploration: generated gallery + the fetched provider catalogue.
+# The variants themselves (design/variants/) are tracked; these are rebuilt by
+# scripts/design-gallery.py on demand.
+design/.build/
+design/fixtures/
