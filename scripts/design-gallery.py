@@ -290,9 +290,16 @@ def gallery_html(variants: list[dict], states: list[dict]) -> str:
         f'<button class="tab" data-state="{s["id"]}">{s["label"]}</button>' for s in states)
     notes = "".join(
         f'<p class="note" data-state="{s["id"]}" hidden>{s["note"]}</p>' for s in states)
+    # The rationale is a full README; showing it inline pushed every popover below the fold.
+    # Lead with one sentence, keep the rest one click away.
+    def caption(v):
+        text = " ".join(v["rationale"].split())
+        head, _, tail = text.partition(". ")
+        return (f'<figcaption><b>{v["id"]}</b><span class="why">{head}.</span>'
+                + (f'<details><summary>full rationale</summary><p>{tail}</p></details>' if tail else "")
+                + "</figcaption>")
     cols = "".join(
-        f'<figure class="col"><figcaption><b>{v["id"]}</b>'
-        f'<span class="why">{v["rationale"]}</span></figcaption>'
+        f'<figure class="col">{caption(v)}'
         f'<iframe data-variant="{v["id"]}" width="{POPOVER_W}" height="{POPOVER_H}" '
         f'loading="lazy" title="{v["id"]}"></iframe></figure>' for v in variants)
     return f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
@@ -313,9 +320,14 @@ def gallery_html(variants: list[dict], states: list[dict]) -> str:
   .note {{ margin:9px 0 0; font-size:12.5px; opacity:.8; max-width:80ch; }}
   .rail {{ display:flex; gap:22px; padding:22px 20px 40px; overflow-x:auto; align-items:flex-start; }}
   .col {{ margin:0; flex:none; width:{POPOVER_W}px; }}
-  figcaption {{ display:flex; flex-direction:column; gap:3px; margin-bottom:9px; min-height:74px; }}
+  figcaption {{ display:flex; flex-direction:column; gap:3px; margin-bottom:9px; height:104px; }}
   figcaption b {{ font-size:13px; }}
-  .why {{ font-size:11.5px; opacity:.75; line-height:1.45; }}
+  .why {{ font-size:11.5px; opacity:.75; line-height:1.45; overflow:hidden; }}
+  details {{ margin-top:auto; font-size:11px; }}
+  summary {{ cursor:pointer; opacity:.7; }}
+  details[open] {{ position:absolute; z-index:3; width:{POPOVER_W}px; max-height:60vh;
+                   overflow:auto; background:#fff; color:#161b24; padding:10px 12px;
+                   border-radius:10px; box-shadow:0 10px 30px rgba(20,30,50,.3); }}
   iframe {{ border:0; border-radius:16px; display:block;
            box-shadow:0 18px 40px rgba(20,30,50,.28), 0 2px 8px rgba(20,30,50,.16); }}
 </style></head><body>

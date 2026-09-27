@@ -81,11 +81,15 @@ async function check(name, states, reference) {
     }
   }
 
+  // Compare the UNION across states, not state by state. The contract is that no action becomes
+  // unreachable, not that it stays on the screen it happens to live on today — IA-5 deliberately
+  // moves auto-switch into settings, and a per-state check made that a failure. All five variants
+  // kept a main-screen shortcut purely to satisfy the stricter rule, which is a workaround for a
+  // bug in this file rather than a design decision.
   if (reference) {
-    for (const [key, html] of rendered) {
-      const missing = [...actionsIn(reference.get(key) || "")].filter((a) => !actionsIn(html).has(a));
-      if (missing.length) problems.push(`${key}: dropped action(s) ${missing.join(", ")}`);
-    }
+    const union = (map) => new Set([...map.values()].flatMap((html) => [...actionsIn(html)]));
+    const missing = [...union(reference)].filter((a) => !union(rendered).has(a));
+    if (missing.length) problems.push(`unreachable action(s) anywhere: ${missing.join(", ")}`);
   }
 
   const leak = escapingHolds(mod, states);
