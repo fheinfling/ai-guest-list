@@ -28,7 +28,8 @@ you've hit this: mid-task, the active account says *"you've reached your usage l
 stuck until it resets. **ai guest list** treats each paid subscription as a **seat** on a guest list.
 When the seat you're on runs out, it quietly **hops you to another seat of the same tool and resumes
 the exact session** (`codex resume` / `claude --resume`) — so your agent keeps working. When every
-seat is resting, it tells you which one **unlocks soonest**.
+seat is resting, it tells you which one **unlocks soonest** — or, if you've added an API key as a
+seat, offers to carry on at pay-per-token rates once you approve it.
 
 It's two thin pieces over your stock tools:
 - a **menubar app** showing live usage + a one-glance status, and
@@ -39,10 +40,10 @@ leave the **macOS Keychain** and the locations the official tools already read �
 anywhere.
 
 <p align="center">
-  <img src="docs/assets/screenshot.png" width="340" alt="The ai guest list popover: Codex and Claude seats with live 5-hour usage bars, an active 'on the floor' seat and a resting one, and the auto-switch toggle." />
+  <img src="docs/assets/screenshot.png" width="340" alt="The ai guest list popover: Codex and Claude seats with live 5-hour usage bars, an active 'on the floor' seat, a resting one, an API-key seat offering 'use in new terminal', and the auto-switch toggle." />
   &nbsp;
-  <img src="docs/assets/screenshot-settings.png" width="340" alt="The settings view: auto-switch strategy and toggles, theme, and the menubar icon legend." />
-  <br><sub><i>The menubar popover and its settings view — seats, live usage, auto-switch (sample accounts).</i></sub>
+  <img src="docs/assets/screenshot-settings.png" width="340" alt="The settings view: auto-switch strategy, the paid-key toggles, theme, and the menubar icon legend." />
+  <br><sub><i>The menubar popover and its settings view — seats, live usage, auto-switch, key seats (sample accounts).</i></sub>
 </p>
 
 ## Why
@@ -76,7 +77,39 @@ anywhere.
 - **Add / remove seats** — official browser sign-in, plus a no-browser path for Codex (paste an
   `auth.json`). Claude is browser sign-in only: a `claude setup-token` is an env-var token, not the
   Keychain login the switcher reads. Credentials live only in the Keychain / the tools' own stores.
+- **Pay-per-token key seats** — an API key becomes a seat too, for when every subscription is
+  resting or when you want one terminal on a specific model. Always asks before spending; one
+  switch stops every paid session. See [below](#bring-your-own-key).
 - **Version & build** shown at the bottom of the settings view.
+
+## Bring your own key
+
+Subscriptions rest; an API key doesn't. Add a **key seat** and the guest list gains a
+pay-per-token option for when every paid seat is resting — or pin one terminal to it deliberately
+with `cx --key <seat>`.
+
+- **Providers** — OpenAI, Anthropic, OpenRouter, Langdock (eu/us/global, both its OpenAI and its
+  Anthropic route) and any endpoint speaking the Responses API. A Chat-Completions-only provider is
+  refused when you add it, rather than failing later: Codex CLI requires Responses.
+- **Two harnesses, no new dependency** — a Responses key drives **Codex CLI**, an
+  Anthropic-compatible one drives **Claude Code**. A key seat only takes over sessions of its own
+  harness, so `codex resume` / `claude --resume` keep working and your work comes with you.
+- **Prices where they exist** — the picker shows input/output $/Mtok and sorts cheap to expensive
+  for providers that publish machine-readable prices. OpenAI, Anthropic and Langdock don't, so their
+  models show **no price** and sort by id. Nothing is filled in from a bundled table that could
+  quietly go stale.
+- **Nothing starts without you** — every hop onto a key seat asks first, naming the seat, the model
+  and the price, in the menubar even when the session is in a terminal.
+- **One switch stops it** — *allow paid key use* halts new paid requests **and** any running paid
+  session within a couple of seconds, leaving the work resumable.
+
+> **This app does not cap your spend.** It shows prices before you choose, asks before it spends,
+> and stops when you tell it to. For a hard limit, use your provider's own budget controls. A turn
+> already sent may still bill — the app says so rather than implying otherwise.
+
+Langdock's EU routes keep **model requests** on the endpoint you picked. That is not the same as
+"your code never reaches a US company": Langdock documents EU hosting on Microsoft Azure, and
+pointing a session at it does not undo what an earlier session already sent elsewhere.
 
 ## Install
 
@@ -159,6 +192,15 @@ Build the app locally with `pip install -e ".[build]" && python setup.py py2app`
 
 Credentials are only ever moved between the Keychain and the locations the official tools already read
 — nothing is proxied off-device or committed to git. Writes are atomic and `0o600`.
+
+**API keys.** A pasted key goes to the Keychain and nowhere else; the store keeps the provider, the
+model and the last four characters. It reaches the agent through that child's environment — never a
+command line, since `ps` is readable by anyone on the machine, and never a file. Key seats also
+disable Codex's shell snapshots and scrub Claude's subprocess environment: without both, the harness
+writes its own environment to disk and its shell tool can read the credential. That was a real leak,
+found by running the thing rather than by a test — the write-up, including what is verified and what
+isn't, is in
+[`docs/VERIFY-keyhome-secret-containment.md`](docs/VERIFY-keyhome-secret-containment.md).
 
 > **Note.** Earlier versions had an optional "save credit" context-compression proxy (Headroom).
 > Measuring it on real workloads showed the savings were negligible (~1–3% cache-adjusted) and not
