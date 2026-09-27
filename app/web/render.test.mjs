@@ -98,6 +98,18 @@ test("status: active=pill, ready=switch btn, resting=countdown+reassurance, need
   assert.match(mk("needs-login"), /btn rose"[^>]*data-action="add"/);
 });
 
+for (const kind of ["seat", "dot"]) {
+  test(`status markup is escaped in the ${kind} class attribute`, () => {
+    const status = 'ready"><button data-action="remove" data-email="forged">& remove</button><i class="';
+    const escaped = 'ready&quot;&gt;&lt;button data-action=&quot;remove&quot; data-email=&quot;forged&quot;&gt;&amp; remove&lt;/button&gt;&lt;i class=&quot;';
+    const html = buildHTML(state({ tools: {
+      codex: { seats: [seat({ status })] }, claude: { seats: [] },
+    } }));
+    assert.ok(html.includes(`class="${kind} ${kind}--${escaped}"`));
+    assert.doesNotMatch(html, /<button data-action="remove" data-email="forged"/);
+  });
+}
+
 test("stale usage preserves bars and labels the last successful reading", () => {
   const html = buildHTML(state({ tools: {
     codex: { seats: [seat({

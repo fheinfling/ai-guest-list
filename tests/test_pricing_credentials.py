@@ -252,3 +252,201 @@ def test_redaction_marker_cannot_recreate_the_key(ctx, capsys, key):
     assert key not in repr(catalog)
     assert key not in path.read_text()
     assert_clean(ctx, capsys)
+
+
+FRAGMENT_KEYS = ("sk-proj-" + "A" * 40 + "-TAILPART-9999",
+                 "sk-proj-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+CATALOG_CALLERS = ("fetch", "cli-json", "cli-human", "bridge")
+
+
+def fragment_rows(key):
+    # Keep the preservation controls in the same catalog as the attacks: each regression test
+    # must fail without the fix, while also rejecting an overbroad or whole-catalog redaction.
+    cases = [
+        ("full", key, "[redacted]"),
+        ("minus-first", key[1:], "[redacted]"),
+        ("suffix-40", key[-40:], "[redacted]"),
+        ("suffix-16", key[-16:], "[redacted]"),
+        ("middle", key[12:36], "[redacted]"),
+        ("exactly-16", key[8:24], "[redacted]"),
+        ("only-15", key[8:23], key[8:23]),
+        ("separate", key[1:] + "|" + key[-40:], "[redacted]|[redacted]"),
+        ("ordinary", "ordinary-model", "ordinary-model"),
+    ]
+    rows = [{"id": f"{label}:{echo}:end", "name": f"name:{echo}:end"}
+            for label, echo, _ in cases]
+    expected = [(f"{label}:{clean}:end", f"name:{clean}:end")
+                for label, _, clean in cases]
+    return rows, expected
+
+
+def run_fragment_caller(ctx, monkeypatch, capsys, caller, key, body):
+    def get(*_):
+        return 200, body
+
+    monkeypatch.setattr(pricing, "_default_get", get)
+    if caller == "fetch":
+        catalog = pricing.fetch_catalog(get_provider("openai"), key, get=get,
+                                        cache_path=ctx.data_dir / "pricing.json", at=NOW)
+        assert catalog.source == "live"
+        models = [asdict(model) for model in catalog.models]
+    elif caller == "bridge":
+        result = bridge.handle(ctx, {"action": "models_list", "provider": "openai", "secret": key})
+        assert result["ok"]
+        models = result["models"]
+    else:
+        monkeypatch.setattr(cli.Context, "default", classmethod(lambda cls: ctx))
+        monkeypatch.setattr(cli.sys, "stdin", io.StringIO(key + "\n"))
+        args = ["keys", "models", "openai"] + (["--json"] if caller == "cli-json" else [])
+        assert cli.main(args) == cli.EXIT_OK
+        models = None
+    output = capsys.readouterr()
+    assert output.err == ""  # Check stderr independently of the serialized/model output.
+    if caller == "cli-json":
+        models = json.loads(output.out)["models"]
+    elif caller in ("fetch", "bridge"):
+        assert output.out == ""
+    return models, output.out
+
+
+def assert_fragment_models(models, output, expected):
+    if models is not None:
+        assert sorted((m["id"], m["display_name"]) for m in models) == sorted(expected)
+    else:
+        for id, name in expected:
+            assert f"  {id} — {name} — " in output
+        assert len(output.splitlines()) == len(expected) + 1
+
+
+@pytest.mark.parametrize("key", FRAGMENT_KEYS, ids=["repeated", "distinct"])
+@pytest.mark.parametrize("encoding", ["literal", "unicode"])
+@pytest.mark.parametrize("caller", CATALOG_CALLERS)
+def test_partial_echo_catalog(ctx, monkeypatch, capsys, key, encoding, caller):
+    path = ctx.data_dir / "pricing.json"
+    ordinary = '{"data":[{"id":"ordinary-model","name":"Ordinary name"}]}'
+    models, output = run_fragment_caller(ctx, monkeypatch, capsys, caller, key, ordinary)
+    assert_fragment_models(models, output, [("ordinary-model", "Ordinary name")])
+    entry, = json.loads(path.read_text()).values()
+    original = pricing.parse_catalog(get_provider("openai"), ordinary,
+                                     verified_at=entry["fetched_at"])
+    assert entry["models"] == json.loads(json.dumps([asdict(m) for m in original], default=str))
+    path.unlink()
+    rows, expected = fragment_rows(key)
+    body = json.dumps({"data": rows})
+    if encoding == "unicode":
+        body = "".join(f"\\u{ord(c):04x}" if c.isalnum() else c for c in body)
+    models, output = run_fragment_caller(ctx, monkeypatch, capsys, caller, key, body)
+    # Read the actual persisted cache, not just the returned Catalog or bridge envelope.
+    entry, = json.loads(path.read_text()).values()
+    assert_fragment_models(entry["models"], "", expected)
+    assert_fragment_models(models, output, expected)
+    for i in range(len(key) - 15):
+        assert key[i:i + 16] not in output, "credential fragment in stdout"
+        assert key[i:i + 16] not in path.read_text(), "credential fragment on disk"
+    cached = pricing.fetch_catalog(get_provider("openai"), key, get=forbidden, cache_path=path,
+                                   at=datetime.fromisoformat(entry["fetched_at"]))
+    assert cached.source == "cache"
+    assert_fragment_models([asdict(m) for m in cached.models], "", expected)
+
+
+@pytest.mark.parametrize("age", [timedelta(hours=1), timedelta(hours=25)], ids=["fresh", "stale"])
+def test_partial_echo_cached_catalog(ctx, capsys, age):
+    key = FRAGMENT_KEYS[1]
+    rows, expected = fragment_rows(key)
+    path = ctx.data_dir / "pricing.json"
+    pricing.fetch_catalog(get_provider("openai"), key, cache_path=path, at=NOW,
+                          get=lambda *_: (200, '{"data":[{"id":"ordinary-model"}]}'))
+    cache = json.loads(path.read_text())
+    entry, = cache.values()
+    entry["models"] = [asdict(m) for m in pricing.parse_catalog(
+        get_provider("openai"), json.dumps({"data": rows}), verified_at=NOW.isoformat())]
+    # Exercise nested mapping keys and values too, independently of today's provider adapters.
+    entry["models"][0]["rates"][key[-40:]] = {"status": "unknown", "same_as": key[8:24]}
+    path.write_text(json.dumps(cache))
+    catalog = pricing.fetch_catalog(get_provider("openai"), key, cache_path=path, at=NOW + age,
+                                    get=lambda *_: (503, ""))
+    assert catalog.source == "cache"
+    repaired, = json.loads(path.read_text()).values()
+    assert_fragment_models(repaired["models"], "", expected)
+    assert_fragment_models([asdict(m) for m in catalog.models], "", expected)
+    assert catalog.models[0].rates["[redacted]"].same_as == "[redacted]"
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert output.err == ""
+
+
+@pytest.mark.parametrize("caller", ["cli-json", "cli-human", "bridge"])
+def test_partial_echo_bridge_without_catalog_sanitizer(ctx, monkeypatch, capsys, caller):
+    key = FRAGMENT_KEYS[1]
+    rows, expected = fragment_rows(key)
+    body = json.dumps({"data": rows})
+    # Isolate the outgoing bridge boundary: a pricing-only fix must not satisfy this test.
+    catalog = pricing.Catalog(pricing.parse_catalog(get_provider("openai"), body), "live", NOW, NOW)
+    monkeypatch.setattr(pricing, "fetch_catalog", lambda *a, **kw: catalog)
+    models, output = run_fragment_caller(ctx, monkeypatch, capsys, caller, key, body)
+    assert_fragment_models(models, output, expected)
+
+
+@pytest.mark.parametrize("caller", ["cli-json", "cli-human", "bridge"])
+def test_partial_echo_error_streams(ctx, monkeypatch, capsys, caller):
+    key = FRAGMENT_KEYS[1]
+    rows, expected = fragment_rows(key)
+    echoed_error = " | ".join(row["name"] for row in rows)
+    clean_error = " | ".join(name for _, name in expected)
+
+    def rejected(*_):
+        # Exercise the expected-error path; unexpected exceptions already use fixed prose.
+        raise bridge._KeyRequestError(echoed_error)
+
+    monkeypatch.setattr(bridge, "_key_provider", rejected)
+    if caller == "bridge":
+        result = bridge.handle(ctx, {"action": "models_list", "provider": "openai", "secret": key})
+        output = capsys.readouterr()
+        assert output.out == ""
+        assert output.err == ""
+    else:
+        monkeypatch.setattr(cli.Context, "default", classmethod(lambda cls: ctx))
+        monkeypatch.setattr(cli.sys, "stdin", io.StringIO(key + "\n"))
+        args = ["keys", "models", "openai"] + (["--json"] if caller == "cli-json" else [])
+        assert cli.main(args) == cli.EXIT_ERR
+        output = capsys.readouterr()
+        if caller == "cli-human":
+            assert output.out == ""
+            assert output.err == f"acctsw: {clean_error}\n"
+            return
+        assert output.err == ""
+        result = json.loads(output.out)
+    assert result["ok"] is False
+    assert result["error"] == clean_error
+
+
+@pytest.mark.parametrize("caller", CATALOG_CALLERS)
+def test_partial_echo_marker_recheck(ctx, monkeypatch, capsys, caller):
+    # The first replacement creates a *different* 17-character fragment of the key. Subsequent
+    # fallback matches cross runs of literal stars, exercising repeated shrinking to termination.
+    cases = [
+        ("sk:[redacted]:tail|0123456789ABCDEF", "sk:0123456789ABCDEF:tail", "***"),
+        ("1234567[redacted]|ABCDEFGHIJKLMNOP|" + "*" * 16,
+         "*" * 15 + "1234567ABCDEFGHIJKLMNOP" + "*" * 15, "***"),
+        ("0123456789ABCDEF", "0123456789ABCDEF", "[redacted]"),
+        ("123456789ABCDEF0", "23456789ABCDEF0|123456789ABCDEF0", "23456789ABCDEF0|[redacted]"),
+        ("sk-[redacted]", "sk-sk-[redacted]", "***"),
+        ("*****", "*" * 15, "[redacted]" * 3),
+    ]
+    for key, echo, clean in cases:
+        path = ctx.data_dir / "pricing.json"
+        path.unlink(missing_ok=True)
+        rows = [{"id": "chosen-model", "name": echo}]
+        models, output = run_fragment_caller(ctx, monkeypatch, capsys, caller, key,
+                                             json.dumps({"data": rows}))
+        entry, = json.loads(path.read_text()).values()
+        expected = [("chosen-model", clean)]
+        assert_fragment_models(entry["models"], "", expected)
+        assert_fragment_models(models, output, expected)
+        for i in range(len(key) - 15):
+            assert key[i:i + 16] not in path.read_text()
+            assert key[i:i + 16] not in output
+    for key in ("", "m", "id", "USD", "name"):
+        ordinary = {"id": ["model-id", "USD model name"]}
+        assert pricing._sanitize_catalog(ordinary, key) == ordinary
+        assert bridge._redact_key(ordinary, key) == ordinary

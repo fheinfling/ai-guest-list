@@ -10,8 +10,69 @@ import hashlib
 import json
 import os
 import tempfile
+from dataclasses import fields, is_dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
+
+
+def redact_key(value: Any, key: str) -> Any:
+    """Scrub credential echoes from decoded catalogs and bridge/CLI responses alike.
+
+    Build the key's window set once for the entire nested value. Keep dataclasses, containers,
+    and non-string metadata intact; empty/public keys and tiny placeholders are a no-op.
+    """
+    if len(key) <= 4:
+        return value
+    width = 16
+    # Accept false positives: a legitimate model id sharing 16 consecutive characters with
+    # the user's credential is not a realistic coincidence.
+    windows = {key[i:i + width] for i in range(len(key) - width + 1)} if len(key) >= width else None
+
+    def scrub(text: str, marker: str) -> str:
+        if windows is None:
+            return text.replace(key, marker)
+        parts = []
+        copied = 0
+        start = end = -1
+        for i in range(len(text) - width + 1):
+            if text[i:i + width] not in windows:
+                continue
+            if start < 0:
+                start = i
+            elif i > end:
+                parts.extend((text[copied:start], marker))
+                copied = end
+                start = i
+            # Overlapping/adjacent windows form one maximal span, including its entire tail.
+            end = i + width
+        if start < 0:
+            return text
+        parts.extend((text[copied:start], marker, text[end:]))
+        return "".join(parts)
+
+    def walk(item: Any) -> Any:
+        if isinstance(item, str):
+            clean = scrub(item, "[redacted]")
+            # A marker joined to adjacent text can recreate a key or a matching fragment.
+            # Each fallback replacement strictly shrinks the string (3 < 5 <= match length),
+            # so even a key made of marker characters cannot make this loop run forever.
+            while True:
+                checked = scrub(clean, "***")
+                if checked == clean:
+                    return clean
+                clean = checked
+        if is_dataclass(item):
+            return replace(item, **{f.name: walk(getattr(item, f.name)) for f in fields(item)})
+        if isinstance(item, dict):
+            return {walk(k): walk(v) for k, v in item.items()}
+        if isinstance(item, list):
+            return [walk(v) for v in item]
+        if isinstance(item, tuple):
+            return tuple(walk(v) for v in item)
+        return item
+
+    return walk(value)
 
 
 def now() -> datetime:

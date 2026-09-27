@@ -27,6 +27,7 @@ from .selection import choose
 from .switch import sync_back
 from .switch import switch as do_switch
 from .util import now, iso, parse_iso
+from .util import redact_key as _redact_key
 from .web_dot import dot_for, door_for
 
 # Settings the UI may toggle (boolean only) — a whitelist so a stray key can't clobber e.g. theme.
@@ -128,17 +129,6 @@ def _key_provider(message: dict):
         raise _KeyRequestError("check the provider's region or custom base_url") from None
 
 
-def _redact_key(value: Any, secret: str) -> Any:
-    """Provider-controlled names can echo a credential just as readily as error bodies can."""
-    if isinstance(value, str):
-        return value.replace(secret, "[redacted]") if secret else value
-    if isinstance(value, dict):
-        return {_redact_key(k, secret): _redact_key(v, secret) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_redact_key(v, secret) for v in value]
-    return value
-
-
 def key_action(ctx: Context, message: dict) -> dict[str, Any]:
     """Shared bridge/CLI key operations, without UI status probes.
 
@@ -165,18 +155,14 @@ def key_action(ctx: Context, message: dict) -> dict[str, Any]:
                 raise _KeyRequestError("Responses support is unverified; set allow_unverified to acknowledge it")
             keyseats_mod.harness_for(provider, allow_unverified=allow)
 
-            def get(url, headers, timeout):
-                status, body = pricing_mod._default_get(url, headers, timeout)
-                # Scrub before catalog caching as well as before returning picker fields.
-                return status, body.replace(secret, "[redacted]")
-
             if action == "key_add":
                 seat = keyseats_mod.add(ctx, provider, secret, label=_key_text(message, "label"),
-                                        model=_key_text(message, "model"), get=get,
+                                        model=_key_text(message, "model"), get=pricing_mod._default_get,
                                         allow_unverified=allow)
                 result = {"ok": True, "added": seat["id"], "seat": seat}
             else:
-                catalog = pricing_mod.fetch_catalog(provider, secret, get=get,
+                # Pricing scrubs decoded fields before caching; raw JSON may escape key bytes.
+                catalog = pricing_mod.fetch_catalog(provider, secret, get=pricing_mod._default_get,
                                                      cache_path=ctx.data_dir / "pricing.json")
                 models = []
                 for model in pricing_mod.sort_models(catalog.models):

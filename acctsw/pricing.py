@@ -13,13 +13,14 @@ import os
 import tempfile
 import urllib.error
 import urllib.request
-from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Literal
 
 from .providers import Provider, WireAPI
+from .util import redact_key as _sanitize_catalog
 
 HttpGet = Callable[[str, dict, float], tuple[int, str]]
 MILLION = Decimal(1_000_000)
@@ -337,33 +338,6 @@ class Catalog:
     def potentially_stale(self) -> bool:
         return (self.source == "cache" and self.fetched_at is not None
                 and self.checked_at - self.fetched_at > CACHED_STALE_AFTER)
-
-
-def _sanitize_catalog(value: Any, key: str) -> Any:
-    """Redact decoded credentials, including future model fields and nested mapping keys.
-
-    Match key-seat validation's minimum length: empty/public keys and tiny placeholders must
-    not rewrite ordinary catalog text. Keep models and their non-secret metadata intact.
-    """
-    if not key or len(key) <= 4:
-        return value
-    if isinstance(value, str):
-        clean = value.replace(key, "[redacted]")
-        # The marker (possibly joined to adjacent text) must not recreate an unusual key.
-        # This fallback strictly shrinks the string because keys here exceed four characters.
-        while key in clean:
-            clean = clean.replace(key, "***")
-        return clean
-    if is_dataclass(value):
-        return replace(value, **{f.name: _sanitize_catalog(getattr(value, f.name), key)
-                                 for f in fields(value)})
-    if isinstance(value, dict):
-        return {_sanitize_catalog(k, key): _sanitize_catalog(v, key) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_sanitize_catalog(v, key) for v in value]
-    if isinstance(value, tuple):
-        return tuple(_sanitize_catalog(v, key) for v in value)
-    return value
 
 
 def _write_catalog_cache(path: Path, cache: dict) -> None:
