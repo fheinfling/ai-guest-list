@@ -35,15 +35,16 @@ It's two thin pieces over your stock tools:
 - a **menubar app** showing live usage + a one-glance status, and
 - supervised `cx` / `cl` launchers that wrap stock `codex` / `claude` and do the hop for you.
 
-Your stock `codex` / `claude` and their desktop apps keep working **untouched**. Credentials never
-leave the **macOS Keychain** and the locations the official tools already read — nothing is uploaded
-anywhere.
+Your stock `codex` / `claude` and their desktop apps keep working **untouched**. Saved credentials
+stay in the **macOS Keychain** and the official tools’ credential stores.
+The app talks directly to providers for sign-in, usage and model information; your coding sessions
+connect through the official tools.
 
 <p align="center">
-  <img src="docs/assets/screenshot.png" width="340" alt="The ai guest list popover: Codex and Claude seats with live 5-hour usage bars, an active 'on the floor' seat, a resting one, an API-key seat offering 'use in new terminal', and the auto-switch toggle." />
+  <img src="docs/assets/screenshot.png" width="340" alt="The ai guest list popover: Codex and Claude seats with live 5-hour usage bars, selected subscription seats, a resting one, an API-key seat offering 'use in new terminal', and the auto-switch toggle." />
   &nbsp;
   <img src="docs/assets/screenshot-settings.png" width="340" alt="The settings view: auto-switch strategy, the paid-key toggles, theme, and the menubar icon legend." />
-  <br><sub><i>The menubar popover and its settings view — seats, live usage, auto-switch, key seats (sample accounts).</i></sub>
+  <br><sub><i>v1.1.0 · The shipping popover and settings, with fictional accounts. Views are expanded to show all content.</i></sub>
 </p>
 
 ## Why
@@ -78,19 +79,29 @@ anywhere.
   `auth.json`). Claude is browser sign-in only: a `claude setup-token` is an env-var token, not the
   Keychain login the switcher reads. Credentials live only in the Keychain / the tools' own stores.
 - **Pay-per-token key seats** — an API key becomes a seat too, for when every subscription is
-  resting or when you want one terminal on a specific model. Always asks before spending; one
-  switch stops every paid session. See [below](#bring-your-own-key).
+  resting or when you want one terminal on a specific model. Paid use is off by default,
+  and confirmation is on by default. One switch stops every paid session. See [below](#bring-your-own-key).
 - **Version & build** shown at the bottom of the settings view.
 
 ## Bring your own key
 
-Subscriptions rest; an API key doesn't. Add a **key seat** and the guest list gains a
-pay-per-token option for when every paid seat is resting — or pin one terminal to it deliberately
+Add a **key seat** and the guest list gains a pay-per-token option for when every subscription
+seat is resting — or pin one terminal to it deliberately
 with `cx --key <seat>`.
+
+1. Open **add a seat → bring an api key instead** in the popover.
+2. Choose a provider, paste your key, and pick a model from its catalog.
+3. In settings, enable **allow paid key use**. Leave **ask before using a paid key** on to
+   review paid use before it starts.
+4. Click **use in new terminal** on the key seat, or let a supervised session offer it when
+   its subscription seats are resting.
+
+Key seats use your provider’s API billing, separately from your Codex or Claude subscription.
 
 - **Providers** — OpenAI, Anthropic, OpenRouter, Langdock (eu/us/global, both its OpenAI and its
   Anthropic route) and any endpoint speaking the Responses API. A Chat-Completions-only provider is
-  refused when you add it, rather than failing later: Codex CLI requires Responses.
+  refused when you add it: Codex CLI requires Responses. Custom or unverified endpoints need
+  explicit opt-in; the seat shows that support is unproven and offers a paid compatibility check.
 - **Two harnesses, no new dependency** — a Responses key drives **Codex CLI**, an
   Anthropic-compatible one drives **Claude Code**. A key seat only takes over sessions of its own
   harness, so `codex resume` / `claude --resume` keep working and your work comes with you.
@@ -98,13 +109,14 @@ with `cx --key <seat>`.
   for providers that publish machine-readable prices. OpenAI, Anthropic and Langdock don't, so their
   models show **no price** and sort by id. Nothing is filled in from a bundled table that could
   quietly go stale.
-- **Nothing starts without you** — every hop onto a key seat asks first, naming the seat, the model
-  and the price, in the menubar even when the session is in a terminal.
-- **One switch stops it** — *allow paid key use* halts new paid requests **and** any running paid
+- **Consent controls** — paid use starts disabled. With confirmation enabled (the default), each
+  hop asks first, naming the seat, model and available price estimate, in the menubar even when
+  the session is in a terminal. You can turn confirmation off in settings.
+- **One switch stops it** — turning off *allow paid key use* halts new paid requests **and** any running paid
   session within a couple of seconds, leaving the work resumable.
 
-> **This app does not cap your spend.** It shows prices before you choose, asks before it spends,
-> and stops when you tell it to. For a hard limit, use your provider's own budget controls. A turn
+> **This app does not cap your spend.** It shows available price estimates, asks before paid use
+> by default, and stops when you tell it to. For a hard limit, use your provider's own budget controls. A turn
 > already sent may still bill — the app says so rather than implying otherwise.
 
 Langdock's EU routes keep **model requests** on the endpoint you picked. That is not the same as
@@ -123,7 +135,7 @@ Then launch **AI Guest List** from Spotlight or `/Applications`, click the menub
 seats**.
 
 **Or download the app directly:**
-1. Grab the latest `.app` from [**Releases**](https://github.com/fheinfling/ai-guest-list/releases/latest).
+1. Grab the latest `AI-Guest-List-v*.zip` from [**Releases**](https://github.com/fheinfling/ai-guest-list/releases/latest).
 2. Unzip, drag **AI Guest List.app** to `/Applications`, and open it.
 
 > **Unsigned-app note.** The app isn't signed/notarized yet, so macOS Gatekeeper blocks the first
@@ -148,7 +160,7 @@ acctsw path                  # wire cx/cl into your shell (PATH + codex/claude a
 ```
 Then a plain `codex` / `claude` is supervised whenever the app is running.
 
-To dedicate one terminal to a saved API-key seat, enable **let a key take the floor** in settings,
+To dedicate one terminal to a saved API-key seat, enable **allow paid key use** in settings,
 then run `cx --key <seat-id>` or `cx --key "seat label"` (`cl --key` for Claude keys). Put `--key`
 before agent arguments; for example, `cx --key "late-night" resume --last`. Labels match exactly;
 an ambiguous label lists the ids to choose from. Each key card also offers **use in new terminal**.
@@ -184,9 +196,11 @@ source .venv/bin/activate
 pip install -e ".[app,dev]"
 python -m pytest -q                 # Python suite
 node --test app/web/*.test.mjs      # web-UI render tests
-bash scripts/smoke.sh               # non-destructive end-to-end smoke
+bash scripts/smoke.sh               # import check + both test suites
 ```
-Build the app locally with `pip install -e ".[build]" && python setup.py py2app` (output in `dist/`).
+Build the app locally with `pip install -e ".[build]" && python scripts/build-web.py && python setup.py py2app`
+(output in `dist/`). Regenerate the README images from the real UI with
+`python scripts/screenshots.py` (requires Google Chrome), then inspect both images in `docs/assets/`.
 
 ## Safety & security
 

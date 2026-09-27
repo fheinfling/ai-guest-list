@@ -5,8 +5,9 @@ Releases are built and published by GitHub Actions when you push a tag — see
 
 ## Versioning
 
-- **Marketing version** (`vX.Y.Z`) lives in **one** place: `acctsw/__init__.py` `__version__`.
-  `setup.py` reads it for `CFBundleShortVersionString`. The release job **fails** if the pushed tag
+- **Marketing version** (`vX.Y.Z`) is defined in: `acctsw/__init__.py` `__version__`.
+  `setup.py` reads it for `CFBundleShortVersionString`; `pyproject.toml` mirrors it for package
+  metadata, and the smoke tests require the two to agree. The release job **fails** if the pushed tag
   doesn't match it, so the tag and the code can never disagree.
 - **Build number** is the git commit count (`git rev-list --count HEAD`) → `CFBundleVersion`.
   It's monotonic and automatic; you never set it by hand.
@@ -15,18 +16,22 @@ Releases are built and published by GitHub Actions when you push a tag — see
 
 ## Cut a release
 
-1. Bump `__version__` in `acctsw/__init__.py` (skip if the version is already what you want to ship).
-   Commit it to `main`.
+1. Bump `__version__` in `acctsw/__init__.py` and its mirror in `pyproject.toml` (skip if already
+   correct). Update the README and regenerate its screenshots after the version bump. Run the
+   Python and web tests, then commit the release changes to `main` through the normal PR flow.
+   If other work is in progress, prepare the release in a separate worktree based on `origin/main`.
 2. Tag and push:
    ```sh
-   git tag v0.1.0
-   git push origin v0.1.0
+   git fetch origin main
+   git tag vX.Y.Z origin/main
+   git push origin vX.Y.Z
    ```
 3. The `release` workflow runs on a macOS runner: verifies the tag matches `__version__`, runs the
    test suite + web tests (a hard gate), builds the `.app` via py2app, zips it with `ditto`, and
    creates a GitHub Release with auto-generated notes and the zip attached. A second job
    (`update-tap`) then bumps `Casks/ai-guest-list.rb` in `fheinfling/homebrew-tap` to the new version
-   + zip sha256 and pushes it — the tap is **not** maintained by hand.
+   + zip sha256 and pushes it — the tap is **not** maintained by hand. Verify both jobs succeed,
+   the zip is attached to the release, and the tap points to the published version.
 
 ## Notes
 
