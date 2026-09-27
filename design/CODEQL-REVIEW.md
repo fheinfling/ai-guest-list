@@ -9,7 +9,7 @@ The reviewed branch is `byok-key-seats` at `7d74be18e227991d0670e39a68338a351206
 No application code or repository tests were changed. All additional probes and their outputs are under:
 
 ```text
-/private/tmp/claude-501/-Users-franzheinfling-Work-ai-guest-list/452248c5-584e-4e57-a89d-a930decfad9c/scratchpad/codeql-review/
+<scratchpad>/codeql-review/
 ```
 
 Executed evidence:

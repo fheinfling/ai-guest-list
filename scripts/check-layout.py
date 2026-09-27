@@ -46,7 +46,7 @@ def gallery_states():
     long["id"] = "long-identities"
     for tool in long["state"]["tools"].values():
         for seat in tool["seats"]:
-            seat["name"] = "Franz Heinfling +codex / A realistically long account name"
+            seat["name"] = "Wilhelmina Featherstone +codex / a realistically long account name"
             seat["plan"] = "Self_Serve_Business_Prolite"
     long["state"]["keys"][0].update(label="test / a long API key seat name", model="gpt-6-luna")
     states.append(long)

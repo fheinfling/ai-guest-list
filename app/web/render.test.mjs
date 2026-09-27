@@ -1511,7 +1511,7 @@ test("roster omits absent or invalid reset times and resets for unreported windo
 });
 
 test("roster long identities and literal models have full-value titles and single-line ellipsis", () => {
-  const name = "Franz Heinfling +codex / a realistically long name";
+  const name = "Wilhelmina Featherstone +codex / a realistically long name";
   const h = rosterHTML(state({ tools: { codex: { seats: [seat({ name })] } },
     keys: [keySeat({ label: name, model: "literal/long-model-id" })] }));
   assert.equal((h.match(new RegExp(`title="${name.replaceAll('+', '\\+')}"`, 'g')) || []).length, 2);
