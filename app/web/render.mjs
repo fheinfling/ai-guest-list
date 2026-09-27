@@ -212,9 +212,9 @@ function seatCard(tool, seat) {
     ${sessionStarted ? `<div class="x-row"><span>session started</span><span class="mono">${esc(sessionStarted)}</span></div>` : ""}
     <button class="logout" data-action="remove" data-tool="${tool}" data-email="${esc(seat.email)}">log out ↗</button>
   </div>`;
-  return `<div class="seat seat--${seat.status}" data-card data-tool="${tool}" data-email="${esc(seat.email)}">
+  return `<div class="seat seat--${esc(seat.status)}" data-card data-tool="${tool}" data-email="${esc(seat.email)}">
     <div class="seat-row${parkedSession ? " seat-row--session" : ""}">
-      <span class="dot dot--${seat.status}"></span>
+      <span class="dot dot--${esc(seat.status)}"></span>
       <span class="seat-name">${esc(seat.name)}</span>${plan}
       <span class="grow"></span>${action}
     </div>
