@@ -1,8 +1,9 @@
-"""Post-session containment using the installed Codex, fake keys and isolated homes.
+"""Post-session containment using installed harnesses, fake keys and isolated homes.
 
 Unlike preparation tests, these start a real thread and execute a shell command through
 Codex's app-server. No model request or real credential is needed. Skipped only when Codex
-is absent. Reproduce the vulnerable controls separately with:
+is absent, unless AGL_REQUIRE_LIVE_HARNESS=1 requires failure instead. Claude's live
+shell/snapshot probe follows the same rule. Reproduce the vulnerable controls separately with:
 
     PYTHONPATH=. python3 tests/test_keyhome_live.py /private/tmp/keyhome-experiment
 
@@ -31,6 +32,22 @@ from acctsw.context import Context
 
 
 FAKE_SECRET = "sk-ACCTSW-FAKE-SECRET-SECURITY-AUDIT-" + "x" * 128
+
+
+def require_harness(name):
+    binary = shutil.which(name)
+    if binary is None:
+        message = f"Live credential containment NOT EXERCISED: {name} is absent from PATH"
+        if os.environ.get("AGL_REQUIRE_LIVE_HARNESS") == "1":
+            pytest.fail(f"{message}; harness was required by AGL_REQUIRE_LIVE_HARNESS=1",
+                        pytrace=False)
+        pytest.skip(f"{message}; install {name} to run the post-session containment regression")
+    return binary
+
+
+def package_entries(home):
+    # Fresh key-seat homes must not download the large app-server daemon, even in CI.
+    return sorted(str(p.relative_to(home)) for p in (home / "packages").glob("*"))
 
 
 def scan(home):
@@ -118,6 +135,7 @@ def run_codex(root, binary, provider="openai", control=None):
             # Observe the home while the process is alive as well as after shutdown.
             time.sleep(.25)
             live_matches = scan(runtime.home)
+            live_packages = package_entries(runtime.home)
         finally:
             # Simulate an interrupted terminal/process: graceful Codex shutdown can unlink
             # an already-leaked snapshot and hide the vulnerability from a post-run scan.
@@ -128,15 +146,14 @@ def run_codex(root, binary, provider="openai", control=None):
             child.stdout.close()
     return {"home": str(runtime.home), "shell": item["aggregatedOutput"].strip(),
             "live_matches": live_matches, "post_session_matches": scan(runtime.home),
+            "live_packages": live_packages, "post_session_packages": package_entries(runtime.home),
             "snapshots": [str(p.relative_to(runtime.home))
                           for p in runtime.home.glob("shell_snapshots/*.sh")]}
 
 
 @pytest.mark.parametrize("provider", ["openai", "langdock", "openrouter", "openai_compatible"])
 def test_real_codex_post_session_secret_containment(provider):
-    binary = shutil.which("codex")
-    if binary is None:
-        pytest.skip("Install Codex to run the post-session containment regression")
+    binary = require_harness("codex")
     # Keep the isolated home short enough for Codex's macOS socket limit.
     with tempfile.TemporaryDirectory(prefix="kh-live-", dir="/tmp") as temp:
         result = run_codex(Path(temp), binary, provider)
@@ -144,6 +161,8 @@ def test_real_codex_post_session_secret_containment(provider):
         assert result["live_matches"] == [], result
         assert result["post_session_matches"] == [], result
         assert result["snapshots"] == [], result
+        assert result["live_packages"] == [], result
+        assert result["post_session_packages"] == [], result
 
 
 def run_claude(root, binary, control=False):
@@ -199,24 +218,26 @@ def run_claude(root, binary, control=False):
                      for p in runtime.home.glob("shell-snapshots/*.sh")]
         assert snapshots, "Claude did not create a snapshot; an empty scan proves nothing"
         live_matches = scan(runtime.home)
+        live_packages = package_entries(runtime.home)
     finally:
         child.kill()
         child.wait(timeout=5)
         os.close(master)
     return {"home": str(runtime.home), "shell": result_file.read_text().strip(),
             "live_matches": live_matches, "post_session_matches": scan(runtime.home),
+            "live_packages": live_packages, "post_session_packages": package_entries(runtime.home),
             "snapshots": snapshots}
 
 
 def test_real_claude_post_session_secret_containment():
-    binary = shutil.which("claude")
-    if binary is None:
-        pytest.skip("Install Claude Code to run the post-session containment regression")
+    binary = require_harness("claude")
     with tempfile.TemporaryDirectory(prefix="kh-live-", dir="/tmp") as temp:
         result = run_claude(Path(temp), binary)
         assert result["shell"] == "KEY_ABSENT", result
         assert result["live_matches"] == [], result
         assert result["post_session_matches"] == [], result
+        assert result["live_packages"] == [], result
+        assert result["post_session_packages"] == [], result
 
 
 if __name__ == "__main__":

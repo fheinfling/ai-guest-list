@@ -89,14 +89,82 @@ jobs:
           flags: ${{ matrix.os }}-py${{ matrix.python }}
           fail_ci_if_error: false                # don't break CI if the token isn't set yet
 
+  live_containment:
+    runs-on: macos-14
+    timeout-minutes: 10
+    env:
+      AGL_REQUIRE_LIVE_HARNESS: "1"
+      DISABLE_AUTOUPDATER: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install test dependencies
+        run: python -m pip install -e ".[dev]"
+
+      - name: Install pinned native harnesses
+        # Credential containment is version-sensitive: an automatic upgrade could silently
+        # change shell/snapshot behavior. Upgrade these audited versions only with review.
+        # Native binaries also work with the probes' deliberately minimal PATH (no Node).
+        shell: bash
+        run: |
+          test "$(uname -m)" = arm64
+          mkdir -p "$RUNNER_TEMP/live-harnesses"
+          curl --fail --location --retry 3 \
+            https://github.com/openai/codex/releases/download/rust-v0.157.0/codex-aarch64-apple-darwin.tar.gz \
+            -o "$RUNNER_TEMP/codex.tar.gz"
+          tar -xzf "$RUNNER_TEMP/codex.tar.gz" -C "$RUNNER_TEMP/live-harnesses"
+          mv "$RUNNER_TEMP/live-harnesses/codex-aarch64-apple-darwin" "$RUNNER_TEMP/live-harnesses/codex"
+          curl --fail --location --retry 3 https://claude.ai/install.sh -o "$RUNNER_TEMP/install-claude.sh"
+          bash "$RUNNER_TEMP/install-claude.sh" 2.1.282
+          echo "$RUNNER_TEMP/live-harnesses" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Verify harness versions
+        run: |
+          test "$(codex --version)" = "codex-cli 0.157.0"
+          test "$(claude --version)" = "2.1.282 (Claude Code)"
+
+      - name: Run all five live containment cases with fake keys
+        # No credentials or successful model requests are needed. Each probe creates a fresh
+        # home and asserts packages/ stays empty while running and after shutdown.
+        run: python -m pytest -v -rs tests/test_keyhome_live.py --junitxml=live-containment.xml
+
+      - name: Require five passes and no skips
+        if: ${{ always() }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          report = Path("live-containment.xml")
+          cases = ET.parse(report).findall(".//testcase") if report.exists() else []
+          passed = len(cases) == 5 and all(
+              case.find("skipped") is None and case.find("failure") is None
+              and case.find("error") is None for case in cases)
+          message = ("Live credential containment: 5/5 passed; packages/ stayed empty."
+                     if passed else "Live credential containment NOT VERIFIED: require 5 passes, zero skips/errors.")
+          print(message)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write(message + "\n")
+          if not passed:
+              raise SystemExit(1)
+          PY
+
   # Branch protection requires the stable `test` context. Matrix names change as platforms are
-  # added, so expose one gate that succeeds only after every platform test and build succeeds.
+  # added, so expose one gate that also requires live credential containment to pass.
   test:
-    needs: platform_tests
+    needs: [platform_tests, live_containment]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
-      - name: Require every platform test and build to pass
+      - name: Require every platform build and live containment test to pass
         env:
           MATRIX_RESULT: ${{ needs.platform_tests.result }}
-        run: test "$MATRIX_RESULT" = success
+          LIVE_RESULT: ${{ needs.live_containment.result }}
+        run: |
+          test "$MATRIX_RESULT" = success
+          test "$LIVE_RESULT" = success

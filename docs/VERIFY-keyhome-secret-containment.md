@@ -119,7 +119,7 @@ Tested binaries on macOS arm64:
 All previous secret-containment assertions remain. The preparation-only test was renamed and
 its scope corrected. New policy tests cover every Codex credential variable; the live tests
 start actual installed harnesses and inspect post-session files. They run with normal pytest,
-skipping a harness only if its executable is absent. The Claude test requires a real snapshot,
+skipping a harness only if its executable is absent and strict mode is unset. The Claude test requires a real snapshot,
 so missing snapshot creation cannot count as success. Live tests passed for all four Codex
 provider variables and Claude's auth token.
 
@@ -138,3 +138,77 @@ Final validation, after the implementation and live-test corrections:
   containment cases ran and passed; none of the skips are those cases.
 - `node --test app/web/render.test.mjs`: **119 passed, 0 failed, 0 skipped**.
 - `git diff --check`: passed.
+
+## Required live coverage in CI
+
+Set `AGL_REQUIRE_LIVE_HARNESS=1` to fail if either harness is absent from PATH:
+
+```sh
+AGL_REQUIRE_LIVE_HARNESS=1 python3 -m pytest -v tests/test_keyhome_live.py
+```
+
+All five cases use one `require_harness` helper. Without the variable, missing harnesses
+still skip so contributors need not install them. The reason explicitly says **Live credential
+containment NOT EXERCISED**. Pytest's default `-rs` option now prints skip reasons for local
+and CI runs, including the platform matrix; those skips are not evidence of containment.
+
+The dedicated `live_containment` macOS arm64 job installs native Codex **0.157.0** from
+the versioned release archive and Claude Code **2.1.282** using
+`bash install-claude.sh 2.1.282`. See the [Codex CLI installation documentation](https://developers.openai.com/codex/cli/)
+and [Claude's specific-version installer documentation](https://code.claude.com/docs/en/setup#install-a-specific-version).
+Exact commands and download URLs are in `.github/workflows/ci.yml`. Version checks reject
+unexpected binaries before running the probes. Native installations avoid relying on Node
+inside the probes' minimal PATH. The generated Codex config disables startup update checks;
+Claude's child environment disables its updater. Pins must be reviewed alongside containment
+evidence when upgraded: future harness behavior must not silently change the security check.
+
+The job requires strict mode and independently checks the JUnit report for **exactly five
+passes, zero skips/errors/failures**. A missing report also fails. Its always-running step
+writes either verified coverage or **NOT VERIFIED** into the Actions summary. The existing
+branch-protection `test` gate now requires both the platform matrix and this live job; a
+failed, skipped, or cancelled live job cannot yield a successful gate.
+
+Every probe starts in a new temporary home without caches or real account credentials.
+It checks that `packages/` is absent or empty both while the harness is alive and after
+shutdown, so the clean runner must demonstrate that no large app-server daemon is installed.
+These are fake-key shell probes, not successful authenticated inference or HTTP 401 tests;
+no real credentials or additional CI secrets are needed.
+
+The Claude PTY probe remains mandatory, including its snapshot assertion and timeout. A
+headless timeout must fail visibly. If hosted runs reveal flakiness, retain the failing gate,
+capture sanitized PTY diagnostics, and fix terminal sizing/readiness synchronization or use
+a runner where the PTY is reliable. Do not skip, xfail, or use `continue-on-error` to turn an
+unexercised containment path green.
+
+Validation of the CI-enforcement change (local macOS arm64, Python 3.14.7):
+
+- Both harnesses hidden using an empty temporary PATH, with an absolute Python executable:
+  strict mode **5 failed, exit 1**; variable unset **5 skipped, exit 0**, with reasons printed.
+- Installed pinned harnesses, strict mode: **5 passed in 2.61s**. All package-directory
+  assertions passed in fresh isolated homes; the Claude PTY probe passed.
+- `python3 -m pytest`: **1514 passed, 15 skipped in 52.32s**. All five live cases passed;
+  the skips concern existing sandbox/PyObjC limitations and are listed in the output.
+- `node --test app/web/render.test.mjs`: **119 passed, 0 failed, 0 skipped**.
+- Workflow YAML parsed and every embedded shell block passed `bash -n`. The actual JUnit
+  guard accepted the live five-pass report and rejected simulated skips, failures, errors,
+  four passes, and a missing report. All 16 success/failure/skipped/cancelled combinations
+  of the platform/live dependency gate behaved correctly.
+
+Required-but-absent demonstration (excerpt of actual output):
+
+```text
+PATH=<empty directory> AGL_REQUIRE_LIVE_HARNESS=1 /opt/homebrew/opt/python@3.14/bin/python3.14 -m pytest -q --tb=short tests/test_keyhome_live.py
+FFFFF                                                                    [100%]
+___________ test_real_codex_post_session_secret_containment[openai] ____________
+Live credential containment NOT EXERCISED: codex is absent from PATH; harness was required by AGL_REQUIRE_LIVE_HARNESS=1
+_______________ test_real_claude_post_session_secret_containment _______________
+Live credential containment NOT EXERCISED: claude is absent from PATH; harness was required by AGL_REQUIRE_LIVE_HARNESS=1
+5 failed in 0.04s
+EXIT STATUS: 1
+```
+
+**Hosted CI has not been run for this change.** Only workflow logic and local probes were
+validated. Local network access could not resolve GitHub, so a fresh binary download was
+not tested here. Empty `packages/` is confirmed locally and enforced on every clean CI run,
+but is not yet a clean hosted-runner observation. Claude PTY reliability on that runner
+also remains to be established; there is no skip or failure exemption for it.
