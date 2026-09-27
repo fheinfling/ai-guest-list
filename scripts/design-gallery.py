@@ -208,6 +208,13 @@ const q = new URLSearchParams(location.search);
 const data = await (await fetch("../states.json")).json();
 const entry = data.find((s) => s.id === q.get("s")) || data[0];
 const state = structuredClone(entry.state);
+// A consent request expires two minutes after it is made, and the fixture is written once at
+// build time — so the consent screens silently emptied a couple of minutes later, and the
+// gallery quietly stopped showing the most important state it has. Rebase the deadline onto
+// the moment of rendering instead.
+for (const r of state.pending_key_switches || []) {
+  r.expires_at = new Date(Date.now() + 120000).toISOString();
+}
 state.settings = { ...state.settings, theme: q.get("t") === "dark" ? "dark" : "light" };
 const root = document.getElementById("root");
 root.innerHTML =

@@ -23,10 +23,23 @@ const REFERENCE = "v0-today";
 const actionsIn = (html) =>
   new Set([...html.matchAll(/data-action="([a-z0-9_-]+)"/gi)].map((m) => m[1]));
 
+// Each state exists to exercise one thing. The union check below proves no action became
+// unreachable, but it cannot tell that the consent card stopped appearing on the consent screen —
+// which is exactly what went unnoticed once the union check replaced the per-state one.
+const DEFINING = {
+  asking: "key-answer", "asking-unpriced": "key-answer", spending: "key-stop",
+  models: "key-model", settings: "toggle", trouble: "key-terminal", main: "settings",
+};
+
 function renderAll(mod, states) {
   const out = new Map();
   for (const entry of states) {
     const state = structuredClone(entry.state);
+    // The fixture is written once; a consent request expires two minutes later. Without this the
+    // consent screens render empty and every variant looks like it dropped them.
+    for (const r of state.pending_key_switches || []) {
+      r.expires_at = new Date(Date.now() + 120000).toISOString();
+    }
     for (const theme of ["light", "dark"]) {
       state.settings = { ...state.settings, theme };
       const html =
@@ -90,6 +103,15 @@ async function check(name, states, reference) {
     const union = (map) => new Set([...map.values()].flatMap((html) => [...actionsIn(html)]));
     const missing = [...union(reference)].filter((a) => !union(rendered).has(a));
     if (missing.length) problems.push(`unreachable action(s) anywhere: ${missing.join(", ")}`);
+  }
+
+  for (const [stateId, action] of Object.entries(DEFINING)) {
+    for (const theme of ["light", "dark"]) {
+      const html = rendered.get(`${stateId}/${theme}`);
+      if (html && !actionsIn(html).has(action)) {
+        problems.push(`${stateId}/${theme}: the state's whole point is missing — no "${action}"`);
+      }
+    }
   }
 
   const leak = escapingHolds(mod, states);
