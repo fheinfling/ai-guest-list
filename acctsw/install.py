@@ -371,7 +371,15 @@ def ensure_launchers(*, bin_dir: Path | None = None, python: str | None = None,
     return changed, msgs
 
 
-def _wrapper_script(name: str, python: str, pkg_root: Path, bin_dir: Path) -> str:
+def engine_script(*, python: str | None = None, pkg_root: Path | None = None) -> str:
+    """Launch this installation's engine without consulting installed wrappers or PATH.
+
+    Shared by CLI installation and app-owned terminal commands. In particular, a preserved
+    source wrapper may run an older engine than the app and cannot handle new app options.
+    ``$@`` is forwarded as argv; callers must pass only options/seat IDs, never credentials.
+    """
+    python = python or sys.executable
+    pkg_root = pkg_root or Path(__file__).resolve().parent.parent
     # Alias bundles give development runs an app identity/icon but borrow the source Python.
     # Follow only their executable symlink: resolving further would lose a venv's dependencies.
     if _is_bundle_python(python):
@@ -386,40 +394,50 @@ def _wrapper_script(name: str, python: str, pkg_root: Path, bin_dir: Path) -> st
             pass
     # shlex.quote the interpolated paths so an install dir containing a quote/backtick/$() can't break
     # out of the generated /bin/sh script (defense-in-depth; these paths aren't attacker-controlled).
-    py, pr, acctsw = shlex.quote(str(python)), shlex.quote(str(pkg_root)), shlex.quote(str(bin_dir / "acctsw"))
-    if name == "acctsw":
-        from .procenv import _PY_ENV_STRIP
-        clean_python = f"unset {' '.join(_PY_ENV_STRIP)}\n"
-        # Wrappers can inherit LaunchServices' absent locale too. Set UTF-8 at interpreter
-        # startup so future text I/O cannot accidentally fall back to ASCII.
-        if _is_bundle_python(python):
-            # The bundled interpreter is the framework python3.11 copied into the app; on its own it
-            # derives sys.prefix from a compiled-in framework path that need not exist on the user's
-            # machine, so it can't find its stdlib and dies with "can't find module 'encodings'". Point
-            # PYTHONHOME at the bundle's own Resources (which carries lib/python311.zip + lib/python3.11)
-            # so it ALWAYS resolves acctsw and the stdlib from inside the .app, machine-independently.
-            # Invoking this interpreter directly skips py2app's __boot__.py, which normally points
-            # OpenSSL at the CA bundle py2app ships. Set the same paths here: without them ssl falls
-            # back to the Python build machine's compiled-in /Library or Homebrew location.
-            # `unset` the leaked redirect vars first (a Terminal the app spawned inherits py2app's
-            # PYTHONHOME/PYTHONPATH) so only our explicit PYTHONHOME on the exec line takes effect.
-            resources = Path(python).parent.parent / "Resources"
-            home = shlex.quote(str(resources))
-            ca_file = shlex.quote(str(resources / "openssl.ca" / "cert.pem"))
-            # Match py2app's 3.11 boot setup: the deliberately nonexistent directory prevents
-            # OpenSSL from consulting a compiled-in host CA directory after loading the bundled PEM.
-            ca_dir = shlex.quote(str(resources / "openssl.ca" / "no-such-file"))
-            return (f"#!/bin/sh\n# ai guest list engine\n"
-                    + clean_python +
-                    f"PYTHONUTF8=1 PYTHONHOME={home} SSL_CERT_FILE={ca_file} SSL_CERT_DIR={ca_dir} "
-                    f'exec {py} -P -m acctsw "$@"\n')
-        # Source checkout: set PYTHONPATH to ONLY pkg_root — do NOT append "$PYTHONPATH". If this wrapper
-        # runs from a shell that inherited py2app's leaked PYTHONPATH (the frozen 3.11 stdlib zip),
-        # appending it would shadow the interpreter's stdlib and crash `python -m acctsw`.
+    py, pr = shlex.quote(str(python)), shlex.quote(str(pkg_root))
+    from .procenv import _PY_ENV_STRIP
+    clean_python = f"unset {' '.join(_PY_ENV_STRIP)}\n"
+    # Wrappers can inherit LaunchServices' absent locale too. Set UTF-8 at interpreter
+    # startup so future text I/O cannot accidentally fall back to ASCII.
+    if _is_bundle_python(python):
+        # The bundled interpreter is the framework python3.11 copied into the app; on its own it
+        # derives sys.prefix from a compiled-in framework path that need not exist on the user's
+        # machine, so it can't find its stdlib and dies with "can't find module 'encodings'". Point
+        # PYTHONHOME at the bundle's own Resources (which carries lib/python311.zip + lib/python3.11)
+        # so it ALWAYS resolves acctsw and the stdlib from inside the .app, machine-independently.
+        # Invoking this interpreter directly skips py2app's __boot__.py, which normally points
+        # OpenSSL at the CA bundle py2app ships. Set the same paths here: without them ssl falls
+        # back to the Python build machine's compiled-in /Library or Homebrew location.
+        # `unset` the leaked redirect vars first (a Terminal the app spawned inherits py2app's
+        # PYTHONHOME/PYTHONPATH) so only our explicit PYTHONHOME on the exec line takes effect.
+        resources = Path(python).parent.parent / "Resources"
+        home = shlex.quote(str(resources))
+        ca_file = shlex.quote(str(resources / "openssl.ca" / "cert.pem"))
+        # Match py2app's 3.11 boot setup: the deliberately nonexistent directory prevents
+        # OpenSSL from consulting a compiled-in host CA directory after loading the bundled PEM.
+        ca_dir = shlex.quote(str(resources / "openssl.ca" / "no-such-file"))
         return (f"#!/bin/sh\n# ai guest list engine\n"
                 + clean_python +
-                f'PYTHONUTF8=1 PYTHONPATH={pr} exec {py} -P -m acctsw "$@"\n')
+                f"PYTHONUTF8=1 PYTHONHOME={home} SSL_CERT_FILE={ca_file} SSL_CERT_DIR={ca_dir} "
+                f'exec {py} -P -m acctsw "$@"\n')
+    # Source checkout: set PYTHONPATH to ONLY pkg_root — do NOT append "$PYTHONPATH". If this wrapper
+    # runs from a shell that inherited py2app's leaked PYTHONPATH (the frozen 3.11 stdlib zip),
+    # appending it would shadow the interpreter's stdlib and crash `python -m acctsw`.
+    return (f"#!/bin/sh\n# ai guest list engine\n"
+            + clean_python +
+            f'PYTHONUTF8=1 PYTHONPATH={pr} exec {py} -P -m acctsw "$@"\n')
+
+
+def _wrapper_script(name: str, python: str, pkg_root: Path, bin_dir: Path) -> str:
+    if name == "acctsw":
+        return engine_script(python=python, pkg_root=pkg_root)
     tool = "codex" if name == "cx" else "claude"
+    command = f'{shlex.quote(str(bin_dir / "acctsw"))} run {tool} "$@"'
+    return supervised_script(tool, command)
+
+
+def supervised_script(tool: str, command: str) -> str:
+    """Keep terminal cleanup around a supervised command, including app-owned launches."""
     # No `exec`: we keep this shell resident so its trap fires after the tool exits. A TUI killed
     # mid-session (supervisor auto-switch) — or, when the app is closed, a stock tool that crashes
     # or is Ctrl-C'd — can't reset the terminal's private modes itself, leaving the shell in
@@ -430,7 +448,7 @@ def _wrapper_script(name: str, python: str, pkg_root: Path, bin_dir: Path) -> st
     reset = 'printf "' + _TERM_RESET.decode("ascii").replace("\x1b", "\\033") + '"'
     return (f"#!/bin/sh\n# supervised {tool} launcher (stock {tool} is not shadowed)\n"
             f"trap {shlex.quote(reset)} EXIT INT TERM HUP\n"
-            f'{acctsw} run {tool} "$@"\n')
+            f"{command}\n")
 
 
 # --- uninstall --------------------------------------------------------------------------------

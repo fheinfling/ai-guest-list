@@ -34,6 +34,8 @@ def build_parser() -> argparse.ArgumentParser:
         description=f"{APP_NAME} — switch between Codex/Claude accounts on usage limits.",
     )
     parser.add_argument("--version", action="version", version=f"acctsw {__version__}")
+    parser.add_argument("--capabilities", action="store_true",
+                        help="report engine features as JSON without accessing user state")
     sub = parser.add_subparsers(dest="command", metavar="<command>")
 
     ins = sub.add_parser("install", help="set up the engine (non-destructive, idempotent)")
@@ -416,6 +418,13 @@ HANDLERS = {
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     ns = parser.parse_args(argv)
+    if ns.capabilities and ns.command:
+        parser.error("--capabilities cannot be combined with a command")
+    if ns.capabilities:
+        # A feature handshake, not a version comparison: development builds can share a version
+        # while exposing different options. Keep this before Context/Keychain/store access.
+        print(json.dumps({"capabilities": ["run-key-v1"]}))
+        return EXIT_OK
     if not ns.command:
         parser.print_help()
         return EXIT_OK

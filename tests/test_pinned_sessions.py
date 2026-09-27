@@ -21,6 +21,30 @@ def no_network(*args, **kwargs):
     pytest.fail("a pin must not probe subscription usage")
 
 
+@pytest.mark.parametrize("tool", ["codex", "claude"])
+@pytest.mark.parametrize("app_open", [False, True])
+@pytest.mark.parametrize("options", [["--key", "seat-id"], ["--key=seat-id"],
+                                    ["--", "--key", "seat-id"]])
+def test_cli_consumes_pin_option_before_any_stock_fallback(ctx, monkeypatch, tool, app_open, options):
+    monkeypatch.setattr(appalive, "app_running", lambda *_: app_open)
+    monkeypatch.setattr(L, "exec_stock", lambda *a, **kw: pytest.fail("pin reached stock"))
+    launch = Mock(return_value=7)
+    monkeypatch.setattr(L, "run", launch)
+    ns = cli.build_parser().parse_args(["run", tool, *options, "--model", "a-model"])
+    assert cli._cmd_run(ctx, ns) == 7
+    assert launch.call_args.args == (ctx, tool, ["--model", "a-model"])
+    assert launch.call_args.kwargs["key"] == "seat-id"
+
+
+@pytest.mark.parametrize("options", [["--key"], ["--key="], ["--key", "--model"]])
+def test_invalid_pin_option_never_reaches_launcher_or_stock(ctx, monkeypatch, options):
+    monkeypatch.setattr(L, "exec_stock", lambda *a, **kw: pytest.fail("pin reached stock"))
+    monkeypatch.setattr(L, "run", lambda *a, **kw: pytest.fail("invalid pin launched"))
+    ns = cli.build_parser().parse_args(["run", "claude", *options])
+    with pytest.raises(AcctswError, match="--key needs"):
+        cli._cmd_run(ctx, ns)
+
+
 def run_pin(ctx, seat, **kwargs):
     return L.run(ctx, "codex", [], key=seat["id"], price_get=price_get,
                  get=no_network, **kwargs)
@@ -252,7 +276,7 @@ def test_only_key_seats_no_subscription_required(ctx):
     assert ctx.load_state().active("codex") is None
 
 
-def test_terminal_command_uses_wrapper_and_launchservices_without_oauth(ctx, monkeypatch):
+def test_terminal_command_uses_own_engine_without_oauth(ctx, monkeypatch):
     seat, _ = setup(ctx)
     commands = []
     monkeypatch.setattr(terminal, "open_in_terminal", commands.append)
@@ -261,7 +285,9 @@ def test_terminal_command_uses_wrapper_and_launchservices_without_oauth(ctx, mon
     result = bridge.key_action(ctx, {"action": "key_terminal", "id": seat["id"]})
     assert result == {"ok": True, "key_terminal": seat["id"]}
     terminal.open_key_terminal(ctx, result["key_terminal"])
-    assert commands == [f"cx --key {seat['id']}"]
+    assert len(commands) == 1
+    assert f"run codex --key {seat['id']}" in commands[0]
+    assert "-P -m acctsw" in commands[0]
     assert SECRET not in commands[0]
     disable(ctx)
     assert bridge.key_action(ctx, {"action": "key_terminal", "id": seat["id"]}) == {
@@ -338,7 +364,8 @@ def test_pinned_terminal_command_reaches_command_script_without_secret(ctx, monk
     terminal.open_key_terminal(ctx, seat["id"])
     assert captured["argv"][:3] == ["open", "-a", "Terminal"]
     assert captured["argv"][-1].endswith(".command")
-    assert f"cx --key {seat['id']}" in captured["script"]
+    assert f"run codex --key {seat['id']}" in captured["script"]
+    assert "-P -m acctsw" in captured["script"]
     assert SECRET not in captured["script"]
 
 
