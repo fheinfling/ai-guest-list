@@ -350,7 +350,15 @@ input:focus-visible ~ .sw, .free-control:focus-within, .proof-gate:focus-within 
   overflow-y:auto; overflow-x:hidden; scrollbar-width:thin;
 }
 .roster-glance h1 { margin-bottom:25px; }
-.roster { width:100%; table-layout:fixed; border-collapse:collapse; }
+/* Seat rows sit on their own light panel, the way v13-band's bands did, so the roster reads as
+   discrete seats against the field rather than as a spreadsheet. Separate borders, not collapsed:
+   a collapsed table cannot round its cells. */
+.roster { width:100%; table-layout:fixed; border-collapse:separate; border-spacing:0 6px; }
+/* The tool heading is a rowgroup th and stays on the field; only seat cells get the panel.
+   Selected per cell rather than per row: :has() is not safe at the macOS 12 floor. */
+.roster tbody > tr > :not(.roster-tool) { background:var(--surface); }
+.roster tbody > tr > :not(.roster-tool):first-child { border-radius:14px 0 0 14px; padding-left:14px; }
+.roster tbody > tr > :not(.roster-tool):last-child { border-radius:0 14px 14px 0; padding-right:14px; }
 .roster-seat-col { width:52%; }
 .roster-window-col { width:24%; }
 .roster th, .roster td { border:0; vertical-align:middle; }
