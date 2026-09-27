@@ -618,9 +618,10 @@ function paidUseControl(state) {
   }
   const stopping = state.settings?.key_fallback === false;
   return `<div class="paid-use-control" aria-label="stop paid use" role="status">
-    <span>${stopping ? "paid use is stopping…" : "paid use:"} ${sessions.join("; ")}</span> ·
-    <button class="link" data-action="key-stop"${stopping ? " disabled" : ""}>stop paid use</button>
-    <span>stops every session and new paid requests. sent turns may still bill.</span>
+    <h2 class="k-q">${stopping ? "paid use is stopping…" : "paid use:"}</h2>
+    <button class="btn rose" data-action="key-stop"${stopping ? " disabled" : ""}>stop paid use</button>
+    <p>${sessions.join("; ")}</p>
+    <p class="add-hint">stops every session and new paid requests. sent turns may still bill.</p>
   </div>`;
 }
 

@@ -1090,7 +1090,8 @@ test("a running paid seat offers a pinned one-tap stop that sends the kill switc
     keys: [keySeat()], running_key_seats: ["key-1"] });
   app.window.AGL.result({ state: snapshot });
   const h = app.root.innerHTML;
-  assert.match(h, /paid use: late-night/);
+  assert.match(h, /<h2 class="k-q">paid use:<\/h2>/);
+  assert.match(paidStrip(h), /late-night · vendor\/model/);
   assert.match(h, /data-action="key-stop">stop paid use<\/button>/);
   assert.ok(h.indexOf('data-action="key-stop"') < h.indexOf('class="main-body"'));
   assert.match(h, /stops every session and new paid requests/);
@@ -1172,13 +1173,16 @@ test("paid-use strip keeps session names visible while stopping and disables the
   assert.match(strip, /sent turns may still bill/);
 });
 
-test("paid-use strip uses inline content and action, distinct from the heavy confirmation prompt", () => {
+test("paid-use strip has a heading and real button without the confirmation's card layout", () => {
   const html = buildHTML(state({ running_key_seats: ["key-1"], pinned_sessions: [paidPin()],
     pending_key_switches: [keyPrompt()] }));
   const strip = paidStrip(html);
   assert.ok(strip);
-  assert.doesNotMatch(strip, /key-confirm|set-card|k-q|k-fine|k-acts|k-go|<section/);
-  assert.match(strip, /<button class="link" data-action="key-stop"/);
+  assert.doesNotMatch(strip, /key-confirm|set-card|k-fine|k-acts|k-go|<section/);
+  assert.match(strip, /<h2 class="k-q">paid use:<\/h2>/);
+  assert.match(strip, /<button class="btn rose" data-action="key-stop">stop paid use<\/button>/);
+  assert.doesNotMatch(strip, /class="link"/);
+  assert.match(strip, /<p>late-night · vendor\/model \(codex · terminal 202\)<\/p>/);
   assert.equal((strip.match(/<div/g) || []).length, 1);
   assert.match(html, /<section class="key-confirm set-card" aria-label="paid key confirmation"/);
 });

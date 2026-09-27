@@ -318,9 +318,11 @@ html, body { background:transparent; width:100%; overflow:hidden; }
 .set-app > .key-prompts { padding:10px 14px 0; }
 .key-confirm { padding:12px 13px; margin-bottom:10px; }
 .paid-use-control { flex:none; margin:10px 0 0; padding:0 2px 8px;
-  border-bottom:1px solid var(--line); color:var(--t2); font-size:11px; line-height:1.5;
+  display:grid; grid-template-columns:minmax(0, 1fr) auto; align-items:center; gap:6px 10px;
+  border-bottom:1px solid var(--line); color:var(--t1); font-size:13px; line-height:1.5;
   overflow-wrap:anywhere; }
-.paid-use-control .link { color:var(--rose); font-weight:700; white-space:nowrap; }
+.paid-use-control > p { grid-column:1 / -1; }
+.paid-use-control .btn { font-size:12.5px; padding:5px 11px; border-width:1.5px; white-space:nowrap; }
 .key-confirm > * + * { border-top:0; }
 .k-q { font-size:13.5px; font-weight:650; letter-spacing:-.1px; }
 .fare { font-family:"Outfit",var(--sans); font-weight:700; letter-spacing:-.6px; line-height:1;
