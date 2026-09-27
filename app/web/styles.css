@@ -7,6 +7,7 @@
 .theme-light {
   color-scheme:light;
   --ink:#06231d; --support:#06231d; --edge:#173c2e; --focus:#153d75;
+  --row-panel:rgba(242,250,245,.28);
   --surface:#f2faf5; --sheet:#e4f3e9; --field-top:#e2f8e6; --field-mid:#bfe9df; --field-base:#46c2a8;
   --button:#10382f; --button-ink:#f2faf5; --line:#9dbfb1;
   --money:#ffe6ad; --shadow:rgba(16,56,47,.22);
@@ -14,6 +15,7 @@
 .theme-dark {
   color-scheme:dark;
   --ink:#fff6df; --support:#fff6df; --edge:#c7dfd1; --focus:#ffe6ad;
+  --row-panel:rgba(24,62,54,.28);
   --surface:#183e36; --sheet:#123c33; --field-top:#102e29; --field-mid:#205444; --field-base:#2f6d58;
   --button:#fff6df; --button-ink:#10382f; --line:#668c78;
   --money:#54402a; --shadow:rgba(0,0,0,.4);
@@ -350,15 +352,20 @@ input:focus-visible ~ .sw, .free-control:focus-within, .proof-gate:focus-within 
   overflow-y:auto; overflow-x:hidden; scrollbar-width:thin;
 }
 .roster-glance h1 { margin-bottom:25px; }
-/* Seat rows sit on their own light panel, the way v13-band's bands did, so the roster reads as
-   discrete seats against the field rather than as a spreadsheet. Separate borders, not collapsed:
-   a collapsed table cannot round its cells. */
-.roster { width:100%; table-layout:fixed; border-collapse:separate; border-spacing:0 6px; }
-/* The tool heading is a rowgroup th and stays on the field; only seat cells get the panel.
-   Selected per cell rather than per row: :has() is not safe at the macOS 12 floor. */
-.roster tbody > tr > :not(.roster-tool) { background:var(--surface); }
-.roster tbody > tr > :not(.roster-tool):first-child { border-radius:14px 0 0 14px; padding-left:14px; }
-.roster tbody > tr > :not(.roster-tool):last-child { border-radius:0 14px 14px 0; padding-right:14px; }
+/* Each seat rides an edge-to-edge band, as v13-band's did: a barely-there wash of the surface
+   over the field, full-bleed, unrounded. Cards would make the roster a stack of objects; this
+   keeps it one calm surface with the seats merely resting on it.
+   The table escapes the glance's 24px gutter so the band reaches both edges, and the cells put
+   that gutter back so the text stays aligned with the heading above. */
+.roster {
+  width:calc(100% + 48px); margin:0 -24px; table-layout:fixed;
+  border-collapse:separate; border-spacing:0 6px;
+}
+.roster th:first-child, .roster td:first-child { padding-left:24px; }
+.roster th:last-child, .roster td:last-child { padding-right:24px; }
+/* The tool heading stays on the open field; only seat cells take the wash. Selected per cell
+   rather than per row because :has() is not safe at the macOS 12 floor either. */
+.roster tbody > tr > :not(.roster-tool) { background:var(--row-panel); }
 .roster-seat-col { width:52%; }
 .roster-window-col { width:24%; }
 .roster th, .roster td { border:0; vertical-align:middle; }
