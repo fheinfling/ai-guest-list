@@ -1,6 +1,6 @@
 // Live glue: render state into the DOM and forward user actions to the Python bridge.
 // All rendering logic lives in render.mjs (pure, unit-tested); this file is the thin wiring.
-import { buildHTML, buildSettings, buildAddSeat, addUsesPaste, reduceReply, updateClockText, buildAddKey, KEY_PROVIDERS, keyRequest, reduceKeyReply, keyConfirmations } from "./render.mjs";
+import { buildHTML, buildSettings, buildAddSeat, addUsesPaste, reduceReply, updateClockText, buildAddKey, KEY_PROVIDERS, keyRequest, reduceKeyReply, keyConfirmations, buildPaidKeyGate, buildModelResults } from "./render.mjs";
 
 const root = document.getElementById("root");
 const overlay = document.createElement("div");   // toast surface only (siblings of #root)
@@ -29,14 +29,26 @@ window.AGL = {
     // no DOM swap, no focus/caret theft.
     const out = reduceReply({ screen, add, lastRev, state }, res);
     const inKeyFlow = screen === "add-key";
-    if (inKeyFlow) out.screen = screen; // native settings requests must not discard a pasted key
+    if (inKeyFlow || screen === "paid-key") out.screen = screen; // keep the current input/confirmation
     screen = out.screen; add = out.add; lastRev = out.lastRev; state = out.state;
     const keyChanged = reduceKeyReply(keyFlow, res);
+    let paidChanged = false, paidHandled = false;
+    if (paidTerminal && res.key_action === "key_terminal" && res.key_target_id === paidTerminal.id) {
+      paidTerminal.pending = false;
+      if (res.code === "paid_use_disabled") {
+        screen = "paid-key"; paidTerminal.error = null;
+        paidHandled = true; paidChanged = true;
+      } else if (screen === "paid-key") {
+        if (res.ok) { screen = "main"; paidTerminal = null; }
+        else paidTerminal.error = res.error || "couldn't open that terminal — try again";
+        paidHandled = true; paidChanged = true;
+      } else paidTerminal = null;
+    }
     if (res.key_action === "answer_key_switch") answering.delete(res.key_target_id);
     if (res.key_action === "key_prove") proving.delete(res.key_target_id);
-    if (keyChanged || (out.render && !inKeyFlow)) render();
+    if (paidChanged || keyChanged || (out.render && !inKeyFlow)) render();
     else refreshKeyPrompts(); // surface consent without replacing inputs or stealing focus
-    if (out.flash && !res.key_request_id) flash(out.flash);
+    if (out.flash && !res.key_request_id && !paidHandled) flash(out.flash);
     if (res.key_action === "key_validate" && res.ok) flash(res.validation?.operation_permitted
       ? "key check passed — this checks account access only" : "key check wasn't permitted — check access with your provider");
     if (out.celebrate) celebrate();
@@ -72,6 +84,7 @@ let renderedScreen = null;  // what the last render() actually drew — gates sc
 // which the poll overwrites) so typed name/token survive a background re-render.
 let add = null;
 let keyFlow = null;
+let paidTerminal = null;
 let keySequence = 0;
 const answering = new Set();
 const proving = new Set();
@@ -104,6 +117,7 @@ function render() {
   root.innerHTML = screen === "settings" ? buildSettings(state)
     : screen === "add" ? buildAddSeat(state, add)
     : screen === "add-key" ? buildAddKey(state, keyFlow)
+    : screen === "paid-key" ? buildPaidKeyGate(state, paidTerminal)
     : buildHTML(state);
   if (!root.querySelector(".key-prompts")) {
     root.querySelector(".set-head")?.insertAdjacentHTML("afterend", keyConfirmations(state, answering));
@@ -147,6 +161,7 @@ function refreshKeyPrompts() {
 
 function keyBack() {
   if (keyFlow?.pending) return;
+  delete keyFlow.modelFilter; // every visit to the picker starts with the full catalog
   if (keyFlow.step === "review") keyFlow.step = "models";
   else if (keyFlow.step === "models") keyFlow.step = "details";
   else if (keyFlow.step === "details") { keyFlow.step = "provider"; keyFlow.secret = ""; }
@@ -203,7 +218,9 @@ document.addEventListener("click", (e) => {
       }
       sendKeyFlow("models_list"); break;
     }
-    case "key-model": keyFlow.model = el.dataset.model; keyFlow.step = "review"; render(); break;
+    case "key-model":
+      keyFlow.model = el.dataset.model; delete keyFlow.modelFilter;
+      keyFlow.step = "review"; render(); break;
     case "key-save":
       if (!keyFlow.pending) sendKeyFlow("key_add", { label: keyFlow.label.trim(), model: keyFlow.model });
       break;
@@ -212,7 +229,17 @@ document.addEventListener("click", (e) => {
       answering.add(el.dataset.id); refreshKeyPrompts();
       send("answer_key_switch", { id: el.dataset.id, approved: el.dataset.approved === "true" }); break;
     case "key-stop": send("toggle", { key: "key_fallback", value: false }); break;
-    case "key-terminal": send("key_terminal", { id: el.dataset.id }); break;
+    case "key-terminal":
+      if (paidTerminal?.pending) break;
+      paidTerminal = { id: el.dataset.id, label: state.keys?.find((key) => key.id === el.dataset.id)?.label || el.dataset.id, pending: true };
+      send("key_terminal", { id: el.dataset.id }); break;
+    case "paid-key-enable":
+      if (!paidTerminal || paidTerminal.pending) break;
+      paidTerminal.pending = true; paidTerminal.error = null;
+      send("key_terminal", { id: paidTerminal.id, enable_paid: true }); render(); break;
+    case "paid-key-back":
+      if (!paidTerminal?.pending) { paidTerminal = null; screen = "main"; render(); }
+      break;
     case "end-pinned-session":
       send("end_pinned_session", { tool, pin: el.dataset.pin }); break;
     case "key-validate": send("key_validate", { id: el.dataset.id }); break;
@@ -298,6 +325,11 @@ function addBack() {
 // Controlled inputs: mirror the add-seat fields into `add` on each keystroke so a background poll
 // re-render (which re-emits value="${...}") reproduces exactly what's typed — no lost text.
 document.addEventListener("input", (e) => {
+  if (screen === "add-key" && keyFlow?.step === "models" && e.target.id === "key-model-filter") {
+    keyFlow.modelFilter = e.target.value;
+    root.querySelector("#key-model-results").innerHTML = buildModelResults(keyFlow);
+    return;
+  }
   const fields = { "key-label": "label", "key-secret": "secret", "key-base-url": "base_url" };
   if (keyFlow && fields[e.target.id]) keyFlow[fields[e.target.id]] = e.target.value;
   if (!add) return;
@@ -319,6 +351,7 @@ document.addEventListener("keydown", (e) => {
   if (screen === "settings") { screen = "main"; render(); }
   else if (screen === "add") addBack();
   else if (screen === "add-key") keyBack();
+  else if (screen === "paid-key" && !paidTerminal?.pending) { paidTerminal = null; screen = "main"; render(); }
 });
 
 // WKWebView normally reflects popover visibility here; the native shell also calls setVisible()

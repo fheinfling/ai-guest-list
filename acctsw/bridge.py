@@ -200,8 +200,16 @@ def key_action(ctx: Context, message: dict) -> dict[str, Any]:
             seat = keyseats_mod.get(ctx, _key_text(message, "id"))
             if seat is None:
                 raise _KeyRequestError("that key seat is no longer on the list")
+            # Only the named-seat enable-and-continue button sends this explicit opt-in.
+            # Persist the same master setting; the launcher still rechecks it before spending.
+            if message.get("enable_paid") is True:
+                with ctx.locked():
+                    state = ctx.load_state()
+                    state.set_setting("key_fallback", True)
+                    state.save()
             if not ctx.load_state().settings()["key_fallback"]:
-                raise _KeyRequestError("paid use is off — allow keys to take the floor in settings first")
+                return {"ok": False, "error": "paid use is off — turn on 'allow paid key use' to continue",
+                        "code": "paid_use_disabled"}
             # The native shell opens only this wrapper command. Consent and prices belong to
             # the launcher; opening a terminal is not approval to start its paid child.
             result = {"ok": True, "key_terminal": seat["id"]}
@@ -440,6 +448,15 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
     try:
         if action in KEY_ACTIONS:
             result = key_action(ctx, message)
+            # The UI correlates asynchronous replies by these two fields: which action came back,
+            # and which seat/request it was about. Without them every correlation branch in
+            # app.mjs silently no-ops — a spinner that never clears, a toast that never fires.
+            # They are stamped here, once, rather than in each handler, so a new key action
+            # cannot forget them. setdefault lets a handler name a different target if it must.
+            result.setdefault("key_action", action)
+            target = message.get("id")
+            if isinstance(target, str) and target:
+                result.setdefault("key_target_id", target)
             try:
                 result["state"] = snapshot_state(ctx)
             except Exception:

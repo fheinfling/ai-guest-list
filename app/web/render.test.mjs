@@ -1129,7 +1129,7 @@ test("each key seat offers use in new terminal with its exact id", () => {
     assert.ok(html.includes(`data-action="key-terminal" data-id="${key.id}">use in new terminal</button>`));
   }
   const app = readFileSync(new URL('./app.mjs', import.meta.url), 'utf8');
-  assert.match(app, /case "key-terminal": send\("key_terminal", \{ id: el.dataset.id \}\)/);
+  assert.match(app, /send\("key_terminal", \{ id: el.dataset.id \}\)/);
 });
 
 test("pinned paid terminals have independent rows and end controls", () => {
@@ -1195,4 +1195,147 @@ test("prices read the same here as they do in the CLI", () => {
   for (const [raw, shown] of Object.entries(TABLE)) {
     assert.equal(formatPrice(raw), `$${shown}`, `formatPrice(${raw})`);
   }
+});
+
+test("model filter matches id and display name without case sensitivity", () => {
+  const catalog = { sort_key: "id", models: [
+    { id: "GPT-5-mini", display_name: "Small helper" },
+    { id: "vendor/large", display_name: "GPT flagship" },
+    { id: "other", display_name: "Different model" },
+  ] };
+  for (const query of ["gpt", "GpT"]) {
+    const h = buildModelPicker(keyFlow({ catalog, modelFilter: query }));
+    assert.match(h, /data-model="GPT-5-mini"/);
+    assert.match(h, /data-model="vendor\/large"/);
+    assert.doesNotMatch(h, /data-model="other"/);
+    assert.match(h, />2 of 3<\/div>/);
+  }
+  assert.match(buildModelPicker(keyFlow({ catalog })), />3 of 3<\/div>/);
+});
+
+test("filtering keeps the original ordering, sort header and price visibility", () => {
+  const models = [
+    { id: "a-match", price: livePrice("9", "2") },
+    { id: "middle", price: livePrice("5", "3") },
+    { id: "z-match", price: livePrice("1", "8") },
+    { id: "unknown-match" },
+  ];
+  for (const sort_key of ["id", "input_usd_per_million_tokens"]) {
+    const flow = keyFlow({ provider: "openai", catalog: { sort_key, models } });
+    const original = buildModelPicker(flow);
+    const filtered = buildModelPicker({ ...flow, modelFilter: "MATCH" });
+    const ids = (h) => [...h.matchAll(/data-model="([^"]+)"/g)].map((m) => m[1]);
+    assert.deepEqual(ids(filtered), ids(original).filter((id) => id.includes("match")));
+    const header = (h) => h.match(/<div class="add-hint">([^<]*sorted by[^<]*)<\/div>/)[1];
+    assert.equal(header(filtered), header(original));
+    assert.match(filtered, />3 of 4<\/div>/);
+    if (sort_key === "id") assert.doesNotMatch(filtered, /input \$|output \$|class="key-price/);
+    else {
+      assert.match(filtered, /input \$1\/Mtok · output \$8\/Mtok/);
+      assert.match(filtered, /input \$9\/Mtok · output \$2\/Mtok/);
+    }
+  }
+});
+
+test("model filter empty state honestly names and escapes the query", () => {
+  const h = buildModelPicker(keyFlow({ modelFilter: '<MiSs "me">',
+    catalog: { sort_key: "id", models: [{ id: "model" }] } }));
+  assert.match(h, /no models match “&lt;MiSs &quot;me&quot;&gt;”/);
+  assert.match(h, />0 of 1<\/div>/);
+  assert.doesNotMatch(h, /data-action="key-model"|<MiSs|no models returned/);
+});
+
+test("paid-use master switch names automatic fallback, pinned terminals and stopping", () => {
+  const h = buildSettings(state());
+  const row = h.match(/<label class="set-toggle-row">(?:(?!<\/label>)[\s\S])*data-key="key_fallback"(?:(?!<\/label>)[\s\S])*<\/label>/)[0];
+  assert.match(row, /class="set-t">allow paid key use<\/span>/);
+  assert.match(row, /on permits paid use: automatic fallback.*and pinned key terminals/);
+  assert.match(row, /real money can be spent/);
+  assert.match(row, /off prevents new paid use and stops a running paid session/);
+  assert.doesNotMatch(row, /let a key take the floor/);
+});
+
+test("blocked named-seat launch offers informed inline enable-and-continue", () => {
+  const app = keyApp();
+  const snapshot = state({ rev: 1, settings: { key_fallback: false }, keys: [keySeat({ label: 'late <shift>' })] });
+  app.window.AGL.result({ state: snapshot });
+  app.click({ action: "key-terminal", id: "key-1" });
+  app.window.AGL.result({ key_action: "key_terminal", key_target_id: "key-1", ok: false,
+    code: "paid_use_disabled", error: "paid use is off", state: snapshot });
+  assert.match(app.root.innerHTML, /app set-app add-app/);
+  assert.match(app.root.innerHTML, /use late &lt;shift&gt; in a new terminal/);
+  assert.match(app.root.innerHTML, /real money can be spent/);
+  assert.match(app.root.innerHTML, /data-action="paid-key-enable">allow paid use and open terminal/);
+  assert.doesNotMatch(app.root.innerHTML, /in settings|open settings|<shift>|modal/);
+  const sentBeforeConsent = app.sent.length;
+  app.window.AGL.result({ state: { ...snapshot, rev: 2 } });
+  assert.equal(app.sent.length, sentBeforeConsent);
+  app.click({ action: "paid-key-enable" });
+  assert.deepEqual(JSON.parse(JSON.stringify(app.sent.at(-1))),
+    { action: "key_terminal", id: "key-1", enable_paid: true });
+  app.click({ action: "paid-key-enable" });
+  assert.equal(app.sent.length, sentBeforeConsent + 1);
+  app.window.AGL.result({ key_action: "key_terminal", key_target_id: "key-1", ok: true,
+    state: { ...snapshot, rev: 3, settings: { key_fallback: true } } });
+  assert.doesNotMatch(app.root.innerHTML, /data-action="paid-key-enable"/);
+});
+
+test("declining a blocked launch leaves paid use off and errors allow retry", () => {
+  const app = keyApp();
+  app.window.AGL.result({ state: state({ keys: [keySeat()] }) });
+  const block = () => {
+    app.click({ action: "key-terminal", id: "key-1" });
+    app.window.AGL.result({ key_action: "key_terminal", key_target_id: "key-1", ok: false, code: "paid_use_disabled" });
+  };
+  block();
+  const count = app.sent.length;
+  app.click({ action: "paid-key-back" });
+  assert.equal(app.sent.length, count);
+  assert.doesNotMatch(app.root.innerHTML, /data-action="paid-key-enable"/);
+  block();
+  app.click({ action: "paid-key-enable" });
+  app.window.AGL.result({ key_action: "key_terminal", key_target_id: "key-1", ok: false, error: "couldn't save that setting" });
+  assert.match(app.root.innerHTML, /couldn't save that setting/);
+  assert.match(app.root.innerHTML, /data-action="paid-key-enable">/);
+});
+
+test("typing filters only results, survives state pushes and resets on each picker visit", () => {
+  const app = keyApp();
+  app.click({ action: "key-start" }); app.click({ action: "key-provider", provider: "openai" });
+  app.input("key-label", "night"); app.input("key-secret", "test-secret");
+  const discover = () => {
+    app.click({ action: "key-discover" });
+    const request = app.sent.at(-1);
+    app.window.AGL.result({ key_action: "models_list", key_request_id: request.key_request_id,
+      ok: true, sort_key: "id", models: [{ id: "gpt-mini" }, { id: "other" }] });
+  };
+  discover();
+  // The DOM boundary exposes a separate results node. Replacing root or touching the input
+  // would discard the focused field/caret in the actual WebView.
+  const results = { innerHTML: "" };
+  app.root.querySelector = (selector) => selector === "#key-model-results" ? results : null;
+  const pickerHTML = app.root.innerHTML;
+  app.input("key-model-filter", "MINI");
+  assert.equal(app.root.innerHTML, pickerHTML);
+  assert.match(results.innerHTML, /data-model="gpt-mini"/);
+  assert.doesNotMatch(results.innerHTML, /data-model="other"/);
+  assert.match(results.innerHTML, />1 of 2<\/div>/);
+  const filtered = results.innerHTML;
+  app.window.AGL.result({ state: state({ rev: 1 }) });
+  assert.equal(app.root.innerHTML, pickerHTML);
+  assert.equal(results.innerHTML, filtered);
+  app.click({ action: "key-model", model: "gpt-mini" });
+  assert.match(app.root.innerHTML, /gpt-mini/);
+  assert.doesNotMatch(app.root.innerHTML, /key-model-filter|MINI/);
+  app.click({ action: "key-back" });
+  assert.match(app.root.innerHTML, /data-model="other"/);
+  assert.match(app.root.innerHTML, /id="key-model-filter"[^>]*value=""/);
+  app.input("key-model-filter", "other");
+  app.click({ action: "key-back" });
+  discover();
+  assert.match(app.root.innerHTML, /id="key-model-filter"[^>]*value=""/);
+  app.click({ action: "key-model", model: "gpt-mini" });
+  app.click({ action: "key-save" });
+  assert.equal(app.sent.at(-1).model, "gpt-mini");
+  assert.equal(Object.hasOwn(app.sent.at(-1), "modelFilter"), false);
 });

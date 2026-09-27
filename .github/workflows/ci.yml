@@ -74,6 +74,13 @@ jobs:
         if: matrix.build
         run: python scripts/smoke-bundle.py
 
+      - name: Build and smoke-test alias app
+        if: matrix.build
+        run: |
+          . .venv/bin/activate
+          python setup.py py2app --alias --dist-dir build/dev/dist --bdist-base build/dev/temp
+          python scripts/smoke-bundle.py "build/dev/dist/AI Guest List.app"
+
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7 (pinned SHA; Dependabot keeps it current)
         with:

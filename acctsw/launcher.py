@@ -930,7 +930,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
     pinned_seat = keyseats.resolve(ctx, key, harness=tool) if key is not None else None
     pin = uuid4().hex if pinned_seat is not None else None
     if pin and not state.settings()["key_fallback"]:
-        raise AcctswError("paid use is off — turn on 'let a key take the floor' before using --key")
+        raise AcctswError("paid use is off — turn on 'allow paid key use' before using --key")
     if pin and not pinned_key_eligible(state, tool, pinned_seat["id"]):
         raise AcctswError("that key seat failed its key or quota check — check it before using --key")
     if not pin and not state.accounts(tool):

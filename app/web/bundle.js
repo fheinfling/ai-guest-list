@@ -536,7 +536,7 @@ function buildSettings(state) {
       ${segBlock("when a seat runs out", strategyHint(strat), "set_strategy", strat, STRATEGY_OPTS)}
       ${toggleRow("supervise_shell", "supervise terminal commands", "codex/claude auto-switch seats · off: only cx/cl do", s.supervise_shell !== false)}
       ${toggleRow("same_tool_only", "keep me on the same tool", "a Codex limit hops to your other Codex seat, never to Claude", s.same_tool_only)}
-      ${toggleRow("key_fallback", "let a key take the floor", "off by default. on allows pinned key terminals and keys when subscription seats rest — real money can be spent. off prevents new paid use and stops a running paid session; the turn already sent may still bill", s.key_fallback === true)}
+      ${toggleRow("key_fallback", "allow paid key use", "off by default. on permits paid use: automatic fallback when subscription seats rest and pinned key terminals — real money can be spent. off prevents new paid use and stops a running paid session; the turn already sent may still bill", s.key_fallback === true)}
       ${toggleRow("confirm_key_switch", "ask before using a paid key", "ask me to approve each hop onto a key. turning this off lets eligible keys spend money without asking again", s.confirm_key_switch !== false)}
       ${toggleRow("notify", "tell me when it switches", "a gentle notification with who's on now", s.notify)}
       ${toggleRow("restart_app", "restart the Codex app after a swap", "the desktop app keeps the old account until it relaunches · terminals switch on their own", s.restart_app)}
@@ -743,28 +743,56 @@ function keyConfirmations(state, answering = new Set(), now = Date.now()) {
   }).join("")}</div>`;
 }
 
-function buildModelPicker(flow) {
+function buildPaidKeyGate(state, flow) {
+  const seat = state.keys?.find((key) => key.id === flow.id);
+  const theme = state.settings?.theme === "dark" ? "dark" : "light";
+  const disabled = flow.pending ? " disabled" : "";
+  return `<div class="app set-app add-app theme-${theme}" style="--accent:${TOOL_META[seat?.harness || "codex"].accent}">
+    <header class="set-head"><button class="set-back" data-action="paid-key-back" title="back"${disabled}>‹</button><span class="set-title">allow paid key use</span></header>
+    <div class="set-body"><section class="set-sec"><span class="set-label">paid use is off</span>
+      <div class="set-card add-method"><span class="set-t">use ${esc(seat?.label || flow.label)} in a new terminal?</span>
+        <div class="add-hint">real money can be spent. this turns on paid key use for pinned terminals and automatic fallback when subscription seats rest.</div>
+        <div class="add-hint">turning paid use off stops a running paid session; the turn already sent may still bill.</div></div>
+      ${flow.error ? `<div class="usage-error" role="alert">${esc(flow.error)}</div>` : ""}
+      <button class="add-cta" data-action="paid-key-enable"${disabled}>${flow.pending ? "opening your terminal…" : "allow paid use and open terminal"}</button>
+      <button class="add-change" data-action="paid-key-back"${disabled}>not now</button>
+    </section></div></div>`;
+}
+
+// Render only these results on input: the filter field itself keeps focus and its caret.
+function buildModelResults(flow) {
   const catalog = flow.catalog || {};
-  const provider = KEY_PROVIDERS[flow.provider];
   const priced = catalog.sort_key === "input_usd_per_million_tokens";
   const models = [...(catalog.models || [])].sort((a, b) => {
     if (!priced) return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
     const av = priceRate(a.price, "input"), bv = priceRate(b.price, "input");
     return (av === null ? Infinity : Number(av)) - (bv === null ? Infinity : Number(bv));
   });
-  const message = priced ? "sorted by input $/Mtok · cheap to expensive · unknown input prices last"
-    : provider?.priced ? "prices unavailable from this catalog · sorted by model id"
-    : "this provider does not publish machine-readable prices · sorted by model id";
-  return `<section class="set-sec"><span class="set-label">pick a model</span>
-    <div class="add-hint">${message}</div>
-    ${catalog.source === "cache" ? `<div class="add-hint">cached live catalog · ${esc(fmtUsageAge(catalog.fetched_at))}${catalog.potentially_stale ? " · over 24h old" : ""}</div>` : ""}
-    ${catalog.error ? `<div class="usage-error">couldn't refresh the catalog — showing the last reading</div>` : ""}
-    <div class="set-card">${models.map((model) => `<button class="add-prov key-model-option" data-action="key-model" data-model="${esc(model.id)}">
+  const query = (flow.modelFilter || "").toLowerCase();
+  const visible = models.filter((model) => model.id.toLowerCase().includes(query)
+    || (model.display_name || "").toLowerCase().includes(query));
+  return `<div class="add-hint" role="status">${visible.length} of ${models.length}</div>
+    <div class="set-card">${visible.map((model) => `<button class="add-prov key-model-option" data-action="key-model" data-model="${esc(model.id)}">
       <span class="add-prov-tx"><span class="key-model mono">${esc(model.id)}</span>
       ${model.display_name && model.display_name !== model.id ? `<span class="add-prov-sub">${esc(model.display_name)}</span>` : ""}
       ${priced ? priceHTML(model.price) : ""}
       ${model.context_window != null ? `<span class="add-hint">${esc(model.context_window)} token context</span>` : ""}</span><span class="add-chev">›</span>
-    </button>`).join("") || `<div class="add-method add-hint">no models returned. go back to check this key and endpoint.</div>`}</div>
+    </button>`).join("") || `<div class="add-method add-hint">${query ? `no models match “${esc(flow.modelFilter)}”.` : "no models returned. go back to check this key and endpoint."}</div>`}</div>`;
+}
+
+function buildModelPicker(flow) {
+  const catalog = flow.catalog || {};
+  const provider = KEY_PROVIDERS[flow.provider];
+  const priced = catalog.sort_key === "input_usd_per_million_tokens";
+  const message = priced ? "sorted by input $/Mtok · cheap to expensive · unknown input prices last"
+    : provider?.priced ? "prices unavailable from this catalog · sorted by model id"
+    : "this provider does not publish machine-readable prices · sorted by model id";
+  return `<section class="set-sec"><span class="set-label">pick a model</span>
+    <div class="set-card"><input class="add-input" id="key-model-filter" type="search" aria-label="filter models" placeholder="filter by model id or name" autocomplete="off" spellcheck="false" value="${esc(flow.modelFilter || "")}"></div>
+    <div class="add-hint">${message}</div>
+    ${catalog.source === "cache" ? `<div class="add-hint">cached live catalog · ${esc(fmtUsageAge(catalog.fetched_at))}${catalog.potentially_stale ? " · over 24h old" : ""}</div>` : ""}
+    ${catalog.error ? `<div class="usage-error">couldn't refresh the catalog — showing the last reading</div>` : ""}
+    <div id="key-model-results">${buildModelResults(flow)}</div>
     ${provider?.pricing ? `<a class="add-hint" href="${provider.pricing}" data-action="key-pricing" data-provider="${flow.provider}">provider pricing and budget controls ↗</a>` : `<div class="add-hint">check your endpoint's pricing and budget controls with its operator.</div>`}
     <div class="add-foot">prices are estimates. use your provider's budget controls for limits — this app does not limit spend.</div>
   </section>`;
@@ -782,7 +810,7 @@ function reduceKeyReply(flow, res) {
   if (!flow?.pending || flow.pending !== res.key_request_id) return false;
   flow.pending = null;
   if (res.key_action === "models_list") {
-    if (res.ok && Array.isArray(res.models)) { flow.catalog = res; flow.step = "models"; }
+    if (res.ok && Array.isArray(res.models)) { flow.catalog = res; flow.step = "models"; delete flow.modelFilter; }
     else { flow.step = "details"; flow.error = res.error || "couldn't load models — try again"; }
   } else if (res.key_action === "key_add") {
     if (res.added) { flow.step = "done"; flow.secret = ""; flow.savedSeat = res.seat; }
@@ -817,7 +845,7 @@ function buildAddKey(state, flow) {
   } else if (flow.step === "review") {
     const model = flow.catalog?.models?.find((m) => m.id === flow.model);
     body = `<section class="set-sec"><span class="set-label">a seat for ${esc(flow.label)}</span><div class="set-card add-method"><span class="set-t">${esc(providerName(flow))}</span><div class="key-model mono">${esc(flow.model)}</div>${priceHTML(model?.price)}</div>
-      <div class="add-foot">saving a key does not start a paid session. allow keys to take the floor in settings when you're ready.</div>
+      <div class="add-foot">saving a key does not start a paid session. choose “use in new terminal” when you're ready.</div>
       <div class="add-foot">use your provider's budget controls for limits — this app does not cap spend.</div></section><button class="add-cta" data-action="key-save">save the key seat →</button>`;
   } else {
     body = `<div class="add-center add-center--done"><div class="add-heart">💛</div><div class="add-welcome">welcome, ${esc(flow.label)}</div><div class="add-sub">your key seat's saved</div>
@@ -860,14 +888,26 @@ window.AGL = {
     // no DOM swap, no focus/caret theft.
     const out = reduceReply({ screen, add, lastRev, state }, res);
     const inKeyFlow = screen === "add-key";
-    if (inKeyFlow) out.screen = screen; // native settings requests must not discard a pasted key
+    if (inKeyFlow || screen === "paid-key") out.screen = screen; // keep the current input/confirmation
     screen = out.screen; add = out.add; lastRev = out.lastRev; state = out.state;
     const keyChanged = reduceKeyReply(keyFlow, res);
+    let paidChanged = false, paidHandled = false;
+    if (paidTerminal && res.key_action === "key_terminal" && res.key_target_id === paidTerminal.id) {
+      paidTerminal.pending = false;
+      if (res.code === "paid_use_disabled") {
+        screen = "paid-key"; paidTerminal.error = null;
+        paidHandled = true; paidChanged = true;
+      } else if (screen === "paid-key") {
+        if (res.ok) { screen = "main"; paidTerminal = null; }
+        else paidTerminal.error = res.error || "couldn't open that terminal — try again";
+        paidHandled = true; paidChanged = true;
+      } else paidTerminal = null;
+    }
     if (res.key_action === "answer_key_switch") answering.delete(res.key_target_id);
     if (res.key_action === "key_prove") proving.delete(res.key_target_id);
-    if (keyChanged || (out.render && !inKeyFlow)) render();
+    if (paidChanged || keyChanged || (out.render && !inKeyFlow)) render();
     else refreshKeyPrompts(); // surface consent without replacing inputs or stealing focus
-    if (out.flash && !res.key_request_id) flash(out.flash);
+    if (out.flash && !res.key_request_id && !paidHandled) flash(out.flash);
     if (res.key_action === "key_validate" && res.ok) flash(res.validation?.operation_permitted
       ? "key check passed — this checks account access only" : "key check wasn't permitted — check access with your provider");
     if (out.celebrate) celebrate();
@@ -903,6 +943,7 @@ let renderedScreen = null;  // what the last render() actually drew — gates sc
 // which the poll overwrites) so typed name/token survive a background re-render.
 let add = null;
 let keyFlow = null;
+let paidTerminal = null;
 let keySequence = 0;
 const answering = new Set();
 const proving = new Set();
@@ -935,6 +976,7 @@ function render() {
   root.innerHTML = screen === "settings" ? buildSettings(state)
     : screen === "add" ? buildAddSeat(state, add)
     : screen === "add-key" ? buildAddKey(state, keyFlow)
+    : screen === "paid-key" ? buildPaidKeyGate(state, paidTerminal)
     : buildHTML(state);
   if (!root.querySelector(".key-prompts")) {
     root.querySelector(".set-head")?.insertAdjacentHTML("afterend", keyConfirmations(state, answering));
@@ -978,6 +1020,7 @@ function refreshKeyPrompts() {
 
 function keyBack() {
   if (keyFlow?.pending) return;
+  delete keyFlow.modelFilter; // every visit to the picker starts with the full catalog
   if (keyFlow.step === "review") keyFlow.step = "models";
   else if (keyFlow.step === "models") keyFlow.step = "details";
   else if (keyFlow.step === "details") { keyFlow.step = "provider"; keyFlow.secret = ""; }
@@ -1034,7 +1077,9 @@ document.addEventListener("click", (e) => {
       }
       sendKeyFlow("models_list"); break;
     }
-    case "key-model": keyFlow.model = el.dataset.model; keyFlow.step = "review"; render(); break;
+    case "key-model":
+      keyFlow.model = el.dataset.model; delete keyFlow.modelFilter;
+      keyFlow.step = "review"; render(); break;
     case "key-save":
       if (!keyFlow.pending) sendKeyFlow("key_add", { label: keyFlow.label.trim(), model: keyFlow.model });
       break;
@@ -1043,7 +1088,17 @@ document.addEventListener("click", (e) => {
       answering.add(el.dataset.id); refreshKeyPrompts();
       send("answer_key_switch", { id: el.dataset.id, approved: el.dataset.approved === "true" }); break;
     case "key-stop": send("toggle", { key: "key_fallback", value: false }); break;
-    case "key-terminal": send("key_terminal", { id: el.dataset.id }); break;
+    case "key-terminal":
+      if (paidTerminal?.pending) break;
+      paidTerminal = { id: el.dataset.id, label: state.keys?.find((key) => key.id === el.dataset.id)?.label || el.dataset.id, pending: true };
+      send("key_terminal", { id: el.dataset.id }); break;
+    case "paid-key-enable":
+      if (!paidTerminal || paidTerminal.pending) break;
+      paidTerminal.pending = true; paidTerminal.error = null;
+      send("key_terminal", { id: paidTerminal.id, enable_paid: true }); render(); break;
+    case "paid-key-back":
+      if (!paidTerminal?.pending) { paidTerminal = null; screen = "main"; render(); }
+      break;
     case "end-pinned-session":
       send("end_pinned_session", { tool, pin: el.dataset.pin }); break;
     case "key-validate": send("key_validate", { id: el.dataset.id }); break;
@@ -1129,6 +1184,11 @@ function addBack() {
 // Controlled inputs: mirror the add-seat fields into `add` on each keystroke so a background poll
 // re-render (which re-emits value="${...}") reproduces exactly what's typed — no lost text.
 document.addEventListener("input", (e) => {
+  if (screen === "add-key" && keyFlow?.step === "models" && e.target.id === "key-model-filter") {
+    keyFlow.modelFilter = e.target.value;
+    root.querySelector("#key-model-results").innerHTML = buildModelResults(keyFlow);
+    return;
+  }
   const fields = { "key-label": "label", "key-secret": "secret", "key-base-url": "base_url" };
   if (keyFlow && fields[e.target.id]) keyFlow[fields[e.target.id]] = e.target.value;
   if (!add) return;
@@ -1150,6 +1210,7 @@ document.addEventListener("keydown", (e) => {
   if (screen === "settings") { screen = "main"; render(); }
   else if (screen === "add") addBack();
   else if (screen === "add-key") keyBack();
+  else if (screen === "paid-key" && !paidTerminal?.pending) { paidTerminal = null; screen = "main"; render(); }
 });
 
 // WKWebView normally reflects popover visibility here; the native shell also calls setVisible()

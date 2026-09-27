@@ -533,7 +533,7 @@ export function buildSettings(state) {
       ${segBlock("when a seat runs out", strategyHint(strat), "set_strategy", strat, STRATEGY_OPTS)}
       ${toggleRow("supervise_shell", "supervise terminal commands", "codex/claude auto-switch seats · off: only cx/cl do", s.supervise_shell !== false)}
       ${toggleRow("same_tool_only", "keep me on the same tool", "a Codex limit hops to your other Codex seat, never to Claude", s.same_tool_only)}
-      ${toggleRow("key_fallback", "let a key take the floor", "off by default. on allows pinned key terminals and keys when subscription seats rest — real money can be spent. off prevents new paid use and stops a running paid session; the turn already sent may still bill", s.key_fallback === true)}
+      ${toggleRow("key_fallback", "allow paid key use", "off by default. on permits paid use: automatic fallback when subscription seats rest and pinned key terminals — real money can be spent. off prevents new paid use and stops a running paid session; the turn already sent may still bill", s.key_fallback === true)}
       ${toggleRow("confirm_key_switch", "ask before using a paid key", "ask me to approve each hop onto a key. turning this off lets eligible keys spend money without asking again", s.confirm_key_switch !== false)}
       ${toggleRow("notify", "tell me when it switches", "a gentle notification with who's on now", s.notify)}
       ${toggleRow("restart_app", "restart the Codex app after a swap", "the desktop app keeps the old account until it relaunches · terminals switch on their own", s.restart_app)}
@@ -740,28 +740,56 @@ export function keyConfirmations(state, answering = new Set(), now = Date.now())
   }).join("")}</div>`;
 }
 
-export function buildModelPicker(flow) {
+export function buildPaidKeyGate(state, flow) {
+  const seat = state.keys?.find((key) => key.id === flow.id);
+  const theme = state.settings?.theme === "dark" ? "dark" : "light";
+  const disabled = flow.pending ? " disabled" : "";
+  return `<div class="app set-app add-app theme-${theme}" style="--accent:${TOOL_META[seat?.harness || "codex"].accent}">
+    <header class="set-head"><button class="set-back" data-action="paid-key-back" title="back"${disabled}>‹</button><span class="set-title">allow paid key use</span></header>
+    <div class="set-body"><section class="set-sec"><span class="set-label">paid use is off</span>
+      <div class="set-card add-method"><span class="set-t">use ${esc(seat?.label || flow.label)} in a new terminal?</span>
+        <div class="add-hint">real money can be spent. this turns on paid key use for pinned terminals and automatic fallback when subscription seats rest.</div>
+        <div class="add-hint">turning paid use off stops a running paid session; the turn already sent may still bill.</div></div>
+      ${flow.error ? `<div class="usage-error" role="alert">${esc(flow.error)}</div>` : ""}
+      <button class="add-cta" data-action="paid-key-enable"${disabled}>${flow.pending ? "opening your terminal…" : "allow paid use and open terminal"}</button>
+      <button class="add-change" data-action="paid-key-back"${disabled}>not now</button>
+    </section></div></div>`;
+}
+
+// Render only these results on input: the filter field itself keeps focus and its caret.
+export function buildModelResults(flow) {
   const catalog = flow.catalog || {};
-  const provider = KEY_PROVIDERS[flow.provider];
   const priced = catalog.sort_key === "input_usd_per_million_tokens";
   const models = [...(catalog.models || [])].sort((a, b) => {
     if (!priced) return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
     const av = priceRate(a.price, "input"), bv = priceRate(b.price, "input");
     return (av === null ? Infinity : Number(av)) - (bv === null ? Infinity : Number(bv));
   });
-  const message = priced ? "sorted by input $/Mtok · cheap to expensive · unknown input prices last"
-    : provider?.priced ? "prices unavailable from this catalog · sorted by model id"
-    : "this provider does not publish machine-readable prices · sorted by model id";
-  return `<section class="set-sec"><span class="set-label">pick a model</span>
-    <div class="add-hint">${message}</div>
-    ${catalog.source === "cache" ? `<div class="add-hint">cached live catalog · ${esc(fmtUsageAge(catalog.fetched_at))}${catalog.potentially_stale ? " · over 24h old" : ""}</div>` : ""}
-    ${catalog.error ? `<div class="usage-error">couldn't refresh the catalog — showing the last reading</div>` : ""}
-    <div class="set-card">${models.map((model) => `<button class="add-prov key-model-option" data-action="key-model" data-model="${esc(model.id)}">
+  const query = (flow.modelFilter || "").toLowerCase();
+  const visible = models.filter((model) => model.id.toLowerCase().includes(query)
+    || (model.display_name || "").toLowerCase().includes(query));
+  return `<div class="add-hint" role="status">${visible.length} of ${models.length}</div>
+    <div class="set-card">${visible.map((model) => `<button class="add-prov key-model-option" data-action="key-model" data-model="${esc(model.id)}">
       <span class="add-prov-tx"><span class="key-model mono">${esc(model.id)}</span>
       ${model.display_name && model.display_name !== model.id ? `<span class="add-prov-sub">${esc(model.display_name)}</span>` : ""}
       ${priced ? priceHTML(model.price) : ""}
       ${model.context_window != null ? `<span class="add-hint">${esc(model.context_window)} token context</span>` : ""}</span><span class="add-chev">›</span>
-    </button>`).join("") || `<div class="add-method add-hint">no models returned. go back to check this key and endpoint.</div>`}</div>
+    </button>`).join("") || `<div class="add-method add-hint">${query ? `no models match “${esc(flow.modelFilter)}”.` : "no models returned. go back to check this key and endpoint."}</div>`}</div>`;
+}
+
+export function buildModelPicker(flow) {
+  const catalog = flow.catalog || {};
+  const provider = KEY_PROVIDERS[flow.provider];
+  const priced = catalog.sort_key === "input_usd_per_million_tokens";
+  const message = priced ? "sorted by input $/Mtok · cheap to expensive · unknown input prices last"
+    : provider?.priced ? "prices unavailable from this catalog · sorted by model id"
+    : "this provider does not publish machine-readable prices · sorted by model id";
+  return `<section class="set-sec"><span class="set-label">pick a model</span>
+    <div class="set-card"><input class="add-input" id="key-model-filter" type="search" aria-label="filter models" placeholder="filter by model id or name" autocomplete="off" spellcheck="false" value="${esc(flow.modelFilter || "")}"></div>
+    <div class="add-hint">${message}</div>
+    ${catalog.source === "cache" ? `<div class="add-hint">cached live catalog · ${esc(fmtUsageAge(catalog.fetched_at))}${catalog.potentially_stale ? " · over 24h old" : ""}</div>` : ""}
+    ${catalog.error ? `<div class="usage-error">couldn't refresh the catalog — showing the last reading</div>` : ""}
+    <div id="key-model-results">${buildModelResults(flow)}</div>
     ${provider?.pricing ? `<a class="add-hint" href="${provider.pricing}" data-action="key-pricing" data-provider="${flow.provider}">provider pricing and budget controls ↗</a>` : `<div class="add-hint">check your endpoint's pricing and budget controls with its operator.</div>`}
     <div class="add-foot">prices are estimates. use your provider's budget controls for limits — this app does not limit spend.</div>
   </section>`;
@@ -779,7 +807,7 @@ export function reduceKeyReply(flow, res) {
   if (!flow?.pending || flow.pending !== res.key_request_id) return false;
   flow.pending = null;
   if (res.key_action === "models_list") {
-    if (res.ok && Array.isArray(res.models)) { flow.catalog = res; flow.step = "models"; }
+    if (res.ok && Array.isArray(res.models)) { flow.catalog = res; flow.step = "models"; delete flow.modelFilter; }
     else { flow.step = "details"; flow.error = res.error || "couldn't load models — try again"; }
   } else if (res.key_action === "key_add") {
     if (res.added) { flow.step = "done"; flow.secret = ""; flow.savedSeat = res.seat; }
@@ -814,7 +842,7 @@ export function buildAddKey(state, flow) {
   } else if (flow.step === "review") {
     const model = flow.catalog?.models?.find((m) => m.id === flow.model);
     body = `<section class="set-sec"><span class="set-label">a seat for ${esc(flow.label)}</span><div class="set-card add-method"><span class="set-t">${esc(providerName(flow))}</span><div class="key-model mono">${esc(flow.model)}</div>${priceHTML(model?.price)}</div>
-      <div class="add-foot">saving a key does not start a paid session. allow keys to take the floor in settings when you're ready.</div>
+      <div class="add-foot">saving a key does not start a paid session. choose “use in new terminal” when you're ready.</div>
       <div class="add-foot">use your provider's budget controls for limits — this app does not cap spend.</div></section><button class="add-cta" data-action="key-save">save the key seat →</button>`;
   } else {
     body = `<div class="add-center add-center--done"><div class="add-heart">💛</div><div class="add-welcome">welcome, ${esc(flow.label)}</div><div class="add-sub">your key seat's saved</div>

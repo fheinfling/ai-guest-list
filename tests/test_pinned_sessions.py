@@ -94,7 +94,7 @@ def test_ambiguous_label_names_every_candidate(ctx):
 
 def test_paid_off_refuses_before_consent_or_spawn(ctx):
     seat, _ = setup(ctx, enabled=False)
-    with pytest.raises(AcctswError, match="paid use is off"):
+    with pytest.raises(AcctswError, match="paid use is off — turn on 'allow paid key use' before using --key"):
         run_pin(ctx, seat, spawn=no_network)
     assert not ctx.load_state().data.get("handoffs")
 
@@ -264,7 +264,33 @@ def test_terminal_command_uses_wrapper_and_launchservices_without_oauth(ctx, mon
     assert commands == [f"cx --key {seat['id']}"]
     assert SECRET not in commands[0]
     disable(ctx)
-    assert not bridge.key_action(ctx, {"action": "key_terminal", "id": seat["id"]})["ok"]
+    assert bridge.key_action(ctx, {"action": "key_terminal", "id": seat["id"]}) == {
+        "ok": False, "error": "paid use is off — turn on 'allow paid key use' to continue",
+        "code": "paid_use_disabled",
+    }
+
+
+@pytest.mark.parametrize("enable_paid", [None, False, "true", 1, True])
+def test_terminal_paid_opt_in_is_explicit_and_uses_the_master_switch(ctx, enable_paid):
+    seat, _ = setup(ctx, enabled=False)
+    result = bridge.key_action(ctx, {"action": "key_terminal", "id": seat["id"],
+                                     "enable_paid": enable_paid})
+    assert result["ok"] is (enable_paid is True)
+    assert ctx.load_state().settings()["key_fallback"] is (enable_paid is True)
+    assert not ctx.load_state().data.get("handoffs")
+    if enable_paid is True:
+        assert result["key_terminal"] == seat["id"]
+        disable(ctx)
+        assert bridge.key_action(ctx, {"action": "key_terminal", "id": seat["id"]})["code"] == "paid_use_disabled"
+        with pytest.raises(AcctswError, match="allow paid key use"):
+            run_pin(ctx, seat, spawn=no_network)
+
+
+def test_terminal_opt_in_cannot_enable_paid_use_for_a_missing_seat(ctx):
+    setup(ctx, enabled=False)
+    result = bridge.key_action(ctx, {"action": "key_terminal", "id": "missing", "enable_paid": True})
+    assert not result["ok"]
+    assert ctx.load_state().settings()["key_fallback"] is False
 
 
 def test_subscription_cannot_fallback_onto_another_terminals_pinned_key(ctx, monkeypatch):
