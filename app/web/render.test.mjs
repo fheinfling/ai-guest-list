@@ -1090,11 +1090,11 @@ test("a running paid seat offers a pinned one-tap stop that sends the kill switc
     keys: [keySeat()], running_key_seats: ["key-1"] });
   app.window.AGL.result({ state: snapshot });
   const h = app.root.innerHTML;
-  assert.match(h, /a paid key is on the floor/);
+  assert.match(h, /paid use: late-night/);
   assert.match(h, /data-action="key-stop">stop paid use<\/button>/);
   assert.ok(h.indexOf('data-action="key-stop"') < h.indexOf('class="main-body"'));
-  assert.match(h, /stop new paid requests and the running session/);
-  assert.match(h, /the turn already sent may still bill/);
+  assert.match(h, /stops every session and new paid requests/);
+  assert.match(h, /sent turns may still bill/);
   app.click({ action: "key-stop" });
   assert.deepEqual(JSON.parse(JSON.stringify(app.sent.at(-1))),
     { action: "toggle", key: "key_fallback", value: false });
@@ -1110,6 +1110,87 @@ test("idle keys and subscription sessions do not offer the paid-session stop", (
   const h = buildHTML(state({ keys: [keySeat()], running_key_seats: [],
     tools: { codex: { seats: [seat({ status: "active", active: true, in_session: true })] } } }));
   assert.doesNotMatch(h, /data-action="key-stop"/);
+});
+
+const paidStrip = (html) => html.match(/<div class="paid-use-control"[^>]*>[\s\S]*?<\/div>/)?.[0];
+const paidPin = (over = {}) => ({ pin: "first-pin", pid: 202, tool: "codex", email: "key-1",
+  key_seat: keySeat(), ...over });
+
+test("paid-use strip names and escapes the running pin's seat and model even after key removal", () => {
+  const html = buildHTML(state({ keys: [], running_key_seats: ["key-1"],
+    pinned_sessions: [paidPin({ key_seat: keySeat({ label: "late <shift>", model: "guest/<model>" }) })] }));
+  const strip = paidStrip(html);
+  assert.ok(strip);
+  assert.match(strip, /late &lt;shift&gt; · guest\/&lt;model&gt; \(codex · terminal 202\)/);
+  assert.doesNotMatch(strip, /<shift>|<model>/);
+  assert.match(strip, /aria-label="stop paid use" role="status"/);
+  assert.ok(html.indexOf(strip) < html.indexOf('data-key="auto_switch"'));
+});
+
+test("paid-use strip names both running sessions and makes its global stop explicit", () => {
+  const second = keySeat({ id: "key-2", label: "writing", model: "claude-model", harness: "claude" });
+  const strip = paidStrip(buildHTML(state({ running_key_seats: ["key-1", "key-2"],
+    pinned_sessions: [paidPin(), paidPin({ pin: "second-pin", pid: 303, tool: "claude",
+      email: "key-2", key_seat: second })] })));
+  assert.match(strip, /late-night · vendor\/model \(codex · terminal 202\)/);
+  assert.match(strip, /writing · claude-model \(claude · terminal 303\)/);
+  assert.match(strip, /stops every session and new paid requests/);
+  assert.match(strip, /sent turns may still bill/);
+  assert.equal((strip.match(/data-action="key-stop"/g) || []).length, 1);
+});
+
+test("paid-use strip keeps two terminals on the same key individually identifiable", () => {
+  const strip = paidStrip(buildHTML(state({ running_key_seats: ["key-1"],
+    pinned_sessions: [paidPin(), paidPin({ pin: "second-pin", pid: 303 })] })));
+  assert.equal((strip.match(/late-night · vendor\/model/g) || []).length, 2);
+  assert.match(strip, /terminal 202/);
+  assert.match(strip, /terminal 303/);
+});
+
+test("paid-use strip also names automatic fallback seats alongside pinned sessions", () => {
+  const strip = paidStrip(buildHTML(state({ running_key_seats: ["key-1", "key-2"],
+    keys: [keySeat({ id: "key-2", label: "fallback", model: "other/model" })],
+    pinned_sessions: [paidPin()] })));
+  assert.match(strip, /late-night · vendor\/model/);
+  assert.match(strip, /fallback · other\/model/);
+});
+
+test("paid-use strip does not render without running sessions", () => {
+  for (const snapshot of [state(), state({ keys: [keySeat()], running_key_seats: [], pinned_sessions: [] })]) {
+    const html = buildHTML(snapshot);
+    assert.equal(paidStrip(html), undefined);
+    assert.doesNotMatch(html, /paid-use-control|data-action="key-stop"/);
+  }
+});
+
+test("paid-use strip keeps session names visible while stopping and disables the action", () => {
+  const strip = paidStrip(buildHTML(state({ settings: { key_fallback: false },
+    running_key_seats: ["key-1"], pinned_sessions: [paidPin()] })));
+  assert.match(strip, /paid use is stopping…/);
+  assert.match(strip, /late-night · vendor\/model/);
+  assert.match(strip, /data-action="key-stop" disabled>stop paid use/);
+  assert.match(strip, /sent turns may still bill/);
+});
+
+test("paid-use strip uses inline content and action, distinct from the heavy confirmation prompt", () => {
+  const html = buildHTML(state({ running_key_seats: ["key-1"], pinned_sessions: [paidPin()],
+    pending_key_switches: [keyPrompt()] }));
+  const strip = paidStrip(html);
+  assert.ok(strip);
+  assert.doesNotMatch(strip, /key-confirm|set-card|k-q|k-fine|k-acts|k-go|<section/);
+  assert.match(strip, /<button class="link" data-action="key-stop"/);
+  assert.equal((strip.match(/<div/g) || []).length, 1);
+  assert.match(html, /<section class="key-confirm set-card" aria-label="paid key confirmation"/);
+});
+
+test("pinned cards retain per-session end actions alongside the global paid-use strip", () => {
+  const html = buildHTML(state({ running_key_seats: ["key-1"],
+    pinned_sessions: [paidPin(), paidPin({ pin: "second-pin", pid: 303, end_requested: true })] }));
+  assert.doesNotMatch(paidStrip(html), /end-pinned-session/);
+  const cards = [...html.matchAll(/<section class="seat seat--key pinned-session"[\s\S]*?<\/section>/g)];
+  assert.equal(cards.length, 2);
+  assert.match(cards[0][0], /data-action="end-pinned-session" data-tool="codex" data-pin="first-pin">end<\/button>/);
+  assert.match(cards[1][0], /data-action="end-pinned-session" data-tool="codex" data-pin="second-pin" disabled>ending…<\/button>/);
 });
 
 test("paid-use settings subtitle explains prevention, session stopping, and in-flight billing", () => {

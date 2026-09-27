@@ -317,7 +317,10 @@ html, body { background:transparent; width:100%; overflow:hidden; }
 .app > .key-prompts { max-height:45%; overflow-y:auto; padding-top:10px; }
 .set-app > .key-prompts { padding:10px 14px 0; }
 .key-confirm { padding:12px 13px; margin-bottom:10px; }
-.paid-use-control { --accent:var(--codex); flex:none; margin:10px 0 0; }
+.paid-use-control { flex:none; margin:10px 0 0; padding:0 2px 8px;
+  border-bottom:1px solid var(--line); color:var(--t2); font-size:11px; line-height:1.5;
+  overflow-wrap:anywhere; }
+.paid-use-control .link { color:var(--rose); font-weight:700; white-space:nowrap; }
 .key-confirm > * + * { border-top:0; }
 .k-q { font-size:13.5px; font-weight:650; letter-spacing:-.1px; }
 .fare { font-family:"Outfit",var(--sans); font-weight:700; letter-spacing:-.6px; line-height:1;

@@ -600,13 +600,25 @@ export function buildHTML(state) {
 }
 
 function paidUseControl(state) {
-  if (!state?.running_key_seats?.length) return "";
+  const pinned = state?.pinned_sessions || [];
+  const running = state?.running_key_seats || [];
+  if (!pinned.length && !running.length) return "";
+  // Keep each terminal visible, even when several pins share a key or the key was removed.
+  const sessions = pinned.map((s) => {
+    const seat = s.key_seat || {};
+    return `${esc(seat.label || s.email)} · ${esc(seat.model)} (${esc(s.tool)} · terminal ${esc(s.pid)})`;
+  });
+  for (const id of running) {
+    if (pinned.some((s) => (s.key_seat?.id || s.email) === id)) continue;
+    const seat = state?.keys?.find((k) => k.id === id);
+    sessions.push(seat ? `${esc(seat.label)} · ${esc(seat.model)} (${esc(seat.harness)})` : esc(id));
+  }
   const stopping = state.settings?.key_fallback === false;
-  return `<section class="key-confirm set-card paid-use-control" aria-label="stop paid use">
-    <div class="k-q">${stopping ? "paid use is stopping…" : "a paid key is on the floor"}</div>
-    <div class="k-fine">stop new paid requests and the running session. the turn already sent may still bill.</div>
-    <div class="k-acts"><button class="k-go" data-action="key-stop"${stopping ? " disabled" : ""}>stop paid use</button></div>
-  </section>`;
+  return `<div class="paid-use-control" aria-label="stop paid use" role="status">
+    <span>${stopping ? "paid use is stopping…" : "paid use:"} ${sessions.join("; ")}</span> ·
+    <button class="link" data-action="key-stop"${stopping ? " disabled" : ""}>stop paid use</button>
+    <span>stops every session and new paid requests. sent turns may still bill.</span>
+  </div>`;
 }
 
 export function pinnedSessions(state) {
