@@ -90,12 +90,21 @@ def _config(runtime: KeyHome, name: str, *, stateless: bool) -> str:
     if stateless:
         # Langdock rejects previous_response_id, used by Codex's WebSocket continuation path.
         lines.append("supports_websockets = false")
-    lines += ["", "[analytics]", "enabled = false", "", "[feedback]", "enabled = false",
+    # env_key is read by Codex itself. Its shell subprocesses must not inherit that key.
+    # Default secret-name exclusions are OFF in Codex 0.157.0. Keep an explicit exclusion
+    # for the actual provider variable as well as enabling the default secret filters.
+    lines += ["", "[shell_environment_policy]", 'inherit = "all"',
+              "ignore_default_excludes = false", f"exclude = [{_quote(runtime.env_key)}]",
+              "", "[analytics]", "enabled = false", "", "[feedback]", "enabled = false",
               "", "[otel]", 'exporter = "none"', 'trace_exporter = "none"',
               # Load-bearing: the default metrics exporter is Statsig -> ab.chatgpt.com,
               # even with a custom inference provider. Disabling analytics alone is insufficient.
               'metrics_exporter = "none"', "log_user_prompt = false",
-              "", "[features]", "apps = false", "plugins = false", ""]
+              "", "[features]", "apps = false", "plugins = false",
+              # Verified with a real 0.157.0 session: snapshot generation bypasses the
+              # shell environment exclusions and writes env_key to disk. Both controls
+              # are required; do not re-enable snapshots based on policy config alone.
+              "shell_snapshot = false", ""]
     return "\n".join(lines)
 
 
@@ -184,6 +193,9 @@ def build_env(ctx: Context, runtime: KeyHome, *, env: dict[str, str] | None = No
             child.pop(key, None)
         child.update(CLAUDE_CONFIG_DIR=str(runtime.home), ANTHROPIC_BASE_URL=runtime.base_url,
                      ANTHROPIC_MODEL=runtime.model, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1",
+                     # Verified with Claude Code 2.1.282: the parent retains the auth token,
+                     # while Bash and snapshot subprocesses receive a scrubbed environment.
+                     CLAUDE_CODE_SUBPROCESS_ENV_SCRUB="1",
                      DISABLE_TELEMETRY="1", DISABLE_ERROR_REPORTING="1", DISABLE_AUTOUPDATER="1")
     child[runtime.env_key] = secret
     return child

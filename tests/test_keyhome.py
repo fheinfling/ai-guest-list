@@ -1,7 +1,8 @@
-"""Key runtimes keep config private, credentials in memory, and Codex socket paths short.
+"""Preparation keeps config private and Codex socket paths short.
 
 These tests exercise the stored-seat/Keychain boundary with fake validation, never a live harness
-or network. Parsing TOML catches escaping and table-scope mistakes that string assertions miss.
+or network. These checks cannot establish post-session containment: test_keyhome_live.py
+exercises the real harness. Parsing TOML catches escaping and table-scope mistakes.
 """
 from __future__ import annotations
 
@@ -55,6 +56,8 @@ def test_codex_provider_and_all_egress_suppression(ctx):
     assert config(runtime) == {
         "model_provider": "langdock_eu", "model": "model-id", "web_search": "disabled",
         "check_for_update_on_startup": False,
+        "shell_environment_policy": {"inherit": "all", "ignore_default_excludes": False,
+                                     "exclude": ["LANGDOCK_API_KEY"]},
         "model_providers": {"langdock_eu": {
             "name": "Langdock EU", "base_url": "https://api.langdock.com/openai/eu/v1",
             "wire_api": "responses", "env_key": "LANGDOCK_API_KEY",
@@ -62,7 +65,8 @@ def test_codex_provider_and_all_egress_suppression(ctx):
             "request_max_retries": 0, "stream_max_retries": 0}},
         "analytics": {"enabled": False}, "feedback": {"enabled": False},
         "otel": {"exporter": "none", "trace_exporter": "none", "metrics_exporter": "none",
-                 "log_user_prompt": False}, "features": {"apps": False, "plugins": False}}
+                 "log_user_prompt": False},
+        "features": {"apps": False, "plugins": False, "shell_snapshot": False}}
     assert runtime.home == ctx.codex_home(f"key:codex:{seat['id']}")
     assert runtime.home.stat().st_mode & 0o777 == 0o700
     assert (runtime.home / "config.toml").stat().st_mode & 0o777 == 0o600
@@ -70,7 +74,7 @@ def test_codex_provider_and_all_egress_suppression(ctx):
 
 @pytest.mark.parametrize("provider,harness", [("langdock", "codex"), ("langdock", "claude"),
                                              ("anthropic", "claude")])
-def test_secret_only_in_child_env_not_files_repr_or_logs(ctx, provider, harness, caplog):
+def test_preparation_does_not_write_or_log_secret(ctx, provider, harness, caplog):
     seat = add(ctx, provider, harness=harness)
     runtime = keyhome.prepare(ctx, seat["id"])
     env = keyhome.build_env(ctx, runtime, env={})
@@ -81,6 +85,20 @@ def test_secret_only_in_child_env_not_files_repr_or_logs(ctx, provider, harness,
     assert not any(SECRET.encode() in data for data in tree(runtime.home).values())
     assert not any(SECRET.encode() in data for data in tree(ctx.data_dir).values())
     assert not any(p.is_symlink() for p in runtime.home.rglob("*"))
+
+
+@pytest.mark.parametrize("provider", ["openai", "langdock", "openrouter", "openai_compatible"])
+def test_codex_credential_excluded_from_shell_and_snapshots(ctx, provider):
+    runtime = keyhome.prepare(ctx, add(ctx, provider, base_url=(
+        "https://gateway.example/v1" if provider == "openai_compatible" else None))["id"])
+    data = config(runtime)
+    policy = data["shell_environment_policy"]
+    assert runtime.env_key in policy["exclude"]
+    assert policy["ignore_default_excludes"] is False
+    assert runtime.env_key not in policy.get("set", {})
+    assert data["features"]["shell_snapshot"] is False
+    # The harness still receives the key for provider authentication.
+    assert keyhome.build_env(ctx, runtime, env={})[runtime.env_key] == SECRET
 
 
 @pytest.mark.parametrize("name", ["OpenAI", "openai", " OpenAI "])
@@ -108,7 +126,8 @@ def test_model_values_cannot_inject_toml(ctx, value):
     data = config(runtime)
     assert data["model"] == value
     assert set(data) == {"model", "model_provider", "web_search", "check_for_update_on_startup",
-                         "model_providers", "analytics", "feedback", "otel", "features"}
+                         "model_providers", "analytics", "feedback", "otel", "features",
+                         "shell_environment_policy"}
 
 
 @pytest.mark.parametrize("base", ['https://gateway.example/v1/"\\injected = true',
@@ -164,6 +183,7 @@ def test_claude_env_and_private_webfetch_settings(ctx, provider, base):
     runtime = keyhome.prepare(ctx, add(ctx, provider, harness="claude")["id"])
     inherited = {"PATH": "/usr/bin", "ANTHROPIC_API_KEY": "wrong-key",
                  "ANTHROPIC_AUTH_TOKEN": "wrong-token", "ANTHROPIC_BASE_URL": "wrong-host",
+                 "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "0",
                  "CLAUDE_CODE_USE_VERTEX": "1", "CLAUDE_CODE_OAUTH_TOKEN": "subscription"}
     before = inherited.copy()
     env = keyhome.build_env(ctx, runtime, env=inherited)
@@ -174,6 +194,7 @@ def test_claude_env_and_private_webfetch_settings(ctx, provider, base):
                    "ANTHROPIC_AUTH_TOKEN": SECRET, "ANTHROPIC_MODEL": "model-id",
                    "CLAUDE_CONFIG_DIR": str(runtime.home),
                    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "DISABLE_TELEMETRY": "1",
+                   "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
                    "DISABLE_ERROR_REPORTING": "1", "DISABLE_AUTOUPDATER": "1"}
     assert inherited == before
     assert json.loads((runtime.home / "settings.json").read_text()) == {"skipWebFetchPreflight": True}
