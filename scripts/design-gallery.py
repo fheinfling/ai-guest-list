@@ -28,6 +28,7 @@ import copy
 import datetime as dt
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -39,7 +40,9 @@ sys.path.insert(0, str(ROOT))
 WEB = ROOT / "app" / "web"
 DESIGN = ROOT / "design"
 VARIANTS = DESIGN / "variants"
-BUILD = DESIGN / ".build"
+# Parallel variant builds would otherwise clobber each other's output: the build starts by
+# removing the directory. AGL_GALLERY_BUILD gives each concurrent run its own.
+BUILD = Path(os.environ.get("AGL_GALLERY_BUILD") or DESIGN / ".build")
 FIXTURES = DESIGN / "fixtures"
 PORT = 8918
 
@@ -157,9 +160,15 @@ def build_states(base: dict, catalog: dict) -> list[dict]:
 
     # 4 — the unhappy list: nothing ready, a key that may not work, the wiring incomplete.
     trouble = copy.deepcopy(base)
-    for seat in trouble["tools"]["codex"]["seats"]:
-        seat["status"], seat["limited"], seat["usage5h"] = "resting", True, 100
-        seat["limited_until"] = _iso(96)
+    # Every tool has to rest, or the header's "0 ready" contradicts the Claude rows right under
+    # it — and a design shaped around an incoherent fixture inherits the incoherence.
+    for tool in ("codex", "claude"):
+        group = trouble["tools"][tool]
+        group["active"] = None
+        for seat in group["seats"]:
+            seat["status"], seat["active"], seat["limited"] = "resting", False, True
+            seat["usage5h"] = 100
+            seat["limited_until"] = _iso(96)
     trouble["counts"] = {"resting": 4, "ready": 0}
     trouble["door"], trouble["dot"] = "shut", "amber"
     trouble["keys"][0]["responses_verified"] = False
@@ -347,7 +356,9 @@ def main() -> int:
 
     states = build(args.refresh_catalog)
     variants = ["v0-today"] + [n for n, _ in discover_variants()]
-    print(f"built {BUILD.relative_to(ROOT)} — {len(variants)} variant(s), {len(states)} states")
+    # AGL_GALLERY_BUILD may point outside the repo, so relative_to() is not safe here.
+    where = BUILD.relative_to(ROOT) if BUILD.is_relative_to(ROOT) else BUILD
+    print(f"built {where} — {len(variants)} variant(s), {len(states)} states")
     for name in variants:
         print(f"  · {name}")
     if args.no_serve:
