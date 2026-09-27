@@ -12,6 +12,7 @@
 :root {
   --codex: #46c2a8;   /* teal  (constant across themes) */
   --claude: #e0795a;  /* coral (constant across themes) */
+  --on-accent: #06231d; /* dark ink stays legible on both harness accents */
   --sans: "Hanken Grotesk", -apple-system, system-ui, sans-serif;
   --mono: "Space Mono", ui-monospace, "SF Mono", Menlo, monospace;
 }
@@ -303,3 +304,44 @@ html, body { background:transparent; width:100%; overflow:hidden; }
 
 .celebrate { animation:pop .5s ease; }
 @keyframes pop { 0%{transform:scale(.99)} 50%{transform:scale(1.01)} 100%{transform:scale(1)} }
+
+/* Key seats share the existing cards, accents and pushed-screen chrome. */
+.key-detail, .key-cost { color:var(--t2); font-size:11.5px; margin-top:6px; }
+.key-model, .key-price { overflow-wrap:anywhere; font-size:10.5px; line-height:1.5; }
+.key-model { color:var(--t1); margin:4px 0; }
+.key-price { color:var(--t2); }
+.key-unproven { color:var(--amber); font-size:11px; margin:7px 0; padding:6px 8px;
+  border:1px solid var(--amber); border-radius:8px; }
+.key-prompts:empty { display:none; }
+.key-prompts { --accent:var(--codex); flex:none; }
+.app > .key-prompts { max-height:45%; overflow-y:auto; padding-top:10px; }
+.set-app > .key-prompts { padding:10px 14px 0; }
+.key-confirm { padding:12px 13px; margin-bottom:10px; }
+.paid-use-control { flex:none; margin:10px 0 0; padding:0 2px 8px;
+  display:grid; grid-template-columns:minmax(0, 1fr) auto; align-items:center; gap:6px 10px;
+  border-bottom:1px solid var(--line); color:var(--t1); font-size:13px; line-height:1.5;
+  overflow-wrap:anywhere; }
+.paid-use-control > p { grid-column:1 / -1; }
+.paid-use-control .btn { font-size:12.5px; padding:5px 11px; border-width:1.5px; white-space:nowrap; }
+.key-confirm > * + * { border-top:0; }
+.k-q { font-size:13.5px; font-weight:650; letter-spacing:-.1px; }
+.fare { font-family:"Outfit",var(--sans); font-weight:700; letter-spacing:-.6px; line-height:1;
+  font-size:34px; display:block; margin:9px 0 1px; overflow-wrap:anywhere; }
+.unit { color:var(--t3); font-size:10.5px; letter-spacing:.01em; }
+.quiet-meta { color:var(--t2); font-size:11.5px; margin-top:9px; line-height:1.5; overflow-wrap:anywhere; }
+.k-model { font-family:var(--mono); font-size:11px; color:var(--t2); }
+.k-fine { color:var(--t3); font-size:10.5px; line-height:1.45; margin-top:10px; }
+.k-acts { display:flex; align-items:center; gap:10px; margin-top:12px; }
+.k-go { flex:1; font:inherit; font-size:12.5px; font-weight:650; padding:9px 12px;
+  border:0; border-radius:10px; background:var(--accent); color:var(--on-accent); cursor:pointer; }
+.k-no { font:inherit; font-size:12.5px; padding:9px 6px; border:0; background:none; color:var(--t2); cursor:pointer; }
+.k-no:hover { color:var(--t1); }
+.key-ack { display:flex; align-items:flex-start; gap:10px; font-size:12px; color:var(--t1);
+  padding:12px; background:var(--card); border:1px solid var(--amber); border-radius:12px; cursor:pointer; }
+.key-ack input { flex:none; margin-top:2px; accent-color:var(--accent); }
+.key-model-option + .key-model-option { border-top:1px solid var(--line); }
+.seat--key .logout { margin-left:12px; }
+.add-cta { flex-shrink:0; }
+button:disabled { opacity:.55; cursor:default; }
+.add-input:focus-visible, .key-ack input:focus-visible, button:focus-visible, a:focus-visible {
+  outline:2px solid var(--accent, var(--codex)); outline-offset:-2px; }

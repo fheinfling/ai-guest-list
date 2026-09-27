@@ -230,17 +230,17 @@ function seatCard(tool, seat) {
   </div>`;
 }
 
-function toolGroup(tool, t) {
+function toolGroup(tool, t, keys = []) {
   const meta = TOOL_META[tool];
   const seats = t?.seats || [];
-  const n = seats.length;
+  const n = seats.length + keys.length;
   return `<section class="group" style="--accent:${meta.accent}">
     <div class="g-head">
       <span class="dot dot--accent"></span>
       <span class="g-name">${meta.label}</span><span class="g-count">· ${n} seat${n === 1 ? "" : "s"}</span>
       <span class="grow"></span><span class="mono g-meta">${esc(t?.plan_label || meta.plan)}</span>
     </div>
-    ${seats.map((s) => seatCard(tool, s)).join("") || `<div class="empty">no seats yet</div>`}
+    ${seats.map((s) => seatCard(tool, s)).join("") + keys.map(keySeatCard).join("") || `<div class="empty">no seats yet</div>`}
     <button class="add-row" data-action="add" data-tool="${tool}">＋ add a seat</button>
   </section>`;
 }
@@ -380,6 +380,7 @@ function addProviderStep() {
     <span class="set-label">who's joining the list?</span>
     <div class="set-card">${row("codex")}${row("claude")}</div>
     <div class="add-foot">nothing leaves your Mac — i just save the seat's credentials so you can hop between them.</div>
+    <button class="add-row" data-action="key-start">＋ bring an api key instead</button>
   </section>`;
 }
 
@@ -535,6 +536,8 @@ function buildSettings(state) {
       ${segBlock("when a seat runs out", strategyHint(strat), "set_strategy", strat, STRATEGY_OPTS)}
       ${toggleRow("supervise_shell", "supervise terminal commands", "codex/claude auto-switch seats · off: only cx/cl do", s.supervise_shell !== false)}
       ${toggleRow("same_tool_only", "keep me on the same tool", "a Codex limit hops to your other Codex seat, never to Claude", s.same_tool_only)}
+      ${toggleRow("key_fallback", "allow paid key use", "off by default. on permits paid use: automatic fallback when subscription seats rest and pinned key terminals — real money can be spent. off prevents new paid use and stops a running paid session; the turn already sent may still bill", s.key_fallback === true)}
+      ${toggleRow("confirm_key_switch", "ask before using a paid key", "ask me to approve each hop onto a key. turning this off lets eligible keys spend money without asking again", s.confirm_key_switch !== false)}
       ${toggleRow("notify", "tell me when it switches", "a gentle notification with who's on now", s.notify)}
       ${toggleRow("restart_app", "restart the Codex app after a swap", "the desktop app keeps the old account until it relaunches · terminals switch on their own", s.restart_app)}
     </div></section>`;
@@ -582,17 +585,290 @@ function buildHTML(state) {
         <button class="ibtn" data-action="add" title="add a seat">＋</button>
       </span>
     </header>
+    ${keyConfirmations(state)}
+    ${paidUseControl(state)}
     <div class="main-body">
       ${supervisionBanner(state)}
       ${controlBar({ icon: REFRESH, title: "auto-switch", sub: "next ready seat · soonest-reset wins",
                      key: "auto_switch", on: s.auto_switch, accentClass: "ic-auto" })}
       ${moved}
-      ${toolGroup("codex", state?.tools?.codex)}
-      ${toolGroup("claude", state?.tools?.claude)}
+      ${pinnedSessions(state)}
+      ${toolGroup("codex", state?.tools?.codex, (state?.keys || []).filter((k) => k.harness === "codex"))}
+      ${toolGroup("claude", state?.tools?.claude, (state?.keys || []).filter((k) => k.harness === "claude"))}
+      <button class="add-row" data-action="key-start">＋ add a key</button>
       <footer class="foot"><span>made with <span class="heart">💛</span></span>
         <button class="link" data-action="quit">quit</button></footer>
     </div>
   </div>`;
+}
+
+function paidUseControl(state) {
+  const pinned = state?.pinned_sessions || [];
+  const running = state?.running_key_seats || [];
+  if (!pinned.length && !running.length) return "";
+  // Keep each terminal visible, even when several pins share a key or the key was removed.
+  const sessions = pinned.map((s) => {
+    const seat = s.key_seat || {};
+    return `${esc(seat.label || s.email)} · ${esc(seat.model)} (${esc(s.tool)} · terminal ${esc(s.pid)})`;
+  });
+  for (const id of running) {
+    if (pinned.some((s) => (s.key_seat?.id || s.email) === id)) continue;
+    const seat = state?.keys?.find((k) => k.id === id);
+    sessions.push(seat ? `${esc(seat.label)} · ${esc(seat.model)} (${esc(seat.harness)})` : esc(id));
+  }
+  const stopping = state.settings?.key_fallback === false;
+  return `<div class="paid-use-control" aria-label="stop paid use" role="status">
+    <h2 class="k-q">${stopping ? "paid use is stopping…" : "paid use:"}</h2>
+    <button class="btn rose" data-action="key-stop"${stopping ? " disabled" : ""}>stop paid use</button>
+    <p>${sessions.join("; ")}</p>
+    <p class="add-hint">stops every session and new paid requests. sent turns may still bill.</p>
+  </div>`;
+}
+
+function pinnedSessions(state) {
+  return (state?.pinned_sessions || []).map((s) => {
+    const seat = s.key_seat || {};
+    return `<section class="seat seat--key pinned-session" aria-label="pinned paid session">
+      <div class="seat-row"><span class="seat-name">${esc(seat.label)}</span><span class="mono chip">pinned · paid</span></div>
+      <div class="key-detail">${esc(providerName(seat))} · ${esc(s.tool)} · terminal ${esc(s.pid)}</div>
+      <div class="key-model mono">${esc(seat.model)}</div>
+      <div class="add-hint">metered · paid per token. end here, then resume on a subscription seat.</div>
+      <button class="btn switch" data-action="end-pinned-session" data-tool="${esc(s.tool)}" data-pin="${esc(s.pin)}"${s.end_requested ? " disabled" : ""}>${s.end_requested ? "ending…" : "end"}</button>
+    </section>`;
+  }).join("");
+}
+
+// Key providers mirror providers.py's harness gate: chat-only catalogs are not usable seats.
+// No price table lives here. Every amount comes from a bridge price envelope.
+const KEY_PROVIDERS = {
+  openai: { name: "openai", harness: "codex", pricing: "https://openai.com/api/pricing/" },
+  anthropic: { name: "anthropic", harness: "claude", pricing: "https://www.anthropic.com/pricing" },
+  openrouter: { name: "openrouter", harness: "codex", priced: true, pricing: "https://openrouter.ai/models" },
+  langdock: { name: "langdock · openai models", harness: "codex", regional: true, pricing: "https://www.langdock.com/pricing" },
+  langdock_anthropic: { name: "langdock · claude models", harness: "claude", regional: true, pricing: "https://www.langdock.com/pricing" },
+  deepseek: { name: "deepseek", harness: "codex", pricing: "https://api-docs.deepseek.com/quick_start/pricing" },
+  xai: { name: "xai", harness: "codex", priced: true, pricing: "https://docs.x.ai/docs/models" },
+  groq: { name: "groq", harness: "codex", unverified: true, pricing: "https://groq.com/pricing" },
+  openai_compatible: { name: "openai-compatible", harness: "codex", unverified: true },
+};
+
+function providerName(seat) {
+  return `${KEY_PROVIDERS[seat.provider]?.name || seat.provider || "key"}${seat.region ? ` · ${seat.region}` : ""}`;
+}
+
+// Reject missing/blank/boolean values before numeric coercion: Number(null) is NOT a free model.
+// Preserve decimal strings until formatting, including tiny nonzero rates.
+function amount(value) {
+  if (!["string", "number"].includes(typeof value) || String(value).trim() === "") return null;
+  return Number.isFinite(Number(value)) && Number(value) >= 0 ? String(value) : null;
+}
+function formatPrice(value) {
+  if (amount(value) === null) return "price unavailable";
+  const number = Number(value);
+  return `$${number.toLocaleString("en-US", { useGrouping: false,
+    ...(number >= 1 ? { maximumFractionDigits: 2 } : { maximumSignificantDigits: 3 }) })}`;
+}
+function priceRate(price, name, seen = []) {
+  if (price?.source !== "live" || price.currency !== "USD" || price.token_unit !== "per_million_tokens") return null;
+  const rate = price.rates?.[name];
+  if (seen.includes(name)) return null;
+  if (rate?.status === "same_as") return priceRate(price, rate.same_as, [...seen, name]);
+  return rate?.status === "known" ? amount(rate.value) : null;
+}
+function priceAge(price, now = Date.now()) {
+  const fetched = price?.verified_at;
+  const age = fetched && Number.isFinite(Date.parse(fetched))
+    ? fmtUsageAge(fetched, now) : amount(price?.age_seconds) !== null
+      ? `fetched ${Math.floor(Number(price.age_seconds) / 60)}m ago` : "fetch age unavailable";
+  return `live price estimate · ${age}${price?.potentially_stale ? " · over 24h old" : ""}`;
+}
+function priceText(price) {
+  const input = priceRate(price, "input"), output = priceRate(price, "output");
+  if (input === null && output === null) return "price unavailable";
+  return `input ${formatPrice(input)}${input === null ? "" : "/Mtok"} · output ${formatPrice(output)}${output === null ? "" : "/Mtok"}`;
+}
+function priceHTML(price) {
+  const text = priceText(price);
+  return `<div class="key-price mono">${esc(text)}</div>${text === "price unavailable" ? "" : `<div class="add-hint">${esc(priceAge(price))}</div>`}`;
+}
+
+function keyProofStatus(seat) {
+  if (seat.harness === "claude") return "";
+  const proof = seat.last_proof;
+  let text = "";
+  if (proof?.outcome === "proven") text = "proven — a Responses turn completed";
+  else if (proof?.outcome === "incompatible") text = "incompatible — this endpoint does not support Responses; this seat will not work";
+  else if (proof?.outcome === "refused") {
+    const reason = { invalid_key: "authentication", insufficient_quota: "quota", rate_limited: "rate limit" }[proof.error] || "access or billing";
+    text = `refused — provider rejected the request (${reason}); Responses support is undetermined`;
+  } else if (proof?.outcome === "inconclusive") {
+    text = `inconclusive — ${proof.error === "timeout" ? "check timed out" : "no completed turn or definitive provider reply"}; Responses support is undetermined`;
+  }
+  return `${text ? `<div class="key-proof" role="status">${text}</div><div class="add-hint">checked ${esc(proof.checked_at)} · ${esc(proof.model)}</div>` : ""}
+    ${seat.responses_verified === false && proof?.outcome !== "incompatible" && proof?.outcome !== "proven" ? `<div class="key-unproven">responses support unproven — this endpoint may not work</div>` : ""}`;
+}
+
+function keySeatCard(seat) {
+  // No running cost is shown. A money figure needs a price, and only OpenRouter and xAI publish
+  // one for a provider that can actually be a key seat — so the card would read "unavailable" for
+  // OpenAI, Anthropic and Langdock, which is worse than not offering the number at all.
+  const unproven = (seat.responses_verified === false || seat.last_proof?.outcome === "incompatible") && seat.harness !== "claude";
+  const validation = seat.last_validation;
+  return `<div class="seat seat--key" data-card data-tool="${esc(seat.harness)}" data-email="key:${esc(seat.id)}">
+    <div class="seat-row"><span class="dot dot--accent"></span><span class="seat-name">${esc(seat.label)}</span><span class="mono chip">api key</span></div>
+    <div class="key-detail">${esc(providerName(seat))} · ${seat.harness === "claude" ? "claude code" : "codex cli"}</div>
+    <div class="key-model mono">${esc(seat.model)}</div>
+    <button class="btn switch" data-action="key-terminal" data-id="${esc(seat.id)}">use in new terminal</button>
+    ${keyProofStatus(seat)}
+    ${validation?.operation_permitted === false ? `<div class="usage-error">key check wasn't permitted${seat.responses_verified ? "" : " — inference access is still unproven"}</div>` : ""}
+    <div class="expand"><div class="add-hint">paid per use · this app does not limit spend</div>
+      ${unproven ? `<div class="add-hint">checking this endpoint sends one real request and costs a small amount of money.</div>
+      <button class="btn switch" data-action="key-prove" data-id="${esc(seat.id)}">check this endpoint</button>` : ""}
+      <button class="btn switch" data-action="key-validate" data-id="${esc(seat.id)}">check key</button>
+      <button class="logout" data-action="key-remove" data-id="${esc(seat.id)}">remove key ↗</button>
+    </div></div>`;
+}
+
+function keyConfirmations(state, answering = new Set(), now = Date.now()) {
+  const requests = (state?.pending_key_switches || []).filter((r) => r.status === "pending" && Date.parse(r.expires_at) > now);
+  return `<div class="key-prompts" aria-live="polite">${requests.map((r) => {
+    const disabled = answering.has(r.id) ? " disabled" : "";
+    const seat = state?.keys?.find((k) => k.id === r.key_seat?.id);
+    const previous = state?.tools?.[r.tool]?.seats?.find((s) => s.email === r.from_seat?.id);
+    const reset = fmtClock(previous?.limited_until).replace(" ", "").toLowerCase();
+    const from = r.from_seat?.label || r.from_seat?.id || "the current seat";
+    const input = priceRate(r.price, "input"), output = priceRate(r.price, "output");
+    const fare = input === null && output === null ? "price unavailable"
+      : `${esc(formatPrice(input))}<span class="unit" style="font-size:13px"> / ${esc(formatPrice(output))}</span>`;
+    const priceHint = priceText(r.price) + (input === null && output === null ? "" : ` · ${priceAge(r.price)}`);
+    const accent = TOOL_META[r.tool]?.accent || TOOL_META.codex.accent;
+    return `<section class="key-confirm set-card" aria-label="paid key confirmation" style="--accent:${accent}">
+      <div class="k-q">${r.pinned ? "pin this terminal to a paid key?" : "use a paid key to keep going?"}</div>
+      <span class="fare" title="${esc(priceHint)}">${fare}</span>
+      <div class="unit">input / output per million tokens</div>
+      <div class="quiet-meta">${esc(r.key_seat?.label)} · ${esc(providerName(r.key_seat || {}))}<br><span class="k-model">${esc(r.key_seat?.model)}</span></div>
+      ${seat ? keyProofStatus(seat) : ""}
+      <div class="k-fine">${r.pinned ? "only this terminal will use the key" : `${esc(from)} is resting${reset ? ` until ${esc(reset)}` : ""}`}. this app doesn't cap spend.</div>
+      <div class="k-acts">
+        <button class="k-no" data-action="key-answer" data-id="${esc(r.id)}" data-approved="false"${disabled}>not now</button>
+        <button class="k-go" data-action="key-answer" data-id="${esc(r.id)}" data-approved="true"${disabled}>use the key</button>
+      </div></section>`;
+  }).join("")}</div>`;
+}
+
+function buildPaidKeyGate(state, flow) {
+  const seat = state.keys?.find((key) => key.id === flow.id);
+  const theme = state.settings?.theme === "dark" ? "dark" : "light";
+  const disabled = flow.pending ? " disabled" : "";
+  return `<div class="app set-app add-app theme-${theme}" style="--accent:${TOOL_META[seat?.harness || "codex"].accent}">
+    <header class="set-head"><button class="set-back" data-action="paid-key-back" title="back"${disabled}>‹</button><span class="set-title">allow paid key use</span></header>
+    <div class="set-body"><section class="set-sec"><span class="set-label">paid use is off</span>
+      <div class="set-card add-method"><span class="set-t">use ${esc(seat?.label || flow.label)} in a new terminal?</span>
+        <div class="add-hint">real money can be spent. this turns on paid key use for pinned terminals and automatic fallback when subscription seats rest.</div>
+        <div class="add-hint">turning paid use off stops a running paid session; the turn already sent may still bill.</div></div>
+      ${flow.error ? `<div class="usage-error" role="alert">${esc(flow.error)}</div>` : ""}
+      <button class="add-cta" data-action="paid-key-enable"${disabled}>${flow.pending ? "opening your terminal…" : "allow paid use and open terminal"}</button>
+      <button class="add-change" data-action="paid-key-back"${disabled}>not now</button>
+    </section></div></div>`;
+}
+
+// Render only these results on input: the filter field itself keeps focus and its caret.
+function buildModelResults(flow) {
+  const catalog = flow.catalog || {};
+  const priced = catalog.sort_key === "input_usd_per_million_tokens";
+  const models = [...(catalog.models || [])].sort((a, b) => {
+    if (!priced) return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+    const av = priceRate(a.price, "input"), bv = priceRate(b.price, "input");
+    return (av === null ? Infinity : Number(av)) - (bv === null ? Infinity : Number(bv));
+  });
+  const query = (flow.modelFilter || "").toLowerCase();
+  const visible = models.filter((model) => model.id.toLowerCase().includes(query)
+    || (model.display_name || "").toLowerCase().includes(query));
+  return `<div class="add-hint" role="status">${visible.length} of ${models.length}</div>
+    <div class="set-card">${visible.map((model) => `<button class="add-prov key-model-option" data-action="key-model" data-model="${esc(model.id)}">
+      <span class="add-prov-tx"><span class="key-model mono">${esc(model.id)}</span>
+      ${model.display_name && model.display_name !== model.id ? `<span class="add-prov-sub">${esc(model.display_name)}</span>` : ""}
+      ${priced ? priceHTML(model.price) : ""}
+      ${model.context_window != null ? `<span class="add-hint">${esc(model.context_window)} token context</span>` : ""}</span><span class="add-chev">›</span>
+    </button>`).join("") || `<div class="add-method add-hint">${query ? `no models match “${esc(flow.modelFilter)}”.` : "no models returned. go back to check this key and endpoint."}</div>`}</div>`;
+}
+
+function buildModelPicker(flow) {
+  const catalog = flow.catalog || {};
+  const provider = KEY_PROVIDERS[flow.provider];
+  const priced = catalog.sort_key === "input_usd_per_million_tokens";
+  const message = priced ? "sorted by input $/Mtok · cheap to expensive · unknown input prices last"
+    : provider?.priced ? "prices unavailable from this catalog · sorted by model id"
+    : "this provider does not publish machine-readable prices · sorted by model id";
+  return `<section class="set-sec"><span class="set-label">pick a model</span>
+    <div class="set-card"><input class="add-input" id="key-model-filter" type="search" aria-label="filter models" placeholder="filter by model id or name" autocomplete="off" spellcheck="false" value="${esc(flow.modelFilter || "")}"></div>
+    <div class="add-hint">${message}</div>
+    ${catalog.source === "cache" ? `<div class="add-hint">cached live catalog · ${esc(fmtUsageAge(catalog.fetched_at))}${catalog.potentially_stale ? " · over 24h old" : ""}</div>` : ""}
+    ${catalog.error ? `<div class="usage-error">couldn't refresh the catalog — showing the last reading</div>` : ""}
+    <div id="key-model-results">${buildModelResults(flow)}</div>
+    ${provider?.pricing ? `<a class="add-hint" href="${provider.pricing}" data-action="key-pricing" data-provider="${flow.provider}">provider pricing and budget controls ↗</a>` : `<div class="add-hint">check your endpoint's pricing and budget controls with its operator.</div>`}
+    <div class="add-foot">prices are estimates. use your provider's budget controls for limits — this app does not limit spend.</div>
+  </section>`;
+}
+
+function keyRequest(flow) {
+  return { provider: flow.provider, secret: flow.secret.trim(), allow_unverified: flow.allow_unverified === true,
+    ...(KEY_PROVIDERS[flow.provider]?.regional ? { region: flow.region } : {}),
+    ...(flow.provider === "openai_compatible" ? { base_url: flow.base_url.trim() } : {}) };
+}
+
+// Native echoes only our request id/action, never the secret. Polls and abandoned-flow replies
+// cannot advance a later flow, even when both use the same provider.
+function reduceKeyReply(flow, res) {
+  if (!flow?.pending || flow.pending !== res.key_request_id) return false;
+  flow.pending = null;
+  if (res.key_action === "models_list") {
+    if (res.ok && Array.isArray(res.models)) { flow.catalog = res; flow.step = "models"; delete flow.modelFilter; }
+    else { flow.step = "details"; flow.error = res.error || "couldn't load models — try again"; }
+  } else if (res.key_action === "key_add") {
+    if (res.added) { flow.step = "done"; flow.secret = ""; flow.savedSeat = res.seat; }
+    else { flow.step = "review"; flow.error = res.error || "couldn't save this key — try again"; }
+  }
+  return true;
+}
+
+function buildAddKey(state, flow) {
+  const theme = state?.settings?.theme === "dark" ? "dark" : "light";
+  const provider = KEY_PROVIDERS[flow.provider];
+  const accent = TOOL_META[provider?.harness || "codex"].accent;
+  let body;
+  if (flow.step === "provider") {
+    body = `<section class="set-sec"><span class="set-label">who's bringing a key?</span><div class="set-card">${Object.entries(KEY_PROVIDERS).map(([id, p]) =>
+      `<button class="add-prov" data-action="key-provider" data-provider="${id}"><span class="add-chip"><span class="add-chip-dot"></span></span>
+      <span class="add-prov-tx"><span class="add-prov-name">${p.name}</span><span class="add-prov-sub">${p.harness === "claude" ? "claude code · messages" : "codex cli · responses"}${p.unverified ? " · unproven" : ""}</span></span><span class="add-chev">›</span></button>`).join("")}</div>
+      <div class="add-foot">the same langdock key works for both routes: openai models through codex, claude models through claude code.</div>
+      <div class="add-foot">openrouter offers live model prices across providers. direct openai, anthropic and langdock catalogs don't publish prices.</div></section>`;
+  } else if (flow.step === "details") {
+    body = `<div class="add-provcard"><span class="add-prov-tx"><span class="add-provcard-t">new ${esc(provider.name)} key seat</span><span class="add-provcard-s">${provider.harness === "claude" ? "claude code" : "codex cli"} sessions</span></span><button class="add-change" data-action="key-back">change</button></div>
+      ${provider.regional ? `<section class="set-sec"><label class="set-label" for="key-region">region</label><div class="set-card"><select class="add-input" id="key-region">${["eu", "us", "global"].map((r) => `<option value="${r}"${flow.region === r ? " selected" : ""}>${r}</option>`).join("")}</select></div></section>` : ""}
+      ${flow.provider === "openai_compatible" ? `<section class="set-sec"><label class="set-label" for="key-base-url">your endpoint's base url</label><div class="set-card"><input class="add-input" id="key-base-url" type="url" placeholder="https://your-host/v1" value="${esc(flow.base_url)}"></div><div class="add-hint">must support responses; chat completions alone won't work.</div></section>` : ""}
+      <section class="set-sec"><label class="set-label" for="key-label">name this seat</label><div class="set-card"><input class="add-input" id="key-label" placeholder="work · late-night" value="${esc(flow.label)}"></div></section>
+      <section class="set-sec"><label class="set-label" for="key-secret">paste your api key</label><div class="set-card"><input class="add-input mono" id="key-secret" type="password" autocomplete="off" spellcheck="false" value="${esc(flow.secret)}"></div><div class="add-hint">sent only to the provider you chose; saved in your Mac's keychain.</div></section>
+      ${provider.unverified ? `<section class="set-sec"><span class="set-t">this endpoint is unproven</span><div class="add-hint">we cannot promise its responses endpoint works with codex, even if it lists models. requests may still cost money.</div><label class="key-ack"><input id="key-ack" type="checkbox"${flow.allow_unverified ? " checked" : ""}> i understand it may not work, and want to try this endpoint</label></section>` : ""}
+      <button class="add-cta" data-action="key-discover">pick a model →</button>`;
+  } else if (flow.step === "connecting") {
+    body = `<div class="add-center"><div class="add-spin"></div><div class="add-h">${flow.operation === "key_add" ? "saving your key seat…" : "looking up models…"}</div><div class="add-sub">${flow.operation === "key_add" ? "tucking the key away safely 💛" : "asking only the provider you chose"}</div></div>`;
+  } else if (flow.step === "models") {
+    body = buildModelPicker(flow);
+  } else if (flow.step === "review") {
+    const model = flow.catalog?.models?.find((m) => m.id === flow.model);
+    body = `<section class="set-sec"><span class="set-label">a seat for ${esc(flow.label)}</span><div class="set-card add-method"><span class="set-t">${esc(providerName(flow))}</span><div class="key-model mono">${esc(flow.model)}</div>${priceHTML(model?.price)}</div>
+      <div class="add-foot">saving a key does not start a paid session. choose “use in new terminal” when you're ready.</div>
+      <div class="add-foot">use your provider's budget controls for limits — this app does not cap spend.</div></section><button class="add-cta" data-action="key-save">save the key seat →</button>`;
+  } else {
+    body = `<div class="add-center add-center--done"><div class="add-heart">💛</div><div class="add-welcome">welcome, ${esc(flow.label)}</div><div class="add-sub">your key seat's saved</div>
+      ${flow.savedSeat?.last_validation?.operation_permitted === false ? `<div class="usage-error">the key check wasn't permitted. check access with your provider before using it.</div>` : ""}
+      <button class="add-cta" data-action="key-cancel">back to the guest list</button></div>`;
+  }
+  return `<div class="app set-app add-app theme-${theme}" style="--accent:${accent}"><header class="set-head">
+    <button class="set-back" data-action="key-back" title="back"${flow.pending ? " disabled" : ""}>‹</button><span class="set-title">add a key</span>
+    ${flow.pending ? "" : `<button class="add-cancel" data-action="key-cancel">cancel</button>`}</header>
+    ${keyConfirmations(state)}<div class="set-body">${flow.error ? `<div class="usage-error" role="alert">${esc(flow.error)}</div>` : ""}${body}</div></div>`;
 }
 
 // Live glue: render state into the DOM and forward user actions to the Python bridge.
@@ -611,7 +887,7 @@ function send(action, payload = {}) {
   try {
     window.webkit.messageHandlers.agl.postMessage(msg);
   } catch (_e) {
-    console.log("[agl] (no bridge)", msg);
+    console.log("[agl] (no bridge)", action); // never log a pasted key or auth blob
   }
 }
 
@@ -624,9 +900,29 @@ window.AGL = {
     // so a pure state push (the 180s poll) updates `state` but the reducer returns render=false —
     // no DOM swap, no focus/caret theft.
     const out = reduceReply({ screen, add, lastRev, state }, res);
+    const inKeyFlow = screen === "add-key";
+    if (inKeyFlow || screen === "paid-key") out.screen = screen; // keep the current input/confirmation
     screen = out.screen; add = out.add; lastRev = out.lastRev; state = out.state;
-    if (out.render) render();
-    if (out.flash) flash(out.flash);
+    const keyChanged = reduceKeyReply(keyFlow, res);
+    let paidChanged = false, paidHandled = false;
+    if (paidTerminal && res.key_action === "key_terminal" && res.key_target_id === paidTerminal.id) {
+      paidTerminal.pending = false;
+      if (res.code === "paid_use_disabled") {
+        screen = "paid-key"; paidTerminal.error = null;
+        paidHandled = true; paidChanged = true;
+      } else if (screen === "paid-key") {
+        if (res.ok) { screen = "main"; paidTerminal = null; }
+        else paidTerminal.error = res.error || "couldn't open that terminal — try again";
+        paidHandled = true; paidChanged = true;
+      } else paidTerminal = null;
+    }
+    if (res.key_action === "answer_key_switch") answering.delete(res.key_target_id);
+    if (res.key_action === "key_prove") proving.delete(res.key_target_id);
+    if (paidChanged || keyChanged || (out.render && !inKeyFlow)) render();
+    else refreshKeyPrompts(); // surface consent without replacing inputs or stealing focus
+    if (out.flash && !res.key_request_id && !paidHandled) flash(out.flash);
+    if (res.key_action === "key_validate" && res.ok) flash(res.validation?.operation_permitted
+      ? "key check passed — this checks account access only" : "key check wasn't permitted — check access with your provider");
     if (out.celebrate) celebrate();
     if (out.closeFlow) setTimeout(() => {      // auto-close this flow's "done" screen; scoped by
       if (screen === "add" && add === out.closeFlow && add.step === "done") {   // object identity so
@@ -647,7 +943,8 @@ function celebrate() {
   setTimeout(() => root.firstElementChild?.classList.remove("celebrate"), 600);
 }
 function flash(text) {
-  overlay.innerHTML = `<div class="toast">${text}</div>`;
+  overlay.innerHTML = '<div class="toast"></div>';
+  overlay.firstElementChild.textContent = text;
   setTimeout(() => { if (overlay.querySelector(".toast")) overlay.innerHTML = ""; }, 3000);
 }
 
@@ -658,6 +955,11 @@ let renderedScreen = null;  // what the last render() actually drew — gates sc
 // transient add-a-seat flow state; non-null only while screen === "add". Held here (not in `state`,
 // which the poll overwrites) so typed name/token survive a background re-render.
 let add = null;
+let keyFlow = null;
+let paidTerminal = null;
+let keySequence = 0;
+const answering = new Set();
+const proving = new Set();
 let clockTimer = null;
 
 function setPopoverVisible(visible) {
@@ -665,6 +967,8 @@ function setPopoverVisible(visible) {
     clockTimer = setInterval(() => {
       // Tick text without rebuilding the DOM or disturbing keyboard focus.
       if (screen === "main") updateClockText(root);
+      // Expired consent is never left looking actionable, even without a state revision.
+      refreshKeyPrompts();
     }, 1000);
   } else if (!visible && clockTimer !== null) {
     clearInterval(clockTimer);
@@ -684,7 +988,18 @@ function render() {
     : [];
   root.innerHTML = screen === "settings" ? buildSettings(state)
     : screen === "add" ? buildAddSeat(state, add)
+    : screen === "add-key" ? buildAddKey(state, keyFlow)
+    : screen === "paid-key" ? buildPaidKeyGate(state, paidTerminal)
     : buildHTML(state);
+  if (!root.querySelector(".key-prompts")) {
+    root.querySelector(".set-head")?.insertAdjacentHTML("afterend", keyConfirmations(state, answering));
+  }
+  refreshKeyPrompts();
+  for (const button of root.querySelectorAll('[data-action="key-prove"]')) {
+    if (proving.has(button.dataset.id)) {
+      button.disabled = true; button.textContent = "checking endpoint…";
+    }
+  }
   renderedScreen = screen;
   if (scrollTop) {
     const nextBody = root.querySelector(".main-body, .set-body");
@@ -702,6 +1017,39 @@ function render() {
   document.body.className = "theme-" + theme;
 }
 
+function refreshKeyPrompts() {
+  const prompts = root.querySelector(".key-prompts");
+  if (!prompts) return;
+  const pending = (state.pending_key_switches || []).filter((r) => r.status === "pending" && Date.parse(r.expires_at) > Date.now());
+  const signature = JSON.stringify([pending, [...answering]]);
+  // Time passing must not rebuild focused approval buttons just to update a price's age.
+  if (prompts.dataset.signature !== signature) {
+    const temp = document.createElement("div");
+    temp.innerHTML = keyConfirmations(state, answering);
+    prompts.innerHTML = temp.firstElementChild.innerHTML;
+    prompts.dataset.signature = signature;
+  }
+}
+
+function keyBack() {
+  if (keyFlow?.pending) return;
+  delete keyFlow.modelFilter; // every visit to the picker starts with the full catalog
+  if (keyFlow.step === "review") keyFlow.step = "models";
+  else if (keyFlow.step === "models") keyFlow.step = "details";
+  else if (keyFlow.step === "details") { keyFlow.step = "provider"; keyFlow.secret = ""; }
+  else { keyFlow = null; screen = "main"; }
+  if (keyFlow) keyFlow.error = null;
+  render();
+}
+
+function sendKeyFlow(action, extra = {}) {
+  const payload = keyRequest(keyFlow);
+  keyFlow.pending = `key-${++keySequence}`;
+  keyFlow.operation = action; keyFlow.step = "connecting"; keyFlow.error = null;
+  send(action, { ...payload, ...extra, key_request_id: keyFlow.pending });
+  render();
+}
+
 // --- event delegation (whole document, so overlay buttons work too) ---------------------------
 document.addEventListener("click", (e) => {
   const el = e.target.closest("[data-action]");
@@ -712,7 +1060,72 @@ document.addEventListener("click", (e) => {
     return;
   }
   const { action, tool, email, value } = el.dataset;
+  if (el.disabled) return;
   switch (action) {
+    case "key-start":
+      add = null;
+      keyFlow = { step: "provider", label: "", secret: "", region: "eu", base_url: "", allow_unverified: false };
+      screen = "add-key"; render(); break;
+    case "key-provider":
+      keyFlow = { step: "details", provider: el.dataset.provider, label: "", secret: "", region: "eu", base_url: "", allow_unverified: false };
+      render(); break;
+    case "key-back": keyBack(); break;
+    case "key-cancel":
+      if (!keyFlow.pending) { keyFlow = null; screen = "main"; render(); }
+      break;
+    case "key-discover": {
+      if (!keyFlow.label.trim() || keyFlow.secret.trim().length <= 4) {
+        keyFlow.error = "give this seat a name and paste your api key"; render(); break;
+      }
+      if (KEY_PROVIDERS[keyFlow.provider].unverified && !keyFlow.allow_unverified) {
+        keyFlow.error = "please choose whether you're happy to try an endpoint we cannot promise works"; render(); break;
+      }
+      if (keyFlow.provider === "openai_compatible") {
+        try {
+          const url = new URL(keyFlow.base_url.trim());
+          if (!["https:", "http:"].includes(url.protocol) || !url.hostname || url.username || url.password || url.search || url.hash) throw Error();
+        } catch {
+          keyFlow.error = "enter an http or https base url without credentials, a query or a fragment"; render(); break;
+        }
+      }
+      sendKeyFlow("models_list"); break;
+    }
+    case "key-model":
+      keyFlow.model = el.dataset.model; delete keyFlow.modelFilter;
+      keyFlow.step = "review"; render(); break;
+    case "key-save":
+      if (!keyFlow.pending) sendKeyFlow("key_add", { label: keyFlow.label.trim(), model: keyFlow.model });
+      break;
+    case "key-answer":
+      if (answering.has(el.dataset.id)) break;
+      answering.add(el.dataset.id); refreshKeyPrompts();
+      send("answer_key_switch", { id: el.dataset.id, approved: el.dataset.approved === "true" }); break;
+    case "key-stop": send("toggle", { key: "key_fallback", value: false }); break;
+    case "key-terminal":
+      if (paidTerminal?.pending) break;
+      paidTerminal = { id: el.dataset.id, label: state.keys?.find((key) => key.id === el.dataset.id)?.label || el.dataset.id, pending: true };
+      send("key_terminal", { id: el.dataset.id }); break;
+    case "paid-key-enable":
+      if (!paidTerminal || paidTerminal.pending) break;
+      paidTerminal.pending = true; paidTerminal.error = null;
+      send("key_terminal", { id: paidTerminal.id, enable_paid: true }); render(); break;
+    case "paid-key-back":
+      if (!paidTerminal?.pending) { paidTerminal = null; screen = "main"; render(); }
+      break;
+    case "end-pinned-session":
+      send("end_pinned_session", { tool, pin: el.dataset.pin }); break;
+    case "key-validate": send("key_validate", { id: el.dataset.id }); break;
+    case "key-prove":
+      if (!proving.has(el.dataset.id)) {
+        proving.add(el.dataset.id); render();
+        send("key_prove", { id: el.dataset.id });
+      }
+      break;
+    case "key-remove":
+      el.textContent = "remove this key from the list?"; el.dataset.action = "key-remove-confirm"; break;
+    case "key-remove-confirm": send("key_remove", { id: el.dataset.id }); break;
+    case "key-pricing":
+      e.preventDefault(); send("key_pricing", { provider: el.dataset.provider }); break;
     case "switch": send("switch", { tool, email }); break;
     case "remove": if (confirm(`wave goodbye to ${email}?`)) send("remove", { tool, email }); break;
     // add-a-seat sub-view (spec §9). Header ＋ (no tool) → provider step; per-provider add-row and
@@ -784,6 +1197,13 @@ function addBack() {
 // Controlled inputs: mirror the add-seat fields into `add` on each keystroke so a background poll
 // re-render (which re-emits value="${...}") reproduces exactly what's typed — no lost text.
 document.addEventListener("input", (e) => {
+  if (screen === "add-key" && keyFlow?.step === "models" && e.target.id === "key-model-filter") {
+    keyFlow.modelFilter = e.target.value;
+    root.querySelector("#key-model-results").innerHTML = buildModelResults(keyFlow);
+    return;
+  }
+  const fields = { "key-label": "label", "key-secret": "secret", "key-base-url": "base_url" };
+  if (keyFlow && fields[e.target.id]) keyFlow[fields[e.target.id]] = e.target.value;
   if (!add) return;
   if (e.target.id === "add-name") add.name = e.target.value;
   else if (e.target.id === "add-token") add.token = e.target.value;
@@ -791,6 +1211,8 @@ document.addEventListener("input", (e) => {
 
 // toggles fire 'change' (clicking the switch graphic doesn't bubble a data-action click)
 document.addEventListener("change", (e) => {
+  if (keyFlow && e.target.id === "key-ack") keyFlow.allow_unverified = e.target.checked;
+  if (keyFlow && e.target.id === "key-region") keyFlow.region = e.target.value;
   const inp = e.target.closest('input[data-action="toggle"]');
   if (inp) send("toggle", { key: inp.dataset.key, value: inp.checked });
 });
@@ -800,6 +1222,8 @@ document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
   if (screen === "settings") { screen = "main"; render(); }
   else if (screen === "add") addBack();
+  else if (screen === "add-key") keyBack();
+  else if (screen === "paid-key" && !paidTerminal?.pending) { paidTerminal = null; screen = "main"; render(); }
 });
 
 // WKWebView normally reflects popover visibility here; the native shell also calls setVisible()

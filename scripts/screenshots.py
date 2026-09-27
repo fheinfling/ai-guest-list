@@ -77,23 +77,36 @@ def sample_payload() -> dict:
                 "usage": u, "account_id": f"acct:{email}"}
 
     s = ctx.load_state()
-    s.data["tools"]["codex"] = {"active": "personal@studio.dev", "accounts": {
-        "work@studio.dev": seat("work@studio.dev", "Work", "Business", usage(100, 101, 74),
+    # Reserved example domains keep every address unmistakably fictional.
+    s.data["tools"]["codex"] = {"active": "personal@studio.example", "accounts": {
+        "work@studio.example": seat("work@studio.example", "Work", "Business", usage(100, 101, 74),
                                 iso(t + dt.timedelta(minutes=101))),
-        "personal@studio.dev": seat("personal@studio.dev", "Personal", "Business",
+        "personal@studio.example": seat("personal@studio.example", "Personal", "Business",
                                     usage(38, 180, 21)),
     }}
-    s.data["tools"]["claude"] = {"active": "studio@studio.dev", "accounts": {
-        "studio@studio.dev": seat("studio@studio.dev", "Studio", "Max", usage(20, 240, 16)),
-        "personal@me.dev": seat("personal@me.dev", "Personal", "Pro", usage(5, 300, 4)),
+    s.data["tools"]["claude"] = {"active": "studio@studio.example", "accounts": {
+        "studio@studio.example": seat("studio@studio.example", "Studio", "Max", usage(20, 240, 16)),
+        "personal@me.example": seat("personal@me.example", "Personal", "Pro", usage(5, 300, 4)),
+    }}
+    # Metadata only: no API key, Keychain write, provider request or real fingerprint.
+    # OpenAI's catalog has no machine-readable prices; the real key card shows no price line.
+    s.data["keys"] = {"sample-openai-key": {
+        "id": "sample-openai-key", "label": "Late-night", "provider": "openai",
+        "harness": "codex", "model": "gpt-5.4", "fingerprint": "demo",
+        "responses_verified": True, "created_at": iso(t),
     }}
     s.data["moved_note"] = "auto-moved Codex · Work → Personal — Work's resting"
     s.data["last_switch_at"] = iso(t)
     s.settings().update({"theme": "light", "auto_switch": True, "strategy": "most_headroom",
                          "same_tool_only": True, "notify": True, "restart_app": False,
-                         "celebrations": True})
+                         "celebrations": True, "key_fallback": False,
+                         "confirm_key_switch": True})
     s.save()
-    return bridge.snapshot_state(ctx)
+    payload = bridge.snapshot_state(ctx)
+    # The shell-wiring probe is host-global even with Context.for_test. Show a sample completed
+    # setup, without carrying this machine's rc path or installation status into the screenshot.
+    payload["supervision"] = {"wrappers": True, "block": True, "on_path": True, "active": True}
+    return payload
 
 
 def shoot(name: str, settings_view: bool, payload: dict) -> Path:

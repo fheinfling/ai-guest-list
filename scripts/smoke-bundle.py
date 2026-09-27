@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Smoke-test the built macOS app through its bundled Python and terminal wrapper.
+"""Smoke-test full and alias macOS apps through their native Python launcher.
 
 This is intentionally a standalone stdlib script.  It must not import ``acctsw`` from the checkout:
 the point is to catch packaging omissions after py2app has produced the release artifact.
+Full builds also check the bundled interpreter, generated CLI wrapper and TLS trust roots.
+Alias builds intentionally follow the source/staging paths recorded in their own bootstrap.
 """
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import os
@@ -21,7 +24,8 @@ from pathlib import Path
 
 
 DEFAULT_BUNDLE = Path("dist/AI Guest List.app")
-CORE_COMMANDS = {"install", "uninstall", "add", "remove", "list", "status", "usage", "switch", "run"}
+CORE_COMMANDS = {"install", "uninstall", "add", "remove", "list", "status", "usage", "switch", "run", "keys"}
+KEY_COMMANDS = {"add", "list", "remove", "prove", "models"}
 
 _GENERATE = r"""
 import json
@@ -48,6 +52,8 @@ from acctsw.usage import Usage, _confirmed_healthy, parse_codex
 
 parser = build_parser()
 subcommands = next(action.choices for action in parser._actions if action.dest == "command")
+key_commands = next(action.choices for action in subcommands["keys"]._actions
+                    if action.dest == "keys_command")
 payload = {
     "plan_type": "self_serve_business_prolite",
     "rate_limit": {
@@ -73,6 +79,7 @@ print(json.dumps({
     "cert_store_stats": verify_context.cert_store_stats(),
     "canonical_codex_home": str(paths.CODEX_HOME),
     "commands": sorted(subcommands),
+    "key_commands": sorted(key_commands),
     "five_hour_pct": windows["5h"].used_pct,
     "weekly_pct": windows["weekly"].used_pct,
     "healthy": _confirmed_healthy(Usage(ok=True, allowed=True, windows=windows)),
@@ -100,6 +107,24 @@ def _run(command: list[str], *, cwd: Path, env: dict[str, str]) -> subprocess.Co
                           capture_output=True, check=True)
 
 
+def _alias_targets(resources: Path) -> tuple[Path, list[Path]]:
+    """Read py2app's recorded source/staging targets without executing bootstrap code here."""
+    tree = ast.parse((resources / "__boot__.py").read_text(encoding="utf-8"))
+    main = None
+    paths = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id == "DEFAULT_SCRIPT"
+                for target in node.targets):
+            main = Path(ast.literal_eval(node.value)).resolve()
+        if (isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id == "_path_inject"):
+            paths.extend(Path(p).resolve() for p in ast.literal_eval(node.value.args[0]))
+    _check(main is not None and main.is_file(), "alias bootstrap has no valid main script")
+    return main, paths
+
+
 def smoke(bundle_arg: Path) -> None:
     repo = Path(__file__).resolve().parent.parent
     bundle = bundle_arg.resolve()
@@ -110,13 +135,22 @@ def smoke(bundle_arg: Path) -> None:
     ca_file = resources / "openssl.ca" / "cert.pem"
     ca_dir = resources / "openssl.ca" / "no-such-file"
 
+    full = (resources / "openssl.ca").is_dir()
+    mode = "FULL" if full else "ALIAS"
+    print(f"checking {mode} bundle: {bundle}", flush=True)
+
     for path, description in (
         (bundle_python, "bundled Python interpreter"),
         (info_path, "bundle Info.plist"),
-        (ca_file, "packaged CA file"),
     ):
         _check(path.exists(), f"missing {description}: {path}")
-    _check(ca_file.is_file() and ca_file.stat().st_size > 0, f"packaged CA file is empty: {ca_file}")
+    if full:
+        _check(ca_file.is_file() and ca_file.stat().st_size > 0,
+               f"missing or empty packaged CA file: {ca_file}")
+    else:
+        _check(not list(resources.glob("lib/python*/app")),
+               "bundle has a packaged app but no packaged CA directory")
+        alias_main, alias_paths = _alias_targets(resources)
 
     info = plistlib.loads(info_path.read_bytes())
     plist_version = str(info["CFBundleShortVersionString"])
@@ -147,8 +181,6 @@ def smoke(bundle_arg: Path) -> None:
         clean_env.update({
             "HOME": str(home),
             "CODEX_HOME": str(private_codex_home),
-            # Direct bundle-Python bootstrap needed to ask the packaged installer for its wrapper.
-            "PYTHONHOME": str(resources),
         })
         app_check = json.loads(_run(
             [str(contents / "MacOS" / info["CFBundleExecutable"]), "--check-app"],
@@ -157,6 +189,30 @@ def smoke(bundle_arg: Path) -> None:
         _check(app_check["bundle_identifier"] == info["CFBundleIdentifier"],
                "native process did not load the application identity")
         _check(app_check["icon_valid"] is True, "AppKit could not load the application icon")
+        for field in ("terminal_file", "menubar_file", "engine_file"):
+            origin = app_check[field]
+            if full:
+                _check(_inside(origin, bundle), f"{field} imported outside bundle: {origin}")
+                _check(not any(_inside(origin, repo / name) for name in ("app", "acctsw")),
+                       f"{field} leaked from checkout: {origin}")
+            else:
+                # Alias artifacts intentionally reference source. Verify the launcher's target,
+                # never add the checkout to sys.path or import the engine in this smoke driver.
+                _check(Path(app_check["main_file"]).resolve() == alias_main,
+                       "native process did not run the alias bootstrap's main script")
+                expected = ([alias_main.parent.parent / "acctsw"]
+                            + [p / "acctsw" for p in alias_paths]
+                            if field == "engine_file" else [alias_main.parent])
+                _check(any(_inside(origin, p) for p in expected),
+                       f"{field} outside alias targets: {origin}")
+        print("app-layer imports passed: open_key_terminal, prepare_then_login, menubar helpers",
+              flush=True)
+        if not full:
+            print("ALIAS: skipping packaged CA and wrapper/TLS checks (source-linked build)")
+            print(f"bundle smoke passed: {bundle} (ALIAS, version {plist_version}, build {plist_build})")
+            return
+        # Only full bundles have a self-contained Python home and generated frozen wrappers.
+        clean_env["PYTHONHOME"] = str(resources)
         generated = json.loads(_run(
             [str(bundle_python), "-c", _GENERATE, str(bundle_python), str(resources), str(bindir)],
             cwd=work,
@@ -226,10 +282,12 @@ def smoke(bundle_arg: Path) -> None:
                f"private inherited CODEX_HOME became canonical: {probe['canonical_codex_home']!r}")
         _check(CORE_COMMANDS <= set(probe["commands"]),
                f"packaged CLI is missing commands: {sorted(CORE_COMMANDS - set(probe['commands']))}")
+        _check(KEY_COMMANDS <= set(probe["key_commands"]),
+               f"packaged CLI is missing keys commands: {sorted(KEY_COMMANDS - set(probe['key_commands']))}")
         _check(probe["five_hour_pct"] is None and probe["weekly_pct"] == 3.0 and probe["healthy"] is True,
                f"packaged weekly-window parser/health result is wrong: {probe!r}")
 
-    print(f"bundle smoke passed: {bundle} (version {plist_version}, build {plist_build})")
+    print(f"bundle smoke passed: {bundle} (FULL, version {plist_version}, build {plist_build})")
 
 
 def main() -> int:

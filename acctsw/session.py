@@ -28,7 +28,16 @@ def _process_file(data_dir: Path, tool: str, pid: int) -> Path:
     return Path(data_dir) / f"session-{tool}-{pid}.json"
 
 
-def _session_files(data_dir: Path, tool: str) -> list[Path]:
+def _session_files(data_dir: Path, tool: str, *, strict: bool = False) -> list[Path]:
+    if strict:
+        # glob can silently suppress directory-read errors. Destructive maintenance needs
+        # an explicit failure instead of a smaller set of protected live homes.
+        try:
+            paths = list(Path(data_dir).iterdir())
+        except FileNotFoundError:
+            paths = []
+        return [_session_file(data_dir, tool), *(p for p in paths
+                if p.name.startswith(f"session-{tool}-") and p.name.endswith('.json'))]
     return [_session_file(data_dir, tool), *Path(data_dir).glob(f"session-{tool}-*.json")]
 
 
@@ -56,7 +65,8 @@ _proc_start = proc_start
 _START_CACHE: dict[int, str] = {}
 
 
-def mark_session(data_dir: Path, tool: str, email: str) -> None:
+def mark_session(data_dir: Path, tool: str, email: str, *, pin: str | None = None,
+                 key_seat: dict | None = None) -> None:
     """Record this supervisor and its active seat at launch and after every successful hop.
 
     A process's ``ps`` start-time never changes, so cache it instead of spawning ``ps`` for every
@@ -73,6 +83,9 @@ def mark_session(data_dir: Path, tool: str, email: str) -> None:
         "process_start": process_start,
         "started_at": iso(now()),
     }
+    if pin is not None:
+        data.update(pin=pin, paid=True, end_requested=False,
+                    key_seat={k: key_seat[k] for k in ("id", "label", "provider", "model")})
     # Keep each terminal's record independently. Retain the legacy mirror for older apps,
     # preserving its existing owner before another terminal replaces it during an upgrade.
     legacy = _session_file(data_dir, tool)
@@ -131,19 +144,19 @@ def active_session(data_dir: Path, tool: str, *, email: str | None = None) -> di
     return newest_session(sessions)
 
 
-def active_sessions(data_dir: Path, tool: str) -> list[dict]:
-    """Every live terminal, deduplicating the backwards-compatible legacy mirror."""
+def active_sessions(data_dir: Path, tool: str, *, strict: bool = False) -> list[dict]:
+    """Every live terminal; strict maintenance reads raise on uncertain/malformed records."""
     sessions = {}
-    for path in _session_files(data_dir, tool):
-        data = _read_session(path)
+    for path in _session_files(data_dir, tool, strict=strict):
+        data = _read_session(path, strict=strict)
         if data is not None:
             previous = sessions.get(data["pid"])
-            sessions[data["pid"]] = (newest_session([previous, data])
+            sessions[data["pid"]] = (newest_session([data, previous])
                                      if previous is not None else data)
     return list(sessions.values())
 
 
-def _read_session(path: Path) -> dict | None:
+def _read_session(path: Path, *, strict: bool = False) -> dict | None:
     record = None
 
     def discard() -> None:
@@ -160,15 +173,35 @@ def _read_session(path: Path) -> dict | None:
         with path.open(encoding="utf-8") as source:
             record = os.fstat(source.fileno())
             data = json.load(source)
+        if strict and (not isinstance(data, dict) or type(data.get('pid')) is not int or
+                       data['pid'] <= 0):
+            raise ValueError('invalid session PID')
         email = data["email"]
         pid = int(data["pid"])
         started_at = data["started_at"]
         if not isinstance(email, str) or not isinstance(started_at, str):
+            if strict:
+                raise ValueError('invalid session record')
             discard()
             return None
+        if strict:
+            if not isinstance(data.get('process_start', ''), str):
+                raise ValueError('invalid session process identity')
+            if 'pin' in data:
+                seat = data.get('key_seat')
+                if (not isinstance(data['pin'], str) or not data['pin'] or
+                        not isinstance(seat, dict) or not isinstance(seat.get('id'), str) or
+                        not seat['id']):
+                    raise ValueError('invalid pinned session record')
+    except FileNotFoundError:
+        return None
     except OSError:
+        if strict:
+            raise
         return None  # an unreadable record is not evidence of a dead session
     except (ValueError, TypeError, KeyError):
+        if strict:
+            raise
         # write_json uses atomic temp+rename, so a parse failure cannot be a partial heartbeat
         # from a concurrent writer. This inode is junk; a replacement is left alone.
         discard()
@@ -187,4 +220,42 @@ def _read_session(path: Path) -> dict | None:
         # formatting until that supervisor exits, so raw inequality is not proof of PID reuse.
         discard()
         return None
-    return {"email": email, "pid": pid, "started_at": started_at}
+    public = {"email": email, "pid": pid, "started_at": started_at}
+    if isinstance(data.get("pin"), str):
+        public.update({k: data.get(k) for k in ("pin", "paid", "key_seat", "end_requested")})
+    return public
+
+
+def request_end(ctx, tool: str, pin: str) -> bool:
+    """Ask ONE live pinned supervisor to stop on its heartbeat, never signal a bare PID.
+
+    The random pin identifies this launch even if a PID gets reused. Updating the existing
+    per-process record keeps start/end/liveness in one registry; no separate stop-file protocol.
+    """
+    from . import TOOLS
+    if tool not in TOOLS or not isinstance(pin, str) or not pin:
+        return False
+    with ctx.locked():
+        for record in active_sessions(ctx.data_dir, tool):
+            if record.get("pin") != pin:
+                continue
+            path = _process_file(ctx.data_dir, tool, record["pid"])
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                return False
+            if data.get("pin") != pin:
+                return False
+            data["end_requested"] = True
+            write_json(path, data, mode=0o600)
+            return True
+    return False
+
+
+def end_requested(data_dir: Path, tool: str, pin: str) -> bool:
+    """The supervisor reads only its own record; no ps subprocess on the heartbeat."""
+    try:
+        data = json.loads(_process_file(data_dir, tool, os.getpid()).read_text(encoding="utf-8"))
+        return data.get("pin") == pin and data.get("end_requested") is True
+    except (OSError, ValueError):
+        return False

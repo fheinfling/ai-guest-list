@@ -709,3 +709,718 @@ test("reduceReply: a tool-less add-op error falls back to the current flow", () 
   const o = reduceReply(UI({ screen: "add", add }), { ok: false, error: "generic", add_op: true });
   assert.equal(o.add.step, "details"); assert.equal(o.flash, "generic");   // no tool → still ours
 });
+
+// Milestone 6: bridge-shaped key metadata/catalogs; all earlier tests above remain unchanged.
+import { buildAddKey, buildModelPicker, keySeatCard, keyConfirmations, keyRequest, reduceKeyReply, KEY_PROVIDERS, formatPrice } from "./render.mjs";
+
+test("Langdock routes visibly distinguish model families and harnesses, sharing one key", () => {
+  const html = buildAddKey({ settings: {} }, { step: "provider" });
+  const row = (id) => html.match(new RegExp(`<button[^>]*data-provider="${id}"[\\s\\S]*?</button>`))?.[0];
+  assert.match(row("langdock"), /langdock · openai models/);
+  assert.match(row("langdock"), /codex cli · responses/);
+  assert.match(row("langdock_anthropic"), /langdock · claude models/);
+  assert.match(row("langdock_anthropic"), /claude code · messages/);
+  assert.match(html, /same langdock key works for both routes/);
+  assert.equal(KEY_PROVIDERS.langdock.harness, "codex");
+  assert.equal(KEY_PROVIDERS.langdock_anthropic.harness, "claude");
+});
+
+test("both Langdock add-key routes retain eu, us and global in details and requests", () => {
+  for (const provider of ["langdock", "langdock_anthropic"]) {
+    for (const region of ["eu", "us", "global"]) {
+      const flow = { step: "details", provider, region, secret: " test-secret ", label: "work" };
+      const html = buildAddKey({ settings: {} }, flow);
+      assert.match(html, /id="key-region"/);
+      assert.ok(html.includes(`<option value="${region}" selected>`));
+      assert.deepEqual(keyRequest(flow), { provider, region, secret: "test-secret", allow_unverified: false });
+    }
+  }
+});
+
+test("Langdock Claude discovery carries its route and region through the shipped bundle", () => {
+  const app = keyApp();
+  app.click({ action: "key-start" });
+  app.click({ action: "key-provider", provider: "langdock_anthropic" });
+  app.input("key-label", "Claude work"); app.input("key-secret", "test-secret");
+  app.handlers.change({ target: { id: "key-region", value: "global", closest: () => null } });
+  app.click({ action: "key-discover" });
+  const request = app.sent.at(-1);
+  assert.equal(request.action, "models_list");
+  assert.equal(request.provider, "langdock_anthropic");
+  assert.equal(request.region, "global");
+  app.window.AGL.result({ key_action: "models_list", key_request_id: request.key_request_id,
+    ok: false, models: [], error: "no models returned; check this key and endpoint" });
+  assert.match(app.root.innerHTML, /no models returned/);
+  assert.match(app.root.innerHTML, /claude code sessions/);
+});
+import { runInNewContext } from "node:vm";
+
+const keySeat = (over = {}) => ({ id: "key-1", label: "late-night", provider: "openrouter",
+  harness: "codex", model: "vendor/model", responses_verified: true, ...over });
+const keyFlow = (over = {}) => ({ step: "details", provider: "openrouter", secret: "test-secret",
+  label: "late-night", region: "eu", base_url: "", allow_unverified: false, ...over });
+const livePrice = (input = "1", output = "3", over = {}) => ({ source: "live", currency: "USD",
+  token_unit: "per_million_tokens", estimate: true, verified_at: "2026-01-01T00:00:00Z",
+  rates: { input: { status: input == null ? "unknown" : "known", value: input },
+    output: { status: output == null ? "unknown" : "known", value: output } }, ...over });
+const keyPrompt = (over = {}) => ({ id: "prompt-1", status: "pending", tool: "codex",
+  expires_at: "2099-01-01T00:00:00Z", from_seat: { id: "work@x.com", label: "work" },
+  key_seat: keySeat(), price: livePrice(), ...over });
+
+test("key seat card sits in its harness group, with model instead of usage bars", () => {
+  const h = buildHTML(state({ keys: [keySeat()] }));
+  assert.match(h, /seat--key/); assert.match(h, /late-night/); assert.match(h, /vendor\/model/);
+  assert.match(h, /openrouter · codex cli/);
+  assert.doesNotMatch(h, /class="track"|\$0|USD 0/);
+  assert.ok(h.indexOf("late-night") < h.indexOf('g-name">Claude'));
+  // No running cost is shown at all: a money figure needs a price, and the providers most likely
+  // to be used as key seats publish none. Supplied spend metadata must not resurrect the display.
+  assert.doesNotMatch(keySeatCard(keySeat({ spend: { amount: "0.000012", currency: "USD" } })),
+    /0\.000012|running cost/);
+});
+
+test("unproven responses seats say so plainly; anthropic uses messages with claude", () => {
+  assert.match(keySeatCard(keySeat({ responses_verified: false })), /responses support unproven.*may not work/);
+  assert.doesNotMatch(keySeatCard(keySeat()), /key-unproven/);
+  const h = keySeatCard(keySeat({ provider: "anthropic", harness: "claude", responses_verified: false }));
+  assert.match(h, /anthropic · claude code/); assert.doesNotMatch(h, /responses support unproven/);
+});
+
+test("endpoint proof renders four distinct outcomes and success removes the warning", () => {
+  const cases = [
+    ["proven", null, /proven — a Responses turn completed/],
+    ["incompatible", "request_rejected", /does not support Responses; this seat will not work/],
+    ["refused", "invalid_key", /refused.*authentication.*Responses support is undetermined/],
+    ["inconclusive", "timeout", /inconclusive.*timed out.*Responses support is undetermined/],
+  ];
+  for (const [outcome, error, expected] of cases) {
+    const h = keySeatCard(keySeat({ responses_verified: outcome === "proven", last_proof: {
+      outcome, error, model: "checked-model", checked_at: "2026-09-26T12:00:00Z",
+    } }));
+    assert.match(h, expected);
+    assert.match(h, /checked-model/); assert.match(h, /2026-09-26/);
+    if (outcome === "proven") assert.doesNotMatch(h, /key-unproven|may not work|data-action="key-prove"/);
+    else {
+      assert.match(h, /data-action="key-prove"/);
+      assert.match(h, /check this endpoint/);
+      assert.match(h, /one real request and costs a small amount of money/);
+    }
+    if (outcome === "refused" || outcome === "inconclusive") assert.doesNotMatch(h, /does not support|will not work/);
+  }
+  // A fresh negative verdict beats an old registry-derived positive flag.
+  const negative = keySeatCard(keySeat({ last_proof: { outcome: "incompatible" } }));
+  assert.match(negative, /will not work/); assert.match(negative, /data-action="key-prove"/);
+  const proven = keySeatCard(keySeat({ last_validation: { operation_permitted: false },
+    last_proof: { outcome: "proven" } }));
+  assert.doesNotMatch(proven, /unproven/);
+});
+
+test("proof rendering uses fixed refusal copy and escapes stored metadata", () => {
+  for (const [error, reason] of [["insufficient_quota", "quota"], ["rate_limited", "rate limit"],
+                                 ["<script>secret</script>", "access or billing"]]) {
+    const h = keySeatCard(keySeat({ responses_verified: false, last_proof: {
+      outcome: "refused", error, model: "<img>", checked_at: "<script>",
+    } }));
+    assert.ok(h.includes(`(${reason})`));
+    assert.doesNotMatch(h, /<img>|<script>|secret/);
+    assert.match(h, /&lt;img&gt;/);
+  }
+  assert.doesNotMatch(keySeatCard(keySeat({ harness: "claude", responses_verified: false })), /key-prove/);
+});
+
+test("priced picker orders by named input $/Mtok, retains both rates and cached age", () => {
+  const models = [
+    { id: "a-expensive", price: livePrice("9", "2") },
+    { id: "b-unknown" }, { id: "z-cheap", price: livePrice("1", "8") },
+  ];
+  const h = buildModelPicker(keyFlow({ catalog: { sort_key: "input_usd_per_million_tokens", models,
+    source: "cache", fetched_at: "2026-01-01T00:00:00Z", potentially_stale: true } }));
+  assert.match(h, /sorted by input \$\/Mtok · cheap to expensive/);
+  assert.ok(h.indexOf('data-model="z-cheap"') < h.indexOf('data-model="a-expensive"'));
+  assert.ok(h.indexOf('data-model="a-expensive"') < h.indexOf('data-model="b-unknown"'));
+  assert.match(h, /input \$1\/Mtok · output \$8\/Mtok/);
+  assert.match(h, /live price estimate/); assert.match(h, /cached live catalog · updated \d+d ago · over 24h old/);
+  assert.match(h, /price unavailable/);
+  assert.deepEqual(models.map((m) => m.id), ["a-expensive", "b-unknown", "z-cheap"]);
+});
+
+test("unpriced picker sorts by id, has no price column, and explains missing prices", () => {
+  const h = buildModelPicker(keyFlow({ provider: "openai", catalog: { sort_key: "id", models: [
+    { id: "z-model" }, { id: "a-model" },
+  ] } }));
+  assert.ok(h.indexOf('data-model="a-model"') < h.indexOf('data-model="z-model"'));
+  assert.match(h, /does not publish machine-readable prices · sorted by model id/);
+  assert.match(h, /provider pricing and budget controls/);
+  assert.doesNotMatch(h, /key-price|\$|Mtok|input price|output price/);
+  const unavailable = buildModelPicker(keyFlow({ catalog: { sort_key: "id", models: [] } }));
+  assert.match(unavailable, /prices unavailable from this catalog/);
+  assert.doesNotMatch(unavailable, /does not publish/);
+});
+
+test("confirmation uses quiet hierarchy, names both seats, and preserves accessible decisions", () => {
+  const h = keyConfirmations({ pending_key_switches: [keyPrompt()] });
+  assert.match(h, /class="k-q">use a paid key to keep going\?/);
+  assert.match(h, /class="quiet-meta">late-night · openrouter<br><span class="k-model">vendor\/model/);
+  assert.match(h, /class="fare"[^>]*>\$1<span class="unit" style="font-size:13px"> \/ \$3<\/span><\/span>/);
+  assert.match(h, /input \/ output per million tokens/);
+  assert.match(h, /live price estimate/);
+  assert.match(h, /class="k-fine">work is resting\. this app doesn't cap spend\./);
+  assert.match(h, /aria-label="paid key confirmation"/); assert.match(h, /aria-live="polite"/);
+  const buttons = h.match(/<button[^>]+>[^<]+<\/button>/g);
+  assert.equal(buttons.length, 2);
+  assert.ok(buttons.every((b) => b.includes('data-id="prompt-1"') && b.includes('data-action="key-answer"')));
+  assert.match(buttons[0], /class="k-no".*>not now<\/button>/);
+  assert.match(buttons[1], /class="k-go".*>use the key<\/button>/);
+  assert.match(buttons[0], /data-approved="false"/); assert.match(buttons[1], /data-approved="true"/);
+  assert.match(keyConfirmations({ pending_key_switches: [keyPrompt({ price: null })] }), /price unavailable/);
+  assert.doesNotMatch(keyConfirmations({ pending_key_switches: [keyPrompt({ expires_at: "2000-01-01" })] }), /data-action="key-answer"/);
+  assert.equal((keyConfirmations({ pending_key_switches: [keyPrompt()] }, new Set(["prompt-1"])).match(/ disabled/g) || []).length, 2);
+});
+
+test("price formatting strips zeros and keeps three significant figures for cheap models", () => {
+  for (const [value, expected] of [["3.000000", "$3"], [15, "$15"], [3.25, "$3.25"],
+    [3.256, "$3.26"], [1.005, "$1.01"], [0.5, "$0.5"], [0.075, "$0.075"],
+    [0.0002, "$0.0002"], [0.000201, "$0.000201"], [0.000202, "$0.000202"],
+    [0.07549, "$0.0755"], [0.00000001, "$0.00000001"], [0, "$0"], ["0.000", "$0"]]) {
+    assert.equal(formatPrice(value), expected, String(value));
+  }
+  for (const value of [null, undefined, "", " ", false, NaN, Infinity, "oops", -1]) {
+    assert.equal(formatPrice(value), "price unavailable");
+  }
+  const catalog = { sort_key: "input_usd_per_million_tokens", models: [
+    { id: "cheap", price: livePrice("0.000201", "3.000000") },
+    { id: "nearby", price: livePrice("0.000202", "15.000000") },
+  ] };
+  const picker = buildModelPicker(keyFlow({ catalog }));
+  assert.match(picker, /input \$0\.000201\/Mtok · output \$3\/Mtok/);
+  assert.match(picker, /input \$0\.000202\/Mtok · output \$15\/Mtok/);
+  const review = buildAddKey(state(), keyFlow({ step: "review", catalog, model: "cheap" }));
+  assert.match(review, /input \$0\.000201\/Mtok · output \$3\/Mtok/);
+  const confirmation = keyConfirmations({ pending_key_switches: [keyPrompt({ price: livePrice("3.000000", "15.000000") })] });
+  assert.match(confirmation, /class="fare"[^>]*>\$3<span[^>]*> \/ \$15<\/span>/);
+});
+
+test("unknown fare is explicit and both decisions remain usable", () => {
+  const h = keyConfirmations({ pending_key_switches: [keyPrompt({ price: null })] });
+  assert.match(h, /class="fare"[^>]*>price unavailable<\/span>/);
+  assert.doesNotMatch(h, /\$\d| disabled/);
+  assert.equal((h.match(/data-action="key-answer"/g) || []).length, 2);
+});
+
+test("confirmation takes its primary colour from the request harness", () => {
+  for (const tool of ["codex", "claude"]) {
+    // Deliberately disagree with the key fixture: the request owns this session's accent.
+    const h = keyConfirmations({ pending_key_switches: [keyPrompt({ tool,
+      key_seat: keySeat({ harness: tool === "claude" ? "codex" : "claude" }) })] });
+    assert.ok(h.includes(`style="--accent:var(--${tool})"`));
+    assert.match(h, /class="k-go".*data-approved="true"/);
+  }
+});
+
+test("confirmation names the resting seat and only includes a known reset time", () => {
+  for (const limited_until of ["2099-01-01T02:18:00", null, "invalid"]) {
+    const h = keyConfirmations(state({ pending_key_switches: [keyPrompt({ from_seat: { id: "work@x.com", label: "Work" } })],
+      tools: { codex: { seats: [seat({ limited_until })] },
+        claude: { seats: [seat({ limited_until: "2099-01-01T05:00:00" })] } } }));
+    if (limited_until?.startsWith("2099")) {
+      assert.match(h, /class="k-fine">Work is resting until 2:18am\. this app doesn't cap spend\./);
+    } else {
+      assert.match(h, /class="k-fine">Work is resting\. this app doesn't cap spend\./);
+      assert.doesNotMatch(h, /until/);
+    }
+  }
+});
+
+test("confirmation retains the stored endpoint proof", () => {
+  const h = keyConfirmations({ pending_key_switches: [keyPrompt()],
+    keys: [keySeat({ last_proof: { outcome: "incompatible", model: "vendor/model" } })] });
+  assert.match(h, /incompatible — this endpoint does not support Responses; this seat will not work/);
+});
+
+test("unknown amounts never become fabricated or bare zero prices in any key view", () => {
+  for (const value of [null, undefined, "", " ", false, NaN, Infinity, "oops", -1]) {
+    const price = livePrice(null, null);
+    price.rates.input = price.rates.output = { status: "known", value };
+    const catalog = { sort_key: "input_usd_per_million_tokens", models: [{ id: "model", price }] };
+    const views = [buildModelPicker(keyFlow({ catalog })),
+      buildAddKey(state(), keyFlow({ step: "review", catalog, model: "model" })),
+      keyConfirmations({ pending_key_switches: [keyPrompt({ price })] })];
+    for (const h of views) {
+      assert.match(h, /unavailable/);
+      assert.doesNotMatch(h, /\$\d|USD \d|>0<|free/);
+    }
+  }
+  const fabricated = livePrice("1", "3", { source: "vendored" });
+  assert.match(keyConfirmations({ pending_key_switches: [keyPrompt({ price: fabricated })] }), /price unavailable/);
+  // A verified zero really is zero; tiny nonzero rates must never round down to it.
+  assert.match(keyConfirmations({ pending_key_switches: [keyPrompt({ price: livePrice("0", "0.00000001") })] }), /input \$0\/Mtok · output \$0\.00000001\/Mtok/);
+});
+
+test("add key is pushed, gates unverified providers with an unchecked explicit choice, and collects routing", () => {
+  const h = buildAddKey(state(), keyFlow({ provider: "openai_compatible" }));
+  assert.match(h, /app set-app add-app/); assert.doesNotMatch(h, /modal|dialog/);
+  assert.match(h, /id="key-base-url"/); assert.match(h, /id="key-secret" type="password"/);
+  assert.match(h, /cannot promise.*responses endpoint works/);
+  assert.match(h, /id="key-ack" type="checkbox">/);
+  assert.match(h, /i understand it may not work/);
+  const region = buildAddKey(state(), keyFlow({ provider: "langdock", region: "us" }));
+  assert.match(region, /value="us" selected/); assert.match(region, /value="global"/);
+  const providers = buildAddKey(state(), keyFlow({ step: "provider" }));
+  assert.doesNotMatch(providers, /data-provider="(?:together|mistral|cerebras)"/);
+  assert.equal(KEY_PROVIDERS.anthropic.harness, "claude");
+});
+
+test("key requests match 5b, and replies correlate to the current request", () => {
+  assert.deepEqual(keyRequest(keyFlow({ provider: "langdock", region: "us" })),
+    { provider: "langdock", secret: "test-secret", region: "us", allow_unverified: false });
+  assert.deepEqual(keyRequest(keyFlow({ provider: "openai_compatible", base_url: " https://local.test/v1 ", allow_unverified: true })),
+    { provider: "openai_compatible", secret: "test-secret", base_url: "https://local.test/v1", allow_unverified: true });
+  const flow = keyFlow({ pending: "new", step: "connecting" });
+  assert.equal(reduceKeyReply(flow, { key_request_id: "old", key_action: "models_list", ok: true, models: [] }), false);
+  assert.equal(flow.step, "connecting");
+  assert.equal(reduceKeyReply(flow, { state: state() }), false);
+  assert.equal(reduceKeyReply(flow, { key_request_id: "new", key_action: "models_list", ok: false, error: "offline" }), true);
+  assert.equal(flow.step, "details"); assert.equal(flow.secret, "test-secret");
+  flow.pending = "save";
+  reduceKeyReply(flow, { key_request_id: "save", key_action: "key_add", ok: true, added: "key-1", seat: keySeat() });
+  assert.equal(flow.step, "done"); assert.equal(flow.secret, "");
+});
+
+test("key settings default to opt-in fallback and confirmation, with clear spending consequences", () => {
+  const h = buildSettings(state());
+  assert.match(h, /data-key="key_fallback" >/);
+  assert.match(h, /data-key="confirm_key_switch" checked/);
+  assert.match(h, /real money can be spent/); assert.match(h, /without asking again/);
+});
+
+// Exercise the shipped glue with a tiny DOM boundary. No provider, native app or third-party DOM.
+function keyApp() {
+  const handlers = {}, sent = [];
+  const root = { innerHTML: "", querySelector: () => null, querySelectorAll: () => [], firstElementChild: null };
+  const document = { getElementById: () => root, body: { appendChild() {} },
+    createElement: () => ({}), addEventListener: (name, fn) => { handlers[name] = fn; },
+    hidden: true, hasFocus: () => false };
+  const window = { webkit: { messageHandlers: { agl: { postMessage: (msg) => sent.push(msg) } } }, addEventListener() {} };
+  runInNewContext(readFileSync(new URL("./bundle.js", import.meta.url), "utf8"),
+    { document, window, console, setTimeout, setInterval, clearInterval, URL });
+  const click = (dataset) => handlers.click({ target: { closest: () => ({ dataset }) }, preventDefault() {} });
+  const input = (id, value) => handlers.input({ target: { id, value } });
+  return { window, root, sent, click, input, handlers };
+}
+
+test("endpoint proof is click-only and duplicate clicks remain blocked across polls", () => {
+  const app = keyApp();
+  const snapshot = { rev: 1, settings: {}, tools: {}, keys: [keySeat({ responses_verified: false })] };
+  app.window.AGL.result({ state: snapshot });
+  assert.equal(app.sent.filter((m) => m.action === "key_prove").length, 0);
+  app.click({ action: "key-prove", id: "key-1" });
+  app.click({ action: "key-prove", id: "key-1" });
+  app.window.AGL.result({ state: { ...snapshot, rev: 2 } });
+  app.click({ action: "key-prove", id: "key-1" });
+  const calls = app.sent.filter((m) => m.action === "key_prove");
+  assert.equal(calls.length, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(calls[0])), { action: "key_prove", id: "key-1" });
+  app.window.AGL.result({ key_action: "key_prove", key_target_id: "key-1", ok: true,
+    state: { ...snapshot, rev: 3, keys: [keySeat({ last_proof: { outcome: "proven", model: "model" } })] } });
+  assert.doesNotMatch(app.root.innerHTML, /responses support unproven|data-action="key-prove"/);
+});
+
+test("key glue calls models_list then key_add, preserves inputs across polls and answers both ways", () => {
+  const app = keyApp();
+  app.click({ action: "key-start" }); app.click({ action: "key-provider", provider: "langdock" });
+  app.input("key-label", "night"); app.input("key-secret", "test-secret");
+  app.handlers.change({ target: { id: "key-region", value: "us", closest: () => null } });
+  const typedView = app.root.innerHTML;
+  app.window.AGL.result({ state: { rev: 1, settings: {}, tools: {} } });
+  assert.equal(app.root.innerHTML, typedView);
+  app.click({ action: "key-discover" });
+  const request = app.sent.at(-1);
+  assert.equal(request.action, "models_list"); assert.equal(request.region, "us"); assert.equal(request.secret, "test-secret");
+  app.window.AGL.result({ key_action: "models_list", key_request_id: request.key_request_id,
+    ok: true, source: "live", sort_key: "id", models: [{ id: "model" }] });
+  assert.match(app.root.innerHTML, /data-model="model"/);
+  app.click({ action: "key-model", model: "model" }); app.click({ action: "key-save" });
+  const save = app.sent.at(-1);
+  assert.equal(save.action, "key_add"); assert.equal(save.label, "night"); assert.equal(save.model, "model");
+  app.window.AGL.result({ key_action: "key_add", key_request_id: save.key_request_id, ok: true, added: "key-1" });
+  assert.match(app.root.innerHTML, /your key seat's saved/); assert.doesNotMatch(app.root.innerHTML, /test-secret/);
+  for (const approved of ["false", "true"]) {
+    app.click({ action: "key-answer", id: `request-${approved}`, approved });
+    assert.equal(app.sent.at(-1).action, "answer_key_switch");
+    assert.equal(app.sent.at(-1).approved, approved === "true");
+  }
+});
+
+test("key glue cannot discover an unverified endpoint without an explicit acknowledgement", () => {
+  const app = keyApp();
+  app.click({ action: "key-start" }); app.click({ action: "key-provider", provider: "openai_compatible" });
+  app.input("key-label", "night"); app.input("key-secret", "test-secret"); app.input("key-base-url", "https://local.test/v1");
+  app.click({ action: "key-discover" });
+  assert.equal(app.sent.at(-1).action, "ready");
+  app.handlers.change({ target: { id: "key-ack", checked: true, closest: () => null } });
+  app.click({ action: "key-discover" });
+  assert.equal(app.sent.at(-1).action, "models_list"); assert.equal(app.sent.at(-1).allow_unverified, true);
+});
+
+test("key confirmation is pinned above the scrolling list and escapes provider-controlled strings", () => {
+  const request = keyPrompt({ key_seat: keySeat({ label: '<img src=x onerror="bad">', model: '<script>bad</script>' }) });
+  const h = buildHTML(state({ pending_key_switches: [request] }));
+  assert.ok(h.indexOf('class="key-prompts"') < h.indexOf('class="main-body"'));
+  assert.doesNotMatch(h, /<img|<script>/);
+  assert.match(h, /&lt;script&gt;/);
+});
+
+test("partial prices and same-as rates preserve unknowns and cannot recurse forever", () => {
+  let h = keyConfirmations({ pending_key_switches: [keyPrompt({ price: livePrice("2", null) })] });
+  assert.match(h, /input \$2\/Mtok · output price unavailable/);
+  const price = livePrice("2", null);
+  price.rates.output = { status: "same_as", same_as: "input" };
+  h = keyConfirmations({ pending_key_switches: [keyPrompt({ price })] });
+  assert.match(h, /input \$2\/Mtok · output \$2\/Mtok/);
+  price.rates.input = { status: "same_as", same_as: "output" };
+  h = keyConfirmations({ pending_key_switches: [keyPrompt({ price })] });
+  assert.match(h, /price unavailable/); assert.doesNotMatch(h, /\$\d/);
+  h = keyConfirmations({ pending_key_switches: [keyPrompt({ price: livePrice("2", "4", { currency: "EUR" }) })] });
+  assert.doesNotMatch(h, /\$\d/);
+});
+
+test("a running paid seat offers a pinned one-tap stop that sends the kill switch action", () => {
+  const app = keyApp();
+  const snapshot = state({ rev: 1, settings: { key_fallback: true },
+    keys: [keySeat()], running_key_seats: ["key-1"] });
+  app.window.AGL.result({ state: snapshot });
+  const h = app.root.innerHTML;
+  assert.match(h, /<h2 class="k-q">paid use:<\/h2>/);
+  assert.match(paidStrip(h), /late-night · vendor\/model/);
+  assert.match(h, /data-action="key-stop">stop paid use<\/button>/);
+  assert.ok(h.indexOf('data-action="key-stop"') < h.indexOf('class="main-body"'));
+  assert.match(h, /stops every session and new paid requests/);
+  assert.match(h, /sent turns may still bill/);
+  app.click({ action: "key-stop" });
+  assert.deepEqual(JSON.parse(JSON.stringify(app.sent.at(-1))),
+    { action: "toggle", key: "key_fallback", value: false });
+  app.window.AGL.result({ state: { ...snapshot, rev: 2, settings: { key_fallback: false } } });
+  assert.match(app.root.innerHTML, /paid use is stopping/);
+  assert.match(app.root.innerHTML, /data-action="key-stop" disabled/);
+  app.window.AGL.result({ state: { ...snapshot, rev: 2, running_key_seats: [],
+    settings: { key_fallback: false } } });
+  assert.doesNotMatch(app.root.innerHTML, /data-action="key-stop"/);
+});
+
+test("idle keys and subscription sessions do not offer the paid-session stop", () => {
+  const h = buildHTML(state({ keys: [keySeat()], running_key_seats: [],
+    tools: { codex: { seats: [seat({ status: "active", active: true, in_session: true })] } } }));
+  assert.doesNotMatch(h, /data-action="key-stop"/);
+});
+
+const paidStrip = (html) => html.match(/<div class="paid-use-control"[^>]*>[\s\S]*?<\/div>/)?.[0];
+const paidPin = (over = {}) => ({ pin: "first-pin", pid: 202, tool: "codex", email: "key-1",
+  key_seat: keySeat(), ...over });
+
+test("paid-use strip names and escapes the running pin's seat and model even after key removal", () => {
+  const html = buildHTML(state({ keys: [], running_key_seats: ["key-1"],
+    pinned_sessions: [paidPin({ key_seat: keySeat({ label: "late <shift>", model: "guest/<model>" }) })] }));
+  const strip = paidStrip(html);
+  assert.ok(strip);
+  assert.match(strip, /late &lt;shift&gt; · guest\/&lt;model&gt; \(codex · terminal 202\)/);
+  assert.doesNotMatch(strip, /<shift>|<model>/);
+  assert.match(strip, /aria-label="stop paid use" role="status"/);
+  assert.ok(html.indexOf(strip) < html.indexOf('data-key="auto_switch"'));
+});
+
+test("paid-use strip names both running sessions and makes its global stop explicit", () => {
+  const second = keySeat({ id: "key-2", label: "writing", model: "claude-model", harness: "claude" });
+  const strip = paidStrip(buildHTML(state({ running_key_seats: ["key-1", "key-2"],
+    pinned_sessions: [paidPin(), paidPin({ pin: "second-pin", pid: 303, tool: "claude",
+      email: "key-2", key_seat: second })] })));
+  assert.match(strip, /late-night · vendor\/model \(codex · terminal 202\)/);
+  assert.match(strip, /writing · claude-model \(claude · terminal 303\)/);
+  assert.match(strip, /stops every session and new paid requests/);
+  assert.match(strip, /sent turns may still bill/);
+  assert.equal((strip.match(/data-action="key-stop"/g) || []).length, 1);
+});
+
+test("paid-use strip keeps two terminals on the same key individually identifiable", () => {
+  const strip = paidStrip(buildHTML(state({ running_key_seats: ["key-1"],
+    pinned_sessions: [paidPin(), paidPin({ pin: "second-pin", pid: 303 })] })));
+  assert.equal((strip.match(/late-night · vendor\/model/g) || []).length, 2);
+  assert.match(strip, /terminal 202/);
+  assert.match(strip, /terminal 303/);
+});
+
+test("paid-use strip also names automatic fallback seats alongside pinned sessions", () => {
+  const strip = paidStrip(buildHTML(state({ running_key_seats: ["key-1", "key-2"],
+    keys: [keySeat({ id: "key-2", label: "fallback", model: "other/model" })],
+    pinned_sessions: [paidPin()] })));
+  assert.match(strip, /late-night · vendor\/model/);
+  assert.match(strip, /fallback · other\/model/);
+});
+
+test("paid-use strip does not render without running sessions", () => {
+  for (const snapshot of [state(), state({ keys: [keySeat()], running_key_seats: [], pinned_sessions: [] })]) {
+    const html = buildHTML(snapshot);
+    assert.equal(paidStrip(html), undefined);
+    assert.doesNotMatch(html, /paid-use-control|data-action="key-stop"/);
+  }
+});
+
+test("paid-use strip keeps session names visible while stopping and disables the action", () => {
+  const strip = paidStrip(buildHTML(state({ settings: { key_fallback: false },
+    running_key_seats: ["key-1"], pinned_sessions: [paidPin()] })));
+  assert.match(strip, /paid use is stopping…/);
+  assert.match(strip, /late-night · vendor\/model/);
+  assert.match(strip, /data-action="key-stop" disabled>stop paid use/);
+  assert.match(strip, /sent turns may still bill/);
+});
+
+test("paid-use strip has a heading and real button without the confirmation's card layout", () => {
+  const html = buildHTML(state({ running_key_seats: ["key-1"], pinned_sessions: [paidPin()],
+    pending_key_switches: [keyPrompt()] }));
+  const strip = paidStrip(html);
+  assert.ok(strip);
+  assert.doesNotMatch(strip, /key-confirm|set-card|k-fine|k-acts|k-go|<section/);
+  assert.match(strip, /<h2 class="k-q">paid use:<\/h2>/);
+  assert.match(strip, /<button class="btn rose" data-action="key-stop">stop paid use<\/button>/);
+  assert.doesNotMatch(strip, /class="link"/);
+  assert.match(strip, /<p>late-night · vendor\/model \(codex · terminal 202\)<\/p>/);
+  assert.equal((strip.match(/<div/g) || []).length, 1);
+  assert.match(html, /<section class="key-confirm set-card" aria-label="paid key confirmation"/);
+});
+
+test("pinned cards retain per-session end actions alongside the global paid-use strip", () => {
+  const html = buildHTML(state({ running_key_seats: ["key-1"],
+    pinned_sessions: [paidPin(), paidPin({ pin: "second-pin", pid: 303, end_requested: true })] }));
+  assert.doesNotMatch(paidStrip(html), /end-pinned-session/);
+  const cards = [...html.matchAll(/<section class="seat seat--key pinned-session"[\s\S]*?<\/section>/g)];
+  assert.equal(cards.length, 2);
+  assert.match(cards[0][0], /data-action="end-pinned-session" data-tool="codex" data-pin="first-pin">end<\/button>/);
+  assert.match(cards[1][0], /data-action="end-pinned-session" data-tool="codex" data-pin="second-pin" disabled>ending…<\/button>/);
+});
+
+test("paid-use settings subtitle explains prevention, session stopping, and in-flight billing", () => {
+  const h = buildSettings(state());
+  const row = h.match(/<label class="set-toggle-row">(?:(?!<\/label>)[\s\S])*data-key="key_fallback"(?:(?!<\/label>)[\s\S])*<\/label>/)[0];
+  assert.match(row, /class="set-s">[^<]*off prevents new paid use and stops a running paid session/);
+  assert.match(row, /the turn already sent may still bill/);
+});
+
+test("each key seat offers use in new terminal with its exact id", () => {
+  const keys = [
+    { id: 'paid-1', label: 'late shift', harness: 'codex', provider: 'openrouter', model: 'guest/model' },
+    { id: 'paid-2', label: 'writing', harness: 'claude', provider: 'anthropic', model: 'claude-model' },
+  ];
+  const html = buildHTML(state({ keys }));
+  for (const key of keys) {
+    assert.ok(html.includes(`data-action="key-terminal" data-id="${key.id}">use in new terminal</button>`));
+  }
+  const app = readFileSync(new URL('./app.mjs', import.meta.url), 'utf8');
+  assert.match(app, /send\("key_terminal", \{ id: el.dataset.id \}\)/);
+});
+
+test("pinned paid terminals have independent rows and end controls", () => {
+  const key = { id: 'paid-1', label: 'late <shift>', provider: 'openrouter', model: 'guest/model' };
+  const pinned_sessions = [
+    { pin: 'first-pin', pid: 202, tool: 'codex', key_seat: key },
+    { pin: 'second-pin', pid: 303, tool: 'codex', key_seat: key, end_requested: true },
+  ];
+  const html = buildHTML(state({ pinned_sessions }));
+  assert.equal((html.match(/aria-label="pinned paid session"/g) || []).length, 2);
+  assert.equal((html.match(/pinned · paid/g) || []).length, 2);
+  assert.match(html, /late &lt;shift&gt;/);
+  assert.match(html, /openrouter · codex · terminal 202/);
+  assert.match(html, /guest\/model/);
+  assert.match(html, /metered · paid per token/);
+  assert.match(html, /data-action="end-pinned-session" data-tool="codex" data-pin="first-pin">end<\/button>/);
+  assert.match(html, /data-pin="second-pin" disabled>ending…<\/button>/);
+  const app = readFileSync(new URL('./app.mjs', import.meta.url), 'utf8');
+  assert.match(app, /send\("end_pinned_session", \{ tool, pin: el.dataset.pin \}\)/);
+});
+
+test("pin confirmation describes one terminal without claiming subscriptions are resting", () => {
+  const html = buildHTML(state({ pending_key_switches: [{
+    id: 'consent-pin', pinned: true, status: 'pending', tool: 'codex',
+    expires_at: '2999-01-01T00:00:00Z',
+    key_seat: { id: 'key', label: 'work', provider: 'openrouter', model: 'guest/model' },
+  }] }));
+  assert.match(html, /pin this terminal to a paid key\?/);
+  assert.match(html, /only this terminal will use the key/);
+  assert.doesNotMatch(html, /the current seat is resting/);
+  assert.match(html, /data-action="key-answer" data-id="consent-pin" data-approved="false"/);
+  assert.match(html, /price unavailable/);
+});
+
+test("shipped pin controls send separate launch and per-terminal end actions", () => {
+  const app = keyApp();
+  app.click({ action: 'key-terminal', id: 'key-1' });
+  assert.deepEqual(JSON.parse(JSON.stringify(app.sent.at(-1))), { action: 'key_terminal', id: 'key-1' });
+  app.click({ action: 'end-pinned-session', tool: 'codex', pin: 'only-this-terminal' });
+  assert.deepEqual(JSON.parse(JSON.stringify(app.sent.at(-1))),
+    { action: 'end_pinned_session', tool: 'codex', pin: 'only-this-terminal' });
+  assert.equal(app.sent.filter((m) => m.action === 'toggle').length, 0);
+});
+
+// The table below is duplicated verbatim in tests/test_price_format.py. Two languages format
+// prices — Python for the CLI and terminal consent, JS for the popover — and they must never
+// print different numbers for the same model. Changing one side fails the other.
+test("prices read the same here as they do in the CLI", () => {
+  const TABLE = {
+    "3.000000": "3",
+    "15": "15",
+    "150": "150",
+    "0.5": "0.5",
+    "0.075": "0.075",
+    "0.0002": "0.0002",
+    "0.00000025": "0.00000025",
+    "0": "0",
+    "0.3125": "0.313",
+    "1.005": "1.01",
+    "0.6496": "0.65",
+    "1.027": "1.03",
+  };
+  for (const [raw, shown] of Object.entries(TABLE)) {
+    assert.equal(formatPrice(raw), `$${shown}`, `formatPrice(${raw})`);
+  }
+});
+
+test("model filter matches id and display name without case sensitivity", () => {
+  const catalog = { sort_key: "id", models: [
+    { id: "GPT-5-mini", display_name: "Small helper" },
+    { id: "vendor/large", display_name: "GPT flagship" },
+    { id: "other", display_name: "Different model" },
+  ] };
+  for (const query of ["gpt", "GpT"]) {
+    const h = buildModelPicker(keyFlow({ catalog, modelFilter: query }));
+    assert.match(h, /data-model="GPT-5-mini"/);
+    assert.match(h, /data-model="vendor\/large"/);
+    assert.doesNotMatch(h, /data-model="other"/);
+    assert.match(h, />2 of 3<\/div>/);
+  }
+  assert.match(buildModelPicker(keyFlow({ catalog })), />3 of 3<\/div>/);
+});
+
+test("filtering keeps the original ordering, sort header and price visibility", () => {
+  const models = [
+    { id: "a-match", price: livePrice("9", "2") },
+    { id: "middle", price: livePrice("5", "3") },
+    { id: "z-match", price: livePrice("1", "8") },
+    { id: "unknown-match" },
+  ];
+  for (const sort_key of ["id", "input_usd_per_million_tokens"]) {
+    const flow = keyFlow({ provider: "openai", catalog: { sort_key, models } });
+    const original = buildModelPicker(flow);
+    const filtered = buildModelPicker({ ...flow, modelFilter: "MATCH" });
+    const ids = (h) => [...h.matchAll(/data-model="([^"]+)"/g)].map((m) => m[1]);
+    assert.deepEqual(ids(filtered), ids(original).filter((id) => id.includes("match")));
+    const header = (h) => h.match(/<div class="add-hint">([^<]*sorted by[^<]*)<\/div>/)[1];
+    assert.equal(header(filtered), header(original));
+    assert.match(filtered, />3 of 4<\/div>/);
+    if (sort_key === "id") assert.doesNotMatch(filtered, /input \$|output \$|class="key-price/);
+    else {
+      assert.match(filtered, /input \$1\/Mtok · output \$8\/Mtok/);
+      assert.match(filtered, /input \$9\/Mtok · output \$2\/Mtok/);
+    }
+  }
+});
+
+test("model filter empty state honestly names and escapes the query", () => {
+  const h = buildModelPicker(keyFlow({ modelFilter: '<MiSs "me">',
+    catalog: { sort_key: "id", models: [{ id: "model" }] } }));
+  assert.match(h, /no models match “&lt;MiSs &quot;me&quot;&gt;”/);
+  assert.match(h, />0 of 1<\/div>/);
+  assert.doesNotMatch(h, /data-action="key-model"|<MiSs|no models returned/);
+});
+
+test("paid-use master switch names automatic fallback, pinned terminals and stopping", () => {
+  const h = buildSettings(state());
+  const row = h.match(/<label class="set-toggle-row">(?:(?!<\/label>)[\s\S])*data-key="key_fallback"(?:(?!<\/label>)[\s\S])*<\/label>/)[0];
+  assert.match(row, /class="set-t">allow paid key use<\/span>/);
+  assert.match(row, /on permits paid use: automatic fallback.*and pinned key terminals/);
+  assert.match(row, /real money can be spent/);
+  assert.match(row, /off prevents new paid use and stops a running paid session/);
+  assert.doesNotMatch(row, /let a key take the floor/);
+});
+
+test("blocked named-seat launch offers informed inline enable-and-continue", () => {
+  const app = keyApp();
+  const snapshot = state({ rev: 1, settings: { key_fallback: false }, keys: [keySeat({ label: 'late <shift>' })] });
+  app.window.AGL.result({ state: snapshot });
+  app.click({ action: "key-terminal", id: "key-1" });
+  app.window.AGL.result({ key_action: "key_terminal", key_target_id: "key-1", ok: false,
+    code: "paid_use_disabled", error: "paid use is off", state: snapshot });
+  assert.match(app.root.innerHTML, /app set-app add-app/);
+  assert.match(app.root.innerHTML, /use late &lt;shift&gt; in a new terminal/);
+  assert.match(app.root.innerHTML, /real money can be spent/);
+  assert.match(app.root.innerHTML, /data-action="paid-key-enable">allow paid use and open terminal/);
+  assert.doesNotMatch(app.root.innerHTML, /in settings|open settings|<shift>|modal/);
+  const sentBeforeConsent = app.sent.length;
+  app.window.AGL.result({ state: { ...snapshot, rev: 2 } });
+  assert.equal(app.sent.length, sentBeforeConsent);
+  app.click({ action: "paid-key-enable" });
+  assert.deepEqual(JSON.parse(JSON.stringify(app.sent.at(-1))),
+    { action: "key_terminal", id: "key-1", enable_paid: true });
+  app.click({ action: "paid-key-enable" });
+  assert.equal(app.sent.length, sentBeforeConsent + 1);
+  app.window.AGL.result({ key_action: "key_terminal", key_target_id: "key-1", ok: true,
+    state: { ...snapshot, rev: 3, settings: { key_fallback: true } } });
+  assert.doesNotMatch(app.root.innerHTML, /data-action="paid-key-enable"/);
+});
+
+test("declining a blocked launch leaves paid use off and errors allow retry", () => {
+  const app = keyApp();
+  app.window.AGL.result({ state: state({ keys: [keySeat()] }) });
+  const block = () => {
+    app.click({ action: "key-terminal", id: "key-1" });
+    app.window.AGL.result({ key_action: "key_terminal", key_target_id: "key-1", ok: false, code: "paid_use_disabled" });
+  };
+  block();
+  const count = app.sent.length;
+  app.click({ action: "paid-key-back" });
+  assert.equal(app.sent.length, count);
+  assert.doesNotMatch(app.root.innerHTML, /data-action="paid-key-enable"/);
+  block();
+  app.click({ action: "paid-key-enable" });
+  app.window.AGL.result({ key_action: "key_terminal", key_target_id: "key-1", ok: false, error: "couldn't save that setting" });
+  assert.match(app.root.innerHTML, /couldn't save that setting/);
+  assert.match(app.root.innerHTML, /data-action="paid-key-enable">/);
+});
+
+test("typing filters only results, survives state pushes and resets on each picker visit", () => {
+  const app = keyApp();
+  app.click({ action: "key-start" }); app.click({ action: "key-provider", provider: "openai" });
+  app.input("key-label", "night"); app.input("key-secret", "test-secret");
+  const discover = () => {
+    app.click({ action: "key-discover" });
+    const request = app.sent.at(-1);
+    app.window.AGL.result({ key_action: "models_list", key_request_id: request.key_request_id,
+      ok: true, sort_key: "id", models: [{ id: "gpt-mini" }, { id: "other" }] });
+  };
+  discover();
+  // The DOM boundary exposes a separate results node. Replacing root or touching the input
+  // would discard the focused field/caret in the actual WebView.
+  const results = { innerHTML: "" };
+  app.root.querySelector = (selector) => selector === "#key-model-results" ? results : null;
+  const pickerHTML = app.root.innerHTML;
+  app.input("key-model-filter", "MINI");
+  assert.equal(app.root.innerHTML, pickerHTML);
+  assert.match(results.innerHTML, /data-model="gpt-mini"/);
+  assert.doesNotMatch(results.innerHTML, /data-model="other"/);
+  assert.match(results.innerHTML, />1 of 2<\/div>/);
+  const filtered = results.innerHTML;
+  app.window.AGL.result({ state: state({ rev: 1 }) });
+  assert.equal(app.root.innerHTML, pickerHTML);
+  assert.equal(results.innerHTML, filtered);
+  app.click({ action: "key-model", model: "gpt-mini" });
+  assert.match(app.root.innerHTML, /gpt-mini/);
+  assert.doesNotMatch(app.root.innerHTML, /key-model-filter|MINI/);
+  app.click({ action: "key-back" });
+  assert.match(app.root.innerHTML, /data-model="other"/);
+  assert.match(app.root.innerHTML, /id="key-model-filter"[^>]*value=""/);
+  app.input("key-model-filter", "other");
+  app.click({ action: "key-back" });
+  discover();
+  assert.match(app.root.innerHTML, /id="key-model-filter"[^>]*value=""/);
+  app.click({ action: "key-model", model: "gpt-mini" });
+  app.click({ action: "key-save" });
+  assert.equal(app.sent.at(-1).model, "gpt-mini");
+  assert.equal(Object.hasOwn(app.sent.at(-1), "modelFilter"), false);
+});

@@ -53,6 +53,26 @@ def _isolate_tool_config_dirs(tmp_path, monkeypatch):
     monkeypatch.setattr(install_mod.Path, "home", classmethod(lambda cls: tmp_path / "_home"))
 
 
+@pytest.fixture(autouse=True)
+def _clear_process_start_caches():
+    """Drop the pid → ``ps`` start-time caches around every test.
+
+    Both caches are keyed on ``os.getpid()``, which in production is the supervisor's own pid and a
+    value that never changes — so caching it is correct there. Under pytest every test shares one
+    pid, so a test that monkeypatches ``_proc_start`` to return a fake start leaves that fake in the
+    cache after its monkeypatch is undone. A later test then writes the fake into a session
+    heartbeat while the real ``ps`` reports the true start, the two disagree, and a live session
+    reads as dead — a failure that only appears when the files run in the same process, and points
+    at the wrong module when it does.
+    """
+    from acctsw import appalive, session
+    for cache in (session._START_CACHE, appalive._START_CACHE):
+        cache.clear()
+    yield
+    for cache in (session._START_CACHE, appalive._START_CACHE):
+        cache.clear()
+
+
 @pytest.fixture
 def ctx(tmp_path):
     c = Context.for_test(tmp_path)

@@ -10,16 +10,46 @@ Run (dev):  bash scripts/run-app.sh
 from __future__ import annotations
 
 import json
+import importlib
+import importlib.util
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
+
+
+def _ensure_app_package() -> None:
+    """Alias launchers run this file as __main__ without exposing its parent package.
+
+    Prefer the normal package (including the full bundle's copy). Only when app itself is
+    absent, load our own package by location without adding the checkout to sys.path.
+    """
+    try:
+        importlib.import_module("app")
+    except ModuleNotFoundError as exc:
+        if exc.name != "app":
+            raise
+        init = Path(__file__).resolve().parent / "__init__.py"
+        spec = importlib.util.spec_from_file_location(
+            "app", init, submodule_search_locations=[str(init.parent)])
+        package = importlib.util.module_from_spec(spec)
+        sys.modules["app"] = package
+        try:
+            spec.loader.exec_module(package)
+        except BaseException:
+            del sys.modules["app"]
+            raise
+
+
+_ensure_app_package()
 
 try:
     import objc
     from AppKit import (NSApplication, NSStatusBar, NSPopover, NSViewController,
                         NSVariableStatusItemLength, NSApplicationActivationPolicyAccessory,
-                        NSUserNotification, NSUserNotificationCenter, NSImage, NSWorkspace)
+                        NSUserNotification, NSUserNotificationCenter, NSImage, NSWorkspace,
+                        NSMenu, NSMenuItem, NSEventModifierFlagCommand, NSEventModifierFlagShift)
     from WebKit import WKWebView, WKWebViewConfiguration, WKUserContentController
     from Foundation import NSObject, NSURL, NSTimer, NSMakeRect, NSMakeSize, NSBundle
 except ImportError:  # allows importing this module's pure helpers without pyobjc installed
@@ -27,6 +57,27 @@ except ImportError:  # allows importing this module's pure helpers without pyobj
 
 from acctsw import TOOLS, appalive, bridge, session
 from acctsw.context import Context, hydrate_path
+from acctsw.util import now, parse_iso
+
+
+def _log_exception(exc: BaseException, secret: str = "") -> None:
+    """Print a redacted traceback, without locals, source lines or provider error bodies.
+
+    A stored key need not be present in the action message. Exception messages (including
+    chained exceptions) can contain it, so retain types and frame locations only.
+    """
+    lines = ["Traceback (most recent call last):\n"]
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        for frame, lineno in traceback.walk_tb(exc.__traceback__):
+            lines.append(f'  File "{frame.f_code.co_filename}", line {lineno}, '
+                         f'in {frame.f_code.co_name}\n')
+        lines.append(f"{type(exc).__name__}\n")
+        exc = exc.__cause__ or (None if exc.__suppress_context__ else exc.__context__)
+        if exc is not None:
+            lines.append("Caused by / during handling of:\n")
+    print(bridge._redact_key("".join(lines), secret), file=sys.stderr, end="")
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 # The open popover is the one place where a person is actively making a decision from the
@@ -41,6 +92,44 @@ STATE_POLL_SECONDS = 3.0
 DOOR_SYMBOL = {"open": "door.left.hand.open", "shut": "door.left.hand.closed"}
 DOOR_EMOJI = {"open": "🪩", "shut": "🚪"}
 NS_TERMINATE_NOW = 1      # NSApplicationTerminateReply.terminateNow
+
+# Open provider help in the default browser, never inside the credential-bearing WKWebView.
+KEY_PRICING_URLS = {
+    "openai": "https://openai.com/api/pricing/",
+    "anthropic": "https://www.anthropic.com/pricing",
+    "openrouter": "https://openrouter.ai/models",
+    "langdock": "https://www.langdock.com/pricing",
+    "deepseek": "https://api-docs.deepseek.com/quick_start/pricing",
+    "xai": "https://docs.x.ai/docs/models",
+    "groq": "https://groq.com/pricing",
+}
+
+
+class KeySwitchNotices:
+    """Deduplicate consent nudges across local polls and action replies, including hidden polls."""
+    def __init__(self):
+        self.seen = set()
+        self.rev = -1
+
+    def deliver(self, state, notify):
+        if not state or state.get("rev", 0) < self.rev:
+            return
+        self.rev = state.get("rev", 0)
+        enabled = state.get("settings", {}).get("notify", True)
+        for request in state.get("pending_key_switches", []):
+            expires = parse_iso(request.get("expires_at"))
+            if (request.get("status") != "pending" or expires is None or expires <= now()
+                    or request["id"] in self.seen):
+                continue
+            self.seen.add(request["id"])
+            if enabled and request.get("notify", True):
+                seat = request.get("key_seat") or {}
+                previous = request.get("from_seat") or {}
+                notify("a paid key needs your okay",
+                       ("pin this terminal to " if request.get("pinned") else
+                        f"leave {previous.get('label') or 'the current seat'} for ") +
+                       f"{seat.get('label')} · {seat.get('model')}? "
+                       "open ai guest list to approve paid use or decline")
 
 
 def usage_poll_interval(popover_visible: bool) -> float:
@@ -60,7 +149,8 @@ def _codex_desktop_app(app) -> bool:
     try:
         bundle = app.bundleIdentifier() or ""
         name = app.localizedName() or ""
-    except Exception:
+    except Exception as exc:
+        _log_exception(exc)
         return False
     return bundle == "com.openai.codex" if bundle else name == "Codex"
 
@@ -79,6 +169,7 @@ def request_codex_restart(running_apps) -> tuple[bool, str | None]:
             if not app.terminate():
                 return True, "Codex did not accept the restart request"
         except Exception as exc:
+            _log_exception(exc)
             detail = str(exc).strip() or exc.__class__.__name__
             return True, f"couldn't ask Codex to quit: {detail}"
     return True, None
@@ -94,6 +185,7 @@ def launch_codex_desktop(*, run=subprocess.run) -> str | None:
         if completed.returncode != 0:
             return completed.stderr.strip() or f"open exited {completed.returncode}"
     except Exception as exc:
+        _log_exception(exc)
         return str(exc).strip() or exc.__class__.__name__
     return None
 
@@ -103,6 +195,7 @@ def _bootstrap_notice(notify, title: str, text: str) -> None:
     try:
         notify(title, text)
     except Exception as exc:
+        _log_exception(exc)
         print(f"{title}: {text} (notification failed: {exc})", file=sys.stderr)
 
 
@@ -120,6 +213,7 @@ def bootstrap_supervision(ctx: Context, notify) -> dict:
     try:
         enabled = bool(ctx.load_state().settings().get("supervise_shell", True))
     except Exception as exc:
+        _log_exception(exc)
         detail = str(exc).strip() or exc.__class__.__name__
         error = f"couldn't read the terminal supervision setting: {detail}"
         _bootstrap_notice(notify, "terminal supervision needs attention", error)
@@ -128,6 +222,7 @@ def bootstrap_supervision(ctx: Context, notify) -> dict:
     try:
         status = install.supervision_status()
     except Exception as exc:
+        _log_exception(exc)
         detail = str(exc).strip() or exc.__class__.__name__
         error = f"couldn't inspect terminal supervision: {detail}"
         _bootstrap_notice(notify, "terminal supervision needs attention", error)
@@ -136,6 +231,7 @@ def bootstrap_supervision(ctx: Context, notify) -> dict:
     try:
         changed, messages = install.ensure_launchers(wire_rc=wire_rc)
     except Exception as exc:
+        _log_exception(exc)
         detail = str(exc).strip() or exc.__class__.__name__
         error = f"couldn't wire codex/claude supervision: {detail}"
         _bootstrap_notice(notify, "terminal supervision needs attention", error)
@@ -144,6 +240,7 @@ def bootstrap_supervision(ctx: Context, notify) -> dict:
     try:
         final_status = install.supervision_status()
     except Exception as exc:
+        _log_exception(exc)
         detail = str(exc).strip() or exc.__class__.__name__
         error = f"terminal supervision was wired, but couldn't be verified: {detail}"
         _bootstrap_notice(notify, "terminal supervision needs attention", error)
@@ -173,7 +270,40 @@ def bootstrap_supervision(ctx: Context, notify) -> dict:
     }
 
 
-if objc is not None:
+def edit_menu_items(command_mask: int, shift_mask: int) -> tuple:
+    """Pure menu definitions: title, selector, key equivalent, modifiers, nil target."""
+    return (
+        ("Undo", "undo:", "z", command_mask, None),
+        ("Redo", "redo:", "Z", command_mask | shift_mask, None),
+        ("Cut", "cut:", "x", command_mask, None),
+        ("Copy", "copy:", "c", command_mask, None),
+        ("Paste", "paste:", "v", command_mask, None),
+        ("Select All", "selectAll:", "a", command_mask, None),
+    )
+
+
+# The import smoke loads app.menubar below; register its Objective-C class only once.
+if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.argv[1:]):
+
+    def install_edit_menu(application):
+        """Give editing shortcuts a route to the first responder.
+
+        This LSUIElement app has no menu bar, but needs a main menu to own key equivalents.
+        Right-click Paste already worked via WKWebView's context menu; nil targets let keyboard
+        actions reach the focused field through the responder chain too. Keep accessory policy.
+        """
+        menu = NSMenu.alloc().initWithTitle_("")
+        edit = NSMenu.alloc().initWithTitle_("Edit")
+        parent = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Edit", None, "")
+        parent.setSubmenu_(edit)
+        menu.addItem_(parent)
+        for title, action, key, modifiers, target in edit_menu_items(
+                NSEventModifierFlagCommand, NSEventModifierFlagShift):
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, key)
+            item.setKeyEquivalentModifierMask_(modifiers)  # Redo explicitly includes Shift.
+            item.setTarget_(target)
+            edit.addItem_(item)
+        application.setMainMenu_(menu)
 
     class AGLDelegate(NSObject):
         def initWithContext_(self, ctx):
@@ -198,10 +328,12 @@ if objc is not None:
             self._acctWarned = set()              # shared-account warnings already toasted this session
             self._login_baseline = {}             # tool → (op, digest of live creds at that login launch)
             self._login_seq = 0                   # monotonic login op id (see the login handler)
+            self._key_notices = KeySwitchNotices()
             return self
 
         # --- lifecycle ----------------------------------------------------------------------
         def applicationDidFinishLaunching_(self, _notif):
+            install_edit_menu(NSApplication.sharedApplication())
             bar = NSStatusBar.systemStatusBar()
             self.statusItem = bar.statusItemWithLength_(NSVariableStatusItemLength)
             self._setBarDoor("open")  # welcoming default until the first state push (fresh install = open)
@@ -211,6 +343,7 @@ if objc is not None:
             # + auto-switch; when it's closed they run stock. Heartbeat is refreshed each usage poll.
             appalive.mark_alive(self.ctx.data_dir)
             self._buildPopover()
+            self._startStateTimer()  # consent expires in 2m; the hidden usage poll takes 3m
             self._startUsageTimer()
             # One-time cleanup of the retired "save credit" Headroom feature — off the main thread so a
             # config restore never blocks the menubar on launch. No-op once nothing remains.
@@ -237,6 +370,7 @@ if objc is not None:
                 self.performSelectorOnMainThread_withObject_waitUntilDone_(
                     objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
             except Exception as exc:
+                _log_exception(exc)
                 detail = str(exc).strip() or exc.__class__.__name__
                 _bootstrap_notice(
                     self._notify,
@@ -261,13 +395,15 @@ if objc is not None:
             try:
                 from acctsw.codexhome import daemon_report
                 daemon_report(self.ctx, fix=True)
-            except Exception:
+            except Exception as exc:
+                _log_exception(exc)
                 pass                    # maintenance must never prevent the menubar from opening
             try:
                 from acctsw import headroom
                 if headroom.legacy_present(self.ctx):
                     headroom.cleanup_legacy(self.ctx)
-            except Exception:
+            except Exception as exc:
+                _log_exception(exc)
                 pass
 
         @objc.python_method
@@ -308,7 +444,6 @@ if objc is not None:
         # --- actions ------------------------------------------------------------------------
         def togglePopover_(self, sender):
             if self.popover.isShown():
-                self._stopStateTimer()
                 self._setWebVisible(False)
                 self.popover.performClose_(sender)
             else:
@@ -321,7 +456,6 @@ if objc is not None:
 
         def popoverDidClose_(self, _notification):
             # Transient popovers also close when the user clicks elsewhere, bypassing togglePopover_.
-            self._stopStateTimer()
             self._setWebVisible(False)
             self._setUsagePollInterval(usage_poll_interval(False))
 
@@ -351,18 +485,20 @@ if objc is not None:
             """
             try:
                 rev = int(self.ctx.load_state().data.get("rev", 0))
-            except Exception:
+            except Exception as exc:
+                _log_exception(exc)
                 return None
             beats = []
             for tool in TOOLS:
                 try:
                     beats.append(session.session_mtime_ns(self.ctx.data_dir, tool))
-                except Exception:
+                except Exception as exc:
+                    _log_exception(exc)
                     beats.append(0)
             return (rev, tuple(beats))
 
         def pollState_(self, _timer):
-            """While open, notice state.json / session writes from supervised cx/cl sessions.
+            """Notice state.json / session writes even when the popover is hidden.
 
             Deliberately network-free: the "status" action only re-reads local state, so the
             engine's per-seat usage cache still governs every endpoint call."""
@@ -399,6 +535,7 @@ if objc is not None:
                         self._last_all_usage_poll = time.monotonic()
                 result = dict(bridge.handle(self.ctx, {"action": "usage", **request}))
             except Exception as exc:
+                _log_exception(exc)
                 detail = str(exc).strip() or exc.__class__.__name__
                 result = {"ok": False, "error": f"couldn't refresh usage: {detail}"}
             result["background"] = True   # the JS must not toast a transient poll error over the UI
@@ -452,7 +589,8 @@ if objc is not None:
                     subprocess.Popen(["open", "-R", str(path)], env=harden_env())
                 elif path.parent.exists():
                     subprocess.Popen(["open", str(path.parent)], env=harden_env())
-            except Exception:
+            except Exception as exc:
+                _log_exception(exc)
                 pass
 
         def loginBg_(self, msg):
@@ -462,13 +600,13 @@ if objc is not None:
             tool = msg["tool"]
             op = msg.get("_op")
             try:
-                # Absolute import (not `.terminal`): under py2app the main script runs as top-level
-                # __main__ with no package context, so a relative import would fail in the .app.
+                # The startup bootstrap also exposes this package in source-linked alias builds.
                 # prepare_then_login resolves the CLI's ABSOLUTE path itself (raising a clear error if
                 # the CLI is missing) and launches via `open` — no AppleEvents/Automation permission.
                 from app.terminal import prepare_then_login
                 prepare_then_login(self.ctx, tool)
             except Exception as e:
+                _log_exception(e)
                 # Launch failed. If a NEWER login for this tool has since superseded us (op identity),
                 # this failure is stale — the user restarted, so stay silent: pushing it would send
                 # the restarted same-tool flow back to details and toast over it. Only the current
@@ -513,7 +651,8 @@ if objc is not None:
                 result = dict(bridge.handle(self.ctx, dict(msg)))
                 if result.get("ok") and msg.get("action") == "snapshot":
                     self._login_baseline.pop(tool, None)   # consumed — a real add completed
-            except Exception:
+            except Exception as exc:
+                _log_exception(exc)
                 result = {"ok": False, "error": "something went wrong saving that seat"}
             # Tag it as an add-op reply FOR THIS TOOL. The JS reducer uses both to attribute the reply
             # to the right flow (vs. a poll error, or a late reply from another tool's abandoned add).
@@ -544,7 +683,8 @@ if objc is not None:
                 return
             try:
                 enabled = bool(self.ctx.load_state().settings().get("restart_app", False))
-            except Exception:
+            except Exception as exc:
+                _log_exception(exc)
                 enabled = False
             if not enabled:
                 return
@@ -553,6 +693,7 @@ if objc is not None:
                     NSWorkspace.sharedWorkspace().runningApplications()
                 )
             except Exception as exc:
+                _log_exception(exc)
                 was_running = False
                 error = str(exc).strip() or exc.__class__.__name__
             if error:
@@ -578,6 +719,7 @@ if objc is not None:
                     for app in NSWorkspace.sharedWorkspace().runningApplications()
                 )
             except Exception as exc:
+                _log_exception(exc)
                 timer.invalidate()
                 self._codex_restart_timer = None
                 self._codex_restart_pending = False
@@ -626,7 +768,8 @@ if objc is not None:
         def userContentController_didReceiveScriptMessage_(self, _ucc, message):
             try:
                 msg = dict(message.body())
-            except Exception:
+            except Exception as exc:
+                _log_exception(exc)
                 return
             action = msg.get("action")
             if action == "quit":
@@ -634,6 +777,16 @@ if objc is not None:
                 return
             if action == "settings":
                 return  # reserved
+            if action == "key_pricing":
+                url = KEY_PRICING_URLS.get(msg.get("provider"))
+                if url:
+                    NSWorkspace.sharedWorkspace().openURL_(NSURL.URLWithString_(url))
+                return
+            if action in bridge.KEY_ACTIONS:
+                # Catalog fetches, validation, Keychain and flock waits belong off AppKit's thread.
+                self.performSelectorInBackground_withObject_(
+                    objc.selector(self.keyBg_, signature=b"v@:@"), msg)
+                return
             if action == "login":
                 # Give each login an op id so a late failure from an abandoned attempt can only drop
                 # ITS OWN baseline, not a newer one for the same tool.
@@ -676,10 +829,46 @@ if objc is not None:
             self._pushResult(result)
             self._updateDot(result.get("state"))
 
+        def keyBg_(self, msg):
+            try:
+                result = dict(bridge.handle(self.ctx, dict(msg)))
+                if result.get("ok") and result.get("key_terminal"):
+                    from app.terminal import open_key_terminal
+                    open_key_terminal(self.ctx, result["key_terminal"])
+                    result["message"] = "your key terminal is opening — approval happens before paid use"
+            except Exception as exc:
+                _log_exception(exc, msg.get("secret") if isinstance(msg.get("secret"), str) else "")
+                # Provider exceptions can echo a credential, so raw text is still never
+                # forwarded wholesale. But collapsing everything into "try again" left the app
+                # unable to say why anything failed — to the user or to us. Our own errors are
+                # prose we wrote and are safe to show; for anything else only the exception's
+                # class name is added, which cannot contain a credential. The result is then
+                # redacted anyway, belt and braces.
+                from acctsw.errors import AcctswError
+                if isinstance(exc, (AcctswError, RuntimeError)):
+                    reason = str(exc).strip()
+                elif isinstance(exc, ModuleNotFoundError) and exc.name:
+                    # The missing module's name is the whole diagnosis and cannot carry a
+                    # credential. Without it this reads as "something is missing, good luck".
+                    reason = f"missing module {exc.name}"
+                else:
+                    reason = f"unexpected {type(exc).__name__}"
+                secret = msg.get("secret")
+                result = bridge._redact_key(
+                    {"ok": False,
+                     "error": f"couldn't complete that key request — {reason or type(exc).__name__}"},
+                    secret if isinstance(secret, str) else "")
+            result["key_action"] = msg.get("action")
+            result["key_request_id"] = msg.get("key_request_id")
+            result["key_target_id"] = msg.get("id")
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
+
         def switchBg_(self, msg):
             try:
                 result = dict(bridge.handle(self.ctx, msg))
             except Exception as exc:
+                _log_exception(exc)
                 result = {"ok": False, "error": str(exc).strip() or exc.__class__.__name__}
             self.performSelectorOnMainThread_withObject_waitUntilDone_(
                 objc.selector(self.finishSwitch_, signature=b"v@:@"), [msg, result], False)
@@ -699,6 +888,7 @@ if objc is not None:
         # --- helpers ------------------------------------------------------------------------
         @objc.python_method
         def _pushResult(self, result):
+            self._key_notices.deliver(result.get("state"), self._notify)
             # Deliberately does NOT stamp _last_state_sig: this runs for pushes from other paths
             # (the usage poll, a user action) whose state may already be older than what is on disk.
             # Stamping here could swallow a change; the state timer records its OWN signature before
@@ -759,6 +949,14 @@ def main() -> int:
     if "--check-app" in sys.argv[1:]:
         # Exercise the native app entrypoint in packaging checks without starting polling,
         # changing shell setup, or opening any account credentials.
+        from app.terminal import open_key_terminal, prepare_then_login
+        from app.menubar import usage_poll_interval, usage_poll_scope, KeySwitchNotices
+        import app.terminal
+        import app.menubar
+        assert callable(open_key_terminal) and callable(prepare_then_login)
+        assert usage_poll_interval(True) < usage_poll_interval(False)
+        assert usage_poll_scope(False, 0, at=1) == "all"
+        assert not KeySwitchNotices().seen
         bundle = NSBundle.mainBundle()
         info = bundle.infoDictionary()
         icon_name = str(info.get("CFBundleIconFile") or "")
@@ -768,9 +966,15 @@ def main() -> int:
             "bundle_identifier": str(bundle.bundleIdentifier() or ""),
             "bundle_name": str(info.get("CFBundleName") or ""),
             "icon_path": str(icon_path),
-            "icon_valid": bool(icon and icon.isValid()),
+            # Decode the icon without isValid(), which asks WindowServer to choose a display
+            # representation and aborts in a headless/sandboxed smoke process.
+            "icon_valid": bool(icon and any(rep.pixelsWide() > 0 and rep.pixelsHigh() > 0
+                                            for rep in icon.representations())),
             "python": sys.executable,
             "engine_file": str(Path(bridge.__file__)),
+            "terminal_file": app.terminal.__file__,
+            "menubar_file": app.menubar.__file__,
+            "main_file": __file__,
         }), flush=True)
         return 0
     # A GUI launch gives us only launchd's minimal PATH; add the dirs where claude/codex/node live
