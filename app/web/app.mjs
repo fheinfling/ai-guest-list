@@ -89,6 +89,44 @@ let keySequence = 0;
 const answering = new Set();
 const proving = new Set();
 let clockTimer = null;
+let drawerMotion = null;
+const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+
+// Animate our content wrapper without depending on WKWebView's ::details-content support.
+// `open` stays true until an exit finishes, but drawer-closing is logically dismissed.
+function moveDrawer(drawer, open, startedAt = Date.now()) {
+  drawerMotion?.animation.cancel();
+  drawerMotion = null;
+  const body = drawer.querySelector(".main-body");
+  if (!open && drawer.contains(document.activeElement)) {
+    drawer.querySelector(".drawer-handle").focus({ preventScroll: true });
+  }
+  drawer.open = true;
+  drawer.classList.toggle("drawer-closing", !open);
+  body.inert = !open;
+  const finish = () => {
+    drawer.open = open;
+    drawer.classList.remove("drawer-closing");
+    body.inert = false;
+    drawerMotion = null;
+  };
+  if (reducedMotion.matches) { finish(); return; }
+  const frames = [{ opacity: 0, transform: "translateY(12px)" }, { opacity: 1, transform: "translateY(0)" }];
+  const animation = drawer.querySelector(".drawer-content").animate(open ? frames : [...frames].reverse(), {
+    duration: 200, easing: "cubic-bezier(.2,.7,.2,1)", fill: "both",
+  });
+  drawerMotion = { animation, open, startedAt };
+  animation.onfinish = () => {
+    if (drawerMotion?.animation !== animation) return;
+    finish(); animation.cancel();
+  };
+  // A poll replaces the wrapper; resume its remaining time instead of replaying the motion.
+  animation.currentTime = Math.min(200, Math.max(0, Date.now() - startedAt));
+}
+
+reducedMotion.addEventListener("change", () => {
+  if (reducedMotion.matches && drawerMotion) drawerMotion.animation.finish();
+});
 
 function setPopoverVisible(visible) {
   if (visible && clockTimer === null) {
@@ -120,8 +158,11 @@ function render() {
   };
   const disclosures = "details.seat-disclosure, details.guest-drawer, details.header-menu";
   const openDisclosures = new Set(screen === renderedScreen
-    ? [...root.querySelectorAll(disclosures)].filter((node) => node.open).map(disclosureKey)
+    ? [...root.querySelectorAll(disclosures)].filter((node) => node.open && !node.classList.contains("drawer-closing")).map(disclosureKey)
     : []);
+  const motion = screen === renderedScreen ? drawerMotion : null;
+  drawerMotion?.animation.cancel();
+  drawerMotion = null;
   root.innerHTML = screen === "settings" ? buildSettings(state)
     : screen === "add" ? buildAddSeat(state, add)
     : screen === "add-key" ? buildAddKey(state, keyFlow)
@@ -143,6 +184,10 @@ function render() {
   // Restore before scrolling: a closed drawer has no scrollable height.
   for (const details of root.querySelectorAll(disclosures)) {
     details.open = openDisclosures.has(disclosureKey(details));
+  }
+  if (motion) {
+    const drawer = root.querySelector("details.guest-drawer");
+    if (drawer) moveDrawer(drawer, motion.open, motion.startedAt);
   }
   if (scrollTop) {
     const nextBody = root.querySelector(".main-body, .set-body");
@@ -188,8 +233,18 @@ function sendKeyFlow(action, extra = {}) {
 
 // --- event delegation (whole document, so overlay buttons work too) ---------------------------
 document.addEventListener("click", (e) => {
+  // Decide containment before a delegated action can replace the clicked DOM.
+  const handle = e.target.closest(".guest-drawer > summary");
+  if (handle) {
+    e.preventDefault();
+    const drawer = handle.parentElement;
+    moveDrawer(drawer, !drawer.open || drawer.classList.contains("drawer-closing"));
+    return;
+  }
+  const drawer = root.querySelector("details.guest-drawer[open]");
+  if (drawer && !drawer.contains(e.target) && !drawer.classList.contains("drawer-closing")) moveDrawer(drawer, false);
   const el = e.target.closest("[data-action]");
-  if (!el) return; // Native <summary> owns disclosure toggling.
+  if (!el) return; // Other summaries retain native disclosure toggling.
   const { action, tool, email, value } = el.dataset;
   if (el.disabled) return;
   switch (action) {
@@ -357,6 +412,12 @@ document.addEventListener("keydown", (e) => {
     e.preventDefault();
     answering.add(request.id); refreshKeyPrompts();
     send("answer_key_switch", { id: request.id, approved: false });
+    return;
+  }
+  const drawer = root.querySelector("details.guest-drawer[open]");
+  if (drawer) {
+    e.preventDefault();
+    if (!drawer.classList.contains("drawer-closing")) moveDrawer(drawer, false);
     return;
   }
   if (screen === "settings") { screen = "main"; render(); }

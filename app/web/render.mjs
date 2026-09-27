@@ -589,7 +589,11 @@ export function buildHTML(state) {
     <table class="roster" aria-label="seats and remaining headroom">
       <colgroup><col class="roster-seat-col"><col class="roster-window-col"><col class="roster-window-col"></colgroup>
       <thead><tr><th scope="col">your seats</th><th scope="col">5-hour left</th><th scope="col">weekly left</th></tr></thead>
-      <tbody>${[...seats].sort((a, b) => Number(b.status === "active") - Number(a.status === "active")).map((seat) => {
+      ${[...new Set(["codex", "claude", ...(state?.keys || []).map((key) => key.harness)])].map((tool) => {
+        const subscriptions = seats.filter((seat) => seat.tool === tool);
+        const keys = (state?.keys || []).filter((key) => key.harness === tool);
+        if (!subscriptions.length && !keys.length) return "";
+        return `<tbody><tr><th class="roster-tool" scope="rowgroup" colspan="3">${esc(TOOL_META[tool]?.label || tool || "API key")} /</th></tr>${subscriptions.sort((a, b) => Number(b.status === "active") - Number(a.status === "active")).map((seat) => {
         const active = seat.status === "active";
         const status = needsHello(seat) ? "sign-in needed" : active ? "active" : seat.status === "resting" ? "resting" : seat.status === "queued" ? "up next" : "ready";
         const windows = ["5h", "weekly"].map((win) => {
@@ -604,12 +608,16 @@ export function buildHTML(state) {
           const why = absent ? `no ${win === "5h" ? "5-hour" : "weekly"} window on this plan`
                              : "usage reading unavailable";
           const missing = left === null;
+          const reset = absent ? null : seat.usage?.windows?.[win]?.resets_at;
+          const resetText = reset && Number.isFinite(Date.parse(reset))
+            ? `<span class="roster-reset" data-reset-at="${esc(reset)}" data-clock-prefix="in" title="window resets at ${esc(new Date(reset).toLocaleString())}">in ${fmtCountdown(reset)}</span>` : "";
           return `<td class="roster-value${missing ? " roster-unknown" : ""}"${
             missing ? ` title="${esc(why)}" aria-label="${esc(why)}"` : ""}>${
-            missing ? "—" : `${left}%`}${seat.usage_stale && !missing ? `<span class="roster-freshness">last known</span>` : ""}</td>`;
+            missing ? "—" : `${left}%`}${seat.usage_stale && !missing ? `<span class="roster-freshness">last known</span>` : ""}${resetText}</td>`;
         }).join("");
-        return `<tr${active ? ' class="roster-active"' : ""}><th scope="row"><span class="roster-identity">${TOOL_META[seat.tool].label} / ${esc(seat.name)}</span><span class="roster-meta">${seat.plan ? `(${esc(seat.plan)}) ` : ""}<span class="roster-status">${status}</span></span></th>${windows}</tr>`;
-      }).join("")}${(state?.keys || []).map((key) => `<tr class="roster-key"><th scope="row"><span class="roster-identity">${esc(TOOL_META[key.harness]?.label || key.harness || "API key")} / ${esc(key.label)}</span>${key.model ? `<span class="roster-meta">${esc(key.model)}</span>` : ""}</th><td class="roster-key-terms" colspan="2">paid per token<span class="roster-meta">no app spend cap</span></td></tr>`).join("")}</tbody>
+        return `<tr${active ? ' class="roster-active"' : ""}><th scope="row"><span class="roster-identity" title="${esc(seat.name || seat.email)}">${esc(seat.name || seat.email)}</span><span class="roster-meta">${planChip(seat.plan)}<span class="roster-status">${status}</span></span></th>${windows}</tr>`;
+      }).join("")}${keys.map((key) => `<tr class="roster-key"><th scope="row"><span class="roster-identity" title="${esc(key.label)}">${esc(key.label)}</span>${key.model ? `<span class="roster-meta" title="${esc(key.model)}">${esc(key.model)}</span>` : ""}</th><td class="roster-key-terms" colspan="2">paid per token<span class="roster-meta">no app spend cap</span></td></tr>`).join("")}</tbody>`;
+      }).join("")}
     </table>
   </section>` : "";
   // app/icon.svg's tile, glow and cream leaf, closed across the room. The knob keeps its
@@ -633,9 +641,9 @@ export function buildHTML(state) {
     <details class="header-menu"><summary class="ibtn" aria-label="app menu" title="app menu">⋯</summary><nav class="menu-panel"><button data-action="settings">settings</button><button data-action="quit">quit ai guest list</button></nav></details></div></header>
     <div class="ambient-stage">${prompts}${paid ? paidUseControl(state) : `<div class="availability">${glance ? roster : ambientVerdict(state)}</div>`}</div>
     <details class="guest-drawer"><summary class="drawer-handle"><span>${glance ? "seat options" : "guest list"}</span>${glance ? "" : `<span class="drawer-count">${seats.length + (state?.keys?.length || 0)} seats</span>`}<span class="chevron" aria-hidden="true">⌃</span></summary>
-      <div class="main-body">${supervisionBanner(state)}${toolGroup("codex", state?.tools?.codex, (state?.keys || []).filter((k) => k.harness === "codex"))}${toolGroup("claude", state?.tools?.claude, (state?.keys || []).filter((k) => k.harness === "claude"))}
+      <div class="drawer-content"><div class="main-body">${supervisionBanner(state)}${toolGroup("codex", state?.tools?.codex, (state?.keys || []).filter((k) => k.harness === "codex"))}${toolGroup("claude", state?.tools?.claude, (state?.keys || []).filter((k) => k.harness === "claude"))}
       ${!seats.length && !state?.keys?.length ? `<p class="empty">use ＋ above to add a subscription or API key.</p>` : ""}${moved}
-      </div></details></div>`;
+      </div></div></details></div>`;
 }
 
 function paidUseControl(state) {
