@@ -597,9 +597,19 @@ function buildHTML(state) {
         const status = needsHello(seat) ? "sign-in needed" : active ? "active" : seat.status === "resting" ? "resting" : seat.status === "queued" ? "up next" : "ready";
         const windows = ["5h", "weekly"].map((win) => {
           const reported = seat.usage?.reported_windows;
-          const used = seat.usage_unknown || (Array.isArray(reported) && !reported.includes(win)) ? null : pct(seat, win);
+          const absent = Array.isArray(reported) && !reported.includes(win);
+          const used = seat.usage_unknown || absent ? null : pct(seat, win);
           const left = Number.isFinite(used) ? Math.round(100 - used) : null;
-          return `<td class="roster-value${left === null ? " roster-unknown" : ""}">${left === null ? "unknown" : `${left}%`}${seat.usage_stale && left !== null ? `<span class="roster-freshness">last known</span>` : ""}</td>`;
+          // A dash rather than a word. Under a heading that reads "5-hour left", "none" and
+          // "unknown" both invite the reading "no headroom left" — which is what 0% means, and
+          // the opposite of what an absent window means. The reason still reaches hover and
+          // assistive tech, so nothing is lost by the cell being quiet.
+          const why = absent ? `no ${win === "5h" ? "5-hour" : "weekly"} window on this plan`
+                             : "usage reading unavailable";
+          const missing = left === null;
+          return `<td class="roster-value${missing ? " roster-unknown" : ""}"${
+            missing ? ` title="${esc(why)}" aria-label="${esc(why)}"` : ""}>${
+            missing ? "—" : `${left}%`}${seat.usage_stale && !missing ? `<span class="roster-freshness">last known</span>` : ""}</td>`;
         }).join("");
         return `<tr${active ? ' class="roster-active"' : ""}><th scope="row"><span class="roster-identity">${TOOL_META[seat.tool].label} / ${esc(seat.name)}</span><span class="roster-meta">${seat.plan ? `(${esc(seat.plan)}) ` : ""}<span class="roster-status">${status}</span></span></th>${windows}</tr>`;
       }).join("")}${(state?.keys || []).map((key) => `<tr class="roster-key"><th scope="row"><span class="roster-identity">${esc(TOOL_META[key.harness]?.label || key.harness || "API key")} / ${esc(key.label)}</span>${key.model ? `<span class="roster-meta">${esc(key.model)}</span>` : ""}</th><td class="roster-key-terms" colspan="2">paid per token<span class="roster-meta">no app spend cap</span></td></tr>`).join("")}</tbody>

@@ -143,7 +143,7 @@ test("unknown roster readings do not imply remaining credit from old cached valu
     usage5h: 100, usageWeek: 75, usage_fetched_at: "2026-09-13T12:00:00Z",
   })] } } }));
   const roster = html.match(/<table class="roster"[\s\S]*?<\/table>/)[0];
-  assert.equal((roster.match(/>unknown<\/td>/g) || []).length, 2);
+  assert.equal((roster.match(/>—<\/td>/g) || []).length, 2);
   assert.doesNotMatch(roster, /\d+%/);
   assert.match(html, /data-usage-at="2026-09-13T12:00:00Z"/);
   assert.match(html, /last known reading/);
@@ -154,7 +154,7 @@ test("missing usage is explicitly unknown in the roster and disclosures", () => 
   const html = buildHTML(state({ tools: { codex: { seats: [seat({ usage_unknown: true,
     usage5h: null, usageWeek: null, usage: { windows: {} },
   })] } } }));
-  assert.equal((html.match(/>unknown<\/td>/g) || []).length, 2);
+  assert.equal((html.match(/>—<\/td>/g) || []).length, 2);
   assert.equal((html.match(/>usage unknown</g) || []).length, 2);
   assert.equal((html.match(/style="width:0%"/g) || []).length, 2);
   assert.doesNotMatch(html, />0%<|>0% left</);
@@ -1460,12 +1460,12 @@ test("roster reports left, unknown, last known and unreported windows without in
   assert.match(render({ usage5h: 38, usageWeek: 21 }), />62%<\/td>[\s\S]*>79%<\/td>/);
   assert.match(render({ usage5h: 100, usageWeek: 0 }), />0%<\/td>[\s\S]*>100%<\/td>/);
   for (const over of [{ usage_unknown: true }, { usage5h: null, usageWeek: null }]) {
-    assert.equal((render(over).match(/>unknown<\/td>/g) || []).length, 2);
+    assert.equal((render(over).match(/>—<\/td>/g) || []).length, 2);
   }
   const stale = render({ usage_stale: true });
   assert.equal((stale.match(/>last known<\/span>/g) || []).length, 2);
   const weekly = render({ usage: { reported_windows: ["weekly"] } });
-  assert.match(weekly, />unknown<\/td>/);
+  assert.match(weekly, />—<\/td>/);
   assert.match(weekly, />90%<\/td>/);
   assert.doesNotMatch(weekly, />80%</);
 });
