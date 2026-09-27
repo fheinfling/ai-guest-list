@@ -1456,6 +1456,11 @@ test("roster groups tools once in one table, active seats lead each group, and h
   assert.match(rows[2], /roster-key/);
   assert.match(rows[2], /literal\/model-id/);
   assert.match(rows[2], /paid per token.*no app spend cap/);
+  // The key seat's own action lives on the band, not only inside the sheet: burying the one
+  // thing a key seat is for was the defect this replaced. It is a credential-free id handoff to
+  // the existing gate, so no price or consent copy belongs on the row itself.
+  assert.match(rows[2], /data-action="key-terminal" data-id="key-1"/);
+  assert.match(rows[2], /use in new terminal/);
   assert.doesNotMatch(rows[2], /roster-value|\d+%/);
   assert.doesNotMatch(h, /invented-|class="track/);
   assert.equal(tools.codex.seats[0].name, "Rest", "render must not reorder bridge state");

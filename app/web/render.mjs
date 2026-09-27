@@ -616,7 +616,7 @@ export function buildHTML(state) {
             missing ? "—" : `${left}%`}${seat.usage_stale && !missing ? `<span class="roster-freshness">last known</span>` : ""}${resetText}</td>`;
         }).join("");
         return `<tr${active ? ' class="roster-active"' : ""}><th scope="row"><span class="roster-identity" title="${esc(seat.name || seat.email)}">${esc(seat.name || seat.email)}</span><span class="roster-meta">${planChip(seat.plan)}<span class="roster-status">${status}</span></span></th>${windows}</tr>`;
-      }).join("")}${keys.map((key) => `<tr class="roster-key"><th scope="row"><span class="roster-identity" title="${esc(key.label)}">${esc(key.label)}</span>${key.model ? `<span class="roster-meta" title="${esc(key.model)}">${esc(key.model)}</span>` : ""}</th><td class="roster-key-terms" colspan="2">paid per token<span class="roster-meta">no app spend cap</span></td></tr>`).join("")}</tbody>`;
+      }).join("")}${keys.map((key) => `<tr class="roster-key"><th scope="row"><span class="roster-identity" title="${esc(key.label)}">${esc(key.label)}</span>${key.model ? `<span class="roster-meta" title="${esc(key.model)}">${esc(key.model)}</span>` : ""}</th><td class="roster-key-terms" colspan="2"><span class="key-terms">paid per token<span class="roster-meta">no app spend cap</span></span><button class="key-use" data-action="key-terminal" data-id="${esc(key.id)}">use in new terminal</button></td></tr>`).join("")}</tbody>`;
       }).join("")}
     </table>
   </section>` : "";

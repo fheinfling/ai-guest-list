@@ -411,3 +411,17 @@ input:focus-visible ~ .sw, .free-control:focus-within, .proof-gate:focus-within 
   .roster-glance h1 { margin-bottom:16px; }
   .roster tbody th, .roster-value { padding-top:9px; padding-bottom:9px; }
 }
+
+/* A key seat's own action, reachable without opening the sheet. Deliberately the same quiet
+   weight as any other secondary control: this one spends real money, so the design should not
+   make it inviting. The paid-use gate and the confirmation still stand behind it.
+   It sits under the terms rather than beside them — the two window columns leave this cell only
+   48% of the width, and side by side wraps "paid per token" onto three lines. A key row is
+   therefore taller than a subscription row, deliberately; check-layout.py knows the difference. */
+.key-terms { display:block; }
+.key-use {
+  display:block; margin:8px 0 0 auto; padding:5px 12px; min-height:28px;
+  border:1px solid var(--edge); border-radius:999px;
+  background:transparent; color:inherit; font:inherit; font-size:.8rem; font-weight:600;
+}
+.key-use:hover { background:var(--surface); }

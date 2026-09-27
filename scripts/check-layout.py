@@ -126,7 +126,11 @@ MEASURE = r"""() => {
   let columns;
   for (const row of rows) {
     const height = row.getBoundingClientRect().height;
-    const budget = row.querySelector('.roster-freshness') ? 90 : 72;
+    // A key row carries an action that subscription rows do not — "use in new terminal" sits
+    // under its terms, because the two window columns leave this cell only 48% of the width.
+    // That is a deliberate 12px, not drift; everything else still holds at 72.
+    const budget = row.querySelector('.roster-freshness') ? 90
+      : row.classList.contains('roster-key') ? 84 : 72;
     check(height <= budget, `roster row ${row.textContent.trim().slice(0, 70)}: ${height.toFixed(1)}px > ${budget}px`);
     const cells = [...row.querySelectorAll('.roster-value')];
     if (!cells.length) continue;
