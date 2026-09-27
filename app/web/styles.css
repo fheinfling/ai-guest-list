@@ -142,8 +142,15 @@ summary::-webkit-details-marker { display:none; }
 .mood-resting .hero-followup { margin-top:14px; }
 
 /* One quiet way down. On demand, a solid sheet covers the reading; the header stays pinned. */
-.guest-drawer { --handle-height:60px; flex:none; margin:0 20px 18px; z-index:4; }
-.drawer-handle { min-height:48px; padding:10px 4px; display:flex; align-items:center; gap:10px; font-weight:600; }
+/* Closed, this is the same sheet as when it is open — just collapsed to its handle. It carries
+   the sheet's own surface, corners and lift so the roster visibly scrolls BEHIND a bar, instead
+   of disappearing under bare text floating on the field. */
+.guest-drawer {
+  --handle-height:60px; flex:none; margin:0; z-index:4;
+  background:var(--sheet); border-radius:26px 26px 0 0;
+  box-shadow:0 -10px 24px var(--shadow);
+}
+.drawer-handle { min-height:56px; padding:10px 24px; display:flex; align-items:center; gap:10px; font-weight:600; }
 .drawer-count { margin-left:auto; font-weight:400; font-size:.9rem; }
 .chevron { display:inline-flex; align-items:center; justify-content:center; width:24px; height:24px; flex:none; font-size:1.15rem; }
 .guest-drawer[open] {
