@@ -17,6 +17,7 @@ executes it — at the cost of not honouring an iTerm/Ghostty preference; reliab
 from __future__ import annotations
 
 import os
+import json
 import shlex
 import subprocess
 import tempfile
@@ -135,12 +136,47 @@ def shell_quote(args: list[str]) -> str:
 
 
 def open_key_terminal(ctx: Context, seat_id: str) -> None:
-    """Open a pinned wrapper, with no OAuth sync-back and no credential in the script."""
+    """Open a pin through this app's engine, with no sync-back or credential in the script.
+
+    Installed cx/cl/acctsw wrappers may intentionally belong to an older source checkout.
+    Never send app engine options through them, even when they exist and are executable.
+    """
     from acctsw import install, keyseats
     seat = keyseats.get(ctx, seat_id)
     if seat is None:
         raise ValueError("that key seat is no longer on the list")
-    wrapper = "cx" if seat["harness"] == "codex" else "cl"
-    installed = install.BIN_DIR / wrapper
-    open_in_terminal(shell_quote([str(installed) if installed.is_file() else wrapper,
-                                   "--key", seat["id"]]))
+    # The harness is interpolated into a generated script; accept only the known tools.
+    tool = seat.get("harness")
+    if tool not in TOOLS:
+        raise ValueError("that key seat has an unknown tool")
+    engine = checked_engine_command("run-key-v1")
+    command = shell_quote([*engine, "run", tool, "--key", seat["id"]])
+    # Preserve cx/cl's terminal reset even if the engine crashes or is interrupted.
+    open_in_terminal(shell_quote(["/bin/sh", "-c", install.supervised_script(tool, command)]))
+
+
+def checked_engine_command(capability: str) -> list[str]:
+    """Resolve and probe the app's runtime before opening Terminal (also for future options).
+
+    Use the same script for the probe and real launch. Its explicit Python environment is
+    applied AFTER the terminal's login shell, so shell rc files cannot redirect the engine.
+    Bundles get their own Python home/CA roots; source and alias installs get their own root.
+    """
+    from acctsw.install import engine_script
+    from acctsw.procenv import harden_env
+    command = ["/bin/sh", "-c", engine_script(), "acctsw"]
+    error = ("this app's engine couldn't start a paid key terminal. Quit and reopen AI Guest List; "
+             "if it persists, reinstall the app or rebuild/restart your source installation.")
+    # Generous timeout: the first launch after an update can wait on Gatekeeper scanning the
+    # bundled interpreter, and a slow start must not read as a broken install.
+    try:
+        result = subprocess.run([*command, "--capabilities"], capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=30, env=harden_env())
+        payload = json.loads(result.stdout) if result.returncode == 0 else None
+        capabilities = payload.get("capabilities") if isinstance(payload, dict) else None
+        if not isinstance(capabilities, list) or capability not in capabilities:
+            raise RuntimeError(error)
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        # Raw subprocess diagnostics may contain user shell output; show only our own prose.
+        raise RuntimeError(error) from exc
+    return command
