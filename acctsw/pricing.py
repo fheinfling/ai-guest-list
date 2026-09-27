@@ -13,7 +13,7 @@ import os
 import tempfile
 import urllib.error
 import urllib.request
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
@@ -339,6 +339,46 @@ class Catalog:
                 and self.checked_at - self.fetched_at > CACHED_STALE_AFTER)
 
 
+def _sanitize_catalog(value: Any, key: str) -> Any:
+    """Redact decoded credentials, including future model fields and nested mapping keys.
+
+    Match key-seat validation's minimum length: empty/public keys and tiny placeholders must
+    not rewrite ordinary catalog text. Keep models and their non-secret metadata intact.
+    """
+    if not key or len(key) <= 4:
+        return value
+    if isinstance(value, str):
+        clean = value.replace(key, "[redacted]")
+        # The marker (possibly joined to adjacent text) must not recreate an unusual key.
+        # This fallback strictly shrinks the string because keys here exceed four characters.
+        while key in clean:
+            clean = clean.replace(key, "***")
+        return clean
+    if is_dataclass(value):
+        return replace(value, **{f.name: _sanitize_catalog(getattr(value, f.name), key)
+                                 for f in fields(value)})
+    if isinstance(value, dict):
+        return {_sanitize_catalog(k, key): _sanitize_catalog(v, key) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_catalog(v, key) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_sanitize_catalog(v, key) for v in value)
+    return value
+
+
+def _write_catalog_cache(path: Path, cache: dict) -> None:
+    temporary = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as f:
+            temporary = f.name
+            json.dump(cache, f, default=str)
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            Path(temporary).unlink(missing_ok=True)
+
+
 def fetch_catalog(provider: Provider, key: str = "", *, get: HttpGet = _default_get,
                   cache_path: Path | None = None, at: datetime | None = None,
                   timeout: float = 20, wire_api: WireAPI | None = None) -> Catalog:
@@ -353,17 +393,29 @@ def fetch_catalog(provider: Provider, key: str = "", *, get: HttpGet = _default_
     cache_key = hashlib.sha256(identity.encode()).hexdigest()
     cache: dict = {}
     cached = None
+    contaminated = False
     try:
         cache = json.loads(path.read_text(), parse_float=Decimal)
         if not isinstance(cache, dict):
             cache = {}
         entry = cache.get(cache_key)
         if isinstance(entry, dict):
+            clean_entry = _sanitize_catalog(entry, key)
+            contaminated = clean_entry != entry
+            cache[cache_key] = entry = clean_entry
             fetched = _date(entry["fetched_at"])
             if fetched <= at:
                 cached = Catalog([_model(m) for m in entry["models"]], "cache", fetched, at)
     except (OSError, ValueError, KeyError, TypeError):
         cache = {}
+    if contaminated:
+        # Repair even fresh entries and stale fallbacks before any return or failed refresh.
+        try:
+            _write_catalog_cache(path, cache)
+        except OSError:
+            # A disposable cache must not retain a known credential if replacement failed.
+            # If even removal is denied, surface that failure instead of silently keeping it.
+            path.unlink(missing_ok=True)
     if cached is not None and not cached.cache_expired:
         return cached
     try:
@@ -372,6 +424,7 @@ def fetch_catalog(provider: Provider, key: str = "", *, get: HttpGet = _default_
         if status != 200:
             raise ValueError(f"http_{status}")
         models = parse_catalog(provider, body, wire_api=wire, verified_at=at.isoformat())
+        models = _sanitize_catalog(models, key)
         if not models:
             if provider.id == "langdock_anthropic":
                 return Catalog([], "unavailable", None, at, "no_models")
@@ -381,16 +434,8 @@ def fetch_catalog(provider: Provider, key: str = "", *, get: HttpGet = _default_
         return replace(cached, error=error) if cached else Catalog(
             [], "unavailable", None, at, error)
     cache[cache_key] = {"fetched_at": at.isoformat(), "models": [asdict(m) for m in models]}
-    temporary = None
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as f:
-            temporary = f.name
-            json.dump(cache, f, default=str)
-        os.replace(temporary, path)
+        _write_catalog_cache(path, cache)
     except OSError:
         pass  # A read-only cache must not discard a successfully fetched catalog.
-    finally:
-        if temporary is not None:
-            Path(temporary).unlink(missing_ok=True)
     return Catalog(models, "live", at, at)
