@@ -657,6 +657,7 @@ def pty_spawn(argv: list, on_output: Callable[[bytes], bool],
     if out_fd is None:
         out_fd = 1
     stdin_is_tty = stdin_fd is not None and os.isatty(stdin_fd)
+    out_is_tty = os.isatty(out_fd)
 
     pid, master_fd = pty.fork()
     if pid == 0:
@@ -740,24 +741,46 @@ def pty_spawn(argv: list, on_output: Callable[[bytes], bool],
                     data = b""
                 if not data:
                     break  # child closed the pty → exited
-                os.write(out_fd, data)
+                try:
+                    os.write(out_fd, data)
+                except OSError:
+                    if out_is_tty:
+                        # The terminal was revoked (window closed) without a SIGHUP reaching us.
+                        pending_signal = signal.SIGHUP
+                        stop_requested = True
+                    break
                 if on_output(data):
                     stop_requested = True
                     break
             if stdin_fd is not None and stdin_fd in rlist:
                 try:
                     inp = os.read(stdin_fd, 65536)
+                except BlockingIOError:
+                    inp = None  # spurious wakeup, not a hangup
                 except OSError:
                     inp = b""
-                if inp:
+                if inp is None:
+                    pass
+                elif inp:
                     os.write(master_fd, inp)
+                elif stdin_is_tty:
+                    # A tty only reads EOF/EIO once it is revoked: the window was closed but no
+                    # SIGHUP reached us (shell/Terminal setups differ). Without this the supervisor
+                    # — and a paid child — would run on headless, and the session never clears.
+                    pending_signal = signal.SIGHUP
+                    stop_requested = True
+                    break
                 else:
-                    watch.remove(stdin_fd)  # stdin EOF → stop watching (avoid busy-loop)
+                    watch.remove(stdin_fd)  # piped stdin EOF → stop watching (avoid busy-loop)
             # Checked on EVERY iteration, not only on a select timeout: a chatty TUI keeps the
             # master fd readable forever, so a timeout-only tick would never fire on the one child
             # that most needs supervising.
             if on_tick is not None and time.monotonic() >= next_tick:
                 next_tick = time.monotonic() + tick_interval
+                if stdin_is_tty and not _tty_alive(stdin_fd):
+                    pending_signal = signal.SIGHUP
+                    stop_requested = True
+                    break
                 if on_tick():
                     stop_requested = True
                     break
@@ -794,6 +817,15 @@ def pty_spawn(argv: list, on_output: Callable[[bytes], bool],
         return _exitcode(status)
     except ChildProcessError:
         return 0
+
+
+def _tty_alive(fd: int) -> bool:
+    """False once the terminal behind ``fd`` has been revoked (its window was closed)."""
+    try:
+        termios.tcgetattr(fd)
+        return True
+    except (termios.error, OSError):
+        return False
 
 
 def _terminate(pid: int, master_fd: int | None = None) -> int:

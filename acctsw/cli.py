@@ -296,7 +296,10 @@ def _cmd_run(ctx: Context, ns) -> int:
     from . import appalive
 
     def notify(msg: str) -> None:
-        print(f"· {msg}", file=sys.stderr)
+        try:
+            print(f"· {msg}", file=sys.stderr)
+        except OSError:
+            pass  # a closed terminal must not abort the stop that follows the message
 
     args = list(ns.args or [])
     if args and args[0] == "--":  # argparse REMAINDER keeps a leading separator
