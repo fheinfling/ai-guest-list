@@ -1,6 +1,7 @@
 # Design brief — the popover, second pass
 
-For whoever designs or builds a variant. Read this before writing any CSS.
+The reasoning behind the shipped popover: who it is for, what was wrong with the design it
+replaced, and the information architecture it answers to. Read this before changing it.
 
 Everything in §2 is **observed**, not asserted: each finding was reproduced by rendering the
 shipping UI from a real engine payload and looking at it. Reproduce them yourself with
@@ -9,8 +10,8 @@ shipping UI from a real engine payload and looking at it. Reproduce them yoursel
 python3 scripts/design-gallery.py          # builds, serves and opens the gallery
 ```
 
-`v0-today` in that gallery is the current design, generated from `app/web/`. It is the baseline
-every variant has to beat.
+`scripts/design-gallery.py` renders the shipping UI from a real engine payload at the true
+376x600, in both themes, across the eight states the findings below refer to.
 
 ---
 
@@ -134,9 +135,9 @@ are already here.
 
 ---
 
-## 3. The information architecture — decided once, shared by all five variants
+## 3. The information architecture
 
-Variants differ in **look**, not in structure. These decisions are settled; a variant that wants to
+These decisions are settled; a change that wants to
 depart from one must say why in its README.
 
 **IA-1 · The popover opens with a verdict, not with materials.**
@@ -296,28 +297,3 @@ developer who is mid-task and mildly annoyed. Spend the boldness in **one** plac
 everything around it quiet.
 
 ---
-
-## 8. What each variant must deliver
-
-`design/variants/v<N>-<name>/`:
-
-- `render.mjs` — a fork of `app/web/render.mjs`, same exports, same behaviour contract.
-- `styles.css` — a fork of `app/web/styles.css`.
-- `README.md` — one paragraph: the palette as 4–6 named hex values, the typefaces and their roles,
-  the layout concept, and **what the one memorable element is**. Say what was deliberately not
-  done.
-
-It must render all eight gallery states, in both themes:
-
-| state | what it is testing |
-|---|---|
-| `main` | the everyday glance |
-| `spending` | money running: one owner for the fact, an obvious stop |
-| `asking` | priced consent — symmetric exits (F1) |
-| `asking-unpriced` | consent with no price — the common case (F3) |
-| `trouble` | nothing ready: does the verdict lead? is the key seat findable? (F5) |
-| `settings` | three sections, one-line subtitles, money set apart (F8) |
-| `models` | 458 real models — the density test (F2) |
-| `models-unpriced` | the honest no-price column |
-
-Add variants and re-run `python3 scripts/design-gallery.py`; they are picked up automatically.
