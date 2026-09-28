@@ -71,7 +71,7 @@ function celebrate() {
   setTimeout(() => root.firstElementChild?.classList.remove("celebrate"), 600);
 }
 function flash(text) {
-  overlay.innerHTML = '<div class="toast"></div>';
+  overlay.innerHTML = '<div class="toast" role="status"></div>';
   overlay.firstElementChild.textContent = text;
   setTimeout(() => { if (overlay.querySelector(".toast")) overlay.innerHTML = ""; }, 3000);
 }
@@ -89,12 +89,50 @@ let keySequence = 0;
 const answering = new Set();
 const proving = new Set();
 let clockTimer = null;
+let drawerMotion = null;
+const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+
+// Animate our content wrapper without depending on WKWebView's ::details-content support.
+// `open` stays true until an exit finishes, but drawer-closing is logically dismissed.
+function moveDrawer(drawer, open, startedAt = Date.now()) {
+  drawerMotion?.animation.cancel();
+  drawerMotion = null;
+  const body = drawer.querySelector(".main-body");
+  if (!open && drawer.contains(document.activeElement)) {
+    drawer.querySelector(".drawer-handle").focus({ preventScroll: true });
+  }
+  drawer.open = true;
+  drawer.classList.toggle("drawer-closing", !open);
+  body.inert = !open;
+  const finish = () => {
+    drawer.open = open;
+    drawer.classList.remove("drawer-closing");
+    body.inert = false;
+    drawerMotion = null;
+  };
+  if (reducedMotion.matches) { finish(); return; }
+  const frames = [{ opacity: 0, transform: "translateY(12px)" }, { opacity: 1, transform: "translateY(0)" }];
+  const animation = drawer.querySelector(".drawer-content").animate(open ? frames : [...frames].reverse(), {
+    duration: 200, easing: "cubic-bezier(.2,.7,.2,1)", fill: "both",
+  });
+  drawerMotion = { animation, open, startedAt };
+  animation.onfinish = () => {
+    if (drawerMotion?.animation !== animation) return;
+    finish(); animation.cancel();
+  };
+  // A poll replaces the wrapper; resume its remaining time instead of replaying the motion.
+  animation.currentTime = Math.min(200, Math.max(0, Date.now() - startedAt));
+}
+
+reducedMotion.addEventListener("change", () => {
+  if (reducedMotion.matches && drawerMotion) drawerMotion.animation.finish();
+});
 
 function setPopoverVisible(visible) {
   if (visible && clockTimer === null) {
     clockTimer = setInterval(() => {
       // Tick text without rebuilding the DOM or disturbing keyboard focus.
-      if (screen === "main") updateClockText(root);
+      updateClockText(root);
       // Expired consent is never left looking actionable, even without a state revision.
       refreshKeyPrompts();
     }, 1000);
@@ -110,10 +148,21 @@ function render() {
   // Only when the screen is unchanged — navigating must start the new screen at the top.
   const prevBody = root.querySelector(".main-body, .set-body");
   const scrollTop = screen === renderedScreen && prevBody ? prevBody.scrollTop : 0;
-  // The one-second countdown paint must not collapse a seat the user is reading.
-  const expandedCards = screen === renderedScreen
-    ? [...root.querySelectorAll(".seat.expanded")].map((card) => [card.dataset.tool, card.dataset.email])
-    : [];
+  // Polls must keep native disclosures open, including the enclosing drawer. Identity follows
+  // the seat or the menu's action, never its position in a reordered list.
+  const disclosureKey = (details) => {
+    const card = details.closest("[data-card]");
+    if (card) return JSON.stringify(["seat", card.dataset.tool, card.dataset.email]);
+    if (details.classList.contains("guest-drawer")) return "guest-drawer";
+    return JSON.stringify(["menu", details.querySelector("[data-action]")?.dataset.action]);
+  };
+  const disclosures = "details.seat-disclosure, details.guest-drawer, details.header-menu";
+  const openDisclosures = new Set(screen === renderedScreen
+    ? [...root.querySelectorAll(disclosures)].filter((node) => node.open && !node.classList.contains("drawer-closing")).map(disclosureKey)
+    : []);
+  const motion = screen === renderedScreen ? drawerMotion : null;
+  drawerMotion?.animation.cancel();
+  drawerMotion = null;
   root.innerHTML = screen === "settings" ? buildSettings(state)
     : screen === "add" ? buildAddSeat(state, add)
     : screen === "add-key" ? buildAddKey(state, keyFlow)
@@ -126,19 +175,23 @@ function render() {
   for (const button of root.querySelectorAll('[data-action="key-prove"]')) {
     if (proving.has(button.dataset.id)) {
       button.disabled = true; button.textContent = "checking endpoint…";
+      // The native checkbox gate must keep the pending button visible after the DOM swap.
+      const gate = button.closest(".proof-gate")?.querySelector(".local-check");
+      if (gate) gate.checked = true;
     }
   }
   renderedScreen = screen;
+  // Restore before scrolling: a closed drawer has no scrollable height.
+  for (const details of root.querySelectorAll(disclosures)) {
+    details.open = openDisclosures.has(disclosureKey(details));
+  }
+  if (motion) {
+    const drawer = root.querySelector("details.guest-drawer");
+    if (drawer) moveDrawer(drawer, motion.open, motion.startedAt);
+  }
   if (scrollTop) {
     const nextBody = root.querySelector(".main-body, .set-body");
     if (nextBody) nextBody.scrollTop = scrollTop;
-  }
-  if (screen === "main" && expandedCards.length) {
-    for (const card of root.querySelectorAll(".seat")) {
-      if (expandedCards.some(([tool, email]) => tool === card.dataset.tool && email === card.dataset.email)) {
-        card.classList.add("expanded");
-      }
-    }
   }
   // mirror the theme onto <body> so overlays (siblings of #root) get the same CSS vars
   const theme = (state.settings && state.settings.theme === "dark") ? "dark" : "light";
@@ -180,13 +233,23 @@ function sendKeyFlow(action, extra = {}) {
 
 // --- event delegation (whole document, so overlay buttons work too) ---------------------------
 document.addEventListener("click", (e) => {
-  const el = e.target.closest("[data-action]");
-  if (!el) {
-    // tapping a seat card body (not an action) expands/collapses it (spec §6)
-    const card = e.target.closest("[data-card]");
-    if (card) card.classList.toggle("expanded");
+  // Decide containment before a delegated action can replace the clicked DOM.
+  const handle = e.target.closest(".guest-drawer > summary");
+  if (handle) {
+    e.preventDefault();
+    const drawer = handle.parentElement;
+    moveDrawer(drawer, !drawer.open || drawer.classList.contains("drawer-closing"));
     return;
   }
+  const drawer = root.querySelector("details.guest-drawer[open]");
+  if (drawer && !drawer.contains(e.target) && !drawer.classList.contains("drawer-closing")) moveDrawer(drawer, false);
+  // The + and ⋯ menus are native <details>, which stay open until their own summary is clicked
+  // again. Dismiss on any click outside, and never leave both open at once.
+  for (const menu of root.querySelectorAll("details.header-menu[open]")) {
+    if (!menu.contains(e.target)) menu.open = false;
+  }
+  const el = e.target.closest("[data-action]");
+  if (!el) return; // Other summaries retain native disclosure toggling.
   const { action, tool, email, value } = el.dataset;
   if (el.disabled) return;
   switch (action) {
@@ -348,6 +411,27 @@ document.addEventListener("change", (e) => {
 // Esc pops a sub-view (spec §9): settings → main; add → one step back (like the chevron).
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
+  const request = (state.pending_key_switches || []).find((r) =>
+    r.status === "pending" && Date.parse(r.expires_at) > Date.now() && !answering.has(r.id));
+  if (request) {
+    e.preventDefault();
+    answering.add(request.id); refreshKeyPrompts();
+    send("answer_key_switch", { id: request.id, approved: false });
+    return;
+  }
+  const drawer = root.querySelector("details.guest-drawer[open]");
+  if (drawer) {
+    e.preventDefault();
+    if (!drawer.classList.contains("drawer-closing")) moveDrawer(drawer, false);
+    return;
+  }
+  const menu = root.querySelector("details.header-menu[open]");
+  if (menu) {
+    e.preventDefault();
+    menu.open = false;
+    menu.querySelector("summary")?.focus();   // keyboard users keep their place
+    return;
+  }
   if (screen === "settings") { screen = "main"; render(); }
   else if (screen === "add") addBack();
   else if (screen === "add-key") keyBack();

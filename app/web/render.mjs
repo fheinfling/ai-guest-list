@@ -1,7 +1,5 @@
-// Pure render logic for the "ai guest list" popover (spec-driven). No DOM/bridge side effects →
-// unit-testable under node. Type rule (spec §0/§3): humanist SANS for UI; MONO only for the
-// wordmark, emails, %, countdowns, plan codes and section meta. Status = flat colored dots, never
-// emoji; the only emoji is 💛.
+// Shipping popover and pushed views: a verdict, an open seat roster, and native disclosures.
+// Pure state-to-markup rendering and bridge reducers; clock updates only change existing text.
 
 export const TOOL_META = {
   codex: { label: "Codex", plan: "CHATGPT BUSINESS", accent: "var(--codex)" },   // teal
@@ -38,9 +36,8 @@ export function doorKey(state) {
   return free || seats.length === 0 ? "open" : "shut";
 }
 
-// The header door mark (same glyph the menu bar swaps), matching the handoff icon-states prototype:
-// open = warm room with a spinning disco ball + twinkles and the door swung ajar; shut = a closed
-// cream door with a gold knob. Animated purely in CSS; aria-label carries the meaning.
+// Accessible door mark for the settings legend, matching the native menu-bar states.
+// Open shows the room and disco ball; shut shows a cream leaf and gold knob.
 export function doorMark(state) {
   const key = doorKey(state);
   const label = key === "open" ? "a model's free — come on in" : "every seat's resting";
@@ -104,8 +101,11 @@ export function fmtSessionAge(iso, now = Date.now()) {
   return ` · ${Math.floor(minutes / 1440)}d`;
 }
 
-// Clock ticks change text only: leave focused buttons, expanded cards, and scroll position intact.
+// Clock ticks change text only: leave focus, native disclosures, and scroll position intact.
 export function updateClockText(root, now = Date.now()) {
+  for (const node of root.querySelectorAll("[data-expire-at]")) {
+    node.textContent = `${Math.max(0, Math.ceil((Date.parse(node.dataset.expireAt) - now) / 1000))}s`;
+  }
   for (const node of root.querySelectorAll("[data-usage-at]")) {
     node.textContent = fmtUsageAge(node.dataset.usageAt, now);
   }
@@ -113,7 +113,7 @@ export function updateClockText(root, now = Date.now()) {
     node.textContent = `${node.dataset.clockPrefix || "resets in"} ${fmtCountdown(node.dataset.resetAt, now)}`;
   }
   for (const node of root.querySelectorAll("[data-session-at]")) {
-    node.textContent = fmtSessionAge(node.dataset.sessionAt, now);
+    node.textContent = fmtSessionAge(node.dataset.sessionAt, now).replace(" · ", "; ");
   }
 }
 
@@ -143,118 +143,64 @@ function planChip(plan) {
 
 // --- seat card --------------------------------------------------------------------------------
 
-function statusBit(tool, seat) {
-  switch (seat.status) {
-    case "active":
-      return seat.in_session
-        ? `<span class="pill floor floor--live"><span class="live-dot" aria-hidden="true"></span>on the floor</span>`
-        : `<span class="pill floor floor--idle">selected</span>`;
-    case "queued": return `<span class="pill queued">up next 💛</span>`;
-    case "resting":
-      return `<span class="mono rest-count" data-reset-at="${esc(seat.limited_until)}" data-clock-prefix="back in">back in ${fmtCountdown(seat.limited_until)}</span>`;
-    case "needs-login":
-      return seat.entitlement_revoked
-        ? `<button class="btn rose revoked" data-action="add" data-tool="${tool}">subscription ended — sign in again</button>`
-        : `<button class="btn rose" data-action="add" data-tool="${tool}">log in</button>`;
-    default:
-      return `<button class="btn switch" data-action="switch" data-tool="${tool}" data-email="${esc(seat.email)}">switch</button>`;
-  }
-}
 
 function bar(seat, win, label) {
-  const v = pct(seat, win);
-  const known = v !== null;
-  const lastKnown = seat?.usage_stale || seat?.usage_unknown;
+  const used = pct(seat, win);
   const reset = seat?.usage?.windows?.[win]?.resets_at;
-  const resetTime = reset ? new Date(reset).getTime() : NaN;
-  const timer = Number.isFinite(resetTime)
-    ? `<div class="usage-reset mono" data-reset-at="${esc(reset)}" title="${esc(new Date(reset).toLocaleString())}">resets in ${fmtCountdown(reset)}</div>`
-    : "";
-  return `<div class="usage${lastKnown ? " usage--stale" : ""}"><span class="mono u-k">${label}</span>
-    <span class="track"><span class="fill" style="width:${known ? v : 0}%"></span></span>
-    <span class="mono u-v">${known ? `${Math.round(v)}%` : "—"}</span></div>${timer}`;
+  const other = seat?.usage?.windows?.[win === "5h" ? "weekly" : "5h"]?.resets_at;
+  // The seat's return is the authoritative countdown. Window resets appear only when distinct.
+  const showReset = reset && reset !== seat.limited_until && reset !== other && Number.isFinite(Date.parse(reset));
+  const left = used === null ? null : Math.round(100 - used);
+  return `<div class="window"><div class="usage"><span>${label} window</span><span>${left === null ? "usage unknown" : left === 0 ? "exhausted" : `${left}% left`}</span></div>
+    <div class="track${left === 0 ? " exhausted" : ""}" aria-hidden="true"><span class="fill" style="width:${left ?? 0}%"></span></div>
+    ${showReset ? `<span class="usage-reset" data-reset-at="${esc(reset)}" data-clock-prefix="window resets in" title="${esc(new Date(reset).toLocaleString())}">window resets in ${fmtCountdown(reset)}</span>` : ""}</div>`;
+}
+
+// The engine can switch to any saved subscription, including a capped one. Say what that
+// means at the action instead of silently withholding it; sign-in always takes precedence.
+// "switch anyway" rather than "switch limited": the latter reads as a noun phrase, or as
+// "switching is limited", and a real user asked what it meant. The row already shows resting,
+// 0% and the reset countdown, so the label only has to carry "despite that".
+function seatAction(tool, seat) {
+  if (needsHello(seat)) return `<button class="row-action" data-action="add" data-tool="${tool}">sign in again</button>`;
+  if (seat.status === "active") return "";
+  const limited = seat.limited || ["resting", "queued"].includes(seat.status);
+  const label = `switch to ${seat.name || seat.email}${limited ? "; this seat's limit applies immediately" : ""}`;
+  return `<button class="row-action" data-action="switch" data-tool="${tool}" data-email="${esc(seat.email)}" aria-label="${esc(label)}" title="${esc(label)}">${limited ? "switch anyway" : "switch"}</button>`;
 }
 
 function seatCard(tool, seat) {
-  const plan = planChip(seat.plan);
-  const parkedSession = !seat.active && seat.in_session;
-  const started = seat.session_started_at || "";
-  const sessionDate = started && Number.isFinite(new Date(started).getTime())
-    ? new Date(started).toLocaleString() : "";
-  // A long-lived terminal is useful context, not a second claim to the live credentials.
-  // Keep the action alongside it; the pair can wrap below the name in the narrow popover.
-  const action = parkedSession
-    ? `<span class="seat-actions"><span class="mono chip terminal-chip" title="${esc(sessionDate ? `session started ${sessionDate}` : "supervised terminal attached")}">in a terminal<span data-session-at="${esc(started)}">${fmtSessionAge(started)}</span></span>${statusBit(tool, seat)}</span>`
-    : statusBit(tool, seat);
+  const fetched = seat.usage_fetched_at || seat.usage?.fetched_at || "";
   const reported = seat?.usage?.reported_windows;
-  const weeklyOnly = tool === "codex" && Array.isArray(reported) &&
-    reported.includes("weekly") && !reported.includes("5h");
-  const fetchedAt = seat.usage_fetched_at || seat.usage?.fetched_at || "";
+  const weeklyOnly = tool === "codex" && Array.isArray(reported) && reported.includes("weekly") && !reported.includes("5h");
+  const stateText = seat.status === "resting"
+    ? `<span data-reset-at="${esc(seat.limited_until)}" data-clock-prefix="back in" title="${esc(fmtClock(seat.limited_until))}">back in ${fmtCountdown(seat.limited_until)}</span>`
+    : seat.status === "active" ? (seat.in_session ? "on the floor" : "selected")
+    : seat.status === "queued" ? "up next" : needsHello(seat) ? "sign-in needed" : "ready";
   const error = seat.usage?.error;
-  const lastKnown = seat.usage_stale || seat.usage_unknown;
-  const issue = ({ rate_limited: "usage updates throttled · retrying automatically",
-    network: "connection unavailable · retrying automatically",
-    token_expired: `usage refresh pending · open ${tool === "codex" ? "Codex" : "Claude"} to refresh`,
-    unauthorized: "usage unavailable · sign in to refresh",
-    forbidden: "usage unavailable · check your subscription",
-    no_token: "usage unavailable · sign in to refresh",
-  })[error] || (error ? "usage update failed · retrying automatically" : "");
-  const freshness = seat.status === "resting" ? "" :
-    `<div class="usage-age mono${lastKnown ? " usage-age--stale" : ""}"><span data-usage-at="${esc(fetchedAt)}">${fmtUsageAge(fetchedAt)}</span>${lastKnown ? " · last known" : ""}</div>
-    ${issue ? `<div class="usage-error">${issue}</div>` : ""}`;
-  const reassure = seat.status === "resting"
-    ? `<div class="reassure mono">taking a breather — back ${fmtClock(seat.limited_until)}</div>` : "";
-  const credit = creditLeft(seat);
-  const sessionStarted = sessionDate;
-  const expanded = `<div class="expand">
-    ${credit !== null ? `<div class="x-row"><span>credit left</span><span class="mono">${credit}%</span></div>` : ""}
-    ${seat.last_on_floor ? `<div class="x-row"><span>last on the floor</span><span class="mono">${esc(fmtClock(seat.last_on_floor))}</span></div>` : ""}
-    ${sessionStarted ? `<div class="x-row"><span>session started</span><span class="mono">${esc(sessionStarted)}</span></div>` : ""}
-    <button class="logout" data-action="remove" data-tool="${tool}" data-email="${esc(seat.email)}">log out ↗</button>
-  </div>`;
-  return `<div class="seat seat--${esc(seat.status)}" data-card data-tool="${tool}" data-email="${esc(seat.email)}">
-    <div class="seat-row${parkedSession ? " seat-row--session" : ""}">
-      <span class="dot dot--${esc(seat.status)}"></span>
-      <span class="seat-name">${esc(seat.name)}</span>${plan}
-      <span class="grow"></span>${action}
-    </div>
-    <div class="seat-email mono">${esc(seat.email)}</div>
-    ${weeklyOnly ? "" : bar(seat, "5h", "5h")}
-    ${bar(seat, "weekly", "7d")}
-    ${freshness}
-    ${reassure}
-    ${expanded}
-  </div>`;
+  const issue = ({ rate_limited: "updates throttled; retrying automatically", network: "connection unavailable; retrying automatically",
+    token_expired: `open ${TOOL_META[tool].label} to refresh usage`, unauthorized: "sign in to refresh usage", forbidden: "check your subscription to refresh usage", no_token: "sign in to refresh usage" })[error] || (error ? "usage update failed; retrying automatically" : "");
+  const action = seatAction(tool, seat);
+  return `<article class="seat seat--${esc(seat.status)}" data-card data-tool="${tool}" data-email="${esc(seat.email)}">
+    <details class="seat-disclosure"><summary class="seat-row"><span class="seat-name">${esc(seat.name)}</span><span class="seat-state">${stateText}</span><span class="chevron" aria-hidden="true">⌄</span></summary>
+    <div class="expand"><p class="seat-email">${esc(seat.email)} ${planChip(seat.plan)}</p>
+    ${weeklyOnly ? "" : bar(seat, "5h", "5h")}${bar(seat, "weekly", "7d")}
+    <p class="support"><span data-usage-at="${esc(fetched)}">${fmtUsageAge(fetched)}</span>${seat.usage_stale || seat.usage_unknown ? "; last known reading" : ""}</p>
+    ${issue ? `<p class="usage-error" role="status">${issue}</p>` : ""}
+    ${seat.in_session ? `<p class="support">terminal attached<span data-session-at="${esc(seat.session_started_at)}">${fmtSessionAge(seat.session_started_at).replace(" · ", "; ")}</span></p>` : ""}
+    ${seat.last_on_floor ? `<p class="support">last on the floor ${esc(fmtClock(seat.last_on_floor))}</p>` : ""}
+    <div class="seat-actions">${action}<button class="logout" data-action="remove" data-tool="${tool}" data-email="${esc(seat.email)}">log out</button></div>
+    </div></details></article>`;
 }
 
 function toolGroup(tool, t, keys = []) {
-  const meta = TOOL_META[tool];
   const seats = t?.seats || [];
-  const n = seats.length + keys.length;
-  return `<section class="group" style="--accent:${meta.accent}">
-    <div class="g-head">
-      <span class="dot dot--accent"></span>
-      <span class="g-name">${meta.label}</span><span class="g-count">· ${n} seat${n === 1 ? "" : "s"}</span>
-      <span class="grow"></span><span class="mono g-meta">${esc(t?.plan_label || meta.plan)}</span>
-    </div>
-    ${seats.map((s) => seatCard(tool, s)).join("") + keys.map(keySeatCard).join("") || `<div class="empty">no seats yet</div>`}
-    <button class="add-row" data-action="add" data-tool="${tool}">＋ add a seat</button>
-  </section>`;
+  if (!seats.length && !keys.length) return "";
+  return `<section class="group" style="--accent:${TOOL_META[tool].accent}"><h2 class="g-head"><span class="tool-marker tool-marker--${tool}" aria-hidden="true"></span>${TOOL_META[tool].label}</h2>
+    ${seats.map((seat) => seatCard(tool, seat)).join("")}${keys.map(keySeatCard).join("")}</section>`;
 }
 
-const REFRESH = `<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="none"
-  stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
-  d="M12.5 4.5a5 5 0 1 0 1.2 3.3"/><path fill="currentColor" d="M13.5 2.2l.6 2.8-2.8.2z"/></svg>`;
 
-function controlBar(opts) {
-  const { icon, title, chip, sub, key, on, accentClass } = opts;
-  return `<label class="ctl">
-    <span class="ctl-ic ${accentClass}">${icon}</span>
-    <span class="ctl-tx"><span class="ctl-t">${title}${chip ? ` <span class="mono ctl-chip">${chip}</span>` : ""}</span>
-      <span class="ctl-s">${sub}</span></span>
-    <input type="checkbox" data-action="toggle" data-key="${key}" ${on ? "checked" : ""}><span class="sw"></span>
-  </label>`;
-}
 
 // Terminal supervision is infrastructure, not a seat-health signal. Keep this decision pure so a
 // missing rc block/wrapper can never be hidden by an otherwise healthy usage snapshot.
@@ -295,14 +241,14 @@ export function supervisionBanner(state) {
 const CODEX_AUTH_PATH = "~/.codex/auth.json";
 const ADD_COPY = {
   codex: {
-    row: "ChatGPT sign-in · Business seat",
-    chip: "Codex CLI · ChatGPT sign-in or auth.json",
+    row: "ChatGPT subscription",
+    chip: "Codex CLI with ChatGPT sign-in or auth.json",
     tokenHint: `paste the contents of ${CODEX_AUTH_PATH} — handy for a headless or shared box.`,
     tokenPh: "paste auth.json contents",
   },
   claude: {
-    row: "Claude.ai sign-in · Max or Pro seat",
-    chip: "Claude Code · Claude.ai sign-in",
+    row: "Claude.ai subscription",
+    chip: "Claude Code with Claude.ai sign-in",
   },
 };
 const BROWSER_HINT = "i'll pop open the official sign-in — nothing leaves your Mac, i just save the seat.";
@@ -384,7 +330,7 @@ function addProviderStep() {
 function addDetailsStep(add, state) {
   const c = ADD_COPY[add.provider];
   const paste = addUsesPaste(add);
-  const cta = paste ? "save the seat →" : "open sign-in →";
+  const cta = paste ? "save the seat" : "open sign-in";
   // One-tap "use the login you already have": when codex is signed in on this Mac to an account that
   // isn't a seat yet, offer to import it directly — the easiest path, no browser dance, no paste.
   const liveEmail = add.provider === "codex" ? state?.codex_live_unregistered?.email : null;
@@ -410,7 +356,7 @@ function addDetailsStep(add, state) {
     const hint = add.method === "token" ? c.tokenHint : BROWSER_HINT;
     // paste flow: show WHERE the file lives + a Finder shortcut, so the user isn't left guessing.
     const tokenWrap = paste
-      ? `<div class="add-tokenwrap"><textarea id="add-token" class="add-token mono"
+      ? `<div class="add-tokenwrap"><textarea id="add-token" aria-label="auth.json contents" class="add-token mono"
            placeholder="${esc(c.tokenPh)}">${esc(add.token)}</textarea></div>
          <div class="add-pathrow"><code class="add-path">${esc(CODEX_AUTH_PATH)}</code>
            <button class="add-reveal" data-action="add-reveal">reveal in Finder</button></div>`
@@ -436,7 +382,7 @@ function addDetailsStep(add, state) {
     <section class="set-sec">
       <span class="set-label">name this seat</span>
       <div class="set-card">
-        <input id="add-name" class="add-input" placeholder="Work · Personal · Late-night" value="${esc(add.name)}">
+        <input id="add-name" aria-label="seat name" class="add-input" placeholder="Work, Personal, Late-night" value="${esc(add.name)}">
       </div>
     </section>
     ${methodSection}
@@ -498,16 +444,11 @@ const STRATEGY_OPTS = [
 ];
 const THEME_OPTS = [{ v: "light", label: "light" }, { v: "dark", label: "dark" }];
 
-function strategyHint(strat) {
-  return strat === "most_headroom"
-    ? "i jump to whoever's got the most room left to breathe"
-    : "if everyone's capped, i hold the seat that wakes up first — shortest wait wins";
-}
-// A toggle row: title + subtitle on the left, 42×24 switch on the right.
+// A toggle row: title and subtitle, explicit on/off text, and a 38×24 switch.
 function toggleRow(key, title, subtitle, on) {
-  return `<label class="set-toggle-row">
-    <span class="set-tx"><span class="set-t">${title}</span><span class="set-s">${subtitle}</span></span>
-    <input type="checkbox" data-action="toggle" data-key="${key}" ${on ? "checked" : ""}><span class="sw"></span></label>`;
+  return `<label class="set-toggle-row"><span class="set-tx"><span class="set-t">${title}</span><span class="set-s">${subtitle}</span></span>
+    <input type="checkbox" data-action="toggle" data-key="${key}" ${on ? "checked" : ""}>
+    <span class="toggle-state" aria-hidden="true"><span class="when-on">on</span><span class="when-off">off</span></span><span class="sw" aria-hidden="true"></span></label>`;
 }
 
 // A segmented block: label + optional hint stacked, then the full-width control on its own line.
@@ -526,112 +467,233 @@ export function buildSettings(state) {
   const theme = s.theme === "dark" ? "dark" : "light";
   const strat = s.strategy === "most_headroom" ? "most_headroom" : "soonest_back";
   const app = state?.app;
-  const ver = app ? `v${app.version}${app.build && app.build !== "dev" ? ` · build ${app.build}` : ""}` : "";
-
-  const autoSwitch = `<section class="set-sec"><span class="set-label">auto-switch</span>
-    <div class="set-card">
-      ${segBlock("when a seat runs out", strategyHint(strat), "set_strategy", strat, STRATEGY_OPTS)}
-      ${toggleRow("supervise_shell", "supervise terminal commands", "codex/claude auto-switch seats · off: only cx/cl do", s.supervise_shell !== false)}
-      ${toggleRow("same_tool_only", "keep me on the same tool", "a Codex limit hops to your other Codex seat, never to Claude", s.same_tool_only)}
-      ${toggleRow("key_fallback", "allow paid key use", "off by default. on permits paid use: automatic fallback when subscription seats rest and pinned key terminals — real money can be spent. off prevents new paid use and stops a running paid session; the turn already sent may still bill", s.key_fallback === true)}
-      ${toggleRow("confirm_key_switch", "ask before using a paid key", "ask me to approve each hop onto a key. turning this off lets eligible keys spend money without asking again", s.confirm_key_switch !== false)}
-      ${toggleRow("notify", "tell me when it switches", "a gentle notification with who's on now", s.notify)}
-      ${toggleRow("restart_app", "restart the Codex app after a swap", "the desktop app keeps the old account until it relaunches · terminals switch on their own", s.restart_app)}
-    </div></section>`;
-
-  const appearance = `<section class="set-sec"><span class="set-label">appearance</span>
-    <div class="set-card">
+  const version = app ? `v${app.version}${app.build && app.build !== "dev" ? ` · build ${app.build}` : ""}` : "";
+  return `<div class="app set-app theme-${theme}"><header class="set-head"><button class="set-back" data-action="settings-back" aria-label="back">‹</button><span class="set-title">settings</span><button class="set-done" data-action="settings-back">done</button></header>
+    <div class="set-body"><section class="set-sec"><h1 class="set-label">switching</h1>
+      ${toggleRow("auto_switch", "auto-switch", "move when a seat runs out", s.auto_switch)}
+      ${segBlock("choose the next seat", "", "set_strategy", strat, STRATEGY_OPTS)}
+      ${toggleRow("supervise_shell", "supervise terminals", "include codex and claude commands", s.supervise_shell !== false)}
+      ${toggleRow("same_tool_only", "stay on the same tool", "Codex to Codex; Claude to Claude", s.same_tool_only)}
+      ${toggleRow("notify", "notify when switched", "show which seat is ready", s.notify)}
+      ${toggleRow("restart_app", "restart the Codex app", "refresh its account after a switch", s.restart_app)}
+      <p class="support">with supervision off, only cx/cl auto-switch. terminals switch without restarting the desktop app.</p>
+    </section><section class="set-sec paid-settings"><h2 class="set-label">paid keys</h2>
+      ${toggleRow("key_fallback", "allow paid use", "off stops sessions and new requests", s.key_fallback === true)}
+      ${toggleRow("confirm_key_switch", "ask before using", "approve each move to a paid key", s.confirm_key_switch !== false)}
+      <p class="support">paid use allows fallback and pinned terminals to spend real money. sent turns may still bill after stopping. this app does not cap spend.</p>
+      <p class="support">turning “ask before using” off allows eligible keys to spend without asking again.</p>
+    </section><section class="set-sec"><h2 class="set-label">appearance</h2>
       ${segBlock("theme", "", "set_theme", theme, THEME_OPTS)}
-      <div class="set-legend">
-        <span class="set-t">what the icon shows</span>
-        <div class="set-legend-row">${doorMark({ door: "open" })}<span class="set-s">a model's free — come on in</span></div>
-        <div class="set-legend-row">${doorMark({ door: "shut" })}<span class="set-s">every seat's resting</span></div>
-        <div class="set-legend-row"><span class="dot dot--queued"></span><span class="set-s">just switched you</span></div>
-        <div class="set-legend-row"><span class="dot dot--needs-login"></span><span class="set-s">a seat needs a hello</span></div>
-      </div>
-    </div></section>`;
+      <div class="set-legend"><p>in your menu bar</p><div>${doorMark({door:"open"})}<span>a model is free</span></div><div>${doorMark({door:"shut"})}<span>every seat is resting</span></div>
+      <p>gold: just switched you</p><p>rose: sign-in needed</p></div>
+    </section><p class="set-ver">ai guest list ${esc(version)}</p></div></div>`;
+}
 
-  return `<div class="app set-app theme-${theme}">
-    <header class="set-head">
-      <button class="set-back" data-action="settings-back" title="back">‹</button>
-      <span class="set-title">settings</span>
-      <button class="set-done" data-action="settings-back">done</button>
-    </header>
-    <div class="set-body">
-      ${autoSwitch}
-      ${appearance}
-      <div class="set-ver">ai guest list ${ver}</div>
-    </div>
-  </div>`;
+
+function ambientArt() { return `<svg xmlns="http://www.w3.org/2000/svg" class="ambient-art" viewBox="265 252 500 500" aria-hidden="true" focusable="false">
+  <defs>
+    <linearGradient id="ambient-tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffe6ad"/>
+      <stop offset="55%" stop-color="#f7c668"/>
+      <stop offset="100%" stop-color="#e7a23f"/>
+    </linearGradient>
+    <radialGradient id="ambient-glow" cx="50%" cy="40%" r="62%">
+      <stop offset="0%" stop-color="#fff6df" stop-opacity=".95"/>
+      <stop offset="100%" stop-color="#fff6df" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="ambient-ball" cx="38%" cy="30%" r="78%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="40%" stop-color="#bfe9df"/>
+      <stop offset="100%" stop-color="#2f8a78"/>
+    </radialGradient>
+    <linearGradient id="ambient-leaf" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#f5eedd"/>
+      <stop offset="100%" stop-color="#d8c8a8"/>
+    </linearGradient>
+    <clipPath id="ambient-ballClip"><circle cx="512" cy="470" r="172"/></clipPath>
+    <clipPath id="ambient-tileClip"><rect x="92" y="92" width="840" height="840" rx="200"/></clipPath>
+  </defs>
+
+  <!-- squircle tile (macOS-style) -->
+  <rect x="92" y="92" width="840" height="840" rx="200" fill="url(#ambient-tile)"/>
+  <g clip-path="url(#ambient-tileClip)">
+    <rect x="92" y="92" width="840" height="840" fill="url(#ambient-glow)"/>
+
+    <!-- door swung open on the left -->
+    <g transform="rotate(-7 250 520)">
+      <rect x="150" y="150" width="120" height="740" rx="26" fill="url(#ambient-leaf)"/>
+      <circle cx="244" cy="540" r="13" fill="#cf9b2e"/>
+    </g>
+
+    <!-- disco ball: string, glow, body, facets, highlight -->
+    <line x1="512" y1="120" x2="512" y2="300" stroke="#b5905a" stroke-width="9"/>
+    <circle cx="512" cy="470" r="200" fill="#fff2cf" opacity=".5"/>
+    <circle cx="512" cy="470" r="172" fill="url(#ambient-ball)"/>
+    <g clip-path="url(#ambient-ballClip)" stroke="#2c7e6d" stroke-width="7" opacity=".5" fill="none">
+      <line x1="392" y1="470" x2="632" y2="470"/>
+      <path d="M360 388 q152 70 304 0"/>
+      <path d="M360 552 q152 -70 304 0"/>
+      <line x1="452" y1="306" x2="452" y2="634"/>
+      <line x1="512" y1="298" x2="512" y2="642"/>
+      <line x1="572" y1="306" x2="572" y2="634"/>
+    </g>
+    <ellipse cx="455" cy="408" rx="46" ry="30" fill="#ffffff" opacity=".92"/>
+
+    <!-- twinkles -->
+    <circle cx="300" cy="300" r="17" fill="#46c2a8"/>
+    <circle cx="745" cy="300" r="14" fill="#e0795a"/>
+    <circle cx="735" cy="690" r="18" fill="#f3c969"/>
+    <circle cx="690" cy="780" r="12" fill="#7c6cf0"/>
+    <circle cx="360" cy="760" r="13" fill="#e0795a"/>
+  </g>
+</svg>`; }
+
+function subscriptionSeats(state) {
+  return ["codex", "claude"].flatMap((tool) => (state?.tools?.[tool]?.seats || []).map((seat) => ({ ...seat, tool })));
+}
+function paidCount(state) {
+  const pinned = state?.pinned_sessions || [];
+  return pinned.length + (state?.running_key_seats || []).filter((id) => !pinned.some((s) => (s.key_seat?.id || s.email) === id)).length;
+}
+function ambientVerdict(state) {
+  const seats = subscriptionSeats(state);
+  const ready = seats.filter((seat) => ["ready", "active"].includes(seat.status));
+  let headline = "you can keep working.";
+  let action = "", detail = "";
+  if (!seats.length) {
+    headline = "add a seat to get started.";
+    action = `<button class="primary" data-action="add">add your first seat</button>`;
+  } else if (!ready.length) {
+    headline = seats.every((seat) => ["resting", "queued"].includes(seat.status)) ? "every subscription is resting." : "your seats need attention.";
+    const key = (state?.keys || [])[0];
+    const login = seats.find(needsHello);
+    const reset = seats.map((seat) => seat.limited_until).filter((iso) => iso && Number.isFinite(Date.parse(iso))).sort((a,b) => Date.parse(a)-Date.parse(b))[0];
+    if (key) {
+      detail = `<p class="hero-support">${esc(key.label)} ${key.responses_verified === false || key.last_proof?.outcome === "incompatible" ? "may help with paid use; endpoint unproven." : "can keep you going with paid use."}</p>`;
+      action = `<button class="primary" data-action="key-terminal" data-id="${esc(key.id)}">use ${esc(key.label)} in a terminal</button>`;
+    } else if (login) {
+      action = `<button class="primary" data-action="add" data-tool="${esc(login.tool)}">sign in to ${esc(login.name)}</button>`;
+    }
+    if (reset) detail += `<p class="hero-support" title="${esc(new Date(reset).toLocaleString())}"><span data-reset-at="${esc(reset)}" data-clock-prefix="next seat back in">next seat back in ${fmtCountdown(reset)}</span></p>`;
+  }
+  return `<section class="ambient-verdict" aria-label="current availability"><h1 role="status">${headline}</h1>
+    <div class="reading" role="status"><span class="reading-value">${ready.length}</span><span class="reading-unit">subscription ${ready.length === 1 ? "seat" : "seats"} ready</span></div>
+    <div class="hero-followup">${detail}${action}</div></section>`;
+}
+
+function rosterTable(state, compact = false) {
+  const seats = subscriptionSeats(state);
+  const spending = new Set([...(state?.running_key_seats || []),
+    ...(state?.pinned_sessions || []).map((session) => session.key_seat?.id || session.email)]);
+  return `<table class="roster" aria-label="seats and remaining headroom">
+      <colgroup><col class="roster-seat-col"><col class="roster-window-col"><col class="roster-window-col"></colgroup>
+      <thead><tr><th scope="col">${compact ? "seat availability" : "your seats"}</th><th scope="col">5-hour left</th><th scope="col">weekly left</th></tr></thead>
+      ${[...new Set(["codex", "claude", ...(state?.keys || []).map((key) => key.harness)])].map((tool) => {
+        const subscriptions = seats.filter((seat) => seat.tool === tool);
+        const keys = (state?.keys || []).filter((key) => key.harness === tool);
+        if (!subscriptions.length && !keys.length) return "";
+        return `<tbody><tr><th class="roster-tool" scope="rowgroup" colspan="3">${esc(TOOL_META[tool]?.label || tool || "API key")} /</th></tr>${subscriptions.sort((a, b) => Number(b.status === "active") - Number(a.status === "active")).map((seat) => {
+        const active = seat.status === "active";
+        const status = needsHello(seat) ? "sign-in needed" : active ? "active" : seat.status === "resting" ? "resting" : seat.status === "queued" ? "up next" : "ready";
+        const windows = ["5h", "weekly"].map((win) => {
+          const reported = seat.usage?.reported_windows;
+          const absent = Array.isArray(reported) && !reported.includes(win);
+          const used = seat.usage_unknown || absent ? null : pct(seat, win);
+          const left = Number.isFinite(used) ? Math.round(100 - used) : null;
+          // A dash rather than a word. Under a heading that reads "5-hour left", "none" and
+          // "unknown" both invite the reading "no headroom left" — which is what 0% means, and
+          // the opposite of what an absent window means. The reason still reaches hover and
+          // assistive tech, so nothing is lost by the cell being quiet.
+          const why = absent ? `no ${win === "5h" ? "5-hour" : "weekly"} window on this plan`
+                             : "usage reading unavailable";
+          const missing = left === null;
+          const reset = absent ? null : seat.usage?.windows?.[win]?.resets_at;
+          const resetText = reset && Number.isFinite(Date.parse(reset))
+            ? `<span class="roster-reset" data-reset-at="${esc(reset)}" data-clock-prefix="in" title="window resets at ${esc(new Date(reset).toLocaleString())}">in ${fmtCountdown(reset)}</span>` : "";
+          return `<td class="roster-value${missing ? " roster-unknown" : ""}"${
+            missing ? ` title="${esc(why)}" aria-label="${esc(why)}"` : ""}>${
+            missing ? "—" : `${left}%`}${seat.usage_stale && !missing ? `<span class="roster-freshness">last known</span>` : ""}${resetText}</td>`;
+        }).join("");
+        const action = seatAction(tool, seat);
+        const identity = `<span class="roster-identity" title="${esc(seat.name || seat.email)}">${esc(seat.name || seat.email)}</span>`;
+        // The row itself carries the action for the pointer — a 344px target instead of a 90px
+        // label. The button stays in the markup as the keyboard and screen-reader path, and
+        // because it is the innermost [data-action], a click on it dispatches once, not twice.
+        // Only a switch becomes a row target. A seat needing sign-in offers "sign in again", and
+        // turning the whole row into a switch would fire the wrong action entirely.
+        const rowAction = action && !active && !needsHello(seat)
+          ? ` data-action="switch" data-tool="${esc(tool)}" data-email="${esc(seat.email)}"` : "";
+        return `<tr class="${active ? "roster-active" : ""}${rowAction ? " roster-actionable" : ""}"${rowAction}><th scope="row">${identity}<span class="roster-meta">${planChip(seat.plan)}<span class="roster-status">${status}</span></span>${action}</th>${windows}</tr>`;
+      }).join("")}${keys.map((key) => `<tr class="roster-key roster-actionable" data-action="key-terminal" data-id="${esc(key.id)}"><th scope="row"><span class="roster-inline"><span class="roster-identity" title="${esc(key.label)}">${esc(key.label)}</span>${spending.has(key.id) ? `<span class="roster-spending">spending now</span>` : ""}</span>${key.model ? `<span class="roster-meta" title="${esc(key.model)}">${esc(key.model)}</span>` : ""}<button class="row-action key-use" data-action="key-terminal" data-id="${esc(key.id)}" aria-label="${esc(`use ${key.label} in a new paid terminal`)}" title="use in a new paid terminal">new terminal</button></th><td class="roster-key-terms" colspan="2"><span class="key-terms">paid per token<span class="roster-meta">no app spend cap</span></span></td></tr>`).join("")}</tbody>`;
+      }).join("")}
+    </table>`;
 }
 
 // --- popover ----------------------------------------------------------------------------------
 
 export function buildHTML(state) {
-  const s = state?.settings || {};
-  const theme = s.theme === "dark" ? "dark" : "light";
-  const c = state?.counts || { resting: 0, ready: 0 };
-  const moved = state?.moved_note ? `<div class="event mono">↪ ${esc(state.moved_note)}</div>` : "";
-  return `<div class="app theme-${theme}">
-    <header class="top">
-      ${doorMark(state)}
-      <span class="brand-tx"><span class="brand"><span class="ai">ai</span> guest list</span>
-        <span class="substatus">${c.resting} resting · ${c.ready} ready</span></span>
-      <span class="top-actions">
-        <button class="ibtn" data-action="settings" title="settings">⋯</button>
-        <button class="ibtn" data-action="add" title="add a seat">＋</button>
-      </span>
-    </header>
-    ${keyConfirmations(state)}
-    ${paidUseControl(state)}
-    <div class="main-body">
-      ${supervisionBanner(state)}
-      ${controlBar({ icon: REFRESH, title: "auto-switch", sub: "next ready seat · soonest-reset wins",
-                     key: "auto_switch", on: s.auto_switch, accentClass: "ic-auto" })}
-      ${moved}
-      ${pinnedSessions(state)}
-      ${toolGroup("codex", state?.tools?.codex, (state?.keys || []).filter((k) => k.harness === "codex"))}
-      ${toolGroup("claude", state?.tools?.claude, (state?.keys || []).filter((k) => k.harness === "claude"))}
-      <button class="add-row" data-action="key-start">＋ add a key</button>
-      <footer class="foot"><span>made with <span class="heart">💛</span></span>
-        <button class="link" data-action="quit">quit</button></footer>
-    </div>
-  </div>`;
+  const theme = state?.settings?.theme === "dark" ? "dark" : "light";
+  const seats = subscriptionSeats(state);
+  const paid = paidCount(state);
+  const ready = seats.some((seat) => ["active", "ready"].includes(seat.status));
+  const mood = paid ? "spending" : ready ? "ready" : seats.length ? "resting" : "empty";
+  const moved = state?.moved_note ? `<section class="event"><h2>last switch</h2><p>${esc(state.moved_note.replaceAll(" · ", ", "))}</p></section>` : "";
+  const prompts = keyConfirmations(state);
+  const asking = prompts.includes('class="key-confirm"');
+  // Consent is deliberately focused: asking permission to spend real money must never gain
+  // a roster, even while another key is spending. Keep both priced and unpriced consent clear.
+  // Multiple active tools are real; never choose one on the user's behalf.
+  const glance = ready && !paid && !asking;
+  const compact = !asking && !glance && (paid > 0 || seats.length > 0);
+  const roster = glance ? `<section class="roster-glance" aria-label="current availability">
+    <h1 role="status">you can keep working.</h1>
+    ${rosterTable(state)}
+  </section>` : "";
+  // app/icon.svg's tile, glow and cream leaf, closed across the room. The knob keeps its
+  // original radius and colour; only the open leaf's width/position changes to close the door.
+  // doorKey and doorMark remain the sole, unchanged availability/mark helpers.
+  const art = !paid && !asking && doorKey(state) === "shut" ? `<svg xmlns="http://www.w3.org/2000/svg" class="ambient-art roster-door" viewBox="92 92 840 840" aria-hidden="true" focusable="false">
+    <defs>
+      <linearGradient id="roster-tile" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#ffe6ad"/><stop offset="55%" stop-color="#f7c668"/><stop offset="100%" stop-color="#e7a23f"/></linearGradient>
+      <radialGradient id="roster-glow" cx="50%" cy="40%" r="62%"><stop offset="0%" stop-color="#fff6df" stop-opacity=".95"/><stop offset="100%" stop-color="#fff6df" stop-opacity="0"/></radialGradient>
+      <linearGradient id="roster-leaf" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#f5eedd"/><stop offset="100%" stop-color="#d8c8a8"/></linearGradient>
+      <clipPath id="roster-tile-clip"><rect x="92" y="92" width="840" height="840" rx="200"/></clipPath>
+    </defs>
+    <rect x="92" y="92" width="840" height="840" rx="200" fill="url(#roster-tile)"/>
+    <g clip-path="url(#roster-tile-clip)"><rect x="92" y="92" width="840" height="840" fill="url(#roster-glow)"/>
+      <rect x="248" y="150" width="528" height="740" rx="26" fill="url(#roster-leaf)"/>
+      <circle cx="716" cy="540" r="13" fill="#cf9b2e"/>
+    </g>
+  </svg>` : ambientArt();
+  return `<div class="app ambient-app${glance ? " roster-app" : ""}${compact ? " compact-roster-app" : ""} theme-${theme} mood-${mood}">${art}
+    <header class="top"><span class="brand">ai guest list</span><div class="top-actions"><details class="header-menu"><summary class="ibtn" aria-label="add a subscription seat or API key" title="add a seat or key">＋</summary><nav class="menu-panel"><button data-action="add">a subscription seat</button><button data-action="key-start">an API key</button></nav></details>
+    <details class="header-menu"><summary class="ibtn" aria-label="app menu" title="app menu">⋯</summary><nav class="menu-panel"><button data-action="settings">settings</button><button data-action="quit">quit ai guest list</button></nav></details></div></header>
+    <div class="ambient-stage">${prompts}${paid ? paidUseControl(state) : `<div class="availability">${glance ? roster : ambientVerdict(state)}</div>`}${compact ? `<section class="roster-compact" aria-label="seat availability" tabindex="0">${rosterTable(state, true)}</section>` : ""}</div>
+    <details class="guest-drawer"><summary class="drawer-handle"><span>${glance ? "seat options" : "guest list"}</span>${glance ? "" : `<span class="drawer-count">${seats.length + (state?.keys?.length || 0)} seats</span>`}<span class="chevron" aria-hidden="true">⌃</span></summary>
+      <div class="drawer-content"><div class="main-body">${supervisionBanner(state)}${toolGroup("codex", state?.tools?.codex, (state?.keys || []).filter((k) => k.harness === "codex"))}${toolGroup("claude", state?.tools?.claude, (state?.keys || []).filter((k) => k.harness === "claude"))}
+      ${!seats.length && !state?.keys?.length ? `<p class="empty">use ＋ above to add a subscription or API key.</p>` : ""}${moved}
+      </div></div></details></div>`;
 }
 
 function paidUseControl(state) {
+  const count = paidCount(state);
+  if (!count) return "";
   const pinned = state?.pinned_sessions || [];
-  const running = state?.running_key_seats || [];
-  if (!pinned.length && !running.length) return "";
-  // Keep each terminal visible, even when several pins share a key or the key was removed.
-  const sessions = pinned.map((s) => {
-    const seat = s.key_seat || {};
-    return `${esc(seat.label || s.email)} · ${esc(seat.model)} (${esc(s.tool)} · terminal ${esc(s.pid)})`;
-  });
-  for (const id of running) {
-    if (pinned.some((s) => (s.key_seat?.id || s.email) === id)) continue;
-    const seat = state?.keys?.find((k) => k.id === id);
-    sessions.push(seat ? `${esc(seat.label)} · ${esc(seat.model)} (${esc(seat.harness)})` : esc(id));
-  }
-  const stopping = state.settings?.key_fallback === false;
-  return `<div class="paid-use-control" aria-label="stop paid use" role="status">
-    <h2 class="k-q">${stopping ? "paid use is stopping…" : "paid use:"}</h2>
-    <button class="btn rose" data-action="key-stop"${stopping ? " disabled" : ""}>stop paid use</button>
-    <p>${sessions.join("; ")}</p>
-    <p class="add-hint">stops every session and new paid requests. sent turns may still bill.</p>
-  </div>`;
+  const stopping = state?.settings?.key_fallback === false;
+  const running = (state?.running_key_seats || []).filter((id) => !pinned.some((s) => (s.key_seat?.id || s.email) === id)).map((id) => {
+    const seat = state?.keys?.find((key) => key.id === id);
+    return `<article class="paid-session"><div><h2>${esc(seat?.label || id)}</h2><p>${esc(seat?.harness || "")} fallback</p><p class="key-model">${esc(seat?.model || "")}</p></div><button data-action="key-stop"${stopping ? " disabled" : ""}>${stopping ? "stopping…" : "stop all"}</button></article>`;
+  }).join("");
+  return `<section class="paid-use-control" aria-label="paid sessions"><h1 role="status">${stopping ? "paid use is stopping…" : "your keys are spending."}</h1><div class="reading" role="status"><span class="reading-value">${count}</span><span class="reading-unit">paid ${count === 1 ? "session" : "sessions"}</span></div>
+    <div class="paid-session-list">${pinnedSessions(state)}${running}</div><button class="primary stop-all" data-action="key-stop"${stopping ? " disabled" : ""}>${stopping ? "stopping paid use…" : "stop all paid use"}</button>
+    <p class="support billing-note">stops sessions and new paid requests.<br>sent turns may still bill.</p></section>`;
 }
 
 export function pinnedSessions(state) {
-  return (state?.pinned_sessions || []).map((s) => {
-    const seat = s.key_seat || {};
-    return `<section class="seat seat--key pinned-session" aria-label="pinned paid session">
-      <div class="seat-row"><span class="seat-name">${esc(seat.label)}</span><span class="mono chip">pinned · paid</span></div>
-      <div class="key-detail">${esc(providerName(seat))} · ${esc(s.tool)} · terminal ${esc(s.pid)}</div>
-      <div class="key-model mono">${esc(seat.model)}</div>
-      <div class="add-hint">metered · paid per token. end here, then resume on a subscription seat.</div>
-      <button class="btn switch" data-action="end-pinned-session" data-tool="${esc(s.tool)}" data-pin="${esc(s.pin)}"${s.end_requested ? " disabled" : ""}>${s.end_requested ? "ending…" : "end"}</button>
-    </section>`;
+  return (state?.pinned_sessions || []).map((session) => {
+    const key = session.key_seat || {};
+    return `<article class="paid-session"><div><h2>${esc(key.label || session.email)}</h2><p>${esc(session.tool)} terminal ${esc(session.pid)}</p><p class="key-model">${esc(key.model)}</p></div>
+      <button class="session-end" data-action="end-pinned-session" data-tool="${esc(session.tool)}" data-pin="${esc(session.pin)}"${session.end_requested ? " disabled" : ""}>${session.end_requested ? "ending…" : "end"}</button></article>`;
   }).join("");
 }
 
@@ -641,8 +703,8 @@ export const KEY_PROVIDERS = {
   openai: { name: "openai", harness: "codex", pricing: "https://openai.com/api/pricing/" },
   anthropic: { name: "anthropic", harness: "claude", pricing: "https://www.anthropic.com/pricing" },
   openrouter: { name: "openrouter", harness: "codex", priced: true, pricing: "https://openrouter.ai/models" },
-  langdock: { name: "langdock · openai models", harness: "codex", regional: true, pricing: "https://www.langdock.com/pricing" },
-  langdock_anthropic: { name: "langdock · claude models", harness: "claude", regional: true, pricing: "https://www.langdock.com/pricing" },
+  langdock: { name: "langdock (openai models)", harness: "codex", regional: true, pricing: "https://www.langdock.com/pricing" },
+  langdock_anthropic: { name: "langdock (claude models)", harness: "claude", regional: true, pricing: "https://www.langdock.com/pricing" },
   deepseek: { name: "deepseek", harness: "codex", pricing: "https://api-docs.deepseek.com/quick_start/pricing" },
   xai: { name: "xai", harness: "codex", priced: true, pricing: "https://docs.x.ai/docs/models" },
   groq: { name: "groq", harness: "codex", unverified: true, pricing: "https://groq.com/pricing" },
@@ -650,7 +712,7 @@ export const KEY_PROVIDERS = {
 };
 
 function providerName(seat) {
-  return `${KEY_PROVIDERS[seat.provider]?.name || seat.provider || "key"}${seat.region ? ` · ${seat.region}` : ""}`;
+  return `${KEY_PROVIDERS[seat.provider]?.name || seat.provider || "key"}${seat.region ? `, ${seat.region}` : ""}`;
 }
 
 // Reject missing/blank/boolean values before numeric coercion: Number(null) is NOT a free model.
@@ -677,12 +739,12 @@ function priceAge(price, now = Date.now()) {
   const age = fetched && Number.isFinite(Date.parse(fetched))
     ? fmtUsageAge(fetched, now) : amount(price?.age_seconds) !== null
       ? `fetched ${Math.floor(Number(price.age_seconds) / 60)}m ago` : "fetch age unavailable";
-  return `live price estimate · ${age}${price?.potentially_stale ? " · over 24h old" : ""}`;
+  return `live price estimate; ${age}${price?.potentially_stale ? "; over 24h old" : ""}`;
 }
 function priceText(price) {
   const input = priceRate(price, "input"), output = priceRate(price, "output");
   if (input === null && output === null) return "price unavailable";
-  return `input ${formatPrice(input)}${input === null ? "" : "/Mtok"} · output ${formatPrice(output)}${output === null ? "" : "/Mtok"}`;
+  return `input ${formatPrice(input)}${input === null ? "" : "/Mtok"}; output ${formatPrice(output)}${output === null ? "" : "/Mtok"}`;
 }
 function priceHTML(price) {
   const text = priceText(price);
@@ -701,55 +763,37 @@ export function keyProofStatus(seat) {
   } else if (proof?.outcome === "inconclusive") {
     text = `inconclusive — ${proof.error === "timeout" ? "check timed out" : "no completed turn or definitive provider reply"}; Responses support is undetermined`;
   }
-  return `${text ? `<div class="key-proof" role="status">${text}</div><div class="add-hint">checked ${esc(proof.checked_at)} · ${esc(proof.model)}</div>` : ""}
+  return `${text ? `<div class="key-proof" role="status">${text}</div><div class="add-hint">checked ${esc(proof.checked_at)}; ${esc(proof.model)}</div>` : ""}
     ${seat.responses_verified === false && proof?.outcome !== "incompatible" && proof?.outcome !== "proven" ? `<div class="key-unproven">responses support unproven — this endpoint may not work</div>` : ""}`;
 }
 
 export function keySeatCard(seat) {
-  // No running cost is shown. A money figure needs a price, and only OpenRouter and xAI publish
-  // one for a provider that can actually be a key seat — so the card would read "unavailable" for
-  // OpenAI, Anthropic and Langdock, which is worse than not offering the number at all.
   const unproven = (seat.responses_verified === false || seat.last_proof?.outcome === "incompatible") && seat.harness !== "claude";
-  const validation = seat.last_validation;
-  return `<div class="seat seat--key" data-card data-tool="${esc(seat.harness)}" data-email="key:${esc(seat.id)}">
-    <div class="seat-row"><span class="dot dot--accent"></span><span class="seat-name">${esc(seat.label)}</span><span class="mono chip">api key</span></div>
-    <div class="key-detail">${esc(providerName(seat))} · ${seat.harness === "claude" ? "claude code" : "codex cli"}</div>
-    <div class="key-model mono">${esc(seat.model)}</div>
-    <button class="btn switch" data-action="key-terminal" data-id="${esc(seat.id)}">use in new terminal</button>
-    ${keyProofStatus(seat)}
-    ${validation?.operation_permitted === false ? `<div class="usage-error">key check wasn't permitted${seat.responses_verified ? "" : " — inference access is still unproven"}</div>` : ""}
-    <div class="expand"><div class="add-hint">paid per use · this app does not limit spend</div>
-      ${unproven ? `<div class="add-hint">checking this endpoint sends one real request and costs a small amount of money.</div>
-      <button class="btn switch" data-action="key-prove" data-id="${esc(seat.id)}">check this endpoint</button>` : ""}
-      <button class="btn switch" data-action="key-validate" data-id="${esc(seat.id)}">check key</button>
-      <button class="logout" data-action="key-remove" data-id="${esc(seat.id)}">remove key ↗</button>
-    </div></div>`;
+  const checked = seat.last_validation;
+  return `<article class="seat seat--key" data-card data-tool="${esc(seat.harness)}" data-email="key:${esc(seat.id)}"><details class="seat-disclosure"><summary class="seat-row"><span class="seat-name">${esc(seat.label)}</span><span class="seat-state">paid key</span><span class="chevron" aria-hidden="true">⌄</span></summary>
+    <div class="expand"><p>${esc(providerName(seat))}</p><p class="key-model">${esc(seat.model)}</p><p class="support">paid per token; this app does not cap spend.</p>
+    <button data-action="key-terminal" data-id="${esc(seat.id)}">use in new terminal</button>${keyProofStatus(seat)}
+    ${checked ? `<p class="key-check-status" role="status">${checked.operation_permitted ? "key check passed; account access confirmed" : "key check was not permitted; check access with your provider"}</p>` : ""}
+    ${unproven ? `<div class="proof-gate"><input class="local-check" type="checkbox" id="proof-${esc(seat.id)}"><label class="proof-open" for="proof-${esc(seat.id)}">check this endpoint</label><div class="proof-choice"><p>this sends a paid request. price unavailable here; check provider pricing. this app does not cap spend.</p><div class="equal-choices"><label class="choice" for="proof-${esc(seat.id)}">not now</label><button class="choice" data-action="key-prove" data-id="${esc(seat.id)}">send paid check</button></div></div></div>` : ""}
+    <div class="seat-actions"><button data-action="key-validate" data-id="${esc(seat.id)}">check key</button><button class="logout" data-action="key-remove" data-id="${esc(seat.id)}">remove key</button></div></div></details></article>`;
 }
 
 export function keyConfirmations(state, answering = new Set(), now = Date.now()) {
   const requests = (state?.pending_key_switches || []).filter((r) => r.status === "pending" && Date.parse(r.expires_at) > now);
   return `<div class="key-prompts" aria-live="polite">${requests.map((r) => {
     const disabled = answering.has(r.id) ? " disabled" : "";
-    const seat = state?.keys?.find((k) => k.id === r.key_seat?.id);
-    const previous = state?.tools?.[r.tool]?.seats?.find((s) => s.email === r.from_seat?.id);
-    const reset = fmtClock(previous?.limited_until).replace(" ", "").toLowerCase();
-    const from = r.from_seat?.label || r.from_seat?.id || "the current seat";
+    const provider = r.key_seat?.provider;
     const input = priceRate(r.price, "input"), output = priceRate(r.price, "output");
-    const fare = input === null && output === null ? "price unavailable"
-      : `${esc(formatPrice(input))}<span class="unit" style="font-size:13px"> / ${esc(formatPrice(output))}</span>`;
-    const priceHint = priceText(r.price) + (input === null && output === null ? "" : ` · ${priceAge(r.price)}`);
-    const accent = TOOL_META[r.tool]?.accent || TOOL_META.codex.accent;
-    return `<section class="key-confirm set-card" aria-label="paid key confirmation" style="--accent:${accent}">
-      <div class="k-q">${r.pinned ? "pin this terminal to a paid key?" : "use a paid key to keep going?"}</div>
-      <span class="fare" title="${esc(priceHint)}">${fare}</span>
-      <div class="unit">input / output per million tokens</div>
-      <div class="quiet-meta">${esc(r.key_seat?.label)} · ${esc(providerName(r.key_seat || {}))}<br><span class="k-model">${esc(r.key_seat?.model)}</span></div>
-      ${seat ? keyProofStatus(seat) : ""}
-      <div class="k-fine">${r.pinned ? "only this terminal will use the key" : `${esc(from)} is resting${reset ? ` until ${esc(reset)}` : ""}`}. this app doesn't cap spend.</div>
-      <div class="k-acts">
-        <button class="k-no" data-action="key-answer" data-id="${esc(r.id)}" data-approved="false"${disabled}>not now</button>
-        <button class="k-go" data-action="key-answer" data-id="${esc(r.id)}" data-approved="true"${disabled}>use the key</button>
-      </div></section>`;
+    const unknown = input === null && output === null;
+    const seconds = Math.max(0, Math.ceil((Date.parse(r.expires_at) - now) / 1000));
+    return `<section class="key-confirm" aria-label="paid key confirmation"><h1>${r.pinned ? "use a paid key in this terminal?" : "use a paid key to keep going?"}</h1>
+      <div class="decision-facts"><p class="decision-seat">${esc(r.key_seat?.label)}</p><p class="k-model">${esc(r.key_seat?.model)}</p>
+      ${unknown ? `<p class="key-price">${esc(KEY_PROVIDERS[provider]?.name || provider || "this provider")} doesn't publish a price here. ${KEY_PROVIDERS[provider]?.pricing ? `<button class="pricing-link" data-action="key-pricing" data-provider="${esc(provider)}">check pricing</button>` : "check with your endpoint operator."}</p>` : `<p class="key-price">input ${esc(formatPrice(input))} / output ${esc(formatPrice(output))}<br>USD per million tokens</p>`}
+      <p class="k-fine">paid per token. this app does not cap spend.</p>
+      ${(state?.keys || []).some((key) => key.id === r.key_seat?.id && key.harness !== "claude" && (key.responses_verified === false || key.last_proof?.outcome === "incompatible")) ? `<p class="key-unproven">endpoint unproven; requests may still bill.</p>` : ""}</div>
+      <p class="expiry"><span data-expire-at="${esc(r.expires_at)}">${seconds}s</span> to decide; Esc declines</p>
+      <div class="k-acts"><button class="choice" data-action="key-answer" data-id="${esc(r.id)}" data-approved="false"${disabled}>${disabled ? "answering…" : "not now"}</button><button class="choice" data-action="key-answer" data-id="${esc(r.id)}" data-approved="true"${disabled}>${disabled ? "answering…" : "use the key"}</button></div>
+    </section>`;
   }).join("")}</div>`;
 }
 
@@ -757,55 +801,45 @@ export function buildPaidKeyGate(state, flow) {
   const seat = state.keys?.find((key) => key.id === flow.id);
   const theme = state.settings?.theme === "dark" ? "dark" : "light";
   const disabled = flow.pending ? " disabled" : "";
-  return `<div class="app set-app add-app theme-${theme}" style="--accent:${TOOL_META[seat?.harness || "codex"].accent}">
-    <header class="set-head"><button class="set-back" data-action="paid-key-back" title="back"${disabled}>‹</button><span class="set-title">allow paid key use</span></header>
-    <div class="set-body"><section class="set-sec"><span class="set-label">paid use is off</span>
-      <div class="set-card add-method"><span class="set-t">use ${esc(seat?.label || flow.label)} in a new terminal?</span>
-        <div class="add-hint">real money can be spent. this turns on paid key use for pinned terminals and automatic fallback when subscription seats rest.</div>
-        <div class="add-hint">turning paid use off stops a running paid session; the turn already sent may still bill.</div></div>
-      ${flow.error ? `<div class="usage-error" role="alert">${esc(flow.error)}</div>` : ""}
-      <button class="add-cta" data-action="paid-key-enable"${disabled}>${flow.pending ? "opening your terminal…" : "allow paid use and open terminal"}</button>
-      <button class="add-change" data-action="paid-key-back"${disabled}>not now</button>
-    </section></div></div>`;
+  return `<div class="app set-app theme-${theme}"><header class="set-head"><button class="set-back" data-action="paid-key-back" aria-label="back"${disabled}>‹</button><span class="set-title">paid use is off</span></header><div class="set-body"><section class="set-sec"><h1>allow paid use for ${esc(seat?.label || flow.label)}?</h1>
+    <p>this opens a paid terminal and enables automatic key fallback. real money can be spent; this app does not cap spend.</p><p class="key-price">price unavailable here. ${KEY_PROVIDERS[seat?.provider]?.pricing ? `<button class="pricing-link" data-action="key-pricing" data-provider="${esc(seat.provider)}">check provider pricing</button>` : "check with your endpoint operator."}</p><p>turning paid use off stops sessions and new requests. sent turns may still bill.</p>
+    ${flow.error ? `<p role="alert">${esc(flow.error)}</p>` : ""}<div class="equal-choices"><button class="choice" data-action="paid-key-back"${disabled}>not now</button><button class="choice" data-action="paid-key-enable"${disabled}>${flow.pending ? "opening…" : "allow and open"}</button></div></section></div></div>`;
 }
 
 // Render only these results on input: the filter field itself keeps focus and its caret.
 export function buildModelResults(flow) {
   const catalog = flow.catalog || {};
   const priced = catalog.sort_key === "input_usd_per_million_tokens";
-  const models = [...(catalog.models || [])].sort((a, b) => {
+  const query = (flow.modelFilter || "").toLowerCase();
+  const isFree = (m) => ["input", "output"].every((name) => priceRate(m.price, name) !== null && Number(priceRate(m.price, name)) === 0);
+  const models = [...(catalog.models || [])].sort((a,b) => {
     if (!priced) return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
     const av = priceRate(a.price, "input"), bv = priceRate(b.price, "input");
     return (av === null ? Infinity : Number(av)) - (bv === null ? Infinity : Number(bv));
   });
-  const query = (flow.modelFilter || "").toLowerCase();
-  const visible = models.filter((model) => model.id.toLowerCase().includes(query)
-    || (model.display_name || "").toLowerCase().includes(query));
-  return `<div class="add-hint" role="status">${visible.length} of ${models.length}</div>
-    <div class="set-card">${visible.map((model) => `<button class="add-prov key-model-option" data-action="key-model" data-model="${esc(model.id)}">
-      <span class="add-prov-tx"><span class="key-model mono">${esc(model.id)}</span>
-      ${model.display_name && model.display_name !== model.id ? `<span class="add-prov-sub">${esc(model.display_name)}</span>` : ""}
-      ${priced ? priceHTML(model.price) : ""}
-      ${model.context_window != null ? `<span class="add-hint">${esc(model.context_window)} token context</span>` : ""}</span><span class="add-chev">›</span>
-    </button>`).join("") || `<div class="add-method add-hint">${query ? `no models match “${esc(flow.modelFilter)}”.` : "no models returned. go back to check this key and endpoint."}</div>`}</div>`;
+  const visible = models.filter((model) => model.id.toLowerCase().includes(query) || (model.display_name || "").toLowerCase().includes(query));
+  const context = (n) => n >= 1000000 ? `${Number((n / 1000000).toFixed(2))}M` : n >= 1000 ? `${Number((n / 1000).toFixed(1))}k` : String(n);
+  const decimal = (value) => {
+    const price = formatPrice(value);
+    if (!price.startsWith("$") || !price.includes(".")) return `<span>${price}</span>`;
+    const [whole, fraction] = price.split(".");
+    return `<span class="decimal"><span>${whole}</span><span>.${fraction}</span></span>`;
+  };
+  return `<p class="model-count" role="status"><span class="without-free">${visible.filter((m) => !isFree(m)).length}</span><span class="with-free">${visible.length}</span> matching models</p>
+    <div class="model-columns"><span>model / context</span>${priced ? `<span>input / output<br>USD per million tokens</span>` : ""}</div>
+    <div class="model-list${priced ? "" : " model-list--unpriced"}">${visible.map((model) => `<button class="key-model-option${isFree(model) ? " is-free" : ""}" data-action="key-model" data-model="${esc(model.id)}"><span class="model-identity"><span class="model-id">${esc(model.id)}</span>${model.context_window != null ? `<span class="model-context">${esc(context(model.context_window))} context</span>` : ""}</span>${priced ? `<span class="model-rates">${isFree(model) ? "free" : `${decimal(priceRate(model.price, "input"))}${decimal(priceRate(model.price, "output"))}`}</span>` : ""}</button>`).join("") || `<p class="empty">${query ? `no models match “${esc(flow.modelFilter)}”.` : "no models returned; go back to check your key and endpoint."}</p>`}
+    ${visible.length && visible.every(isFree) ? `<p class="only-free">only free models match; use “show” above to include them.</p>` : ""}</div>`;
 }
 
 export function buildModelPicker(flow) {
   const catalog = flow.catalog || {};
   const provider = KEY_PROVIDERS[flow.provider];
   const priced = catalog.sort_key === "input_usd_per_million_tokens";
-  const message = priced ? "sorted by input $/Mtok · cheap to expensive · unknown input prices last"
-    : provider?.priced ? "prices unavailable from this catalog · sorted by model id"
-    : "this provider does not publish machine-readable prices · sorted by model id";
-  return `<section class="set-sec"><span class="set-label">pick a model</span>
-    <div class="set-card"><input class="add-input" id="key-model-filter" type="search" aria-label="filter models" placeholder="filter by model id or name" autocomplete="off" spellcheck="false" value="${esc(flow.modelFilter || "")}"></div>
-    <div class="add-hint">${message}</div>
-    ${catalog.source === "cache" ? `<div class="add-hint">cached live catalog · ${esc(fmtUsageAge(catalog.fetched_at))}${catalog.potentially_stale ? " · over 24h old" : ""}</div>` : ""}
-    ${catalog.error ? `<div class="usage-error">couldn't refresh the catalog — showing the last reading</div>` : ""}
-    <div id="key-model-results">${buildModelResults(flow)}</div>
-    ${provider?.pricing ? `<a class="add-hint" href="${provider.pricing}" data-action="key-pricing" data-provider="${flow.provider}">provider pricing and budget controls ↗</a>` : `<div class="add-hint">check your endpoint's pricing and budget controls with its operator.</div>`}
-    <div class="add-foot">prices are estimates. use your provider's budget controls for limits — this app does not limit spend.</div>
-  </section>`;
+  return `<section class="model-picker"><div class="search-region"><label class="set-label" for="key-model-filter">find your model</label><input class="add-input" id="key-model-filter" type="search" autofocus aria-label="search models" placeholder="model id or name" autocomplete="off" spellcheck="false" value="${esc(flow.modelFilter || "")}">
+    <label class="free-control"><input id="show-free-models" type="checkbox"><span class="without-free">free models hidden <b>show</b></span><span class="with-free">free models shown <b>hide</b></span></label>
+    <p class="support">${priced ? "sorted by input price; unknown prices last" : "this provider publishes no machine-readable prices."}</p></div><div id="key-model-results">${buildModelResults(flow)}</div>
+    <footer class="model-footer"><p class="support">${catalog.source === "cache" ? "cached" : "live"} ${priced ? "price estimates" : "catalog"}; ${esc(fmtUsageAge(catalog.fetched_at))}${catalog.potentially_stale ? "; over 24h old" : ""}</p>${catalog.error ? `<p class="usage-error">refresh failed; showing the last catalog.</p>` : ""}
+    ${provider?.pricing ? `<button class="pricing-link" data-action="key-pricing" data-provider="${esc(flow.provider)}">provider pricing and budget controls</button>` : `<p class="support">ask your endpoint operator about pricing.</p>`}<p class="support">this app does not cap spend.</p></footer></section>`;
 }
 
 export function keyRequest(flow) {
@@ -837,17 +871,17 @@ export function buildAddKey(state, flow) {
   if (flow.step === "provider") {
     body = `<section class="set-sec"><span class="set-label">who's bringing a key?</span><div class="set-card">${Object.entries(KEY_PROVIDERS).map(([id, p]) =>
       `<button class="add-prov" data-action="key-provider" data-provider="${id}"><span class="add-chip"><span class="add-chip-dot"></span></span>
-      <span class="add-prov-tx"><span class="add-prov-name">${p.name}</span><span class="add-prov-sub">${p.harness === "claude" ? "claude code · messages" : "codex cli · responses"}${p.unverified ? " · unproven" : ""}</span></span><span class="add-chev">›</span></button>`).join("")}</div>
+      <span class="add-prov-tx"><span class="add-prov-name">${p.name}</span><span class="add-prov-sub">${p.harness === "claude" ? "claude code (messages)" : "codex cli (responses)"}${p.unverified ? "; unproven" : ""}</span></span><span class="add-chev">›</span></button>`).join("")}</div>
       <div class="add-foot">the same langdock key works for both routes: openai models through codex, claude models through claude code.</div>
       <div class="add-foot">openrouter offers live model prices across providers. direct openai, anthropic and langdock catalogs don't publish prices.</div></section>`;
   } else if (flow.step === "details") {
     body = `<div class="add-provcard"><span class="add-prov-tx"><span class="add-provcard-t">new ${esc(provider.name)} key seat</span><span class="add-provcard-s">${provider.harness === "claude" ? "claude code" : "codex cli"} sessions</span></span><button class="add-change" data-action="key-back">change</button></div>
       ${provider.regional ? `<section class="set-sec"><label class="set-label" for="key-region">region</label><div class="set-card"><select class="add-input" id="key-region">${["eu", "us", "global"].map((r) => `<option value="${r}"${flow.region === r ? " selected" : ""}>${r}</option>`).join("")}</select></div></section>` : ""}
       ${flow.provider === "openai_compatible" ? `<section class="set-sec"><label class="set-label" for="key-base-url">your endpoint's base url</label><div class="set-card"><input class="add-input" id="key-base-url" type="url" placeholder="https://your-host/v1" value="${esc(flow.base_url)}"></div><div class="add-hint">must support responses; chat completions alone won't work.</div></section>` : ""}
-      <section class="set-sec"><label class="set-label" for="key-label">name this seat</label><div class="set-card"><input class="add-input" id="key-label" placeholder="work · late-night" value="${esc(flow.label)}"></div></section>
+      <section class="set-sec"><label class="set-label" for="key-label">name this seat</label><div class="set-card"><input class="add-input" id="key-label" placeholder="work, late-night" value="${esc(flow.label)}"></div></section>
       <section class="set-sec"><label class="set-label" for="key-secret">paste your api key</label><div class="set-card"><input class="add-input mono" id="key-secret" type="password" autocomplete="off" spellcheck="false" value="${esc(flow.secret)}"></div><div class="add-hint">sent only to the provider you chose; saved in your Mac's keychain.</div></section>
       ${provider.unverified ? `<section class="set-sec"><span class="set-t">this endpoint is unproven</span><div class="add-hint">we cannot promise its responses endpoint works with codex, even if it lists models. requests may still cost money.</div><label class="key-ack"><input id="key-ack" type="checkbox"${flow.allow_unverified ? " checked" : ""}> i understand it may not work, and want to try this endpoint</label></section>` : ""}
-      <button class="add-cta" data-action="key-discover">pick a model →</button>`;
+      <button class="add-cta" data-action="key-discover">pick a model</button>`;
   } else if (flow.step === "connecting") {
     body = `<div class="add-center"><div class="add-spin"></div><div class="add-h">${flow.operation === "key_add" ? "saving your key seat…" : "looking up models…"}</div><div class="add-sub">${flow.operation === "key_add" ? "tucking the key away safely 💛" : "asking only the provider you chose"}</div></div>`;
   } else if (flow.step === "models") {
@@ -856,7 +890,7 @@ export function buildAddKey(state, flow) {
     const model = flow.catalog?.models?.find((m) => m.id === flow.model);
     body = `<section class="set-sec"><span class="set-label">a seat for ${esc(flow.label)}</span><div class="set-card add-method"><span class="set-t">${esc(providerName(flow))}</span><div class="key-model mono">${esc(flow.model)}</div>${priceHTML(model?.price)}</div>
       <div class="add-foot">saving a key does not start a paid session. choose “use in new terminal” when you're ready.</div>
-      <div class="add-foot">use your provider's budget controls for limits — this app does not cap spend.</div></section><button class="add-cta" data-action="key-save">save the key seat →</button>`;
+      <div class="add-foot">use your provider's budget controls for limits — this app does not cap spend.</div></section><button class="add-cta" data-action="key-save">save the key seat</button>`;
   } else {
     body = `<div class="add-center add-center--done"><div class="add-heart">💛</div><div class="add-welcome">welcome, ${esc(flow.label)}</div><div class="add-sub">your key seat's saved</div>
       ${flow.savedSeat?.last_validation?.operation_permitted === false ? `<div class="usage-error">the key check wasn't permitted. check access with your provider before using it.</div>` : ""}
@@ -865,5 +899,5 @@ export function buildAddKey(state, flow) {
   return `<div class="app set-app add-app theme-${theme}" style="--accent:${accent}"><header class="set-head">
     <button class="set-back" data-action="key-back" title="back"${flow.pending ? " disabled" : ""}>‹</button><span class="set-title">add a key</span>
     ${flow.pending ? "" : `<button class="add-cancel" data-action="key-cancel">cancel</button>`}</header>
-    ${keyConfirmations(state)}<div class="set-body">${flow.error ? `<div class="usage-error" role="alert">${esc(flow.error)}</div>` : ""}${body}</div></div>`;
+    ${keyConfirmations(state)}<div class="set-body${flow.step === "models" ? " picker-body" : ""}">${flow.error ? `<div class="usage-error" role="alert">${esc(flow.error)}</div>` : ""}${body}</div></div>`;
 }

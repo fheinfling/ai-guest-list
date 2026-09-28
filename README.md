@@ -41,10 +41,10 @@ The app talks directly to providers for sign-in, usage and model information; yo
 connect through the official tools.
 
 <p align="center">
-  <img src="docs/assets/screenshot.png" width="340" alt="The ai guest list popover: Codex and Claude seats with live 5-hour usage bars, selected subscription seats, a resting one, an API-key seat offering 'use in new terminal', and the auto-switch toggle." />
+  <img src="docs/assets/screenshot.png" width="340" alt="The ai guest list popover: the verdict 'you can keep working', then one row per seat giving the tool, the account and how much 5-hour and weekly headroom is left — active seats first, a resting one at 0%, and an API-key seat priced per token." />
   &nbsp;
-  <img src="docs/assets/screenshot-settings.png" width="340" alt="The settings view: auto-switch strategy, the paid-key toggles, theme, and the menubar icon legend." />
-  <br><sub><i>v1.1.0 · The shipping popover and settings, with fictional accounts. Views are expanded to show all content.</i></sub>
+  <img src="docs/assets/screenshot-settings.png" width="340" alt="The settings view in three sections: switching, paid keys set apart on gold, and appearance with the theme picker and the menu-bar icon legend." />
+  <br><sub><i>The shipping popover and settings, with fictional accounts. Views are expanded to show all content.</i></sub>
 </p>
 
 ## Why
@@ -65,8 +65,9 @@ connect through the official tools.
   ready. Limits are read from Codex's own session events and the usage API's own flags — not from
   screen text — so a reworded banner can't fool it. And if a seat is put to rest while you're working
   on it (the menubar's usage poll notices first), the *running* session hops too.
-- **Live limits in the bar** — 5-hour + weekly usage and reset timers, read from the official usage
-  endpoints. Both windows stay visible, with the age of the last successful reading. Active seats
+- **Live headroom in the bar** — how much of the 5-hour and weekly window each seat has **left**,
+  read from the official usage endpoints, one row per seat with the active ones first. Both
+  windows stay visible, and an unknown or stale reading says so rather than showing a zero. Active seats
   refresh every 30 seconds while the popover is open; background and parked-seat refreshes run
   every three minutes. Provider throttling backs off and keeps the last reading visibly stale.
 - **Desktop switching** — the menubar moves a confirmed-limited seat to a verified healthy seat of
