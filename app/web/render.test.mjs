@@ -1433,6 +1433,133 @@ test("typing filters only results, survives state pushes and resets on each pick
 const rosterHTML = (snapshot) => buildHTML(snapshot).match(/<table class="roster"[\s\S]*?<\/table>/)?.[0];
 const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
 
+test("glance markup remains byte-identical to before the roster extraction", () => {
+  // Captured from the original inline renderer. Active subscriptions require no row actions,
+  // so this pins the extraction independently of the intentional new switch/key treatments.
+  // Both tool groups, remaining headroom, stale readings and an unreported window are covered.
+  const snapshot = state({ tools: {
+    codex: { seats: [seat({ status: "active", usage_stale: true })] },
+    claude: { seats: [seat({ name: "Studio", email: "studio@x.com", plan: "Max", status: "active",
+      usage: { reported_windows: ["weekly"] } })] },
+  } });
+  const expected = readFileSync(new URL("./fixtures/glance-before-extraction.html", import.meta.url), "utf8");
+  for (const theme of ["light", "dark"]) {
+    snapshot.settings.theme = theme;
+    assert.equal(buildHTML(snapshot).match(/<section class="roster-glance"[\s\S]*?<\/section>/)[0], expected);
+  }
+});
+
+for (const screen of ["spending", "nothing-ready"]) {
+  test(`${screen} has a compact roster with every seat, left semantics and ticking resets`, () => {
+    const now = Date.parse("2099-01-01T00:00:00Z");
+    const five = "2099-01-01T02:30:00Z", week = "2099-01-04T00:00:00Z";
+    const snapshot = state({ tools: {
+      codex: { seats: [seat({ name: "Resting Codex", status: "resting", usage5h: 100, usageWeek: 21,
+        limited: true, limited_until: five,
+        usage: { windows: { "5h": { resets_at: five }, weekly: { resets_at: week } } } }),
+      seat({ name: "Weekly Codex", email: "weekly@x.com", status: "queued", usageWeek: 38,
+        usage: { reported_windows: ["weekly"], windows: { weekly: { resets_at: week } } } })] },
+      claude: { seats: [seat({ name: "Resting Claude", email: "claude@x.com", status: "resting",
+        usage5h: 38, usageWeek: 100, usage_stale: true,
+        usage: { windows: { "5h": { resets_at: five }, weekly: { resets_at: week } } } })] },
+    }, keys: [keySeat(), keySeat({ id: "key-2", label: "other key", harness: "claude" })],
+    ...(screen === "spending" ? { running_key_seats: ["key-1"] } : {}) });
+    const html = buildHTML(snapshot);
+    const compact = html.match(/<section class="roster-compact"[\s\S]*?<\/section>/)?.[0];
+    assert.ok(compact);
+    assert.match(compact, /seat availability/);
+    assert.ok(html.indexOf(compact) > html.indexOf(screen === "spending" ? 'class="paid-use-control"' : 'class="ambient-verdict"'));
+    assert.equal((compact.match(/<table /g) || []).length, 1);
+    assert.equal((compact.match(/scope="row"/g) || []).length, 5);
+    assert.equal((compact.match(/scope="rowgroup"/g) || []).length, 2);
+    for (const name of ["Resting Codex", "Weekly Codex", "Resting Claude", "late-night", "other key"]) {
+      assert.ok(compact.includes(`>${name}</span>`), `${name} is in the roster`);
+    }
+    assert.match(compact, />5-hour left<.*>weekly left</);
+    assert.match(compact, />0%<span class="roster-reset"/);
+    assert.match(compact, />79%<span class="roster-reset"/);
+    assert.match(compact, />62%<span class="roster-reset"/);
+    assert.match(compact, /aria-label="no 5-hour window on this plan">—<\/td>/);
+    assert.equal((compact.match(/last known/g) || []).length, 2);
+    assert.equal((compact.match(/paid per token/g) || []).length, 2);
+    assert.equal((compact.match(/no app spend cap/g) || []).length, 2);
+    const nodes = [...compact.matchAll(/data-reset-at="([^"]+)" data-clock-prefix="([^"]+)"/g)]
+      .map(([, resetAt, clockPrefix]) => ({ dataset: { resetAt, clockPrefix } }));
+    assert.equal(nodes.length, 5);
+    const root = { querySelectorAll: (selector) => selector === "[data-reset-at]" ? nodes : [] };
+    updateClockText(root, now);
+    assert.deepEqual(nodes.map((node) => node.textContent), ["in 2h 30m", "in 3d", "in 3d", "in 2h 30m", "in 3d"]);
+    updateClockText(root, now + 60000);
+    assert.deepEqual(nodes.map((node) => node.textContent), ["in 2h 29m", "in 2d23h", "in 2d23h", "in 2h 29m", "in 2d23h"]);
+  });
+}
+
+for (const [screen, price] of [["asking", livePrice("2", "4")], ["asking-unpriced", null]]) {
+  test(`${screen} deliberately contains no roster, including during other paid use`, () => {
+    for (const running_key_seats of [[], ["key-1"]]) {
+      const html = buildHTML(state({ tools: { codex: { seats: [seat()] } }, keys: [keySeat()],
+        pending_key_switches: [keyPrompt({ price })], running_key_seats }));
+      assert.match(html, /class="key-confirm"/);
+      assert.doesNotMatch(html, /<table|class="roster-compact"|class="roster-glance"/);
+    }
+  });
+}
+
+test("running and pinned key seats say spending now while idle keys retain their terms", () => {
+  for (const paid of [{ running_key_seats: ["key-1"] },
+    { pinned_sessions: [{ key_seat: keySeat() }] }, { pinned_sessions: [{ email: "key-1" }] }]) {
+    const h = rosterHTML(state({ tools: { codex: { seats: [seat()] } },
+      keys: [keySeat(), keySeat({ id: "idle", label: "idle key" })], ...paid }));
+    const keys = [...h.matchAll(/<tr class="roster-key[^"]*"[^>]*>[\s\S]*?<\/tr>/g)].map((m) => m[0]);
+    assert.match(keys[0], />spending now</);
+    assert.doesNotMatch(keys[1], /spending now/);
+    for (const key of keys) assert.match(key, /paid per token.*no app spend cap/);
+  }
+});
+
+for (const tool of ["codex", "claude"]) {
+  for (const status of ["resting", "queued", "ready", "active", "needs-login"]) {
+    test(`${tool} ${status} has the same honest seat action in the roster and sheet`, () => {
+      const email = `seat+${status}@${tool}.example`;
+      const html = buildHTML(state({ tools: { [tool]: { seats: [seat({ status, email, name: "My seat" })] } } }));
+      const roster = html.match(/<table class="roster"[\s\S]*?<\/table>/)[0];
+      const card = html.match(/<article class="seat[^"]*"[\s\S]*?<\/article>/)[0];
+      for (const surface of [roster, card]) {
+        if (status === "active") {
+          assert.doesNotMatch(surface, /data-action="switch"/);
+        } else if (status === "needs-login") {
+          assert.match(surface, new RegExp(`data-action="add" data-tool="${tool}">sign in again`));
+          assert.doesNotMatch(surface, /data-action="switch"/);
+        } else {
+          assert.ok(surface.includes(`class="row-action" data-action="switch" data-tool="${tool}" data-email="${email}"`));
+          assert.match(surface, /aria-label="switch to My seat/);
+          if (["resting", "queued"].includes(status)) {
+            assert.match(surface, /this seat's limit applies immediately/);
+            assert.match(surface, />switch anyway<\/button>/);
+          }
+        }
+      }
+    });
+  }
+}
+
+test("unauthorized usage takes precedence over switch on both subscription surfaces", () => {
+  const html = buildHTML(state({ tools: { codex: { seats: [seat({ usage: { error: "unauthorized" } })] } } }));
+  assert.equal((html.match(/>sign in again<\/button>/g) || []).length, 2);
+  assert.doesNotMatch(html, /data-action="switch"/);
+});
+
+test("resting roster switches dispatch the emitted tool and email unchanged", () => {
+  for (const tool of ["codex", "claude"]) {
+    const email = "franz+codex@example.test";
+    const roster = rosterHTML(state({ tools: { [tool]: { seats: [seat({ status: "resting", email })] } } }));
+    const [, emittedTool, emittedEmail] = roster.match(/data-action="switch" data-tool="([^"]+)" data-email="([^"]+)"/);
+    const app = keyApp();
+    app.click({ action: "switch", tool: emittedTool, email: emittedEmail });
+    assert.deepEqual(JSON.parse(JSON.stringify(app.sent.at(-1))), { action: "switch", tool, email });
+  }
+});
+
 test("roster groups tools once in one table, active seats lead each group, and has no subscription models", () => {
   const tools = {
     codex: { seats: [seat({ name: "Rest", email: "rest", status: "resting" }),
@@ -1460,7 +1587,8 @@ test("roster groups tools once in one table, active seats lead each group, and h
   // thing a key seat is for was the defect this replaced. It is a credential-free id handoff to
   // the existing gate, so no price or consent copy belongs on the row itself.
   assert.match(rows[2], /data-action="key-terminal" data-id="key-1"/);
-  assert.match(rows[2], /use in new terminal/);
+  assert.match(rows[2], /aria-label="use late-night in a new paid terminal"/);
+  assert.match(rows[2], />new terminal<\/button>/);
   assert.doesNotMatch(rows[2], /roster-value|\d+%/);
   assert.doesNotMatch(h, /invented-|class="track/);
   assert.equal(tools.codex.seats[0].name, "Rest", "render must not reorder bridge state");
@@ -1485,7 +1613,7 @@ test("roster escapes names and titles, key labels, literal models and unknown ha
   const hostile = '<img src=x onerror="bad()">&';
   const h = rosterHTML(state({ tools: { codex: { seats: [seat({ name: hostile, plan: hostile })] } },
     keys: [keySeat({ label: hostile, model: hostile, harness: hostile })] }));
-  assert.equal((h.match(/&lt;img src=x onerror=&quot;bad\(\)&quot;&gt;&amp;/g) || []).length, 7);
+  assert.equal((h.match(/&lt;img src=x onerror=&quot;bad\(\)&quot;&gt;&amp;/g) || []).length, 10);
   assert.doesNotMatch(h, /<img|onerror="|<script/);
   const noModel = rosterHTML(state({ tools: { codex: { seats: [seat()] } }, keys: [keySeat({ model: null })] }));
   assert.doesNotMatch(noModel, /null|undefined|unknown model/);

@@ -352,8 +352,7 @@ input:focus-visible ~ .sw, .free-control:focus-within, .proof-gate:focus-within 
   *,*::before,*::after { animation:none !important; transition:none !important; scroll-behavior:auto !important; }
 }
 
-/* The everyday roster uses shared headings and active-first rows.
-   Consent, spending, settings and pickers retain their own layouts. */
+/* The everyday roster uses shared headings and active-first rows. */
 .roster-glance {
   flex:1; min-height:0; padding:22px 24px 12px;
   overflow-y:auto; overflow-x:hidden; scrollbar-width:thin;
@@ -412,16 +411,51 @@ input:focus-visible ~ .sw, .free-control:focus-within, .proof-gate:focus-within 
   .roster tbody th, .roster-value { padding-top:9px; padding-bottom:9px; }
 }
 
-/* A key seat's own action, reachable without opening the sheet. Deliberately the same quiet
-   weight as any other secondary control: this one spends real money, so the design should not
-   make it inviting. The paid-use gate and the confirmation still stand behind it.
-   It sits under the terms rather than beside them — the two window columns leave this cell only
-   48% of the width, and side by side wraps "paid per token" onto three lines. A key row is
-   therefore taller than a subscription row, deliberately; check-layout.py knows the difference. */
+/* Row actions sit beside identity/model text, leaving the figures and paid terms in their
+   columns. The shared underlined treatment is secondary, with a real 28px target and focus ring. */
 .key-terms { display:block; }
-.key-use {
-  display:block; margin:8px 0 0 auto; padding:5px 12px; min-height:28px;
-  border:1px solid var(--edge); border-radius:999px;
-  background:transparent; color:inherit; font:inherit; font-size:.8rem; font-weight:600;
+.row-action {
+  display:inline-flex; align-items:center; justify-content:center; flex:none;
+  min-width:28px; min-height:28px; padding:3px 2px; border:0; border-radius:3px;
+  background:transparent; color:inherit; font-size:13px; font-weight:500;
+  white-space:nowrap; text-decoration:underline; text-underline-offset:3px;
 }
-.key-use:hover { background:var(--surface); }
+.roster-inline { display:flex; align-items:center; gap:6px; min-width:0; }
+.roster-inline > .roster-identity, .roster-inline > .roster-meta { flex:1; }
+.roster-inline > .roster-meta { margin-top:0; }
+.roster-spending { flex:none; font-size:13px; font-weight:600; }
+.seat-actions { align-items:center; }
+
+/* The verdict stays above a separately bounded roster. Long session lists can scroll inside
+   the paid hero; neither a long roster nor a long session list can push away the sheet handle. */
+.compact-roster-app .availability { flex:0 1 auto; max-height:290px; }
+.compact-roster-app .ambient-verdict { padding:10px 24px 14px; }
+.compact-roster-app .ambient-verdict h1 { min-height:0; }
+.compact-roster-app .reading { flex-direction:row; justify-content:center; gap:10px; margin:6px 0; }
+.compact-roster-app .reading-value { font-size:2.5rem; }
+.compact-roster-app .hero-followup { gap:8px; margin-top:4px; }
+.compact-roster-app .paid-use-control { flex:0 1 auto; max-height:290px; padding:10px 24px 14px; }
+.compact-roster-app .paid-session-list { margin-bottom:8px; }
+.compact-roster-app .billing-note { margin-top:6px; }
+.roster-compact {
+  flex:1; min-height:0; padding:4px 24px 12px;
+  overflow-y:auto; overflow-x:hidden; scrollbar-width:thin; scroll-padding:8px;
+}
+.roster-compact:focus-visible { outline-offset:-4px; }
+.roster-compact .roster { border-spacing:0 4px; }
+.roster-compact .roster tbody th, .roster-compact .roster-value { padding-top:6px; padding-bottom:6px; }
+.roster-compact .roster .roster-tool { padding-top:8px; padding-bottom:0; }
+.roster-compact .roster-value { font-size:1.35rem; }
+.roster-compact .roster-active .roster-value { font-size:1.6rem; }
+/* Compact body copy has a 13px floor, including countdowns, missing readings and provenance. */
+.roster-compact .roster-identity, .roster-compact .roster-meta,
+.roster-compact .roster thead th, .roster-compact .roster .roster-tool,
+.roster-compact .roster-reset, .roster-compact .roster-freshness,
+.roster-compact .roster-key-terms, .roster-compact .roster .roster-unknown { font-size:13px; }
+
+/* The action sits on its own line under the seat's meta, small and quiet, and the whole row is a
+   pointer target. The button is the keyboard path; the row is a convenience, so the row gets no
+   role or tabindex it could not honour. */
+.row-action { display:inline-flex; margin-top:6px; }
+.roster-actionable { cursor:pointer; }
+.roster-actionable:hover > * { background:var(--surface); }

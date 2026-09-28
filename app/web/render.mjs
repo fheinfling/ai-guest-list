@@ -156,6 +156,19 @@ function bar(seat, win, label) {
     ${showReset ? `<span class="usage-reset" data-reset-at="${esc(reset)}" data-clock-prefix="window resets in" title="${esc(new Date(reset).toLocaleString())}">window resets in ${fmtCountdown(reset)}</span>` : ""}</div>`;
 }
 
+// The engine can switch to any saved subscription, including a capped one. Say what that
+// means at the action instead of silently withholding it; sign-in always takes precedence.
+// "switch anyway" rather than "switch limited": the latter reads as a noun phrase, or as
+// "switching is limited", and a real user asked what it meant. The row already shows resting,
+// 0% and the reset countdown, so the label only has to carry "despite that".
+function seatAction(tool, seat) {
+  if (needsHello(seat)) return `<button class="row-action" data-action="add" data-tool="${tool}">sign in again</button>`;
+  if (seat.status === "active") return "";
+  const limited = seat.limited || ["resting", "queued"].includes(seat.status);
+  const label = `switch to ${seat.name || seat.email}${limited ? "; this seat's limit applies immediately" : ""}`;
+  return `<button class="row-action" data-action="switch" data-tool="${tool}" data-email="${esc(seat.email)}" aria-label="${esc(label)}" title="${esc(label)}">${limited ? "switch anyway" : "switch"}</button>`;
+}
+
 function seatCard(tool, seat) {
   const fetched = seat.usage_fetched_at || seat.usage?.fetched_at || "";
   const reported = seat?.usage?.reported_windows;
@@ -167,9 +180,7 @@ function seatCard(tool, seat) {
   const error = seat.usage?.error;
   const issue = ({ rate_limited: "updates throttled; retrying automatically", network: "connection unavailable; retrying automatically",
     token_expired: `open ${TOOL_META[tool].label} to refresh usage`, unauthorized: "sign in to refresh usage", forbidden: "check your subscription to refresh usage", no_token: "sign in to refresh usage" })[error] || (error ? "usage update failed; retrying automatically" : "");
-  const action = needsHello(seat)
-    ? `<button data-action="add" data-tool="${tool}">sign in again</button>`
-    : ["ready", "queued"].includes(seat.status) ? `<button data-action="switch" data-tool="${tool}" data-email="${esc(seat.email)}">switch to this seat</button>` : "";
+  const action = seatAction(tool, seat);
   return `<article class="seat seat--${esc(seat.status)}" data-card data-tool="${tool}" data-email="${esc(seat.email)}">
     <details class="seat-disclosure"><summary class="seat-row"><span class="seat-name">${esc(seat.name)}</span><span class="seat-state">${stateText}</span><span class="chevron" aria-hidden="true">⌄</span></summary>
     <div class="expand"><p class="seat-email">${esc(seat.email)} ${planChip(seat.plan)}</p>
@@ -570,25 +581,13 @@ function ambientVerdict(state) {
     <div class="hero-followup">${detail}${action}</div></section>`;
 }
 
-// --- popover ----------------------------------------------------------------------------------
-
-export function buildHTML(state) {
-  const theme = state?.settings?.theme === "dark" ? "dark" : "light";
+function rosterTable(state, compact = false) {
   const seats = subscriptionSeats(state);
-  const paid = paidCount(state);
-  const ready = seats.some((seat) => ["active", "ready"].includes(seat.status));
-  const mood = paid ? "spending" : ready ? "ready" : seats.length ? "resting" : "empty";
-  const moved = state?.moved_note ? `<section class="event"><h2>last switch</h2><p>${esc(state.moved_note.replaceAll(" · ", ", "))}</p></section>` : "";
-  const prompts = keyConfirmations(state);
-  const asking = prompts.includes('class="key-confirm"');
-  // The roster is the everyday glance; consent, spending and trouble get their own verdict.
-  // Multiple active tools are real; never choose one on the user's behalf.
-  const glance = ready && !paid && !asking;
-  const roster = glance ? `<section class="roster-glance" aria-label="current availability">
-    <h1 role="status">you can keep working.</h1>
-    <table class="roster" aria-label="seats and remaining headroom">
+  const spending = new Set([...(state?.running_key_seats || []),
+    ...(state?.pinned_sessions || []).map((session) => session.key_seat?.id || session.email)]);
+  return `<table class="roster" aria-label="seats and remaining headroom">
       <colgroup><col class="roster-seat-col"><col class="roster-window-col"><col class="roster-window-col"></colgroup>
-      <thead><tr><th scope="col">your seats</th><th scope="col">5-hour left</th><th scope="col">weekly left</th></tr></thead>
+      <thead><tr><th scope="col">${compact ? "seat availability" : "your seats"}</th><th scope="col">5-hour left</th><th scope="col">weekly left</th></tr></thead>
       ${[...new Set(["codex", "claude", ...(state?.keys || []).map((key) => key.harness)])].map((tool) => {
         const subscriptions = seats.filter((seat) => seat.tool === tool);
         const keys = (state?.keys || []).filter((key) => key.harness === tool);
@@ -615,10 +614,40 @@ export function buildHTML(state) {
             missing ? ` title="${esc(why)}" aria-label="${esc(why)}"` : ""}>${
             missing ? "—" : `${left}%`}${seat.usage_stale && !missing ? `<span class="roster-freshness">last known</span>` : ""}${resetText}</td>`;
         }).join("");
-        return `<tr${active ? ' class="roster-active"' : ""}><th scope="row"><span class="roster-identity" title="${esc(seat.name || seat.email)}">${esc(seat.name || seat.email)}</span><span class="roster-meta">${planChip(seat.plan)}<span class="roster-status">${status}</span></span></th>${windows}</tr>`;
-      }).join("")}${keys.map((key) => `<tr class="roster-key"><th scope="row"><span class="roster-identity" title="${esc(key.label)}">${esc(key.label)}</span>${key.model ? `<span class="roster-meta" title="${esc(key.model)}">${esc(key.model)}</span>` : ""}</th><td class="roster-key-terms" colspan="2"><span class="key-terms">paid per token<span class="roster-meta">no app spend cap</span></span><button class="key-use" data-action="key-terminal" data-id="${esc(key.id)}">use in new terminal</button></td></tr>`).join("")}</tbody>`;
+        const action = seatAction(tool, seat);
+        const identity = `<span class="roster-identity" title="${esc(seat.name || seat.email)}">${esc(seat.name || seat.email)}</span>`;
+        // The row itself carries the action for the pointer — a 344px target instead of a 90px
+        // label. The button stays in the markup as the keyboard and screen-reader path, and
+        // because it is the innermost [data-action], a click on it dispatches once, not twice.
+        // Only a switch becomes a row target. A seat needing sign-in offers "sign in again", and
+        // turning the whole row into a switch would fire the wrong action entirely.
+        const rowAction = action && !active && !needsHello(seat)
+          ? ` data-action="switch" data-tool="${esc(tool)}" data-email="${esc(seat.email)}"` : "";
+        return `<tr class="${active ? "roster-active" : ""}${rowAction ? " roster-actionable" : ""}"${rowAction}><th scope="row">${identity}<span class="roster-meta">${planChip(seat.plan)}<span class="roster-status">${status}</span></span>${action}</th>${windows}</tr>`;
+      }).join("")}${keys.map((key) => `<tr class="roster-key roster-actionable" data-action="key-terminal" data-id="${esc(key.id)}"><th scope="row"><span class="roster-inline"><span class="roster-identity" title="${esc(key.label)}">${esc(key.label)}</span>${spending.has(key.id) ? `<span class="roster-spending">spending now</span>` : ""}</span>${key.model ? `<span class="roster-meta" title="${esc(key.model)}">${esc(key.model)}</span>` : ""}<button class="row-action key-use" data-action="key-terminal" data-id="${esc(key.id)}" aria-label="${esc(`use ${key.label} in a new paid terminal`)}" title="use in a new paid terminal">new terminal</button></th><td class="roster-key-terms" colspan="2"><span class="key-terms">paid per token<span class="roster-meta">no app spend cap</span></span></td></tr>`).join("")}</tbody>`;
       }).join("")}
-    </table>
+    </table>`;
+}
+
+// --- popover ----------------------------------------------------------------------------------
+
+export function buildHTML(state) {
+  const theme = state?.settings?.theme === "dark" ? "dark" : "light";
+  const seats = subscriptionSeats(state);
+  const paid = paidCount(state);
+  const ready = seats.some((seat) => ["active", "ready"].includes(seat.status));
+  const mood = paid ? "spending" : ready ? "ready" : seats.length ? "resting" : "empty";
+  const moved = state?.moved_note ? `<section class="event"><h2>last switch</h2><p>${esc(state.moved_note.replaceAll(" · ", ", "))}</p></section>` : "";
+  const prompts = keyConfirmations(state);
+  const asking = prompts.includes('class="key-confirm"');
+  // Consent is deliberately focused: asking permission to spend real money must never gain
+  // a roster, even while another key is spending. Keep both priced and unpriced consent clear.
+  // Multiple active tools are real; never choose one on the user's behalf.
+  const glance = ready && !paid && !asking;
+  const compact = !asking && !glance && (paid > 0 || seats.length > 0);
+  const roster = glance ? `<section class="roster-glance" aria-label="current availability">
+    <h1 role="status">you can keep working.</h1>
+    ${rosterTable(state)}
   </section>` : "";
   // app/icon.svg's tile, glow and cream leaf, closed across the room. The knob keeps its
   // original radius and colour; only the open leaf's width/position changes to close the door.
@@ -636,10 +665,10 @@ export function buildHTML(state) {
       <circle cx="716" cy="540" r="13" fill="#cf9b2e"/>
     </g>
   </svg>` : ambientArt();
-  return `<div class="app ambient-app${glance ? " roster-app" : ""} theme-${theme} mood-${mood}">${art}
+  return `<div class="app ambient-app${glance ? " roster-app" : ""}${compact ? " compact-roster-app" : ""} theme-${theme} mood-${mood}">${art}
     <header class="top"><span class="brand">ai guest list</span><div class="top-actions"><details class="header-menu"><summary class="ibtn" aria-label="add a subscription seat or API key" title="add a seat or key">＋</summary><nav class="menu-panel"><button data-action="add">a subscription seat</button><button data-action="key-start">an API key</button></nav></details>
     <details class="header-menu"><summary class="ibtn" aria-label="app menu" title="app menu">⋯</summary><nav class="menu-panel"><button data-action="settings">settings</button><button data-action="quit">quit ai guest list</button></nav></details></div></header>
-    <div class="ambient-stage">${prompts}${paid ? paidUseControl(state) : `<div class="availability">${glance ? roster : ambientVerdict(state)}</div>`}</div>
+    <div class="ambient-stage">${prompts}${paid ? paidUseControl(state) : `<div class="availability">${glance ? roster : ambientVerdict(state)}</div>`}${compact ? `<section class="roster-compact" aria-label="seat availability" tabindex="0">${rosterTable(state, true)}</section>` : ""}</div>
     <details class="guest-drawer"><summary class="drawer-handle"><span>${glance ? "seat options" : "guest list"}</span>${glance ? "" : `<span class="drawer-count">${seats.length + (state?.keys?.length || 0)} seats</span>`}<span class="chevron" aria-hidden="true">⌃</span></summary>
       <div class="drawer-content"><div class="main-body">${supervisionBanner(state)}${toolGroup("codex", state?.tools?.codex, (state?.keys || []).filter((k) => k.harness === "codex"))}${toolGroup("claude", state?.tools?.claude, (state?.keys || []).filter((k) => k.harness === "claude"))}
       ${!seats.length && !state?.keys?.length ? `<p class="empty">use ＋ above to add a subscription or API key.</p>` : ""}${moved}

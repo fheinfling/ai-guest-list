@@ -12,8 +12,10 @@ The real bundle handles navigation, disclosures and model-picker replies.
 Only decorative SVGs and reachable content INSIDE a working vertical scroller
 may exceed the viewport. Scroller frames themselves must fit, and scrolling to
 the end must expose their last content; overflow:hidden cannot hide a failure.
-Roster seat rows have a 72px budget (90px for last-known readings), independently
-of the stylesheet. An unavailable browser is an ERROR (exit 2), never a pass.
+Roster seat rows have a 72px budget (90px for last-known readings), and compact
+rows have 62px/78px budgets, plus 24px for a row that carries an action on its own
+line, independently of the stylesheet. An unavailable
+browser is an ERROR (exit 2), never a pass.
 """
 from __future__ import annotations
 
@@ -50,6 +52,21 @@ def gallery_states():
             seat["plan"] = "Self_Serve_Business_Prolite"
     long["state"]["keys"][0].update(label="test / a long API key seat name", model="gpt-6-luna")
     states.append(long)
+    # Enough seats to force the compact roster to scroll in BOTH hero layouts. Include a
+    # stale reading so the compact provenance budget is exercised as well as ordinary rows.
+    for source in ("spending", "trouble"):
+        overflow = copy.deepcopy(next(entry for entry in states if entry["id"] == source))
+        overflow["id"] = source + "-overflow"
+        for tool in overflow["state"]["tools"].values():
+            originals = tool["seats"]
+            tool["seats"] = []
+            for index in range(4):
+                for original in originals:
+                    seat = copy.deepcopy(original)
+                    seat["email"] = f'{index}-{seat["email"]}'
+                    seat["usage_stale"] = index == 0
+                    tool["seats"].append(seat)
+        states.append(overflow)
     return states
 
 
@@ -71,7 +88,7 @@ MEASURE = r"""() => {
     check(el.scrollHeight <= 600 && el.scrollWidth <= 376, `${name(el)} page overflows: ${el.scrollWidth}x${el.scrollHeight}`);
   }
   const elements = [...document.querySelectorAll('#root *')].filter(visible);
-  const intended = '.roster-glance, .main-body, .ambient-verdict, .set-body:not(.picker-body), .model-list, .key-prompts:not(:empty), .paid-session-list';
+  const intended = '.roster-glance, .roster-compact, .main-body, .ambient-verdict, .set-body:not(.picker-body), .model-list, .key-prompts:not(:empty), .paid-session-list';
   for (const el of document.querySelectorAll(intended)) {
     if (visible(el)) check(el.scrollHeight <= el.clientHeight + tolerance || scrolls(el),
       `${name(el)} is an intended scroller with unreachable overflow`);
@@ -126,11 +143,16 @@ MEASURE = r"""() => {
   let columns;
   for (const row of rows) {
     const height = row.getBoundingClientRect().height;
-    // A key row carries an action that subscription rows do not — "use in new terminal" sits
-    // under its terms, because the two window columns leave this cell only 48% of the width.
-    // That is a deliberate 12px, not drift; everything else still holds at 72.
-    const budget = row.querySelector('.roster-freshness') ? 90
-      : row.classList.contains('roster-key') ? 84 : 72;
+    // Compact rows use tighter padding and smaller figures, with a 13px body-copy floor.
+    // Their own budgets must not loosen the everyday 72/90px limits. Inline key actions now
+    // fit the same two lines as subscriptions, so there is no longer a special key allowance.
+    const compact = row.closest('.roster-compact');
+    const stale = row.querySelector('.roster-freshness');
+    // A row carrying an action now puts it on its own line beneath the seat's meta — a
+    // deliberate extra line, because crammed beside the name it read badly and the label was
+    // ambiguous. Rows without an action still hold at the original limits.
+    const act = row.querySelector('.row-action') ? 24 : 0;
+    const budget = (compact ? (stale ? 78 : 62) : (stale ? 90 : 72)) + act;
     check(height <= budget, `roster row ${row.textContent.trim().slice(0, 70)}: ${height.toFixed(1)}px > ${budget}px`);
     const cells = [...row.querySelectorAll('.roster-value')];
     if (!cells.length) continue;
@@ -138,7 +160,47 @@ MEASURE = r"""() => {
     if (!columns) columns = positions;
     check(positions.every((v, i) => Math.abs(v - columns[i]) <= tolerance), 'roster window columns do not align across tools');
   }
+  const focused = document.activeElement;
+  for (const action of document.querySelectorAll('.row-action')) {
+    if (!visible(action)) continue;
+    const r = action.getBoundingClientRect();
+    check(r.width >= 28 && r.height >= 28, `row action target is ${r.width}x${r.height}`);
+    check(action.tabIndex >= 0, 'row action is not keyboard focusable');
+    action.focus({preventScroll: true});
+    const ring = getComputedStyle(action);
+    check(ring.outlineStyle !== 'none' && parseFloat(ring.outlineWidth) >= 2,
+      'row action has no visible keyboard focus ring');
+  }
+  focused?.focus({preventScroll: true});
+  for (const el of document.querySelectorAll('.roster-compact *')) {
+    if ([...el.childNodes].some(n => n.nodeType === Node.TEXT_NODE && n.textContent.trim())) {
+      check(parseFloat(getComputedStyle(el).fontSize) >= 13, `${name(el)} compact text is below 13px`);
+    }
+  }
   return [...new Set(errors)];
+}"""
+
+
+COMPACT_SCROLL = r"""overflowExpected => {
+  const roster = document.querySelector('.roster-compact');
+  if (!roster) return ['compact roster is missing'];
+  const hero = document.querySelector('.paid-use-control, .ambient-verdict');
+  const handle = document.querySelector('.drawer-handle');
+  const before = [hero, handle].map(el => el.getBoundingClientRect().y);
+  const errors = [];
+  if (overflowExpected && roster.scrollHeight <= roster.clientHeight) errors.push('fixture does not overflow the compact roster');
+  roster.scrollTop = roster.scrollHeight;
+  if (overflowExpected && roster.scrollTop === 0) errors.push('compact roster cannot scroll');
+  const last = roster.querySelector('tbody:last-child tr:last-child').getBoundingClientRect();
+  const bounds = roster.getBoundingClientRect();
+  if (last.top < bounds.top || last.bottom > bounds.bottom) errors.push('last seat is unreachable');
+  [hero, handle].forEach((el, i) => {
+    if (el.getBoundingClientRect().y !== before[i]) errors.push('roster scrolling moved the hero or sheet handle');
+  });
+  const h = handle.getBoundingClientRect();
+  if (h.top < 0 || h.bottom > 600) errors.push('sheet handle is unreachable');
+  roster.scrollTop = 0;
+  return errors;
 }"""
 
 
@@ -214,11 +276,17 @@ def main():
                         label = f'{theme}/{entry["id"]}'
                         try:
                             load_state(page, url, entry, theme)
-                            report(label, page.evaluate(MEASURE))
+                            # Establish keyboard modality before measuring row-action focus rings.
+                            page.keyboard.press("Tab")
+                            errors = page.evaluate(MEASURE)
+                            if entry["id"].startswith(("spending", "trouble")):
+                                errors += page.evaluate(COMPACT_SCROLL, entry["id"].endswith("-overflow"))
+                            report(label, errors)
                             if entry["screen"] != "main":
                                 continue
                             page.locator('.guest-drawer > summary').click()
                             page.locator('.seat--key .seat-disclosure > summary').first.click()
+                            page.keyboard.press("Tab")
                             errors = page.evaluate(MEASURE)
                             # Browser keyboard focus must bring both formerly clipped actions into view.
                             for action in ('key-validate', 'key-remove'):

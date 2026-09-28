@@ -243,6 +243,11 @@ document.addEventListener("click", (e) => {
   }
   const drawer = root.querySelector("details.guest-drawer[open]");
   if (drawer && !drawer.contains(e.target) && !drawer.classList.contains("drawer-closing")) moveDrawer(drawer, false);
+  // The + and ⋯ menus are native <details>, which stay open until their own summary is clicked
+  // again. Dismiss on any click outside, and never leave both open at once.
+  for (const menu of root.querySelectorAll("details.header-menu[open]")) {
+    if (!menu.contains(e.target)) menu.open = false;
+  }
   const el = e.target.closest("[data-action]");
   if (!el) return; // Other summaries retain native disclosure toggling.
   const { action, tool, email, value } = el.dataset;
@@ -418,6 +423,13 @@ document.addEventListener("keydown", (e) => {
   if (drawer) {
     e.preventDefault();
     if (!drawer.classList.contains("drawer-closing")) moveDrawer(drawer, false);
+    return;
+  }
+  const menu = root.querySelector("details.header-menu[open]");
+  if (menu) {
+    e.preventDefault();
+    menu.open = false;
+    menu.querySelector("summary")?.focus();   // keyboard users keep their place
     return;
   }
   if (screen === "settings") { screen = "main"; render(); }
