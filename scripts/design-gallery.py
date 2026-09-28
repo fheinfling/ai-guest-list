@@ -47,6 +47,10 @@ FIXTURES = DESIGN / "fixtures"
 PORT = 8918
 
 POPOVER_W, POPOVER_H = 376, 600   # the real WKWebView popover, menubar.py
+# http.server sends only Last-Modified, and every gallery URL used to be identical between
+# builds — so a browser served the previous build from cache and the gallery looked frozen.
+# Every build gets a stamp, and it is threaded through every URL the page fetches.
+STAMP = str(int(dt.datetime.now(dt.timezone.utc).timestamp()))
 
 
 def _screenshots_module():
@@ -203,9 +207,9 @@ def build_states(base: dict, catalog: dict) -> list[dict]:
 # --- the gallery ----------------------------------------------------------------------------------
 
 FRAME_JS = """
-import * as R from "./render.mjs";
+import * as R from "./render.mjs?b=__STAMP__";
 const q = new URLSearchParams(location.search);
-const data = await (await fetch("../states.json")).json();
+const data = await (await fetch("../states.json?b=__STAMP__")).json();
 const entry = data.find((s) => s.id === q.get("s")) || data[0];
 const state = structuredClone(entry.state);
 // A consent request expires two minutes after it is made, and the fixture is written once at
@@ -244,7 +248,7 @@ def frame_html(variant: str) -> str:
     return (f'<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
             f'<title>{variant}</title><link rel="stylesheet" href="styles.css">'
             f"<style>{FRAME_CSS}</style></head><body><div id=\"root\"></div>"
-            f'<script type="module" src="frame.js"></script></body></html>')
+            f'<script type="module" src="frame.js?b={STAMP}"></script></body></html>')
 
 
 def discover_variants() -> list[tuple[str, Path]]:
@@ -280,7 +284,7 @@ def build(refresh_catalog: bool = False) -> list[dict]:
         styles_src = (src / "styles.css") if src else (WEB / "styles.css")
         shutil.copy(render_src, out / "render.mjs")
         shutil.copy(styles_src, out / "styles.css")
-        (out / "frame.js").write_text(FRAME_JS)
+        (out / "frame.js").write_text(FRAME_JS.replace("__STAMP__", STAMP))
         (out / "index.html").write_text(frame_html(name))
     shutil.copytree(WEB / "fonts", BUILD / "fonts")
     for name, src in variants:                 # each frame resolves fonts/ relative to itself
@@ -354,7 +358,7 @@ def gallery_html(variants: list[dict], states: list[dict]) -> str:
     for (const t of document.querySelectorAll(".tab")) t.classList.toggle("on", t.dataset.state === stateId);
     for (const n of document.querySelectorAll(".note")) n.hidden = n.dataset.state !== stateId;
     for (const f of document.querySelectorAll("iframe"))
-      f.src = `${{f.dataset.variant}}/index.html?s=${{stateId}}&t=${{theme}}`;
+      f.src = `${{f.dataset.variant}}/index.html?s=${{stateId}}&t=${{theme}}&b={STAMP}`;
   }};
   document.addEventListener("click", (e) => {{
     const tab = e.target.closest(".tab");
