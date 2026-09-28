@@ -1474,6 +1474,65 @@ def test_pty_spawn_nonzero_exit_propagates():
     assert rc == 7
 
 
+class _FdStream:
+    def __init__(self, fd):
+        self._fd = fd
+
+    def fileno(self):
+        return self._fd
+
+
+def _spawn_on_fake_terminal(monkeypatch, close_after=0.3, **kw):
+    """Run pty_spawn with stdin/stdout on a pty slave whose master is closed mid-run, as when a
+    Terminal window is closed without a SIGHUP reaching the supervisor."""
+    master, slave = os.openpty()
+    deaths, real_kill = [], os.kill
+
+    def kill(pid, sig):
+        if pid == os.getpid():
+            deaths.append(sig)  # never signal the pytest runner
+        else:
+            real_kill(pid, sig)
+    monkeypatch.setattr(L.os, 'kill', kill)
+    monkeypatch.setattr(L.sys, 'stdin', _FdStream(slave))
+    monkeypatch.setattr(L.sys, 'stdout', _FdStream(slave))
+    threading.Timer(close_after, os.close, (master,)).start()
+    started = time.monotonic()
+    try:
+        L.pty_spawn(['/bin/sh', '-c', 'exec sleep 30'], lambda data: False, **kw)
+    finally:
+        os.close(slave)
+    return deaths, time.monotonic() - started
+
+
+def test_pty_spawn_stops_child_when_its_terminal_is_revoked(monkeypatch):
+    """A closed window with no SIGHUP must not leave a headless supervisor (and paid child)."""
+    deaths, elapsed = _spawn_on_fake_terminal(monkeypatch)
+    assert deaths == [L.signal.SIGHUP]
+    assert elapsed < 10
+
+
+def test_tty_alive_detects_a_closed_fd():
+    master, slave = os.openpty()
+    try:
+        assert L._tty_alive(slave)
+    finally:
+        os.close(master)
+        os.close(slave)
+    assert not L._tty_alive(slave)
+
+
+def test_pty_spawn_piped_stdin_eof_keeps_child_running(monkeypatch):
+    r, w = os.pipe()
+    os.close(w)  # immediate EOF on a non-tty stdin
+    monkeypatch.setattr(L.sys, 'stdin', _FdStream(r))
+    try:
+        rc = L.pty_spawn(['/bin/sh', '-c', 'sleep 0.3; exit 5'], lambda data: False)
+    finally:
+        os.close(r)
+    assert rc == 5  # ran to completion; EOF only stopped watching stdin
+
+
 def test_manual_switch_restarts_real_pty_child_with_new_credentials(ctx, tmp_path, monkeypatch):
     """Exercise actual process shutdown, saved conversation, and per-account homes together."""
     import sys
