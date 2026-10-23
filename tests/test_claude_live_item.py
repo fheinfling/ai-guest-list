@@ -27,7 +27,7 @@ def test_switching_claude_seats_leaves_raw_json_claude_can_read(ctx, monkeypatch
     state.upsert_seat("claude", "b@x.com")
     ctx.snapshot_set("claude", "b@x.com", make_claude_blob("team"))
     state.save()
-    monkeypatch.setattr(acct.identity, "claude_status_email", lambda _: "a@x.com")
+    monkeypatch.setattr(acct.identity, "claude_profile_email", lambda *_args, **_kwargs: "a@x.com")
 
     switch(ctx, state, "claude", "b@x.com")
 

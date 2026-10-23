@@ -22,7 +22,7 @@ from pathlib import Path
 from . import TOOLS, __version__
 from . import accounts as acct
 from .context import Context
-from .identity import live_email
+from .identity import claude_profile_email, live_email
 from .switch import sync_back
 from .util import atomic_write_text, now, iso, read_text, read_text_lossless, sha256_text, write_json
 
@@ -156,7 +156,7 @@ def _entry_from(ctx: Context, tool: str, blob: str) -> dict:
     freshest copy of that identity rather than blindly restoring the frozen token)."""
     email = ctx.cred[tool].email_of(blob)
     if not email and tool == "claude":
-        email = live_email(ctx, "claude")  # at capture time the live claude IS the original
+        email = claude_profile_email(blob, ctx.claude_bin)
     return {"present": True, "sha256": sha256_text(blob), "captured_at": iso(now()), "email": email}
 
 
@@ -217,13 +217,14 @@ def install(ctx: Context, *, dry_run: bool = False, register: bool = True,
             blob = ctx.cred[tool].get_live()
             if not blob:
                 continue
-            email = live_email(ctx, tool)
+            email = (claude_profile_email(blob, ctx.claude_bin) if tool == "claude"
+                     else live_email(ctx, tool))
             if not email:
                 plan.actions.append(f"skip register {tool}: could not identify email")
                 continue
-            def _reg(t=tool, e=email):
+            def _reg(t=tool, e=email, b=blob):
                 st = ctx.load_state()
-                acct.add(ctx, st, t, email=e)
+                acct.add(ctx, st, t, email=e, blob=b)
             plan.do(f"register first seat: {tool}:{email}", _reg)
 
     # 3. install the bin wrappers (never shadow stock codex/claude).

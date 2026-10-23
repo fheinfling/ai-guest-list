@@ -51,9 +51,12 @@ def add(ctx: Context, state: State, tool: str, *, name: str | None = None,
     live = blob if blob is not None else ctx.cred[tool].get_live()
     if not live:
         raise NoLiveCreds(f"no live {tool} credentials — sign in with the official tool first")
-    em = email or identity.live_email(ctx, tool)
+    em = email or (identity.claude_profile_email(live, ctx.claude_bin) if tool == "claude"
+                   else identity.live_email(ctx, tool))
     if not em:
         raise CannotIdentify(f"could not determine the account email for {tool}")
+    if tool == "claude":
+        em = next((known for known in state.accounts(tool) if known.lower() == em.lower()), em)
     ctx.snapshot_set(tool, em, live)
     seat = state.upsert_seat(tool, em, name=name, plan=plan_of(tool, live))
     # Fingerprint the PERSON behind the creds so we can warn when two seats are secretly the same
@@ -130,7 +133,7 @@ def reconcile_claude(
     """Capture a fresh/out-of-band Claude Keychain login into the matching seat snapshot.
 
     Claude's credential blob has no email, so comparing it with ``state.active`` cannot identify its
-    owner. The official ``claude auth status --json`` identity is the guard: a known out-of-band
+    owner. Anthropic's OAuth profile identifies the access token's owner: a known out-of-band
     login is adopted and captured under its real seat, while an unknown/inconclusive identity is
     never written over the old active seat's snapshot. Lock-owning callers resolve and pass
     ``live_identity`` before taking the flock; direct callers may omit it when no lock is held.
@@ -142,13 +145,16 @@ def reconcile_claude(
     live = resolved.blob
     if not live:
         return None
-    # The identity answer belongs only to the exact bytes observed before the subprocess. If an
+    # The identity answer belongs only to the exact bytes sent to the profile endpoint. If an
     # official login replaced the Keychain item while the caller waited for the flock, writing the
     # new bytes under the old answer would recreate the cross-account snapshot corruption guard.
     if ctx.cred["claude"].get_live() != live:
         return None
     em = resolved.email
-    if not em or em not in state.accounts("claude"):
+    if not em:
+        return None
+    em = next((known for known in state.accounts("claude") if known.lower() == em.lower()), None)
+    if em is None:
         return None
     changed = ctx.snapshot_get("claude", em) != live
     ctx.snapshot_set("claude", em, live)

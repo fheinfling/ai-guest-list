@@ -397,7 +397,7 @@ def _auto_switch_after_usage(ctx: Context, summary: dict[str, Any], *,
             if tool == "codex" and ctx.cred[tool].email_of(outgoing_after) != active:
                 continue
             if tool == "claude" and (live_identity is None or live_identity.blob != outgoing_after
-                                      or live_identity.email != active):
+                                      or (live_identity.email or "").lower() != active.lower()):
                 continue
             try:
                 do_switch(ctx, state, tool, candidate, live_identity=live_identity)
@@ -563,8 +563,8 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
             scope = message.get("scope", "all")
             if scope not in ("active", "all"):
                 return {"ok": False, "error": f"bad usage scope: {scope}"}
-            # Claude auth status is needed only when the live Keychain bytes differ from the named
-            # active snapshot.  Normal 30-second card refreshes avoid that potentially 30s process.
+            # Claude profile lookup is needed only when live Keychain bytes differ from the active
+            # snapshot.  Normal 30-second card refreshes avoid that potentially 10s request.
             # All credential/identity probes happen before the flock.
             before = ctx.load_state()
             requested_tool = message.get("tool")
@@ -616,7 +616,7 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
             # Keychain login this app snapshots. Claude seats are added via browser sign-in only.)
             tool = message["tool"]
             # Reject Claude explicitly before the lock: sync_back would otherwise need its slow
-            # identity subprocess, and the paste action has no supported Claude credential format.
+            # profile request, and the paste action has no supported Claude credential format.
             if tool != "codex":
                 return {"ok": False, "error": "pasting credentials is codex-only"}
             blob = message["blob"]
@@ -666,8 +666,8 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
             email = message.get("email")
             live = None
             if tool == "claude" and not email:
-                # The Claude blob cannot identify itself. Resolve auth status before the flock and
-                # pass the exact bytes into add(), closing both the 30s lock stall and a login TOCTOU.
+                # Resolve the token owner before the flock and pass the exact bytes into add(),
+                # closing both the HTTP lock stall and a login TOCTOU.
                 resolved = identity_mod.claude_live_identity(ctx)
                 if not resolved.blob:
                     raise NoLiveCreds(

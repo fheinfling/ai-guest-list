@@ -4,6 +4,7 @@ No unit test ever touches the real ~/.codex/auth.json or the real macOS Keychain
 """
 import base64
 import json
+import socket
 
 import pytest
 
@@ -78,3 +79,11 @@ def ctx(tmp_path):
     c = Context.for_test(tmp_path)
     c.ensure_dirs()
     return c
+
+
+@pytest.fixture(autouse=True)
+def _no_network(monkeypatch):
+    """HTTP tests inject transports or urllib handlers; no test may open a real connection."""
+    def offline(*_args, **_kwargs):
+        raise OSError("network disabled in tests")
+    monkeypatch.setattr(socket, "create_connection", offline)

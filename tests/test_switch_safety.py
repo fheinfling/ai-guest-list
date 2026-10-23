@@ -128,14 +128,14 @@ def test_manual_switch_preserves_supervised_codex_token_rotation(ctx, monkeypatc
 
 
 def test_sync_back_claude_unknown_identity_never_clobbers_old_seat(ctx, monkeypatch):
-    """Claude email_of is permanently None; an unknown auth-status identity must stop account B's
+    """Claude email_of is permanently None; an unknown profile identity must stop account B's
     Keychain bytes from being saved under active seat A."""
     ctx.cred["claude"].set_live(make_claude_blob("max"))
     state = ctx.load_state()
     acct.add(ctx, state, "claude", email="a@x.com")
     before = ctx.snapshot_get("claude", "a@x.com")
     ctx.cred["claude"].set_live(make_claude_blob("pro"))
-    monkeypatch.setattr(acct.identity, "claude_status_email", lambda _: "stranger@x.com")
+    monkeypatch.setattr(acct.identity, "claude_profile_email", lambda *_args, **_kwargs: "stranger@x.com")
 
     assert sync_back(ctx, state, "claude") is False
     assert ctx.snapshot_get("claude", "a@x.com") == before
@@ -158,7 +158,7 @@ def test_sync_back_claude_stale_blob_identity_is_noop(ctx):
 
 
 def test_bridge_claude_switch_resolves_identity_before_state_lock(ctx, monkeypatch):
-    """`claude auth status --json` may stall for 30 seconds. A UI switch must resolve it before
+    """The Claude profile request may take 10 seconds. A UI switch must resolve it before
     taking the cross-process state flock while still tying that identity to the exact live blob."""
     ctx.cred["claude"].set_live(make_claude_blob("max"))
     acct.add(ctx, ctx.load_state(), "claude", email="a@x.com")
@@ -177,12 +177,12 @@ def test_bridge_claude_switch_resolves_identity_before_state_lock(ctx, monkeypat
             finally:
                 held["value"] = False
 
-    def status_email(_claude_bin):
-        assert held["value"] is False, "Claude identity subprocess ran under the state flock"
+    def profile_email(_blob, _claude_bin, **_kwargs):
+        assert held["value"] is False, "Claude profile request ran under the state flock"
         return "b@x.com"
 
     monkeypatch.setattr(ctx, "locked", tracked_locked)
-    monkeypatch.setattr(acct.identity, "claude_status_email", status_email)
+    monkeypatch.setattr(acct.identity, "claude_profile_email", profile_email)
 
     result = bridge.handle(ctx, {"action": "switch", "tool": "claude", "email": "a@x.com"})
 

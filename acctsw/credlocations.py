@@ -147,5 +147,5 @@ class ClaudeCredLocation:
 
     def email_of(self, blob: str) -> str | None:
         # Not derivable from the blob (only OAuth tokens + subscriptionType). Email is captured
-        # from `claude auth status` at add-time and stored in state instead.
+        # from the OAuth profile endpoint at add-time and stored in state instead.
         return None

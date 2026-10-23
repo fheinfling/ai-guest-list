@@ -986,9 +986,9 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                                          promote=promote)
             os.environ["CODEX_HOME"] = str(home)
 
-    # Claude's official identity command can stall for 30 seconds. Resolve it with NO state flock,
+    # Claude's profile request can take 10 seconds. Resolve it with NO state flock,
     # and memoise the answer only for the exact live Keychain blob: each distinct credential value
-    # gets its own answer, while later hops cannot serially respawn the CLI for unchanged bytes.
+    # gets its own answer, while later hops avoid repeating the request for unchanged bytes.
     # The reconcile write rechecks that the same blob is still live.
     claude_identities: dict[str | None, identity_mod.ClaudeLiveIdentity] = {}
 
@@ -998,7 +998,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         live = ctx.cred["claude"].get_live()
         if live in claude_identities:
             return claude_identities[live]
-        resolved = identity_mod.claude_live_identity(ctx)  # subprocess — caller holds no state lock
+        resolved = identity_mod.claude_live_identity(ctx)  # HTTP — caller holds no state lock
         if resolved.blob == live:
             claude_identities[live] = resolved
         return resolved
@@ -1299,11 +1299,11 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         live_identity = None
         if tool == "claude":
             # The wait may return the seat that is already active. Check that cheaply first so the
-            # common no-switch path never pays for `claude auth status`; resolve only between locks.
+            # common no-switch path skips the profile request; resolve only between locks.
             with ctx.locked():
                 if email == ctx.load_state().active(tool):
                     return True
-            live_identity = _claude_live_identity()  # slow Claude status happens before the flock
+            live_identity = _claude_live_identity()  # profile request — before the flock
         with ctx.locked():
             state = ctx.load_state()
             if not cold_start and not state.settings().get("auto_switch", True):
@@ -1393,7 +1393,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                            live_identity=None)
                 _activate_codex_home(state.active(tool))
             if claude_switch_needed:
-                live_identity = _claude_live_identity()  # subprocess — no state flock held
+                live_identity = _claude_live_identity()  # HTTP — no state flock held
                 with ctx.locked():
                     state = ctx.load_state()
                     sel = choose(state, tool)  # selection may have changed while identity resolved
@@ -2100,7 +2100,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             # The callback already classified the banner, selected this exact landing seat, and
             # checked the budget while the child was alive. Commit that decision without choose() or
             # another usage fetch on the corpse.
-            live_identity = _claude_live_identity()  # slow Claude status happens before the flock
+            live_identity = _claude_live_identity()  # profile request — before the flock
             committed = False
             handoff_blocked = ""
             with ctx.locked():
@@ -2152,7 +2152,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         # replaces the live item first — the stored snapshot then holds a superseded refresh token
         # and the seat silently stops working. What we DO skip is the cost: when the live blob is
         # byte-identical to the stored snapshot there is nothing to preserve, so the common
-        # no-rotation launch never pays for `claude auth status`.
+        # no-rotation launch never pays for the Claude profile request.
         try:
             if key_runtime is not None or pin:
                 pass  # no OAuth blob belongs to a key child, including failed spawn/prepare paths
@@ -2172,7 +2172,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     rotated = bool(active) and ctx.cred[tool].get_live() != ctx.snapshot_get(
                         tool, active)
                 if rotated:
-                    live_identity = _claude_live_identity()  # subprocess — never under the flock
+                    live_identity = _claude_live_identity()  # HTTP — never under the flock
                     with ctx.locked():
                         st = ctx.load_state()
                         if sync_back(ctx, st, tool, live_identity=live_identity):

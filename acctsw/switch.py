@@ -25,7 +25,7 @@ def sync_back(ctx: Context, state: State, tool: str, *,
     Guard: if the live creds belong to a *different* account than ``state.active`` (e.g. the user ran
     a stock login or switched in the GUI), capture/adopt a known identity or skip the sync-back
     instead of corrupting the old seat's snapshot with foreign bytes. Codex identifies from its JWT;
-    Claude must reconcile through ``claude auth status --json`` because its blob has no email.
+    Claude must reconcile through the OAuth profile endpoint because its blob has no email.
     Lock-owning Claude callers must resolve and pass ``live_identity`` before taking the flock.
     """
     if tool == "claude":
