@@ -97,7 +97,7 @@ class SecurityKeychain:
             capture_output=True, text=True, encoding="utf-8", errors="replace",
         )
         if proc.returncode != 0:
-            raise KeychainError(f"keychain set failed for {service}:{account}: {proc.stderr.strip()}")
+            raise KeychainError("keychain write failed")
 
     def delete(self, service: str, account: str) -> bool:
         proc = subprocess.run(

@@ -48,8 +48,9 @@ def test_usage_reconciles_both_provider_identities_before_poll(ctx, monkeypatch)
     monkeypatch.setattr(acct, "reconcile_codex", lambda _ctx, _state: seen.append("codex"))
     monkeypatch.setattr(
         bridge.identity_mod, "claude_live_identity",
-        lambda _ctx: bridge.identity_mod.ClaudeLiveIdentity(
-            blob=ctx.cred["claude"].get_live(), email="c@x.com"),
+        lambda _ctx, *, email=None: bridge.identity_mod.ClaudeLiveIdentity(
+            blob=(ctx.claude_cred(email) if email else ctx.cred["claude"]).get_live(),
+            email="c@x.com"),
     )
     monkeypatch.setattr(
         acct, "reconcile_claude",
@@ -361,9 +362,10 @@ def test_switch_action(ctx):
     assert r["state"]["tools"]["codex"]["active"] == "a@x.com"
 
 
-def test_switch_unknown_seat_is_friendly_error(ctx):
+@pytest.mark.parametrize("tool", ["codex", "claude"])
+def test_switch_unknown_seat_is_friendly_error(ctx, tool):
     _add(ctx, "a@x.com")
-    r = bridge.handle(ctx, {"action": "switch", "tool": "codex", "email": "ghost@x.com"})
+    r = bridge.handle(ctx, {"action": "switch", "tool": tool, "email": "ghost@x.com"})
     assert r["ok"] is False and "ghost@x.com" in r["error"]
 
 

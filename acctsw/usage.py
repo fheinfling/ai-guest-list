@@ -608,6 +608,9 @@ FALSE_ALARM_MAX_PCT = 90.0
 
 def _seat_blob(ctx, state, tool: str, email: str) -> str | None:
     """Freshest credentials that can be proved to belong to the requested seat."""
+    if tool == "claude":
+        from . import claudehome
+        return claudehome.load(ctx, email)
     snapshot = ctx.snapshot_get(tool, email)
     if state.active(tool) != email:
         return snapshot
@@ -738,6 +741,9 @@ def _detached_blob(ctx, state, tool: str, email: str, *, active: bool) -> str | 
     private home.  Claude's blob carries no identity; its live bytes are usable only when they match
     the named snapshot.  The bridge reconciles a changed Claude login before reaching this helper.
     """
+    if tool == "claude":
+        from . import claudehome
+        return claudehome.load(ctx, email)
     snapshot = ctx.snapshot_get(tool, email)
     if not active:
         return snapshot

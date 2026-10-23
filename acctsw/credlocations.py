@@ -123,7 +123,10 @@ class ClaudeCredLocation:
         self.account = account
 
     def get_live(self) -> str | None:
-        stored = self.keychain.get_raw(self.service, self.account)
+        try:
+            stored = self.keychain.get_raw(self.service, self.account)
+        except Exception:
+            raise KeychainError("Claude credentials could not be read") from None
         if stored is None or _is_json(stored):
             return stored
         decoded = _decode(stored)
@@ -143,7 +146,10 @@ class ClaudeCredLocation:
 
     def set_live(self, blob: str) -> None:
         # Claude Code reads its item verbatim: never apply our snapshot encoding here.
-        self.keychain.set_raw(self.service, self.account, blob)
+        try:
+            self.keychain.set_raw(self.service, self.account, blob)
+        except Exception:
+            raise KeychainError("Claude credentials could not be saved") from None
 
     def email_of(self, blob: str) -> str | None:
         # Not derivable from the blob (only OAuth tokens + subscriptionType). Email is captured

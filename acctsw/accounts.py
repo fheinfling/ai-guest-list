@@ -58,6 +58,10 @@ def add(ctx: Context, state: State, tool: str, *, name: str | None = None,
     if tool == "claude":
         em = next((known for known in state.accounts(tool) if known.lower() == em.lower()), em)
     ctx.snapshot_set(tool, em, live)
+    if tool == "claude":
+        from . import claudehome
+        claudehome.save(ctx, em, live)
+        state.data["tools"][tool]["captured_stock_digest"] = _claude_digest(live)
     seat = state.upsert_seat(tool, em, name=name, plan=plan_of(tool, live))
     # Fingerprint the PERSON behind the creds so we can warn when two seats are secretly the same
     # login (shared quota — they can't cover each other), and record the workspace/subscription id
@@ -127,6 +131,11 @@ def reconcile_codex(ctx: Context, state: State) -> str | None:
     return em
 
 
+def _claude_digest(blob: str) -> str:
+    import hashlib
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
 def reconcile_claude(
         ctx: Context, state: State,
         *, live_identity: identity.ClaudeLiveIdentity | None = None) -> str | None:
@@ -141,8 +150,15 @@ def reconcile_claude(
     """
     if not state.accounts("claude"):
         return None
+    if live_identity is None:
+        current = ctx.cred["claude"].get_live()
+        if (not current or state.data["tools"]["claude"].get("captured_stock_digest")
+                == _claude_digest(current)):
+            return None
     resolved = live_identity or identity.claude_live_identity(ctx)
     live = resolved.blob
+    if live and state.data["tools"]["claude"].get("captured_stock_digest") == _claude_digest(live):
+        return None
     if not live:
         return None
     # The identity answer belongs only to the exact bytes sent to the profile endpoint. If an
@@ -156,17 +172,38 @@ def reconcile_claude(
     em = next((known for known in state.accounts("claude") if known.lower() == em.lower()), None)
     if em is None:
         return None
-    changed = ctx.snapshot_get("claude", em) != live
-    ctx.snapshot_set("claude", em, live)
-    dirty = False
+    # Reconciliation must not bypass convergence's owner/CAS/ambiguity decision. In particular,
+    # a tie between two changed copies is NOT authority to reinstall stock over a private home.
+    home = ctx.claude_cred(em).get_live()
+    if home is not None and home != live:
+        if not ctx._store_lock_held():
+            from . import claudesync
+            claudesync.converge(ctx)
+            state.data = ctx.load_state().data
+            home = ctx.claude_cred(em).get_live()
+        if home != live or ctx.cred["claude"].get_live() != live:
+            return None
+    before = ctx.snapshot_get("claude", em)
+    from . import claudesync
+    tracker = claudesync.tracker(ctx)
+    coordinated = any(seen and seen.blob == live for seen in
+                      (tracker.proofs.get(None), tracker.seen.get(None)))
+    if coordinated and before != live:
+        # The coordinator deliberately preserved a racing/ambiguous snapshot. Never bypass it.
+        return None
+    changed = before != live
+    if changed:
+        ctx.snapshot_set("claude", em, live)
+    if home is None:
+        from . import claudehome
+        # Observer capture may seed an empty item, but may not replace a racing home login.
+        claudehome.ensure_home(ctx, em, capture=True)
+    state.data["tools"]["claude"]["captured_stock_digest"] = _claude_digest(live)
     if changed:
         _creds_refreshed(state, "claude", em)
-        dirty = True
     if state.active("claude") != em:
         state.set_active("claude", em)
-        dirty = True
-    if dirty:
-        state.save()
+    state.save()
     return em
 
 

@@ -179,7 +179,7 @@ def test_bridge_claude_switch_resolves_identity_before_state_lock(ctx, monkeypat
 
     def profile_email(_blob, _claude_bin, **_kwargs):
         assert held["value"] is False, "Claude profile request ran under the state flock"
-        return "b@x.com"
+        return "b@x.com" if '"pro"' in _blob else "a@x.com"
 
     monkeypatch.setattr(ctx, "locked", tracked_locked)
     monkeypatch.setattr(acct.identity, "claude_profile_email", profile_email)

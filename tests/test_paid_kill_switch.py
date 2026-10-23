@@ -86,7 +86,7 @@ def test_subscription_child_ignores_paid_kill_switch(ctx, tool):
     _, reset = setup(ctx, tool=tool)
     calls = []
 
-    def spawn(argv, output, on_tick=None):
+    def spawn(argv, output, on_tick=None, *, env=None):
         calls.append(argv)
         assert not on_tick()
         disable(ctx)

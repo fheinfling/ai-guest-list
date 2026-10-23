@@ -317,6 +317,7 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
             self._state_timer = None
             self._usage_timer = None
             self._usage_interval = None
+            self._claude_sync_inflight = False
             self._usage_poll_inflight = False
             self._pending_usage_request = None
             self._last_all_usage_poll = 0.0
@@ -500,8 +501,12 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
         def pollState_(self, _timer):
             """Notice state.json / session writes even when the popover is hidden.
 
-            Deliberately network-free: the "status" action only re-reads local state, so the
-            engine's per-seat usage cache still governs every endpoint call."""
+            The bridge checks Claude item bytes in a coalesced background worker each 3s tick;
+            only changed bytes require profile HTTP. Status itself still only reads local state."""
+            if not self._claude_sync_inflight:
+                self._claude_sync_inflight = True
+                self.performSelectorInBackground_withObject_(
+                    objc.selector(self.syncClaudeBg_, signature=b"v@:@"), None)
             sig = self._stateSignature()
             if sig is None or sig == self._last_state_sig:
                 return
@@ -509,6 +514,12 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
             result = dict(bridge.handle(self.ctx, {"action": "status"}))
             result["background"] = True
             self.applyResult_(result)
+
+        def syncClaudeBg_(self, _request):
+            try:
+                bridge.handle(self.ctx, {"action": "claude_sync"})
+            finally:
+                self._claude_sync_inflight = False
 
         def pollUsage_(self, _timer):
             # Run the network refresh OFF the main thread so the menubar UI never freezes.  A slow

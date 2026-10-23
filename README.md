@@ -37,6 +37,8 @@ It's two thin pieces over your stock tools:
 
 Your stock `codex` / `claude` and their desktop apps keep working **untouched**. Saved credentials
 stay in the **macOS Keychain** and the official tools’ credential stores.
+Each Claude account keeps its own login, so sessions on different accounts no longer log each
+other out. Plain `claude` follows the account you select in the app.
 The app talks directly to providers for sign-in, usage and model information; your coding sessions
 connect through the official tools.
 
@@ -187,6 +189,14 @@ ends all paid sessions; a turn already sent may still bill. Subscription childre
 - `cx` / `cl` — supervised launchers for `codex` / `claude`. **Stock binaries are never renamed or
   shadowed**; the app is the master switch for ordinary invocations — closed app ⇒ `cx`/`cl` run
   the real tool. An explicit `--key` pin stays supervised, including when the app is closed.
+
+Each Claude account keeps its own login. Sessions on different accounts can run side by side
+without logging each other out. Your projects, conversation history, settings and custom tools
+stay available across accounts. Plain `claude` follows the account you select in the app.
+
+If a Claude seat asks you to sign in again, complete browser sign-in for that account and re-add
+it through the app or `acctsw add`. Existing logins migrate automatically; a login saved under the
+wrong account needs re-adding.
 
 See [`docs/PLAN.md`](docs/PLAN.md) for the full design and [`docs/RELEASING.md`](docs/RELEASING.md) for
 the release flow.

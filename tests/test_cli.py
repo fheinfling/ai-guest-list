@@ -104,6 +104,10 @@ def test_keychain_error_is_friendly(isolated, monkeypatch, capsys):
     from acctsw.keychain import KeychainError
     from tests.conftest import make_claude_blob
     isolated.cred["claude"].set_live(make_claude_blob())
+    from acctsw import usage
+    monkeypatch.setattr(usage, "claude_user_agent", lambda *_: "claude-code/fake")
+    monkeypatch.setattr(usage, "_default_get", lambda *_:
+                        (200, '{"account":{"email":"c@x.com"}}'))
 
     def boom(*a, **k):
         raise KeychainError("security: boom")

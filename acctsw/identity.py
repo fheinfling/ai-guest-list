@@ -37,13 +37,14 @@ def live_email(ctx: Context, tool: str) -> str | None:
     raise ValueError(f"unknown tool: {tool}")
 
 
-def claude_live_identity(ctx: Context, *, get: HttpGet | None = None) -> ClaudeLiveIdentity:
+def claude_live_identity(ctx: Context, *, email: str | None = None,
+                         get: HttpGet | None = None) -> ClaudeLiveIdentity:
     """Resolve the token owner's email for the exact currently-live Claude credential blob.
 
     The profile request has a 10-second timeout. Callers that also need ``Context.locked()`` must
     invoke this first and pass the returned pair through to the mutation. No refresh token is used.
     """
-    blob = ctx.cred["claude"].get_live()
+    blob = (ctx.claude_cred(email) if email else ctx.cred["claude"]).get_live()
     email = claude_profile_email(blob, ctx.claude_bin, get=get) if blob else None
     return ClaudeLiveIdentity(blob=blob, email=email)
 

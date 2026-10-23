@@ -189,6 +189,7 @@ def build_env(ctx: Context, runtime: KeyHome, *, env: dict[str, str] | None = No
     else:
         # Inherited subscription/cloud routing must not override this API-key seat.
         for key in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS",
+                    "CLAUDE_SECURESTORAGE_CONFIG_DIR",
                     "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"):
             child.pop(key, None)
         child.update(CLAUDE_CONFIG_DIR=str(runtime.home), ANTHROPIC_BASE_URL=runtime.base_url,

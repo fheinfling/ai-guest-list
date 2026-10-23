@@ -167,7 +167,7 @@ class FakeSpawn:
         self.stops = 0
         self.ticks = 0
 
-    def __call__(self, argv, on_output, on_tick=None):
+    def __call__(self, argv, on_output, on_tick=None, *, env=None):
         script = self.scripts[len(self.calls)]
         out, status = script[0], script[1]
         hooks = list(script[2]) if len(script) > 2 else []
@@ -464,8 +464,8 @@ def test_run_claude_no_switch_skips_identity_cli(ctx, monkeypatch):
     assert len(spawn.calls) == 1
 
 
-def test_run_claude_hop_resolves_identity_before_spawn(ctx, monkeypatch):
-    """A real Claude seat hop still resolves the outgoing blob's identity before switching."""
+def test_run_claude_hop_leaves_stock_identity_alone(ctx, monkeypatch):
+    """A Claude hop uses private credentials without probing the unrelated stock item."""
     state = _two_claude(ctx)  # active c1
     state.set_limited_until(
         "claude", "c1@x.com", iso(now() + timedelta(hours=1)), source="usage"
@@ -479,7 +479,7 @@ def test_run_claude_hop_resolves_identity_before_spawn(ctx, monkeypatch):
             blob=ctx.cred["claude"].get_live(), email="c1@x.com"
         )
 
-    def spawn(argv, on_output, on_tick=None):
+    def spawn(argv, on_output, on_tick=None, *, env=None):
         events.append("spawn")
         on_output(b"all good, done\n")
         return 0
@@ -487,7 +487,7 @@ def test_run_claude_hop_resolves_identity_before_spawn(ctx, monkeypatch):
     monkeypatch.setattr(L.identity_mod, "claude_live_identity", resolve_identity)
 
     assert run(ctx, "claude", [], spawn=spawn, get=fake_get({})) == 0
-    assert events == ["identity", "spawn"]
+    assert events == ["spawn"]
     assert ctx.load_state().active("claude") == "c2@x.com"
 
 
@@ -663,7 +663,7 @@ def test_confirmed_limit_starts_one_advisory_seat_watcher(ctx, monkeypatch):
     sleeps = []
     calls = []
 
-    def spawn(argv, on_output, on_tick=None):
+    def spawn(argv, on_output, on_tick=None, *, env=None):
         calls.append(list(argv))
         assert on_output(b"usage limit reached\n") is False
         assert ready.wait(2), "seat watcher did not notify"
@@ -1168,7 +1168,7 @@ def test_activate_codex_home_promotes_only_without_a_live_session(ctx, monkeypat
     assert seen and seen[0] is True
 
 
-def test_run_claude_resume_uses_continue(ctx):
+def test_run_claude_resume_uses_exact_session_id(ctx):
     for em in ("c1@x.com", "c2@x.com"):
         ctx.cred["claude"].set_live(__import__("tests.conftest", fromlist=["make_claude_blob"]).make_claude_blob())
         st = ctx.load_state()
@@ -1181,7 +1181,8 @@ def test_run_claude_resume_uses_continue(ctx):
     spawn = FakeSpawn([(b"usage limit reached\n", 1), (b"resumed\n", 0)])
     rc = run(ctx, "claude", [], spawn=spawn, get=get, notify=lambda m: None)
     assert rc == 0
-    assert spawn.calls[1][-1] == "--continue"
+    session_id = spawn.calls[0][spawn.calls[0].index("--session-id") + 1]
+    assert spawn.calls[1][-2:] == ["--resume", session_id]
 
 
 def test_run_claude_waits_then_starts_original_invocation_when_all_seats_resting(ctx):
@@ -1201,7 +1202,9 @@ def test_run_claude_waits_then_starts_original_invocation_when_all_seats_resting
     assert rc == 0
     assert len(sleeps) == 1
     assert sleeps[0] > 0
-    assert spawn.calls[0] == build_cmd(ctx, "claude", [])
+    assert spawn.calls[0][0] == "claude"
+    assert spawn.calls[0][1] == "--session-id"
+    assert "--resume" not in spawn.calls[0]
     assert any("waiting until" in m for m in msgs)
     assert ctx.load_state().get_seat("claude", "c1@x.com").get("limited_until") is None
 
@@ -1578,7 +1581,7 @@ while True:
     output = bytearray()
     clicked = False
 
-    def spawn(argv, on_output, on_tick=None):
+    def spawn(argv, on_output, on_tick=None, *, env=None):
         def observe(chunk):
             nonlocal clicked
             output.extend(chunk)
@@ -1637,15 +1640,15 @@ def test_run_claude_exit_syncs_back_rotated_creds(ctx, monkeypatch):
     acct.add(ctx, ctx.load_state(), "claude", email="solo@x.com")
     rotated = make_claude_blob("max").replace('"accessToken": "x"', '"accessToken": "rotated"')
 
-    def rotate_mid_session(_argv, on_output, on_tick=None):
-        ctx.cred["claude"].set_live(rotated)   # the child refreshed its token while running
+    def rotate_mid_session(_argv, on_output, on_tick=None, *, env=None):
+        ctx.claude_cred("solo@x.com").set_live(rotated)   # child rotates its private item
         on_output(b"done\n")
         return 0
 
     monkeypatch.setattr(
         L.identity_mod, "claude_live_identity",
-        lambda _c: L.identity_mod.ClaudeLiveIdentity(blob=ctx.cred["claude"].get_live(),
-                                                     email="solo@x.com"))
+        lambda _c, **kw: L.identity_mod.ClaudeLiveIdentity(blob=(ctx.claude_cred(kw["email"]) if kw.get("email") else ctx.cred["claude"]).get_live(),
+                                                     email="solo@x.com" if kw.get("email") else None))
 
     assert run(ctx, "claude", [], spawn=rotate_mid_session, get=fake_get({})) == 0
     assert ctx.snapshot_get("claude", "solo@x.com") == rotated
@@ -1888,7 +1891,7 @@ def test_manual_switch_uses_latest_choice_during_shutdown(ctx, target):
 
     calls = []
 
-    def spawn(argv, on_output, on_tick=None):
+    def spawn(argv, on_output, on_tick=None, *, env=None):
         calls.append(list(argv))
         if len(calls) == 1:
             click("b@x.com")
@@ -2145,7 +2148,7 @@ def test_tick_costs_one_stat_when_nothing_changed(ctx, monkeypatch):
     monkeypatch.setattr(L.os, "stat", counting_stat)
     seen = {}
 
-    def spawn(argv, on_output, on_tick=None):
+    def spawn(argv, on_output, on_tick=None, *, env=None):
         before = loads["n"]
         stats["n"] = 0
         for _ in range(50):

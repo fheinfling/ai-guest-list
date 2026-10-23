@@ -282,6 +282,12 @@ def _auto_switch_after_usage(ctx: Context, summary: dict[str, Any], *,
     candidate against a fresh provider response outside the state flock, then checks every decision
     input again under the flock immediately before the existing safe switch primitive runs.
     """
+    def saved_blob(tool, email):
+        if tool == "claude":
+            from . import claudehome
+            return claudehome.load(ctx, email)
+        return ctx.snapshot_get(tool, email)
+
     excluded_by_tool = excluded_by_tool or {}
     for tool, tool_summary in summary.items():
         if not isinstance(tool_summary, dict):
@@ -333,10 +339,10 @@ def _auto_switch_after_usage(ctx: Context, summary: dict[str, Any], *,
 
         # Keychain access is a subprocess on macOS.  Pin both snapshots with no state flock held;
         # the receipt revision below makes a state writer invalidate this decision before commit.
-        outgoing_blob = ctx.cred[tool].get_live()
+        outgoing_blob = saved_blob(tool, active) if tool == "claude" else ctx.cred[tool].get_live()
         outgoing_digest = _blob_digest(outgoing_blob)
-        active_snapshot_digest = _blob_digest(ctx.snapshot_get(tool, active))
-        candidate_digest_before = _blob_digest(ctx.snapshot_get(tool, candidate))
+        active_snapshot_digest = _blob_digest(saved_blob(tool, active))
+        candidate_digest_before = _blob_digest(saved_blob(tool, candidate))
         if not outgoing_digest or not candidate_digest_before:
             continue
         if (active_seat.get("usage") or {}).get("credential_digest") != outgoing_digest:
@@ -352,7 +358,10 @@ def _auto_switch_after_usage(ctx: Context, summary: dict[str, Any], *,
             excluded_by_tool.setdefault(tool, {active}).add(candidate)
             return _auto_switch_after_usage(ctx, summary, excluded_by_tool=excluded_by_tool)
 
-        candidate_digest_after = _blob_digest(ctx.snapshot_get(tool, candidate))
+        candidate_digest_after = _blob_digest(saved_blob(tool, candidate))
+        if tool == "claude":
+            from . import claudehome
+            claudehome.prepare(ctx, candidate)
         receipt_state = ctx.load_state()
         receipt_rev = receipt_state.data.get("rev")
         if candidate_digest_after is None or candidate_digest_after != candidate_digest_before:
@@ -361,9 +370,13 @@ def _auto_switch_after_usage(ctx: Context, summary: dict[str, Any], *,
 
         # Claude's identity query may block; resolve before taking the handoff lock.  `do_switch`
         # verifies this exact blob again before it writes, so a login racing this probe is harmless.
-        live_identity = identity_mod.claude_live_identity(ctx) if tool == "claude" else None
-        outgoing_after = ctx.cred[tool].get_live()
-        candidate_after = ctx.snapshot_get(tool, candidate)
+        if tool == "claude":
+            from . import claudesync
+            live_identity = claudesync.cached_identity(ctx, email=active)
+        else:
+            live_identity = None
+        outgoing_after = saved_blob(tool, active) if tool == "claude" else ctx.cred[tool].get_live()
+        candidate_after = saved_blob(tool, candidate)
         outgoing_unchanged = _blob_digest(outgoing_after) == outgoing_digest
         candidate_unchanged = _blob_digest(candidate_after) == candidate_digest_before
         with ctx.locked():
@@ -400,7 +413,8 @@ def _auto_switch_after_usage(ctx: Context, summary: dict[str, Any], *,
                                       or (live_identity.email or "").lower() != active.lower()):
                 continue
             try:
-                do_switch(ctx, state, tool, candidate, live_identity=live_identity)
+                do_switch(ctx, state, tool, candidate, sync=(tool != "claude"),
+                          live_identity=live_identity)
                 state.data["last_switch_at"] = iso(now())
                 state.save()
             except (AcctswError, OSError) as exc:
@@ -451,6 +465,11 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
                 result.update(ok=False, state=None, error="couldn't refresh status after that key request")
             secret = message.get("secret")
             return _redact_key(result, secret if isinstance(secret, str) else "")
+
+        if action == "claude_sync":
+            from . import claudesync
+            claudesync.converge(ctx)
+            return {"ok": True}
 
         if action in ("ready", "status", "dot"):
             return {"ok": True, "state": snapshot_state(ctx)}
@@ -539,12 +558,18 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
 
         if action == "switch":
             tool = message["tool"]
-            # Claude's blob has no email, and its official identity probe can wait 30 seconds.
+            # Resolve changed Claude token owners before taking the cross-process state flock.
             # Resolve the blob/email pair before taking the cross-process flock; reconcile_claude
             # rechecks the exact blob under the lock before trusting the answer.
-            live_identity = (
-                identity_mod.claude_live_identity(ctx) if tool == "claude" else None
-            )
+            if tool == "claude":
+                from . import claudehome, claudesync
+                claudesync.converge(ctx)
+                claudehome.prepare(ctx, message["email"])
+            live_identity = None
+            if tool == "claude":
+                seen = claudesync.tracker(ctx).seen.get(None)
+                live_identity = identity_mod.ClaudeLiveIdentity(
+                    seen.blob if seen else None, seen.email if seen else None)
             with ctx.locked():
                 state = ctx.load_state()
                 do_switch(ctx, state, tool, message["email"], manual=True,
@@ -566,6 +591,9 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
             # Claude profile lookup is needed only when live Keychain bytes differ from the active
             # snapshot.  Normal 30-second card refreshes avoid that potentially 10s request.
             # All credential/identity probes happen before the flock.
+            if message.get("tool") in (None, "claude"):
+                from . import claudesync
+                claudesync.converge(ctx)
             before = ctx.load_state()
             requested_tool = message.get("tool")
             want_codex = requested_tool in (None, "codex")
@@ -581,8 +609,10 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
                 live_claude = ctx.cred["claude"].get_live()
                 saved_claude = (ctx.snapshot_get("claude", active_claude)
                                 if active_claude else None)
-                if live_claude != saved_claude:
-                    live_identity = identity_mod.claude_live_identity(ctx)
+                captured = before.data["tools"]["claude"].get("captured_stock_digest")
+                if live_claude != saved_claude and (
+                        not live_claude or acct._claude_digest(live_claude) != captured):
+                    live_identity = claudesync.cached_identity(ctx)
                     reconcile_claude = True
                 claude_ua = usage_mod.claude_user_agent(ctx.claude_bin)
             else:
@@ -665,7 +695,7 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
             tool = message["tool"]
             email = message.get("email")
             live = None
-            if tool == "claude" and not email:
+            if tool == "claude":
                 # Resolve the token owner before the flock and pass the exact bytes into add(),
                 # closing both the HTTP lock stall and a login TOCTOU.
                 resolved = identity_mod.claude_live_identity(ctx)
