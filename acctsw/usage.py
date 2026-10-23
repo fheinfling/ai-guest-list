@@ -105,10 +105,18 @@ class UsageFetchResult:
 
 # --- real transport ---------------------------------------------------------------------------
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def _default_get(url: str, headers: dict, timeout: float) -> tuple[int, str]:
     req = urllib.request.Request(url, headers=headers, method="GET")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        # A profile probe must never forward the bearer token to a redirect target.
+        open_request = (urllib.request.build_opener(_NoRedirect()).open
+                        if url == P.CLAUDE_PROFILE_URL else urllib.request.urlopen)
+        with open_request(req, timeout=timeout) as resp:
             return resp.status, resp.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         body = ""

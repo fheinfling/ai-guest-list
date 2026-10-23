@@ -152,7 +152,7 @@ def test_add_without_live_creds_errors(ctx):
 
 
 def test_add_claude_uses_supplied_email(ctx):
-    # Claude blob carries no email → identity must be supplied (M6/CLI passes it via auth status)
+    # Claude blob carries no email → identity must be supplied (M6/CLI passes it via the profile)
     ctx.cred["claude"].set_live(make_claude_blob())
     state = ctx.load_state()
     seat = acct.add(ctx, state, "claude", email="c@x.com")
@@ -250,7 +250,7 @@ def test_reconcile_codex_ignores_unknown_identity(ctx):
 
 
 def test_reconcile_claude_captures_and_adopts_out_of_band_login(ctx, monkeypatch):
-    """Claude blobs carry no email: auth-status identity must route fresh Keychain bytes to the
+    """Claude blobs carry no email: profile identity must route fresh Keychain bytes to the
     matching known seat instead of leaving state on the old account."""
     ctx.cred["claude"].set_live(make_claude_blob("max"))
     acct.add(ctx, ctx.load_state(), "claude", email="a@x.com")
@@ -259,7 +259,7 @@ def test_reconcile_claude_captures_and_adopts_out_of_band_login(ctx, monkeypatch
     state.upsert_seat("claude", "b@x.com")
     ctx.snapshot_set("claude", "b@x.com", make_claude_blob("max"))
     state.save()
-    monkeypatch.setattr(acct.identity, "claude_status_email", lambda _: "b@x.com")
+    monkeypatch.setattr(acct.identity, "claude_profile_email", lambda *_args, **_kwargs: "b@x.com")
 
     assert acct.reconcile_claude(ctx, state) == "b@x.com"
     loaded = ctx.load_state()

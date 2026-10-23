@@ -450,7 +450,7 @@ def test_run_clean_exit_no_switch(ctx):
 
 
 def test_run_claude_no_switch_skips_identity_cli(ctx, monkeypatch):
-    """An already-chosen Claude seat must launch without paying for `claude auth status`."""
+    """An already-chosen Claude seat must launch without paying for the Claude profile request."""
     ctx.cred["claude"].set_live(make_claude_blob())
     acct.add(ctx, ctx.load_state(), "claude", email="solo@x.com")
 
@@ -1653,7 +1653,7 @@ def test_run_claude_exit_syncs_back_rotated_creds(ctx, monkeypatch):
 
 def test_run_claude_exit_without_rotation_skips_identity_cli(ctx, monkeypatch):
     """The sync-back is preserved, but its COST is not paid when there is nothing to preserve: an
-    unchanged live blob is byte-identical to the snapshot, so no `claude auth status` is spawned."""
+    unchanged live blob is byte-identical to the snapshot, so no Claude profile request is sent."""
     ctx.cred["claude"].set_live(make_claude_blob())
     acct.add(ctx, ctx.load_state(), "claude", email="solo@x.com")
 

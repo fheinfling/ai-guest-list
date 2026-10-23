@@ -40,7 +40,7 @@ def test_shared_account_warning_rides_the_nested_state(ctx):
 
 
 def test_usage_reconciles_both_provider_identities_before_poll(ctx, monkeypatch):
-    """A poll captures a changed Claude login, while ordinary ticks skip the slow identity CLI."""
+    """A poll captures a changed Claude login, while ordinary ticks skip the slow profile lookup."""
     seen = []
     ctx.cred["claude"].set_live(make_claude_blob("max"))
     acct.add(ctx, ctx.load_state(), "claude", email="c@x.com")
@@ -135,7 +135,7 @@ def test_targeted_codex_usage_does_not_probe_claude(ctx, monkeypatch):
     acct.add(ctx, ctx.load_state(), "claude", email="c@x.com")
     monkeypatch.setattr(
         bridge.identity_mod, "claude_live_identity",
-        lambda _ctx: pytest.fail("targeted Codex refresh must not run Claude auth status"),
+        lambda _ctx: pytest.fail("targeted Codex refresh must not run Claude profile lookup"),
     )
     monkeypatch.setattr(
         bridge.usage_mod, "claude_user_agent",

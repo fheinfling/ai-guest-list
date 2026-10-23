@@ -23,7 +23,7 @@ def _seed_live(ctx, codex_email="orig@x.com"):
 
 def test_install_captures_factory_image_and_registers(ctx, tmp_path):
     _seed_live(ctx)
-    # claude identity isn't derivable from blob → register only codex here (no claude bin in tests)
+    # Without a profile response, register only Codex.
     plan = install(ctx, bin_dir=tmp_path / "bin", register=True)
     # factory image stored in keychain for codex
     assert ctx.keychain.get(ctx.keychain_service, _backup_account("codex")) is not None

@@ -89,14 +89,20 @@ def test_handoff_rechecks_changes_during_probe(ctx, monkeypatch, change):
         assert ctx.load_state().active("codex") == "seat0@test.example"
 
 
-def test_claude_handoff_checks_identity_and_switches(ctx, monkeypatch):
+@pytest.mark.parametrize("email", ["seat0@test.example", "SEAT0@TEST.EXAMPLE", None,
+                                  "unknown@test.example"])
+def test_claude_handoff_checks_identity_and_switches(ctx, monkeypatch, email):
     summary = seed(ctx, "claude", spare_count=1)
     from acctsw.identity import ClaudeLiveIdentity
     monkeypatch.setattr(bridge.identity_mod, "claude_live_identity", lambda c:
-                        ClaudeLiveIdentity(blob=c.cred["claude"].get_live(), email="seat0@test.example"))
+                        ClaudeLiveIdentity(blob=c.cred["claude"].get_live(), email=email))
     probe(monkeypatch)
     result = bridge._auto_switch_after_usage(ctx, summary)
-    assert result["tool"] == "claude" and result["to"] == "seat1@test.example"
+    if email and email.lower() == "seat0@test.example":
+        assert result["tool"] == "claude" and result["to"] == "seat1@test.example"
+    else:
+        assert result is None
+        assert ctx.load_state().active("claude") == "seat0@test.example"
 
 
 def test_forced_display_refresh_respects_provider_error_backoff(ctx):

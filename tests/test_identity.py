@@ -1,20 +1,9 @@
-"""Identity resolution tests (reviewer gap #4) — codex via JWT, claude via mocked CLI."""
-import json
-import subprocess
-import types
-
+"""Identity resolution tests — Codex via JWT, Claude via an injected profile transport."""
 import pytest
 
-from acctsw import identity
-from acctsw.identity import claude_status_email, live_email
+from acctsw.identity import claude_profile_email, live_email
 from acctsw.credlocations import codex_jwt_email
-from tests.conftest import make_codex_blob
-
-
-def _fake_run(stdout="", returncode=0):
-    def run(*a, **k):
-        return types.SimpleNamespace(stdout=stdout, stderr="", returncode=returncode)
-    return run
+from tests.conftest import make_claude_blob, make_codex_blob
 
 
 def test_codex_live_email_from_jwt(ctx):
@@ -39,24 +28,22 @@ def test_codex_jwt_email_rejects_valid_json_with_a_wrong_shape(blob):
     assert codex_jwt_email(blob) is None
 
 
-def test_claude_status_email_parses_json(monkeypatch):
-    monkeypatch.setattr(identity, "shutil", types.SimpleNamespace(which=lambda _: "/bin/claude"))
-    monkeypatch.setattr(subprocess, "run",
-                        _fake_run(json.dumps({"loggedIn": True, "email": "c@x.com"})))
-    assert claude_status_email("/bin/claude") == "c@x.com"
+def test_claude_profile_email_parses_json():
+    get = lambda *_args: (200, '{"account": {"email": "c@x.com"}}')
+    assert claude_profile_email(make_claude_blob(), get=get) == "c@x.com"
 
 
-def test_claude_status_email_logged_out(monkeypatch):
-    monkeypatch.setattr(subprocess, "run",
-                        _fake_run(json.dumps({"loggedIn": False})))
-    assert claude_status_email("/bin/claude") is None
+def test_claude_profile_email_logged_out():
+    assert claude_profile_email(make_claude_blob(), get=lambda *_: (401, "")) is None
 
 
-def test_claude_status_email_no_binary(monkeypatch):
-    monkeypatch.setattr(identity, "shutil", types.SimpleNamespace(which=lambda _: None))
-    assert claude_status_email(None) is None
+def test_claude_profile_email_no_binary(monkeypatch):
+    from acctsw import usage
+    monkeypatch.setattr(usage.shutil, "which", lambda _: None)
+    usage._claude_user_agent_for_exe.cache_clear()
+    assert claude_profile_email(make_claude_blob(), get=lambda *_:
+                                (200, '{"account": {"email": "c@x.com"}}')) == "c@x.com"
 
 
-def test_claude_status_email_bad_json(monkeypatch):
-    monkeypatch.setattr(subprocess, "run", _fake_run("not json"))
-    assert claude_status_email("/bin/claude") is None
+def test_claude_profile_email_bad_json():
+    assert claude_profile_email(make_claude_blob(), get=lambda *_: (200, "not json")) is None
