@@ -45,6 +45,8 @@ class KeychainBackend(Protocol):
 
     def get(self, service: str, account: str) -> str | None: ...
     def set(self, service: str, account: str, secret: str) -> None: ...
+    def get_raw(self, service: str, account: str) -> str | None: ...
+    def set_raw(self, service: str, account: str, value: str) -> None: ...
     def delete(self, service: str, account: str) -> bool: ...
 
 
@@ -59,6 +61,11 @@ class SecurityKeychain:
         self._security = security_path
 
     def get(self, service: str, account: str) -> str | None:
+        stored = self.get_raw(service, account)
+        return None if stored is None else _decode(stored)
+
+    def get_raw(self, service: str, account: str) -> str | None:
+        """The item's bytes exactly as stored — no base64/hex decoding."""
         proc = subprocess.run(
             [self._security, "find-generic-password", "-s", service, "-a", account, "-w"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -66,10 +73,18 @@ class SecurityKeychain:
         if proc.returncode != 0:
             return None
         # `-w` prints the password with a trailing newline.
-        return _decode(proc.stdout.rstrip("\n"))
+        return proc.stdout.rstrip("\n")
 
     def set(self, service: str, account: str, secret: str) -> None:
-        # Pass the (base64) blob inline via `-w <value>`. The tempting alternative — `-w` with no
+        """Store one of OUR items, base64-encoded (see ``_encode``)."""
+        self.set_raw(service, account, _encode(secret))
+
+    def set_raw(self, service: str, account: str, value: str) -> None:
+        """Store ``value`` verbatim — for an item another program reads, e.g. Claude Code's own.
+
+        ``value`` must be single-line printable text, or ``security -w`` reads it back as hex.
+        """
+        # Pass the value inline via `-w <value>`. The tempting alternative — `-w` with no
         # value, feeding the secret over stdin — is BROKEN for real credentials: `security` reads
         # that prompt with readpassphrase(), which silently TRUNCATES to 128 bytes (returncode 0,
         # no error) and, when a child TUI holds the tty in raw mode, can block waiting on /dev/tty.
@@ -77,9 +92,8 @@ class SecurityKeychain:
         # has no length cap. The `ps` exposure it was meant to avoid is moot: a same-user process
         # that could read our argv can just call `security find-generic-password` and read the item
         # directly. -U updates the item if it already exists.
-        blob = _encode(secret)
         proc = subprocess.run(
-            [self._security, "add-generic-password", "-U", "-s", service, "-a", account, "-w", blob],
+            [self._security, "add-generic-password", "-U", "-s", service, "-a", account, "-w", value],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
         )
         if proc.returncode != 0:
@@ -94,16 +108,24 @@ class SecurityKeychain:
 
 
 class InMemoryKeychain:
-    """Test double; behaves like a generic-password store."""
+    """Test double; stores exactly what ``SecurityKeychain`` would, so ``get_raw`` shows what
+    another program reading the item (Claude Code) would see."""
 
     def __init__(self) -> None:
         self._store: dict[tuple[str, str], str] = {}
 
     def get(self, service: str, account: str) -> str | None:
+        stored = self.get_raw(service, account)
+        return None if stored is None else _decode(stored)
+
+    def get_raw(self, service: str, account: str) -> str | None:
         return self._store.get((service, account))
 
     def set(self, service: str, account: str, secret: str) -> None:
-        self._store[(service, account)] = secret
+        self.set_raw(service, account, _encode(secret))
+
+    def set_raw(self, service: str, account: str, value: str) -> None:
+        self._store[(service, account)] = value
 
     def delete(self, service: str, account: str) -> bool:
         return self._store.pop((service, account), None) is not None

@@ -13,7 +13,7 @@ import json
 from pathlib import Path
 from typing import Protocol
 
-from .keychain import KeychainBackend
+from .keychain import KeychainBackend, KeychainError, _decode, _encode
 from .util import atomic_write_text, jwt_payload
 
 
@@ -98,6 +98,14 @@ class CodexCredLocation:
         return fallback if isinstance(fallback, str) and fallback else None
 
 
+def _is_json(text: str) -> bool:
+    """Whether ``text`` is a JSON object — the shape of every Claude Code credential item."""
+    try:
+        return isinstance(json.loads(text), dict)
+    except ValueError:
+        return False
+
+
 class ClaudeCredLocation:
     """Active Claude account lives in the Keychain. The blob has no email; callers supply it.
 
@@ -115,10 +123,27 @@ class ClaudeCredLocation:
         self.account = account
 
     def get_live(self) -> str | None:
-        return self.keychain.get(self.service, self.account)
+        stored = self.keychain.get_raw(self.service, self.account)
+        if stored is None or _is_json(stored):
+            return stored
+        decoded = _decode(stored)
+        if decoded == stored or not _is_json(decoded):
+            return stored  # not ours to reinterpret
+        if _encode(decoded) != stored:
+            return decoded  # e.g. `security` printing multi-line JSON as hex: readable, not ours
+        # Builds up to 1.2.0 wrote this item base64-encoded like our own snapshots. Claude Code
+        # cannot read that and reports "Not logged in", so restore the raw JSON it expects — unless
+        # something rewrote the item since we read it (a fresh login must never lose to old bytes).
+        try:
+            if self.keychain.get_raw(self.service, self.account) == stored:
+                self.keychain.set_raw(self.service, self.account, decoded)
+        except KeychainError:
+            pass  # a reader must not fail; the next read retries the repair
+        return decoded
 
     def set_live(self, blob: str) -> None:
-        self.keychain.set(self.service, self.account, blob)
+        # Claude Code reads its item verbatim: never apply our snapshot encoding here.
+        self.keychain.set_raw(self.service, self.account, blob)
 
     def email_of(self, blob: str) -> str | None:
         # Not derivable from the blob (only OAuth tokens + subscriptionType). Email is captured
