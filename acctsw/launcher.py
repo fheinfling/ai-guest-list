@@ -29,6 +29,8 @@ and never decide anything on their own when something better is available:
 """
 from __future__ import annotations
 
+from .util import email_key
+
 import fcntl
 import json
 import logging
@@ -1094,7 +1096,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             if st.get_seat("claude", email) is None:
                 return
             if (email not in claude_home_warnings and seen and seen.blob == current
-                    and ((seen.email and seen.email.casefold() != email.casefold())
+                    and ((seen.email and email_key(seen.email) != email_key(email))
                          or (not seen.email and current != ctx.snapshot_get("claude", email)))):
                 claude_home_warnings.add(email)
                 notify(f"claude: login in {email}'s home could not be identified as {email}; "

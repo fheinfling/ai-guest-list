@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Protocol
 
 from .keychain import KeychainBackend, KeychainError, _decode, _encode
-from .util import atomic_write_text, jwt_payload
+from .util import atomic_write_text, email_key, jwt_payload
 
 
 def _codex_auth_tokens(blob: str) -> dict | None:
@@ -51,7 +51,7 @@ def codex_jwt_email(blob: str) -> str | None:
 def codex_jwt_matches(email: str, blob: str) -> bool:
     """Whether a Codex credential's JWT names exactly this email (case-insensitively)."""
     actual = codex_jwt_email(blob)
-    return actual is not None and actual.casefold() == email.casefold()
+    return actual is not None and email_key(actual) == email_key(email)
 
 
 class CredLocation(Protocol):

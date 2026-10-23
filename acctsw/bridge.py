@@ -6,6 +6,8 @@ WKScriptMessage dicts here and pushes the returned ``state`` back into the web v
 """
 from __future__ import annotations
 
+from .util import email_key
+
 import hashlib
 from typing import Any
 
@@ -410,7 +412,7 @@ def _auto_switch_after_usage(ctx: Context, summary: dict[str, Any], *,
             if tool == "codex" and ctx.cred[tool].email_of(outgoing_after) != active:
                 continue
             if tool == "claude" and (live_identity is None or live_identity.blob != outgoing_after
-                                      or (live_identity.email or "").lower() != active.lower()):
+                                      or email_key(live_identity.email or "") != email_key(active)):
                 continue
             try:
                 do_switch(ctx, state, tool, candidate, sync=(tool != "claude"),

@@ -31,6 +31,8 @@ Same-account rotation coordination lives in claudesync; .claude.json is only for
 """
 from __future__ import annotations
 
+from .util import email_key
+
 import hashlib
 from contextlib import contextmanager
 import json
@@ -230,7 +232,7 @@ def merge_config(ctx, email: str, *, capture: bool = False) -> None:
                 atomic_write_text(source, json.dumps(canonical, indent=2), mode=0o600)
     local = _apply_shared(local, shared)
     account = canonical.get("oauthAccount") or {}
-    if (capture or not path.exists()) and account.get("emailAddress", "").casefold() == email.casefold():
+    if (capture or not path.exists()) and email_key(account.get("emailAddress", "")) == email_key(email):
         local["oauthAccount"] = account
     elif capture or (not path.exists() and "oauthAccount" not in local):
         local["oauthAccount"] = {"emailAddress": email}
@@ -260,8 +262,8 @@ def prepare(ctx, email: str) -> None:
     stock_answer = cached_identity(ctx) if stock else None
     stock_owner = stock_answer.email if stock_answer and stock_answer.blob == stock else None
     seed, proven = snapshot, bool(owner)
-    mismatch = bool(owner and owner.casefold() != email.casefold())
-    if not mismatch and stock_owner and stock_owner.casefold() == email.casefold():
+    mismatch = bool(owner and email_key(owner) != email_key(email))
+    if not mismatch and stock_owner and email_key(stock_owner) == email_key(email):
         candidate = newest([snapshot, stock]) if snapshot else stock
         if candidate == stock:
             seed, proven = stock, True
@@ -364,12 +366,12 @@ def sync_back(ctx, state, email: str, *, live_identity=None) -> bool:
     resolved = live_identity or identity.claude_live_identity(ctx, email=email)
     if state.get_seat("claude", email) is None:
         return False
-    if (resolved.blob and resolved.email and resolved.email.casefold() != email.casefold()
+    if (resolved.blob and resolved.email and email_key(resolved.email) != email_key(email)
             and ctx.claude_cred(email).get_live() == resolved.blob):
         from .claudesync import quarantine
         quarantine(ctx, state, email)
         return False
-    if (not resolved.blob or not resolved.email or resolved.email.casefold() != email.casefold()
+    if (not resolved.blob or not resolved.email or email_key(resolved.email) != email_key(email)
             or ctx.claude_cred(email).get_live() != resolved.blob
             or state.get_seat("claude", email) is None):
         return False

@@ -12,7 +12,7 @@ from .errors import CannotIdentify, NoLiveCreds
 from .selection import choose
 from .state import State
 from .usage import MAX_TRUSTED_AGE_S, account_fingerprint, account_workspace
-from .util import now, parse_iso, jwt_payload
+from .util import email_key, now, parse_iso, jwt_payload
 
 # raw plan code -> display label (spec §4: Business|Team|Pro|Max|Free)
 _PLAN_LABELS = {"business": "Business", "team": "Team", "enterprise": "Enterprise",
@@ -56,7 +56,7 @@ def add(ctx: Context, state: State, tool: str, *, name: str | None = None,
     if not em:
         raise CannotIdentify(f"could not determine the account email for {tool}")
     if tool == "claude":
-        em = next((known for known in state.accounts(tool) if known.lower() == em.lower()), em)
+        em = next((known for known in state.accounts(tool) if email_key(known) == email_key(em)), em)
     ctx.snapshot_set(tool, em, live)
     if tool == "claude":
         from . import claudehome
@@ -169,7 +169,7 @@ def reconcile_claude(
     em = resolved.email
     if not em:
         return None
-    em = next((known for known in state.accounts("claude") if known.lower() == em.lower()), None)
+    em = next((known for known in state.accounts("claude") if email_key(known) == email_key(em)), None)
     if em is None:
         return None
     # Reconciliation must not bypass convergence's owner/CAS/ambiguity decision. In particular,

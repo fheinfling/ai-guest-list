@@ -110,6 +110,28 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+class HttpReply(tuple):
+    """Two-value transport result with only a parsed, non-sensitive retry delay attached."""
+    def __new__(cls, status, body, headers):
+        import math
+        import time
+        from email.utils import parsedate_to_datetime
+        reply = super().__new__(cls, (status, body))
+        reply.retry_after = None
+        value = headers.get('Retry-After') if headers else None
+        if value is not None:
+            try:
+                seconds = float(value)
+            except (ValueError, TypeError):
+                try:
+                    seconds = parsedate_to_datetime(value).timestamp() - time.time()
+                except (ValueError, TypeError, OverflowError):
+                    return reply
+            if math.isfinite(seconds) and seconds >= 0:
+                reply.retry_after = seconds
+        return reply
+
+
 def _default_get(url: str, headers: dict, timeout: float) -> tuple[int, str]:
     req = urllib.request.Request(url, headers=headers, method="GET")
     try:
@@ -117,14 +139,14 @@ def _default_get(url: str, headers: dict, timeout: float) -> tuple[int, str]:
         open_request = (urllib.request.build_opener(_NoRedirect()).open
                         if url == P.CLAUDE_PROFILE_URL else urllib.request.urlopen)
         with open_request(req, timeout=timeout) as resp:
-            return resp.status, resp.read().decode("utf-8", "replace")
+            return HttpReply(resp.status, resp.read().decode("utf-8", "replace"), resp.headers)
     except urllib.error.HTTPError as e:
         body = ""
         try:
             body = e.read().decode("utf-8", "replace")
         except Exception:
             pass
-        return e.code, body
+        return HttpReply(e.code, body, e.headers)
     except (urllib.error.URLError, OSError, TimeoutError):
         return 0, ""  # network failure
 

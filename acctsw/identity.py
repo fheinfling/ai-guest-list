@@ -26,6 +26,7 @@ class ClaudeLiveIdentity:
     """
     blob: str | None
     email: str | None
+    retry_after: float | None = None
 
 
 def live_email(ctx: Context, tool: str) -> str | None:
@@ -45,12 +46,14 @@ def claude_live_identity(ctx: Context, *, email: str | None = None,
     invoke this first and pass the returned pair through to the mutation. No refresh token is used.
     """
     blob = (ctx.claude_cred(email) if email else ctx.cred["claude"]).get_live()
-    email = claude_profile_email(blob, ctx.claude_bin, get=get) if blob else None
-    return ClaudeLiveIdentity(blob=blob, email=email)
+    delays = []
+    owner = claude_profile_email(blob, ctx.claude_bin, get=get,
+                                on_retry_after=delays.append) if blob else None
+    return ClaudeLiveIdentity(blob, owner, delays[0] if delays else None)
 
 
 def claude_profile_email(blob: str, claude_bin: str | None = None,
-                         *, get: HttpGet | None = None) -> str | None:
+                         *, get: HttpGet | None = None, on_retry_after=None) -> str | None:
     """Read only account.email; an inconclusive profile leaves the credential owner unknown."""
     from . import usage  # lazy: usage's reconciliation path also imports identity
     try:
@@ -59,12 +62,15 @@ def claude_profile_email(blob: str, claude_bin: str | None = None,
         token = oauth.get("accessToken") if isinstance(oauth, dict) else None
         if not isinstance(token, str) or not token.strip():
             return None
-        status, body = (get or usage._default_get)(P.CLAUDE_PROFILE_URL, {
+        response = (get or usage._default_get)(P.CLAUDE_PROFILE_URL, {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
             "User-Agent": usage.claude_user_agent(claude_bin),
         }, 10.0)
+        status, body = response
         if status != 200:
+            if on_retry_after is not None:
+                on_retry_after(getattr(response, 'retry_after', None))
             return None
         profile = json.loads(body)
         account = profile.get("account") if isinstance(profile, dict) else None

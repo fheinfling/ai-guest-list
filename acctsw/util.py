@@ -16,6 +16,11 @@ from pathlib import Path
 from typing import Any
 
 
+def email_key(email: str) -> str:
+    """Case-insensitive seat identity, shared by capture, migration and convergence."""
+    return email.casefold()
+
+
 def redact_key(value: Any, key: str) -> Any:
     """Scrub credential echoes from decoded catalogs and bridge/CLI responses alike.
 

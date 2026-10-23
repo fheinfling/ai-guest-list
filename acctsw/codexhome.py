@@ -58,6 +58,8 @@ otherwise the heal simply waits for the next launch.
 """
 from __future__ import annotations
 
+from .util import email_key
+
 import contextlib
 import errno
 import fcntl
@@ -113,7 +115,7 @@ def _slug(email: str) -> str:
     prefix (~1e-8 for a handful of seats), while every extra character spends the path budget that
     a deep ``$HOME`` needs far more often.
     """
-    return hashlib.sha256(email.casefold().encode("utf-8")).hexdigest()[:8]
+    return hashlib.sha256(email_key(email).encode("utf-8")).hexdigest()[:8]
 
 
 def home_dir(email: str, root: Path | None = None) -> Path:
