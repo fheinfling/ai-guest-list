@@ -72,8 +72,10 @@ else
     die 'draft has no unsigned app zip; re-run CI before signing again'
   mv "$WORK_DIR/input/$UNSIGNED" "$WORK_DIR/$UNSIGNED"
   WORKFLOW="$REPO/.github/workflows/release.yml"
+  # --cert-identity pins the exact workflow file AND tag; gh rejects combining it with
+  # --signer-workflow, so it is the single identity constraint.
   if ! gh attestation verify "$WORK_DIR/$UNSIGNED" \
-      --repo "$REPO" --signer-workflow "$WORKFLOW" \
+      --repo "$REPO" \
       --source-ref "refs/tags/$TAG" \
       --cert-identity "https://github.com/$WORKFLOW@refs/tags/$TAG" \
       --cert-oidc-issuer https://token.actions.githubusercontent.com \
