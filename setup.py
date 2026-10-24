@@ -65,10 +65,18 @@ DATA_FILES = [
     ("web/fonts", glob("app/web/fonts/*")),
 ]
 
+# CPython's own test suites (fixture data, public dummy TLS keys) are never imported by the app.
+# scripts/release-bundle.py refuses any bundle that still contains one.
+STDLIB_TEST_PACKAGES = [
+    "test", "unittest.test", "lib2to3.tests", "tkinter.test", "ctypes.test", "sqlite3.test",
+    "distutils.tests", "idlelib.idle_test",
+]
+
 OPTIONS = {
     "argv_emulation": False,            # menubar agent: no CLI args, and avoids the Carbon dependency
     "iconfile": "app/icon.icns",        # the disco-door app icon (source: app/icon.svg)
     "packages": ["acctsw", "app"],      # engine + shell (py2app follows imports, this is belt+braces)
+    "excludes": STDLIB_TEST_PACKAGES,
     "plist": {
         "CFBundleName": "AI Guest List",
         "CFBundleDisplayName": "AI Guest List",

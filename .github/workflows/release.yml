@@ -139,6 +139,19 @@ jobs:
           grep -Fq "sha256 \"${SHA256}\""  "$CASK"
           # This version has no in-app updater; Homebrew must keep managing upgrades.
           sed -i -E '/^[[:space:]]*auto_updates[[:space:]]/d' "$CASK"
+          # Published releases are Developer ID signed and notarized: drop the legacy unsigned notice.
+          python3 - "$CASK" <<'CASKEOF'
+          import re, sys
+          path = sys.argv[1]
+          text = open(path, encoding="utf-8").read()
+          block = re.compile(r"\n(?:[ \t]*\n)?[ \t]*caveats <<~EOS\n.*?\n[ \t]*EOS\n", re.S)
+          text = block.sub(lambda m: "\n" if "not signed or notarized" in m.group(0) else m.group(0), text)
+          text = re.sub(r"\n{3,}", "\n\n", text)
+          open(path, "w", encoding="utf-8").write(text)
+          CASKEOF
+          if grep -Fq "not signed or notarized" "$CASK"; then
+            echo "::error::the unsigned-build notice is still in the cask"; exit 1
+          fi
           git diff -- "$CASK"
 
       - name: Commit and push

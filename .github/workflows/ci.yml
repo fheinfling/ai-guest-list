@@ -69,6 +69,9 @@ jobs:
           git diff --exit-code -- app/web/bundle.js
           python setup.py py2app
           lipo "dist/AI Guest List.app/Contents/MacOS/AI Guest List" -verify_arch "$EXPECTED_ARCH"
+          # Same release-content gate as the release build: no stdlib test suites, no PEM keys.
+          python scripts/strip-bundle.py "dist/AI Guest List.app"
+          python scripts/release-bundle.py scan "dist/AI Guest List.app"
 
       - name: Smoke-test packaged app
         if: matrix.build

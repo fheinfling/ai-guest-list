@@ -83,7 +83,8 @@ login keychain, never in the repo or GitHub secrets. See [the workflow](../.gith
    This publishes the tested bytes without signing again. `update-tap` runs only on the
    **release published** event: it checks the published zip's SHA-256 against the manifest and
    bumps the cask. Homebrew manages upgrades because this branch has no in-app updater; the job
-   removes any obsolete `auto_updates` declaration. Verify that job succeeds.
+   removes any obsolete `auto_updates` declaration and the legacy unsigned-build `caveats` notice.
+   Verify that job succeeds.
    Omitting `--no-publish` from a fresh local signing run also explicitly authorizes publication.
 
 ## Recovery and local checks
@@ -128,6 +129,9 @@ login keychain, never in the repo or GitHub secrets. See [the workflow](../.gith
 
 ## Notes
 
+- **Bundle content gate.** `scripts/release-bundle.py scan` (run by PR CI on every build and by
+  release CI before attaching the draft) refuses CPython test suites (excluded in `setup.py`) and
+  any PEM private-key block, in loose files or inside archives.
 - **README screenshots.** Regenerate with `.venv/bin/python scripts/screenshots.py` whenever the
   popover or settings view changes (and check the version in the settings footer). It seeds sample
   seats, runs them through the real engine, and shoots the real web UI — so the images can't drift
