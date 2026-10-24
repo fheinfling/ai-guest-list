@@ -612,10 +612,10 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
             op = msg.get("_op")
             try:
                 # The startup bootstrap also exposes this package in source-linked alias builds.
-                # prepare_then_login resolves the CLI's ABSOLUTE path itself (raising a clear error if
-                # the CLI is missing) and launches via `open` — no AppleEvents/Automation permission.
+                # prepare_then_login resolves this app's engine and launches isolated sign-in
+                # via `open` — no AppleEvents/Automation permission.
                 from app.terminal import prepare_then_login
-                prepare_then_login(self.ctx, tool)
+                prepare_then_login(self.ctx, tool, seat=msg.get("email"))
             except Exception as e:
                 _log_exception(e)
                 # Launch failed. If a NEWER login for this tool has since superseded us (op identity),

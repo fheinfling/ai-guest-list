@@ -49,10 +49,13 @@ def build_parser() -> argparse.ArgumentParser:
     uni.add_argument("--purge", action="store_true", help="also delete the store + keychain items")
     uni.add_argument("--dry-run", action="store_true", help="print actions without doing them")
 
-    add = sub.add_parser("add", help="add (sign in) a seat from the live account")
+    add = sub.add_parser("add", help="import a stock login (use signin for a new login)")
     _add_tool_arg(add)
     add.add_argument("--name", help="friendly name for this seat")
     add.add_argument("--email", help="override detected email (Codex only)")
+    signin = sub.add_parser("signin", help="sign in privately and select the identified seat")
+    _add_tool_arg(signin)
+    signin.add_argument("--seat", help="require this account for sign in again")
     rm = sub.add_parser("remove", help="remove (sign out) a seat")
     _add_tool_arg(rm)
     rm.add_argument("email", help="account email to remove")
@@ -186,7 +189,7 @@ def _cmd_add(ctx: Context, ns) -> int:
         from .identity import claude_live_identity
         resolved = claude_live_identity(ctx)  # HTTP before the store lock; --email is no proof.
         if not resolved.blob:
-            raise NoLiveCreds("no live claude credentials — sign in with the official tool first")
+            raise NoLiveCreds("no live claude credentials — run `acctsw signin claude`")
         if not resolved.email:
             raise CannotIdentify("could not determine the account email for claude")
         with ctx.locked():
@@ -196,6 +199,11 @@ def _cmd_add(ctx: Context, ns) -> int:
         seat = acct.add(ctx, ctx.load_state(), ns.tool, name=ns.name, email=ns.email)
     print(f"✓ seat saved — {ns.tool}:{seat['email']} (now on the floor)")
     return EXIT_OK
+
+
+def _cmd_signin(ctx: Context, ns) -> int:
+    from .authflows import signin
+    return signin(ctx, ns.tool, seat=ns.seat)
 
 
 def _cmd_remove(ctx: Context, ns) -> int:
@@ -387,7 +395,7 @@ def _cmd_install(ctx: Context, ns) -> int:
     if getattr(ns, "dry_run", False):
         print("· dry run — nothing changed")
     else:
-        print("✓ installed — add seats with `acctsw add codex` / `acctsw add claude`")
+        print("✓ installed — sign in with `acctsw signin codex` / `acctsw signin claude`")
     return EXIT_OK
 
 
@@ -419,6 +427,7 @@ def _not_impl(ctx: Context, ns) -> int:
 HANDLERS = {
     "keys": _cmd_keys,
     "add": _cmd_add,
+    "signin": _cmd_signin,
     "remove": _cmd_remove,
     "list": _cmd_list,
     "status": _cmd_status,
@@ -440,7 +449,7 @@ def main(argv: list[str] | None = None) -> int:
     if ns.capabilities:
         # A feature handshake, not a version comparison: development builds can share a version
         # while exposing different options. Keep this before Context/Keychain/store access.
-        print(json.dumps({"capabilities": ["run-key-v1"]}))
+        print(json.dumps({"capabilities": ["run-key-v1", "isolated-signin-v1"]}))
         return EXIT_OK
     if not ns.command:
         parser.print_help()

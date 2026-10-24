@@ -404,11 +404,24 @@ def build_cmd(ctx: Context, tool: str, args: list) -> list:
 def exec_stock(ctx: Context, tool: str, args: list) -> int:
     """Replace this process with the STOCK tool — no supervision, no auto-switch.
 
-    Used when the menubar app is closed: terminal ``codex``/``claude`` must then behave exactly
-    like the real tool (against whatever account is currently in ~/.codex / the keychain). We
-    ``execvp`` rather than spawn so the tool fully owns the terminal (TTY, signals, exit code).
-    Returns 127 only if exec fails (binary missing); on success it never returns.
+    Ordinary invocations and non-login auth commands exec the real tool with its TTY/signals.
+    Browser login uses an isolated foreground child; shared stock logout removes only local creds.
+    --revoke opts into official logout. Returns 127 if exec fails; a successful exec never returns.
     """
+    from . import authflows
+    login = authflows.OFFICIAL_LOGIN[tool]
+    logout = ["logout"] if tool == "codex" else ["auth", "logout"]
+    if (args[:len(login)] == login
+            and not (tool == "codex" and args[1:2] == ["status"])
+            and "--help" not in args and "-h" not in args):
+        return authflows.signin(ctx, tool, args=args[len(login):])
+    if args[:len(logout)] == logout and "--help" not in args and "-h" not in args:
+        if "--revoke" in args[len(logout):]:
+            print("WARNING: official logout revokes this login, including any seat sharing it.",
+                  file=sys.stderr)
+            args = [arg for arg in args if arg != "--revoke"]
+        elif authflows.safe_logout(ctx, tool):
+            return 0
     argv = build_cmd(ctx, tool, args)
     try:
         os.execvpe(argv[0], argv, harden_env())
@@ -943,7 +956,8 @@ def _claude_transcript_meta(path: Path) -> dict:
 # seat to pick, switch, or auto-switch, and the interactive OAuth flow needs the tool to fully own the
 # real TTY. Under our PTY the sign-in never completes: the browser redirects to
 # http://localhost:PORT/callback but the callback server (running in the supervised child) is torn
-# down / never handed the request, so the seat is never actually added. Run these as the stock tool.
+# down / never handed the request, so the seat is never actually added. exec_stock routes browser
+# login through isolated foreground sign-in and guards logout; other commands stay stock.
 _PASSTHROUGH_CMDS = frozenset({"login", "logout", "auth", "setup-token"})
 
 
@@ -1013,7 +1027,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
     if key is not None and args and args[0] in _PASSTHROUGH_CMDS:
         raise AcctswError("a pinned key is for a work session, not a sign-in command")
     if args and args[0] in _PASSTHROUGH_CMDS:
-        # Credential flow (e.g. `claude auth login`): run stock, unsupervised, so the OAuth
+        # Credential flow (e.g. `claude auth login`): use exec_stock routing so the OAuth
         # localhost-callback + interactive prompts work exactly as they do for a plain invocation.
         return exec_stock(ctx, tool, args)
     if tool == "claude" and key is None:
@@ -2260,7 +2274,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     active = st.active(tool)
                     if active:
                         blob = ctx.snapshot_get("codex", active)
-                        if blob:
+                        if blob and not st.data["tools"][tool].get("stock_logged_out"):
                             ctx.set_live("codex", blob)
             elif child_started:
                 _sync_claude_home(launch_email)

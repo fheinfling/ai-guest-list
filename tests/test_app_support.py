@@ -178,11 +178,11 @@ def test_prepare_then_login_resolves_absolute_command_when_none(ctx, monkeypatch
     """With no explicit command, prepare_then_login resolves the CLI's absolute path and launches it."""
     ctx.cred["codex"].set_live(make_codex_blob("a@x.com"))
     acct.add(ctx, ctx.load_state(), "codex", email="a@x.com")
-    ctx.codex_bin = "/opt/homebrew/bin/codex"
+    monkeypatch.setattr(terminal, "checked_engine_command", lambda cap: ["/absolute/acctsw"])
     opened = {}
     monkeypatch.setattr(terminal, "open_in_terminal", lambda cmd: opened.setdefault("cmd", cmd))
     terminal.prepare_then_login(ctx, "codex")  # command defaults to None → resolve
-    assert opened["cmd"] == "/opt/homebrew/bin/codex login"
+    assert opened["cmd"] == "/absolute/acctsw signin codex"
 
 
 def test_prepare_then_login_unresolved_cli_falls_back_to_bare(ctx, monkeypatch):
@@ -191,7 +191,8 @@ def test_prepare_then_login_unresolved_cli_falls_back_to_bare(ctx, monkeypatch):
     ctx.cred["codex"].set_live(make_codex_blob("a@x.com"))
     acct.add(ctx, ctx.load_state(), "codex", email="a@x.com")
     ctx.codex_bin = None
+    monkeypatch.setattr(terminal, "checked_engine_command", lambda cap: ["/absolute/acctsw"])
     opened = {}
     monkeypatch.setattr(terminal, "open_in_terminal", lambda cmd: opened.setdefault("cmd", cmd))
     terminal.prepare_then_login(ctx, "codex")
-    assert opened["cmd"] == "codex login"  # launched with the bare name, not aborted
+    assert opened["cmd"] == "/absolute/acctsw signin codex"

@@ -50,7 +50,7 @@ def add(ctx: Context, state: State, tool: str, *, name: str | None = None,
     """
     live = blob if blob is not None else ctx.cred[tool].get_live()
     if not live:
-        raise NoLiveCreds(f"no live {tool} credentials — sign in with the official tool first")
+        raise NoLiveCreds(f"no live {tool} credentials — run `acctsw signin {tool}`")
     em = email or (identity.claude_profile_email(live, ctx.claude_bin) if tool == "claude"
                    else identity.live_email(ctx, tool))
     if not em:

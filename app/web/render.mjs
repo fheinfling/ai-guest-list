@@ -162,7 +162,7 @@ function bar(seat, win, label) {
 // "switching is limited", and a real user asked what it meant. The row already shows resting,
 // 0% and the reset countdown, so the label only has to carry "despite that".
 function seatAction(tool, seat) {
-  if (needsHello(seat)) return `<button class="row-action" data-action="add" data-tool="${tool}">sign in again</button>`;
+  if (needsHello(seat)) return `<button class="row-action" data-action="add" data-tool="${tool}" data-email="${esc(seat.email)}">sign in again</button>`;
   if (seat.status === "active") return "";
   const limited = seat.limited || ["resting", "queued"].includes(seat.status);
   const label = `switch to ${seat.name || seat.email}${limited ? "; this seat's limit applies immediately" : ""}`;
@@ -572,7 +572,7 @@ function ambientVerdict(state) {
       detail = `<p class="hero-support">${esc(key.label)} ${key.responses_verified === false || key.last_proof?.outcome === "incompatible" ? "may help with paid use; endpoint unproven." : "can keep you going with paid use."}</p>`;
       action = `<button class="primary" data-action="key-terminal" data-id="${esc(key.id)}">use ${esc(key.label)} in a terminal</button>`;
     } else if (login) {
-      action = `<button class="primary" data-action="add" data-tool="${esc(login.tool)}">sign in to ${esc(login.name)}</button>`;
+      action = `<button class="primary" data-action="add" data-tool="${esc(login.tool)}" data-email="${esc(login.email)}">sign in to ${esc(login.name)}</button>`;
     }
     if (reset) detail += `<p class="hero-support" title="${esc(new Date(reset).toLocaleString())}"><span data-reset-at="${esc(reset)}" data-clock-prefix="next seat back in">next seat back in ${fmtCountdown(reset)}</span></p>`;
   }

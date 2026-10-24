@@ -95,7 +95,7 @@ test("seat summaries retain status, countdown, switch and sign-in actions", () =
   assert.match(mk("ready"), /data-action="switch" data-tool="codex" data-email="work@x.com"/);
   assert.match(mk("resting", { limited_until: new Date(Date.now() + 6e6).toISOString() }), /data-clock-prefix="back in"/);
   assert.match(mk("queued"), /class="seat-state">up next/);
-  assert.match(mk("needs-login"), /data-action="add" data-tool="codex">sign in again/);
+  assert.match(mk("needs-login"), /data-action="add" data-tool="codex" data-email="work@x.com">sign in again/);
 });
 
 for (const kind of ["seat", "roster"]) {
@@ -223,7 +223,7 @@ test("revoked entitlement retains the sign-in action on a non-active seat", () =
     })] },
     claude: { seats: [] },
   } }));
-  assert.match(html, /data-action="add" data-tool="codex">sign in again</);
+  assert.match(html, /data-action="add" data-tool="codex" data-email="work@x.com">sign in again</);
   assert.doesNotMatch(html, />log in</);
 });
 
@@ -1528,7 +1528,7 @@ for (const tool of ["codex", "claude"]) {
         if (status === "active") {
           assert.doesNotMatch(surface, /data-action="switch"/);
         } else if (status === "needs-login") {
-          assert.match(surface, new RegExp(`data-action="add" data-tool="${tool}">sign in again`));
+          assert.match(surface, new RegExp(`data-action="add" data-tool="${tool}" data-email="[^" ]+">sign in again`));
           assert.doesNotMatch(surface, /data-action="switch"/);
         } else {
           assert.ok(surface.includes(`class="row-action" data-action="switch" data-tool="${tool}" data-email="${email}"`));
@@ -2064,4 +2064,32 @@ test("visible clock ticks update consent over settings without replacing focused
   assert.ok(parseInt(expiry.textContent, 10) <= 60);
   assert.equal(app.root.innerHTML, before);
   app.window.AGL.setVisible(false);
+});
+
+test("account-specific sign-in carries the seat to the engine; plus stays unrestricted", () => {
+  for (const tool of ["codex", "claude"]) {
+    const app = keyApp();
+    app.click({ action: "add", tool, email: "alpha@example.test" });
+    app.click({ action: "add-cta" });
+    const login = app.sent.find((msg) => msg.action === "login");
+    assert.equal(login.tool, tool);
+    assert.equal(login.email, "alpha@example.test");
+    const plus = keyApp();
+    plus.click({ action: "add" });
+    plus.click({ action: "add-provider", tool });
+    plus.click({ action: "add-cta" });
+    const plain = plus.sent.find((msg) => msg.action === "login");
+    assert.equal(plain.tool, tool);
+    assert.equal(plain.email, undefined);
+  }
+});
+
+test("sign-in buttons carry escaped seat identity on the row and attention prompt", () => {
+  const email = 'alpha"<&@example.test';
+  for (const tool of ["codex", "claude"]) {
+    const html = buildHTML(state({ tools: { [tool]: { seats: [seat({ email, status: "needs-login" })] } } }));
+    const target = `data-action="add" data-tool="${tool}" data-email="alpha&quot;&lt;&amp;@example.test"`;
+    assert.ok(html.includes(`${target}>sign in again`));
+    assert.ok(html.includes(`${target}>sign in to`));
+  }
 });

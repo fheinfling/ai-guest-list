@@ -88,10 +88,11 @@ def switch(ctx: Context, state: State, tool: str, email: str, *, sync: bool = Tr
         blob = ctx.snapshot_get(tool, email)
     if blob is None:
         raise MissingSnapshot(f"stored creds for {tool}:{email} not found — re-add this seat")
-    if mirror:
+    if mirror and (manual or not state.data["tools"][tool].get("stock_logged_out")):
         if tool == "claude":
             claudehome.mirror_identity(ctx, email)
         ctx.set_live(tool, blob)
+        state.data["tools"][tool].pop("stock_logged_out", None)
         if tool == "claude":
             from .accounts import _claude_digest
             state.data["tools"][tool]["captured_stock_digest"] = _claude_digest(blob)
