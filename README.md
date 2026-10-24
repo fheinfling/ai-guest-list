@@ -78,7 +78,7 @@ connect through the official tools.
   Codex desktop app quits gracefully and reopens; continue in your existing thread. Supervised
   terminal sessions resume automatically. Nearly full seats stay active until a confirmed limit.
 - **Zero-touch setup** — installing the app wires `codex` / `claude` to the supervised launchers; when
-  the app is closed they behave exactly like stock.
+  the app is closed ordinary work sessions run the stock tool. Sign-in and logout stay protected.
 - **Add / remove seats** — official browser sign-in, plus a no-browser path for Codex (paste an
   `auth.json`). Claude is browser sign-in only: a `claude setup-token` is an env-var token, not the
   Keychain login the switcher reads. Credentials live only in the Keychain / the tools' own stores.
@@ -194,9 +194,21 @@ Each Claude account keeps its own login. Sessions on different accounts can run 
 without logging each other out. Your projects, conversation history, settings and custom tools
 stay available across accounts. Plain `claude` follows the account you select in the app.
 
-If a Claude seat asks you to sign in again, complete browser sign-in for that account and re-add
-it through the app or `acctsw add`. Existing logins migrate automatically; a login saved under the
-wrong account needs re-adding.
+Signing in another account never signs out the others. Use **＋** or **sign in again** in the app,
+or `acctsw signin codex` / `acctsw signin claude`. Each official browser sign-in runs privately,
+then selects the identified account, just like `acctsw add`. To repair one seat, use
+`acctsw signin <tool> --seat EMAIL`; signing into a different account leaves that seat untouched.
+`acctsw add <tool>` can still import an existing stock login.
+
+Through the wrappers, `codex logout` and `claude auth logout` remove only the stock login when
+it belongs to a registered seat. Use the app's sign-out to really sign a seat out. Plain tools
+stay logged out until the next manual seat switch or explicit sign-in; background polling and
+automatic switches do not restore that stock login. `codex logout --revoke` or
+`claude auth logout --revoke` explicitly runs the official revoking logout, affecting any seat
+sharing that login.
+
+A `/logout` inside a running Claude session or logout inside the Codex TUI cannot be intercepted.
+It revokes that session's own login; in a private seat home, that is the seat's login.
 
 See [`docs/PLAN.md`](docs/PLAN.md) for the full design and [`docs/RELEASING.md`](docs/RELEASING.md) for
 the release flow.

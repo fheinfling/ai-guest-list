@@ -197,6 +197,8 @@ def _converge(ctx, *, verify=None):
                         continue
                     source = next(k for k in contenders if observed[k].blob == winner)
                     for key in keys:
+                        if key is None and state.data["tools"]["claude"].get("stock_logged_out"):
+                            continue
                         if (locations[source].get_live() != winner
                                 or locations[key].get_live() != observed[key].blob):
                             continue

@@ -1,6 +1,6 @@
-"""Run an official login flow in a terminal for the 'add a seat' UX (no-browser-dance promise).
+"""Run the engine's isolated official login flow in Terminal for the 'add a seat' UX.
 
-IMPORTANT (invariant from docs/PLAN.md): before the official login overwrites the live creds, the
+IMPORTANT (invariant from docs/PLAN.md): before selecting a new login changes the stock mirror, the
 currently-active seat must be synced back, or its rotated refresh token is lost. Call
 ``prepare_then_login`` (which sync-backs first) rather than launching the login directly.
 
@@ -45,7 +45,7 @@ def open_in_terminal(command: str) -> None:
       ``node`` (which ``codex``/``claude`` need); a login+interactive shell reproduces the terminal
       PATH. We do NOT use ``$SHELL`` because a non-POSIX login shell (fish/tcsh) rejects the combined
       ``-lic`` flags and the sign-in would never run — zsh is the macOS default and always parses them,
-      and the CLI is already resolved to an absolute path by ``resolve_login_command``.
+      and the engine is resolved to an absolute path by ``resolve_login_command``.
 
     The script deletes ITSELF once the login shell returns (``rm -- "$0"``), so no temp file is left
     behind and none is ever swept out from under an in-flight sign-in."""
@@ -89,26 +89,21 @@ def open_in_terminal(command: str) -> None:
                 pass
 
 
-def resolve_login_command(ctx: Context, tool: str) -> str:
-    """Build the official sign-in command as a shell string, preferring the CLI's ABSOLUTE path.
-
-    Prefer the absolute binary the engine already found (``ctx.codex_bin``/``ctx.claude_bin``), so a
-    GUI app's minimal PATH can't hide a CLI that IS installed. Otherwise fall back to the BARE command
-    name — never hard-fail here: the login runs in a login+interactive zsh (see ``open_in_terminal``)
-    whose PATH covers Homebrew/npm and ``~/.zprofile``/``~/.zshrc``, so most installs still resolve. If
-    the CLI is genuinely absent the bare command surfaces a visible "command not found" in the terminal
-    we opened (same as the previous osascript path) — we deliberately do NOT probe the login shell to
-    pre-detect that: an interactive-shell probe misreads aliases/wrappers, can false-fail a TTY-guarded
-    shim, and adds seconds of latency, all to improve one rare error message."""
+def resolve_login_command(ctx: Context, tool: str, *, seat: str | None = None) -> str:
+    """Launch this installation's isolated sign-in, bypassing stale installed wrappers."""
     from acctsw.bridge import LOGIN_SUBCMD
     if tool not in TOOLS:
         raise ValueError(f"unknown tool: {tool}")
-    exe = (ctx.codex_bin if tool == "codex" else ctx.claude_bin) or tool
-    return shell_quote([exe, *LOGIN_SUBCMD[tool]])
+    engine = checked_engine_command("isolated-signin-v1")
+    args = [*engine, *LOGIN_SUBCMD[tool]]
+    if seat:
+        args.extend(["--seat", seat])
+    return shell_quote(args)
 
 
-def prepare_then_login(ctx: Context, tool: str, command: str | None = None) -> None:
-    """Sync-back the active seat (so its rotated token isn't lost), then launch the login.
+def prepare_then_login(ctx: Context, tool: str, command: str | None = None, *,
+                       seat: str | None = None) -> None:
+    """Preserve outgoing stock rotations, then launch isolated sign-in in this app's engine.
 
     ``command`` defaults to the resolved absolute-path login command (see ``resolve_login_command``);
     tests may inject an explicit one. The resolution runs BEFORE the sync-back so a missing CLI is
@@ -122,7 +117,7 @@ def prepare_then_login(ctx: Context, tool: str, command: str | None = None) -> N
     if tool not in TOOLS:
         raise ValueError(f"unknown tool: {tool}")
     if command is None:
-        command = resolve_login_command(ctx, tool)
+        command = resolve_login_command(ctx, tool, seat=seat)
     live_identity = identity_mod.claude_live_identity(ctx) if tool == "claude" else None
     with ctx.locked():
         state = ctx.load_state()
@@ -165,7 +160,8 @@ def checked_engine_command(capability: str) -> list[str]:
     from acctsw.install import engine_script
     from acctsw.procenv import harden_env
     command = ["/bin/sh", "-c", engine_script(), "acctsw"]
-    error = ("this app's engine couldn't start a paid key terminal. Quit and reopen AI Guest List; "
+    purpose = "sign-in" if capability == "isolated-signin-v1" else "a paid key terminal"
+    error = (f"this app's engine couldn't start {purpose}. Quit and reopen AI Guest List; "
              "if it persists, reinstall the app or rebuild/restart your source installation.")
     # Generous timeout: the first launch after an update can wait on Gatekeeper scanning the
     # bundled interpreter, and a slow start must not read as a broken install.

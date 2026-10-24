@@ -11,7 +11,7 @@ from .util import email_key
 import hashlib
 from typing import Any
 
-from . import __version__, build_number
+from . import TOOLS, __version__, build_number
 from . import accounts as acct
 from . import identity as identity_mod
 from . import install as install_mod
@@ -427,22 +427,17 @@ def _auto_switch_after_usage(ctx: Context, summary: dict[str, Any], *,
     return None
 
 
-# The official browser sign-in sub-command per tool (the binary is prepended by the launcher with its
-# ABSOLUTE path — see terminal.resolve_login_command — so a GUI app's minimal PATH can't hide the CLI).
-# Single source of truth for "how each tool logs in", shared by login_command (logical string) and the
-# terminal launcher (absolute argv).
-LOGIN_SUBCMD = {"codex": ["login"], "claude": ["auth", "login"]}
+# Engine commands for every browser sign-in entry point. Official argv lives in authflows.
+LOGIN_SUBCMD = {tool: ["signin", tool] for tool in TOOLS}
 
 
-def login_command(tool: str, method: str = "browser") -> str:
-    """The logical Terminal command for an official browser sign-in, e.g. ``"codex login"``. Kept in
-    the bridge (not the UI) so the engine stays the source of truth for how each tool logs in.
-    ``method`` is reserved but currently unused: both tools' only Terminal path is the browser sign-in
-    (codex's no-browser option pastes an auth.json / imports the current login in-app; Claude has no
-    working no-browser path — `claude setup-token` produces an env-var token, not the Keychain login
-    this app snapshots). The actual launch resolves the CLI's absolute path via
-    ``terminal.resolve_login_command``; this string is the logical form used in tests/messages."""
-    return " ".join([tool, *LOGIN_SUBCMD[tool]])
+def login_command(tool: str, method: str = "browser", *, seat: str | None = None) -> str:
+    """Logical isolated sign-in command; Terminal resolves this installation's engine absolutely."""
+    import shlex
+    args = ["acctsw", *LOGIN_SUBCMD[tool]]
+    if seat:
+        args.extend(["--seat", seat])
+    return shlex.join(args)
 
 
 def handle(ctx: Context, message: dict) -> dict[str, Any]:
@@ -703,7 +698,7 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
                 resolved = identity_mod.claude_live_identity(ctx)
                 if not resolved.blob:
                     raise NoLiveCreds(
-                        "no live claude credentials — sign in with the official tool first"
+                        "no live claude credentials — run `acctsw signin claude`"
                     )
                 if not resolved.email:
                     raise CannotIdentify("could not determine the account email for claude")

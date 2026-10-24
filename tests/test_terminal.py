@@ -87,33 +87,26 @@ def test_open_in_terminal_raises_and_surfaces_reason_when_open_fails(monkeypatch
     assert "LSOpenURLsWithRole failed" in str(e.value)  # the real reason is surfaced, not just "try again"
 
 
-def test_resolve_login_command_uses_absolute_binary(ctx):
-    ctx.codex_bin = "/opt/homebrew/bin/codex"
-    ctx.claude_bin = "/opt/homebrew/bin/claude"
-    assert terminal.resolve_login_command(ctx, "codex") == "/opt/homebrew/bin/codex login"
-    assert terminal.resolve_login_command(ctx, "claude") == "/opt/homebrew/bin/claude auth login"
+@pytest.mark.parametrize("tool", ["codex", "claude"])
+def test_resolve_login_command_uses_this_engine(ctx, monkeypatch, tool):
+    commands = []
+    def checked(capability):
+        commands.append(capability)
+        return ["/absolute/app engine", "-m", "acctsw"]
+    monkeypatch.setattr(terminal, "checked_engine_command", checked)
+    ctx.codex_bin = ctx.claude_bin = None
+    assert shlex.split(terminal.resolve_login_command(ctx, tool)) == [
+        "/absolute/app engine", "-m", "acctsw", "signin", tool]
+    seat = "alpha+test@example.test"
+    assert shlex.split(terminal.resolve_login_command(ctx, tool, seat=seat))[-4:] == [
+        "signin", tool, "--seat", seat]
+    assert commands == ["isolated-signin-v1", "isolated-signin-v1"]
 
 
-def test_resolve_login_command_falls_back_to_bare_when_unresolved(ctx):
-    # a CLI on an rc-only shim (asdf/volta/nvm) isn't on the GUI app's PATH → ctx.*_bin is None.
-    # Fall back to the bare name (never hard-fail): the login+interactive shell sources rc and finds
-    # it. A genuinely-absent CLI just surfaces "command not found" in the terminal we opened.
-    ctx.codex_bin = None
-    assert terminal.resolve_login_command(ctx, "codex") == "codex login"
-    ctx.claude_bin = None
-    assert terminal.resolve_login_command(ctx, "claude") == "claude auth login"
-
-
-def test_resolve_login_command_quotes_a_spacey_path(ctx):
-    ctx.codex_bin = "/Users/a b/bin/codex"
-    cmd = terminal.resolve_login_command(ctx, "codex")
-    # a path with a space must be shell-quoted so the login shell runs the right binary
-    assert "'/Users/a b/bin/codex'" in cmd and cmd.endswith("login")
-
-
+@pytest.mark.parametrize("flow", ["key", "signin"])
 @pytest.mark.parametrize("mode", ["source", "bundle", "alias"])
 @pytest.mark.parametrize("tool", ["codex", "claude"])
-def test_key_terminal_bypasses_preserved_old_wrappers(ctx, tmp_path, monkeypatch, mode, tool):
+def test_app_terminal_bypasses_preserved_old_wrappers(ctx, tmp_path, monkeypatch, mode, tool, flow):
     """Execute the selected engine with a stale wrapper, hostile cwd/env, and quoted paths.
 
     The bundle shim models Python's bundled search path while recording its startup env;
@@ -128,7 +121,7 @@ def test_key_terminal_bypasses_preserved_old_wrappers(ctx, tmp_path, monkeypatch
     (root / "acctsw" / "__main__.py").write_text('''
 import json, os, sys
 from pathlib import Path
-from acctsw import cli, launcher
+from acctsw import authflows, cli, launcher
 if sys.argv[1:] != ["--capabilities"]:
     cli.Context.default = classmethod(lambda cls: cls.for_test(Path(os.environ["TEST_STORE"])))
     def launch(ctx, tool, args, **kwargs):
@@ -137,6 +130,9 @@ if sys.argv[1:] != ["--capabilities"]:
                           "ca": os.environ.get("SSL_CERT_FILE")}))
         return 0
     launcher.run = launch
+    def signin(ctx, tool, *, seat=None, **kwargs):
+        return launch(ctx, tool, [], key=seat)
+    authflows.signin = signin
     launcher.exec_stock = lambda *a, **k: sys.exit("must never reach stock")
 raise SystemExit(cli.main())
 ''')
@@ -189,7 +185,10 @@ raise SystemExit(cli.main())
     commands = []
     monkeypatch.setattr(terminal, "open_in_terminal", commands.append)
 
-    terminal.open_key_terminal(ctx, seat_id)
+    if flow == "key":
+        terminal.open_key_terminal(ctx, seat_id)
+    else:
+        terminal.open_in_terminal(terminal.resolve_login_command(ctx, tool, seat=seat_id))
     # Run the exact command after login-shell initialization, including hostile Python vars.
     result = subprocess.run(["/bin/sh", "-c", commands[0]], capture_output=True,
                             text=True, timeout=10)
