@@ -443,7 +443,7 @@ def test_manual_mirror_moves_profile_without_mcp_loss(ctx, homes):
 def test_home_permissions_are_repaired_and_private_files_have_private_modes(ctx, homes):
     state = seed(ctx)
     home = homes.ensure_home(ctx, "a@test")
-    os.chmod(home, 0o755)
+    os.chmod(home, 0o750)  # loosened (not world-readable) to prove ensure_home repairs it
     homes.ensure_home(ctx, "a@test")
     assert home.stat().st_mode & 0o777 == 0o700
     for name in (".claude.json", ".acctsw-shared.json", ".acctsw-seeded"):
