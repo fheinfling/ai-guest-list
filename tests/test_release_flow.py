@@ -33,6 +33,10 @@ if tool == "gh":
             sys.exit("unknown command: attestation")
         print("--repo --signer-workflow --source-ref --cert-identity --cert-oidc-issuer --deny-self-hosted-runners")
     elif args[:2] == ["attestation", "verify"]:
+        # Mirror gh 2.102: these identity flags are mutually exclusive.
+        exclusive = {"--cert-identity", "--cert-identity-regex", "--signer-repo", "--signer-workflow"}
+        if len(exclusive & set(args)) > 1:
+            sys.exit("if any flags in the group are set none of the others can be")
         sys.exit(state.get("attestation_exit", 0))
     elif args[:2] == ["auth", "status"]:
         pass
@@ -200,7 +204,7 @@ def test_provenance_is_constrained_and_precedes_first_codesign(release_cli):
     assert Path(verify[3]).name == unsigned.name
     workflow = "fheinfling/ai-guest-list/.github/workflows/release.yml"
     assert verify[4:] == [
-        "--repo", "fheinfling/ai-guest-list", "--signer-workflow", workflow,
+        "--repo", "fheinfling/ai-guest-list",
         "--source-ref", "refs/tags/v1.3.0", "--cert-identity",
         f"https://github.com/{workflow}@refs/tags/v1.3.0",
         "--cert-oidc-issuer", "https://token.actions.githubusercontent.com",
