@@ -1,7 +1,7 @@
 """Official foreground sign-in in disposable homes; protect seats from stock logout revocation."""
 from __future__ import annotations
 
-import hashlib
+import hmac
 import json
 from pathlib import Path
 import shutil
@@ -88,12 +88,17 @@ def signin(ctx: Context, tool: str, *, seat: str | None = None, args=()) -> int:
                     raise AcctswError("could not remove the temporary sign-in home") from None
 
 
-def _refresh_digest(blob: str) -> str | None:
+def _refresh_token(blob: str) -> str | None:
     try:
         token = json.loads(blob)["claudeAiOauth"]["refreshToken"]
-        return hashlib.sha256(token.encode("utf-8")).hexdigest() if isinstance(token, str) and token else None
+        return token if isinstance(token, str) and token else None
     except (ValueError, TypeError, KeyError):
         return None
+
+
+def _same_refresh_token(a: str | None, b: str | None) -> bool:
+    # Compare in memory only; never hash or keep a credential-derived value.
+    return bool(a and b) and hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
 
 
 def _shared_seat(ctx, state, tool, blob, owner=None):
@@ -102,10 +107,10 @@ def _shared_seat(ctx, state, tool, blob, owner=None):
         if match:
             return match
     if tool == "claude":
-        digest = _refresh_digest(blob)
+        token = _refresh_token(blob)
         for email in state.accounts(tool):
             for stored in (ctx.claude_cred(email).get_live(), ctx.snapshot_get(tool, email)):
-                if stored and (stored == blob or (digest and _refresh_digest(stored) == digest)):
+                if stored and (stored == blob or _same_refresh_token(token, _refresh_token(stored))):
                     return email
     return None
 
