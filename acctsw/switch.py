@@ -7,7 +7,7 @@ Order matters (per plan):
   2. Install the chosen account's snapshot into the canonical location ATOMICALLY.
   3. Update active in state and persist.
 
-Only one account is ever active per tool (sequential), so there is no concurrency hazard.
+Supervised children use private homes. The canonical location is only the stock-tool mirror.
 """
 from __future__ import annotations
 
@@ -60,12 +60,15 @@ def sync_back(ctx: Context, state: State, tool: str, *,
 
 def switch(ctx: Context, state: State, tool: str, email: str, *, sync: bool = True,
            manual: bool = False,
+           mirror: bool = True,
+           save: bool = True,
            live_identity: ClaudeLiveIdentity | None = None) -> None:
     """Make ``email`` the active seat for ``tool``.
 
-    ``sync=False`` skips the sync-back-from-mirror — used by the launcher for codex, where codex
-    maintains the account's own home directly (the home, not ~/.codex, is the source of truth).
+    ``sync=False`` skips sync-back from the stock mirror. Both supervised tools maintain their
+    own homes; ``mirror=False`` also leaves stock credentials alone (supervised Claude hops).
     ``manual=True`` records a request for supervised Codex sessions to resume on the selected seat.
+    ``save=False`` lets a lock-owning caller persist additional hop metadata in the same write.
     """
     if email not in state.accounts(tool):
         raise UnknownSeat(f"no seat '{email}' for {tool}")
@@ -75,10 +78,23 @@ def switch(ctx: Context, state: State, tool: str, email: str, *, sync: bool = Tr
         sync_back(ctx, state, tool, live_identity=live_identity)
 
     # 2. install chosen account's stored creds into the canonical location (the active mirror)
-    blob = ctx.snapshot_get(tool, email)
+    if tool == "claude":
+        from . import claudehome
+        if not ctx._store_lock_held():
+            claudehome.prepare(ctx, email)
+        claudehome.ensure_home(ctx, email)
+        blob = claudehome.load(ctx, email)
+    else:
+        blob = ctx.snapshot_get(tool, email)
     if blob is None:
         raise MissingSnapshot(f"stored creds for {tool}:{email} not found — re-add this seat")
-    ctx.set_live(tool, blob)
+    if mirror:
+        if tool == "claude":
+            claudehome.mirror_identity(ctx, email)
+        ctx.set_live(tool, blob)
+        if tool == "claude":
+            from .accounts import _claude_digest
+            state.data["tools"][tool]["captured_stock_digest"] = _claude_digest(blob)
 
     # 3. record active
     state.set_active(tool, email)
@@ -91,4 +107,5 @@ def switch(ctx: Context, state: State, tool: str, email: str, *, sync: bool = Tr
         state.data["tools"][tool]["manual_switch"] = {
             "id": int(state.data.get("rev", 0)) + 1, "email": email,
         }
-    state.save()
+    if save:
+        state.save()

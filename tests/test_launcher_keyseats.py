@@ -296,8 +296,8 @@ def test_claude_key_child_does_not_sync_subscription_credentials(ctx, monkeypatc
     calls, spies = [], []
     def spawn(argv, output, on_tick=None, *, env=None):
         calls.append(argv)
-        if env is None:
-            path = P.CLAUDE_CONFIG_DIR / "projects" / "test-project" / f"{THREAD}.jsonl"
+        if len(calls) == 1:
+            path = ctx._claude_real / "projects" / "test-project" / f"{THREAD}.jsonl"
             path.parent.mkdir(parents=True)
             path.write_text(json.dumps({"sessionId": THREAD, "cwd": os.getcwd()}) + "\n")
             assert not output(b"You've hit your usage limit\n")
@@ -396,7 +396,8 @@ def test_cold_resume_copies_exact_conversation(ctx, args):
         copied = Path(env["CODEX_HOME"]) / "sessions" / path.relative_to(ctx._codex_real / "sessions")
         assert copied.read_bytes() == path.read_bytes()
         return 0
-    assert L.run(ctx, "codex", args, spawn=spawn, get=usage_get(reset), price_get=price_get) == 0
+    assert L.run(ctx, "codex", args, spawn=spawn, get=usage_get(reset), price_get=price_get,
+                 sleep=lambda *_: pytest.fail("cold paid resume waited for subscription headroom")) == 0
 
 
 def test_cold_key_uses_approved_model_despite_original_model_argument(ctx):

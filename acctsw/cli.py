@@ -17,7 +17,7 @@ from . import bridge
 from . import keyseats as keyseats_mod
 from . import paths as P
 from .context import Context
-from .errors import AcctswError
+from .errors import AcctswError, CannotIdentify, NoLiveCreds
 from .switch import switch as do_switch
 
 # Exit codes: 0 ok, 1 expected error, 2 argparse usage error, 3 not-implemented-yet.
@@ -52,7 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
     add = sub.add_parser("add", help="add (sign in) a seat from the live account")
     _add_tool_arg(add)
     add.add_argument("--name", help="friendly name for this seat")
-    add.add_argument("--email", help="override detected email")
+    add.add_argument("--email", help="override detected email (Codex only)")
     rm = sub.add_parser("remove", help="remove (sign out) a seat")
     _add_tool_arg(rm)
     rm.add_argument("email", help="account email to remove")
@@ -182,8 +182,18 @@ def _cmd_keys(ctx: Context, ns) -> int:
 
 
 def _cmd_add(ctx: Context, ns) -> int:
-    state = ctx.load_state()
-    seat = acct.add(ctx, state, ns.tool, name=ns.name, email=ns.email)
+    if ns.tool == "claude":
+        from .identity import claude_live_identity
+        resolved = claude_live_identity(ctx)  # HTTP before the store lock; --email is no proof.
+        if not resolved.blob:
+            raise NoLiveCreds("no live claude credentials — sign in with the official tool first")
+        if not resolved.email:
+            raise CannotIdentify("could not determine the account email for claude")
+        with ctx.locked():
+            seat = acct.add(ctx, ctx.load_state(), ns.tool, name=ns.name,
+                            email=resolved.email, blob=resolved.blob)
+    else:
+        seat = acct.add(ctx, ctx.load_state(), ns.tool, name=ns.name, email=ns.email)
     print(f"✓ seat saved — {ns.tool}:{seat['email']} (now on the floor)")
     return EXIT_OK
 
@@ -251,7 +261,11 @@ def _cmd_daemons(ctx: Context, ns) -> int:
 
 def _cmd_switch(ctx: Context, ns) -> int:
     from . import identity as identity_mod
-    live_identity = identity_mod.claude_live_identity(ctx) if ns.tool == "claude" else None
+    if ns.tool == "claude":
+        from . import claudehome, claudesync
+        claudesync.converge(ctx)
+        claudehome.prepare(ctx, ns.email)
+    live_identity = claudesync.cached_identity(ctx) if ns.tool == "claude" else None
     with ctx.locked():
         state = ctx.load_state()
         do_switch(ctx, state, ns.tool, ns.email, manual=True, live_identity=live_identity)

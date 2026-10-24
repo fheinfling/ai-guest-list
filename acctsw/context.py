@@ -11,6 +11,7 @@ import fcntl
 import os
 import pwd
 import shutil
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -18,7 +19,7 @@ from . import paths as P
 from .credlocations import ClaudeCredLocation, CodexCredLocation, CredLocation
 from .credlocations import codex_jwt_matches
 from .errors import CredentialIdentityMismatch, UnsafeCodexMirror
-from .keychain import InMemoryKeychain, KeychainBackend, SecurityKeychain
+from .keychain import InMemoryKeychain, KeychainBackend, KeychainError, SecurityKeychain
 from .state import State
 from .util import chmod_dir
 
@@ -62,6 +63,9 @@ class Context:
     codex_bin: str | None = None   # path to the official `codex` CLI (for the launcher)
     homes_root: Path | None = None  # per-account Codex homes root (None → P.CODEX_HOMES)
     codex_real: Path | None = None  # the real shared ~/.codex (None → P.CODEX_HOME)
+    claude_real: Path | None = None  # shared Claude settings/transcripts, never a seat home
+    claude_config_explicit: bool = True  # unset CLAUDE_CONFIG_DIR uses ~/.claude.json instead
+    claude_config_value: str | None = None  # exact stock spelling matters to Claude's service hash
 
     @property
     def _homes_root(self) -> Path:
@@ -74,12 +78,23 @@ class Context:
     # --- factory: real system ----------------------------------------------------------------
     @classmethod
     def default(cls) -> "Context":
+        from .claudehome import service_name
+        inherited_claude = os.environ.get("CLAUDE_CONFIG_DIR")
+        external_claude = bool(inherited_claude and Path(inherited_claude) == P.CLAUDE_CONFIG_DIR)
+        explicit_claude = os.environ.get("ACCTSW_CLAUDE_SHARED_EXPLICIT",
+                                         str(int(external_claude))) == "1"
+        stock_config = (os.environ.get("ACCTSW_CLAUDE_STOCK_CONFIG",
+                                       inherited_claude or str(P.CLAUDE_CONFIG_DIR))
+                        if explicit_claude else None)
         keychain = SecurityKeychain()
         # macOS short username from the passwd db (robust under sudo/launchd, unlike $USER).
         username = pwd.getpwuid(os.getuid()).pw_name
         cred = {
             "codex": CodexCredLocation(P.CODEX_AUTH),
-            "claude": ClaudeCredLocation(keychain, P.CLAUDE_KEYCHAIN_SERVICE, username),
+            "claude": ClaudeCredLocation(keychain, service_name(
+                os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR",
+                               stock_config)
+            ), username),
         }
         return cls(
             data_dir=P.DATA_DIR,
@@ -92,6 +107,9 @@ class Context:
             codex_bin=which_tool("codex"),
             homes_root=P.CODEX_HOMES,
             codex_real=P.CODEX_HOME,
+            claude_real=P.CLAUDE_CONFIG_DIR,
+            claude_config_explicit=explicit_claude,
+            claude_config_value=stock_config,
         )
 
     # --- factory: tests ----------------------------------------------------------------------
@@ -112,6 +130,7 @@ class Context:
             cred=cred,
             homes_root=root / ".account-switcher" / "ch",
             codex_real=root / "codex",
+            claude_real=root / "claude",
         )
 
     # --- helpers -----------------------------------------------------------------------------
@@ -121,6 +140,9 @@ class Context:
 
     def load_state(self) -> State:
         return State.load(self.state_file)
+
+    def _store_lock_held(self):
+        return bool(getattr(self.__dict__.get("_lock_local"), "depth", 0))
 
     @contextlib.contextmanager
     def locked(self):
@@ -134,7 +156,12 @@ class Context:
         f = open(self.data_dir / ".lock", "w")
         try:
             fcntl.flock(f, fcntl.LOCK_EX)
-            yield
+            local = self.__dict__.setdefault("_lock_local", threading.local())
+            local.depth = getattr(local, "depth", 0) + 1
+            try:
+                yield
+            finally:
+                local.depth -= 1
         finally:
             fcntl.flock(f, fcntl.LOCK_UN)
             f.close()
@@ -143,11 +170,30 @@ class Context:
         """Keychain account name for our snapshot of a seat: ``<tool>:<email>``."""
         return f"{tool}:{email}"
 
-    # --- per-seat credential store (codex → on-disk per-account home; claude → keychain) -------
+    # --- per-seat homes and snapshots -------------------------------------------------------
     def codex_home(self, email: str) -> Path:
         """The CODEX_HOME directory for a codex seat (used by the launcher)."""
         from . import codexhome
         return codexhome.home_dir(email, self._homes_root)
+
+    @property
+    def _claude_real(self) -> Path:
+        return (self.claude_real or P.CLAUDE_CONFIG_DIR).absolute()
+
+    @property
+    def _claude_config_value(self) -> str | None:
+        if not self.claude_config_explicit:
+            return None
+        return self.claude_config_value if self.claude_config_value is not None else str(self._claude_real)
+
+    def claude_home(self, email: str) -> Path:
+        from . import claudehome
+        return claudehome.home_dir(email, self.data_dir / "clh")
+
+    def claude_cred(self, email: str) -> ClaudeCredLocation:
+        from .claudehome import service_name
+        return ClaudeCredLocation(self.keychain, service_name(str(self.claude_home(email))),
+                                  self.cred["claude"].account)
 
     def _codex_mirror_is_private_home(self) -> bool:
         """Whether the canonical Codex writer was accidentally aimed at a seat home.
@@ -184,7 +230,10 @@ class Context:
             # Treat an old/corrupted snapshot as unavailable rather than ever installing it under
             # its label.  The caller can re-authenticate that seat without harming another one.
             return blob if blob and codex_jwt_matches(email, blob) else None
-        return self.keychain.get(self.keychain_service, self.snapshot_key(tool, email))
+        try:
+            return self.keychain.get(self.keychain_service, self.snapshot_key(tool, email))
+        except Exception:
+            raise KeychainError("Claude snapshot could not be read") from None
 
     def snapshot_set(self, tool: str, email: str, blob: str) -> None:
         if tool == "codex":
@@ -195,10 +244,15 @@ class Context:
             from . import codexhome
             codexhome.save(email, blob, codex_home=self._codex_real, root=self._homes_root)
         else:
-            self.keychain.set(self.keychain_service, self.snapshot_key(tool, email), blob)
+            try:
+                self.keychain.set(self.keychain_service, self.snapshot_key(tool, email), blob)
+            except Exception:
+                raise KeychainError("Claude snapshot could not be saved") from None
 
     def snapshot_delete(self, tool: str, email: str) -> bool:
         if tool == "codex":
             from . import codexhome
             return codexhome.delete(email, root=self._homes_root)
+        from . import claudehome
+        claudehome.delete(self, email)
         return self.keychain.delete(self.keychain_service, self.snapshot_key(tool, email))

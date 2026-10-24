@@ -53,14 +53,14 @@ def _seats(ctx):
 def test_reconcile_refresh_uses_token_owner_despite_stale_config_label(ctx, profile):
     state = _seats(ctx)
     before_b = ctx.snapshot_get("claude", "b@x.com")
-    fresh = _blob("tok-g-rotated", "tok-refresh-g-rotated")
+    fresh = _blob("tok-g-rotated", "tok-refresh-g-rotated").replace('"expiresAt": 1', '"expiresAt": 2')
     ctx.cred["claude"].set_live(fresh)
 
     assert accounts.reconcile_claude(ctx, state) == "g@x.com"
     assert ctx.snapshot_get("claude", "g@x.com") == fresh
     assert ctx.snapshot_get("claude", "b@x.com") == before_b
     assert ctx.load_state().active("claude") == "g@x.com"
-    assert len(profile[0]) == 1
+    assert len(profile[0]) == 4
     assert profile[1] == []
 
 
@@ -175,7 +175,7 @@ def test_profile_matches_existing_seats_case_insensitively(ctx, monkeypatch, pro
     state = _seats(ctx)
     monkeypatch.setattr(usage, "_default_get", lambda *_args:
                         (200, '{"account": {"email": "G@X.COM"}}'))
-    fresh = _blob("tok-g-new")
+    fresh = _blob("tok-g-new").replace('"expiresAt": 1', '"expiresAt": 2')
     ctx.cred["claude"].set_live(fresh)
     assert accounts.reconcile_claude(ctx, state) == "g@x.com"
     assert accounts.add(ctx, state, "claude")["email"] == "g@x.com"

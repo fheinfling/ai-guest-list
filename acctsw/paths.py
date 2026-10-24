@@ -23,6 +23,7 @@ CODEX_HOMES = DATA_DIR / "ch"
 # Pre-1.0.2 homes lived here, one directory per address. Now the by-address index: a symlink per
 # seat into CODEX_HOMES, so `ls ~/.account-switcher/codex-homes/` still answers "which seats?".
 CODEX_HOMES_LEGACY = DATA_DIR / "codex-homes"
+CLAUDE_HOMES = DATA_DIR / "clh"
 
 # Keychain service that holds our per-account credential snapshots.
 KEYCHAIN_SERVICE = "acct-switcher"  # accounts named "codex:<email>" / "claude:<email>"
@@ -69,7 +70,16 @@ CODEX_SESSIONS = CODEX_HOME / "sessions"
 
 # Claude stores the active account in the macOS Keychain under this generic-password service.
 CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials"
-CLAUDE_CONFIG_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude"))
+def _canonical_claude_home() -> Path:
+    inherited = os.environ.get("CLAUDE_CONFIG_DIR")
+    candidate = Path(inherited) if inherited else HOME / ".claude"
+    for root in (CLAUDE_HOMES, CODEX_HOMES):  # BYOK Claude homes live under ch too
+        if _contains(root, candidate) or _contains(root.resolve(), candidate.resolve()):
+            return Path(os.environ.get("ACCTSW_CLAUDE_SHARED_DIR", HOME / ".claude"))
+    return candidate
+
+
+CLAUDE_CONFIG_DIR = _canonical_claude_home()
 
 # --- usage endpoints (see docs/PLAN.md for header requirements) ------------------------------
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"

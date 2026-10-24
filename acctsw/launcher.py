@@ -29,6 +29,8 @@ and never decide anything on their own when something better is available:
 """
 from __future__ import annotations
 
+from .util import email_key
+
 import fcntl
 import json
 import logging
@@ -910,9 +912,9 @@ def _noop(_msg: str) -> None:
     pass
 
 
-def _claude_transcripts() -> dict[Path, int]:
+def _claude_transcripts(ctx: Context | None = None) -> dict[Path, int]:
     from . import paths
-    root = Path(os.environ.get("CLAUDE_CONFIG_DIR", paths.CLAUDE_CONFIG_DIR)) / "projects"
+    root = (ctx._claude_real if ctx is not None else paths.CLAUDE_CONFIG_DIR) / "projects"
     found = {}
     for path in root.glob("*/*.jsonl"):
         try:
@@ -945,6 +947,62 @@ def _claude_transcript_meta(path: Path) -> dict:
 _PASSTHROUGH_CMDS = frozenset({"login", "logout", "auth", "setup-token"})
 
 
+# Commands/aliases from Claude 2.1.309 --help, plus older config/migrate-installer commands.
+# Match only the first positional word: a bare prompt is also a work session.
+_CLAUDE_SUBCOMMANDS = _PASSTHROUGH_CMDS | frozenset({
+    "agents", "attach", "auto-mode", "doctor", "gateway", "import", "install", "logs", "mcp",
+    "plugin", "plugins", "purge", "respawn", "rm", "stop", "kill", "ultrareview", "update",
+    "upgrade", "config", "migrate-installer",
+})
+_CLAUDE_VARIADIC_OPTIONS = frozenset({
+    "--add-dir", "--allowedTools", "--allowed-tools", "--betas", "--disallowedTools",
+    "--disallowed-tools", "--file", "--mcp-config", "--tools",
+})
+_CLAUDE_VALUE_OPTIONS = _CLAUDE_VARIADIC_OPTIONS | frozenset({
+    "--agent", "--agents", "--append-system-prompt", "--autocompact", "--cloud", "-d", "--debug",
+    "--debug-file", "--effort", "--environment", "--fallback-model", "--from-pr", "--input-format",
+    "--json-schema", "--max-budget-usd", "--model", "-n", "--name", "--output-format",
+    "--permission-mode", "--permission-prompts", "--plugin-dir", "--plugin-url",
+    "--prompt-suggestions", "--remote-control", "--remote-control-session-name-prefix",
+    "-r", "--resume", "--session-id", "--setting-sources", "--settings", "--system-prompt",
+    "--system-prompt-snapshot", "--teleport", "--tmux", "-w", "--worktree",
+})
+
+
+def _claude_is_session(args: list) -> bool:
+    first = None
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            break  # The remaining words are a literal prompt, including command/flag spellings.
+        if arg in ("--version", "-v", "--help", "-h"):
+            return False
+        if arg in _CLAUDE_VALUE_OPTIONS:
+            if i + 1 < len(args) and (not args[i + 1].startswith("-") or arg not in {
+                    "-d", "--debug", "--cloud", "--from-pr", "--prompt-suggestions",
+                    "--remote-control", "-r", "--resume", "--teleport", "--tmux", "-w", "--worktree"}):
+                i += 1
+                if arg in _CLAUDE_VARIADIC_OPTIONS:
+                    while i + 1 < len(args) and not args[i + 1].startswith("-"):
+                        i += 1
+        elif not arg.startswith("-") and first is None:
+            first = arg
+        i += 1
+    return first not in _CLAUDE_SUBCOMMANDS
+
+
+def _claude_env(ctx: Context, email: str) -> dict:
+    env = harden_env()
+    env["CLAUDE_CONFIG_DIR"] = str(ctx.claude_home(email))
+    env["ACCTSW_CLAUDE_SHARED_DIR"] = str(ctx._claude_real)
+    env["ACCTSW_CLAUDE_SHARED_EXPLICIT"] = str(int(ctx.claude_config_explicit))
+    env["ACCTSW_CLAUDE_STOCK_CONFIG"] = ctx._claude_config_value or ""
+    env["USER"] = ctx.cred["claude"].account
+    env.pop("CLAUDE_SECURESTORAGE_CONFIG_DIR", None)
+    return env
+
+
 def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         notify: Notifier = _noop, get=usage_mod._default_get,
         price_get=pricing._default_get,
@@ -958,7 +1016,31 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         # Credential flow (e.g. `claude auth login`): run stock, unsupervised, so the OAuth
         # localhost-callback + interactive prompts work exactly as they do for a plain invocation.
         return exec_stock(ctx, tool, args)
+    if tool == "claude" and key is None:
+        from . import claudehome, claudesync
+        claudesync.converge(ctx)
+        claudehome.prepare_all(ctx)
     state = ctx.load_state()
+    if tool == "claude" and not _claude_is_session(args):
+        if key is not None:
+            raise AcctswError("a pinned key is for a work session")
+        email = state.active(tool)
+        if not email:
+            return exec_stock(ctx, tool, args)
+        # Management/info commands spend no conversation capacity. Keep the active seat even if
+        # resting, and exec directly so dashboard `agents --json` has no PTY, probes or hop loop.
+        from . import claudehome
+        with ctx.locked():
+            claudehome.ensure_home(ctx, email)
+        argv = build_cmd(ctx, tool, args)
+        try:
+            os.execvpe(argv[0], argv, _claude_env(ctx, email))
+        except OSError:
+            return 127
+        return 127
+    claude_options = args[:args.index("--")] if "--" in args else args
+    claude_fork = (tool == "claude" and "--fork-session" in claude_options and any(
+        a.split("=", 1)[0] in ("--resume", "-r", "--continue", "-c") for a in claude_options))
     pinned_seat = keyseats.resolve(ctx, key, harness=tool) if key is not None else None
     pin = uuid4().hex if pinned_seat is not None else None
     if pin and not state.settings()["key_fallback"]:
@@ -973,7 +1055,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
     # — the passthrough and NoSeats branches above return without ever reaching this far, so cleaning
     # here would miss exactly the fresh-install / `cx login` cases that most need it.
 
-    def _activate_codex_home(email):
+    def _activate_home(email):
         """Point codex at the account's own home so it maintains that account's tokens in place."""
         if tool == "codex" and email:
             from . import codexhome
@@ -985,32 +1067,41 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             home = codexhome.ensure_home(email, codex_home=ctx._codex_real, root=ctx._homes_root,
                                          promote=promote)
             os.environ["CODEX_HOME"] = str(home)
+        elif tool == "claude" and email:
+            from . import claudehome
+            claudehome.ensure_home(ctx, email,
+                                   promote=active_session(ctx.data_dir, "claude") is None)
 
-    # Claude's profile request can take 10 seconds. Resolve it with NO state flock,
-    # and memoise the answer only for the exact live Keychain blob: each distinct credential value
-    # gets its own answer, while later hops avoid repeating the request for unchanged bytes.
-    # The reconcile write rechecks that the same blob is still live.
-    claude_identities: dict[str | None, identity_mod.ClaudeLiveIdentity] = {}
 
-    def _claude_live_identity() -> identity_mod.ClaudeLiveIdentity | None:
-        if tool != "claude":
-            return None
-        live = ctx.cred["claude"].get_live()
-        if live in claude_identities:
-            return claude_identities[live]
-        resolved = identity_mod.claude_live_identity(ctx)  # HTTP — caller holds no state lock
-        if resolved.blob == live:
-            claude_identities[live] = resolved
-        return resolved
-
-    def _commit_switch(state, email, live_identity=None):
-        """Persist a seat hop: switch creds, repoint codex's home, stamp the switch time. Caller holds
-        ctx.locked(), having resolved any Claude identity before the lock, and owns the surrounding
-        notify/budget bookkeeping."""
-        switch(ctx, state, tool, email, sync=(tool != "codex"), live_identity=live_identity)
-        _activate_codex_home(email)
+    def _commit_switch(state, email):
+        """Persist a seat hop and prepare its private home. Caller holds ctx.locked()."""
+        switch(ctx, state, tool, email, sync=False, mirror=(tool != "claude"), save=False)
+        _activate_home(email)
         state.data["last_switch_at"] = iso(now())
         state.save()
+
+    claude_home_warnings = set()
+    claude_exit_verifications = set()
+
+    def _sync_claude_home(email):
+        from . import claudehome, claudesync
+        unverified = ((ctx.claude_home(email) / ".acctsw-unverified").exists()
+                      and email not in claude_exit_verifications)
+        claude_exit_verifications.add(email)
+        claudesync.converge(ctx, verify=email if unverified else None)
+        current = ctx.claude_cred(email).get_live()
+        seen = claudesync.tracker(ctx).seen.get(email)
+        with ctx.locked():
+            st = ctx.load_state()
+            if st.get_seat("claude", email) is None:
+                return
+            if (email not in claude_home_warnings and seen and seen.blob == current
+                    and ((seen.email and email_key(seen.email) != email_key(email))
+                         or (not seen.email and current != ctx.snapshot_get("claude", email)))):
+                claude_home_warnings.add(email)
+                notify(f"claude: login in {email}'s home could not be identified as {email}; "
+                       "credentials retained there, re-add the intended account")
+            claudehome.merge_config(ctx, email)
 
     auth_failed: set = set()   # seats whose token died THIS run — skip them for the rest of it
 
@@ -1039,6 +1130,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         key_session = (thread, path, relative)
 
     def _capture_key_session() -> bool:
+        if claude_fork and child_started:
+            return False
         if tool == "codex" and rollout_source is not None:
             rollout_source.poll(force_attach=True)
             path = rollout_source.attached
@@ -1050,7 +1143,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             return False
         if tool == "claude" and child_started:
             candidates = [(path, _claude_transcript_meta(path))
-                          for path, stamp in _claude_transcripts().items()
+                          for path, stamp in _claude_transcripts(ctx).items()
                           if (claude_before or {}).get(path) != stamp]
             candidates = [(path, meta) for path, meta in candidates
                           if meta.get("cwd") == os.getcwd()]
@@ -1066,7 +1159,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         if not wants_resume:
             return not child_started
         candidates = (rollout.scan_rollouts(rollout.sessions_roots(ctx, state.active(tool)))
-                      if tool == "codex" else _claude_transcripts())
+                      if tool == "codex" else _claude_transcripts(ctx))
         # A stopped paid session lives in its private home. Include it in an explicit/last resume
         # so enabling paid use later cannot replace its newer turns with the subscription copy.
         from . import codexhome
@@ -1296,20 +1389,12 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         if email is None or (not cold_start and not _auto_switch_is_on()):
             return False
         hopped = False
-        live_identity = None
-        if tool == "claude":
-            # The wait may return the seat that is already active. Check that cheaply first so the
-            # common no-switch path skips the profile request; resolve only between locks.
-            with ctx.locked():
-                if email == ctx.load_state().active(tool):
-                    return True
-            live_identity = _claude_live_identity()  # profile request — before the flock
         with ctx.locked():
             state = ctx.load_state()
             if not cold_start and not state.settings().get("auto_switch", True):
                 return False
             if email != state.active(tool):
-                _commit_switch(state, email, live_identity)
+                _commit_switch(state, email)
                 hopped = True
         if hopped:
             mark_session(ctx.data_dir, tool, email)
@@ -1367,38 +1452,19 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     and _activate_key(cold_start=True)):
                 return EXIT_GAVE_UP
         else:
-            # Initial selection is cheap. If Claude actually needs a switch, resolve its slow identity
-            # between two lock acquisitions and re-run selection before committing.
-            claude_switch_needed = False
             with ctx.locked():
                 state = ctx.load_state()
                 if tool == "codex":
                     from . import accounts as _acct
                     if active_session(ctx.data_dir, tool) is None:
-                        # A live supervisor owns its private tokens; its shared mirror can be older.
                         _acct.reconcile_codex(ctx, state)
                 sel = choose(state, tool)
                 if not sel.email and all(s.get("auth_error") for s in state.accounts(tool).values()):
                     notify(f"all {tool} seats need you to sign in again — re-add them via the app")
                     return EXIT_GAVE_UP
-                claude_switch_needed = (
-                    tool == "claude"
-                    and sel.available
-                    and bool(sel.email)
-                    and sel.email != state.active(tool)
-                )
-                if (sel.available and sel.email and sel.email != state.active(tool)
-                        and not claude_switch_needed):
-                    switch(ctx, state, tool, sel.email, sync=(tool != "codex"),
-                           live_identity=None)
-                _activate_codex_home(state.active(tool))
-            if claude_switch_needed:
-                live_identity = _claude_live_identity()  # HTTP — no state flock held
-                with ctx.locked():
-                    state = ctx.load_state()
-                    sel = choose(state, tool)  # selection may have changed while identity resolved
-                    if sel.available and sel.email and sel.email != state.active(tool):
-                        switch(ctx, state, tool, sel.email, live_identity=live_identity)
+                if sel.available and sel.email and sel.email != state.active(tool):
+                    switch(ctx, state, tool, sel.email, sync=False, mirror=(tool != "claude"))
+                _activate_home(state.active(tool))
             if sel.all_limited:
                 # The wait verifies against the live endpoint and recomputes targets from state, so it
                 # does not need a pre-known unlock time (unlocks_at may be None for reactive marks).
@@ -1408,9 +1474,41 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         switches = 0
         resuming = False
         resume_thread = None
+        if tool == "claude":
+            options = claude_options
+            resumed = any(a.split("=", 1)[0] in ("--resume", "-r", "--continue", "-c")
+                          for a in options)
+            for i, arg in enumerate(options):
+                if arg in ("--session-id", "--resume", "-r") and i + 1 < len(options):
+                    if not options[i + 1].startswith("-"):
+                        resume_thread = options[i + 1]
+                elif arg.startswith(("--session-id=", "--resume=")):
+                    resume_thread = arg.split("=", 1)[1]
+            if resume_thread is None and not resumed:
+                # Pin fresh sessions to an ID before the child starts. A global --continue could
+                # otherwise resume a different tab's newest transcript after a concurrent hop.
+                resume_thread = str(uuid4())
+                args = ["--session-id", resume_thread, *args]
+
+        def _capture_claude_resume():
+            nonlocal resume_thread
+            # Forks write a NEW ID. A shared-tree delta may belong to the parent or another tab;
+            # leave the child running rather than risk resuming its pre-fork conversation.
+            if claude_fork:
+                return False
+            if resume_thread:
+                return True
+            candidates = [(path, _claude_transcript_meta(path))
+                          for path, stamp in _claude_transcripts(ctx).items()
+                          if (claude_before or {}).get(path) != stamp]
+            candidates = [(path, meta) for path, meta in candidates if meta.get("cwd") == os.getcwd()]
+            if len(candidates) == 1:
+                resume_thread = candidates[0][1].get("sessionId")
+            return bool(resume_thread)
+
         if initial_resting is not None:
             # No child has run yet. Even after waiting, honor the original invocation (including
-            # --version or a fresh prompt); only a handoff during a session should add resume.
+            # a fresh prompt); only a handoff during a session should add resume.
             if not _wait_and_activate(cold_start=True):
                 notify(f"all {tool} seats are resting; soonest unlocks at "
                        f"{initial_resting.unlocks_at}")
@@ -1602,6 +1700,11 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                         notify(f"{tool} hit a confirmed limit, but auto-switch is off — staying on this seat")
                         scan["auto_switch_off_notified"] = True
                     return False
+                if tool == "claude" and not _capture_claude_resume():
+                    _undo_realign()
+                    notify("claude: couldn't identify this session for resume — staying on this seat")
+                    clear()
+                    return False
                 hit.update({
                     "reason": reason,
                     "email": landing,
@@ -1710,13 +1813,16 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                             notify(f"{tool}: couldn't make the resume copy; your work is still saved "
                                    f"in {key_runtime.home}")
             argv = resume_cmd(ctx, tool) if resuming else build_cmd(ctx, tool, args)
-            if resuming and tool == "codex" and resume_thread:
-                argv = [argv[0], "resume", resume_thread]
+            if resuming and resume_thread:
+                argv = [argv[0], "resume" if tool == "codex" else "--resume", resume_thread]
+            if tool == "claude":
+                claudesync.converge(ctx)
+                claudehome.prepare_all(ctx)
             with ctx.locked():
                 launch_email = ctx.load_state().active(tool)
                 # A click between the previous handoff and this launch may have moved active.
                 # Keep the child's actual credentials and its recorded launch seat together.
-                _activate_codex_home(launch_email)
+                _activate_home(launch_email)
             if launch_email:
                 mark_session(ctx.data_dir, tool, launch_email)
             # ``reason`` is set ONLY for a fully approved stop. ``handled`` also covers matches that
@@ -1962,12 +2068,17 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 decision_reason = "revoked" if verdict == "revoked" else reason
                 return _decide_and_maybe_stop(reason=decision_reason, hard=hard, clear=buf.clear)
 
-            # Claude has no rollout watcher. Only inspect its transcript tree when key fallback
-            # is enabled; ordinary subscription launches keep their original filesystem work.
-            if tool == "claude" and ctx.load_state().settings().get("key_fallback"):
-                claude_before = _claude_transcripts()
+            # Shared transcript deltas identify resumed Claude sessions, across seat homes.
+            if tool == "claude":
+                claude_before = _claude_transcripts(ctx)
             child_started = True
-            status = spawn(argv, on_output, on_tick=_tick)  # NO lock held here
+            if tool == "claude":
+                claude_exit_verifications.clear()
+                status = spawn(argv, on_output, on_tick=_tick, env=_claude_env(ctx, launch_email))
+                _sync_claude_home(launch_email)
+                _capture_claude_resume()
+            else:
+                status = spawn(argv, on_output, on_tick=_tick)  # NO lock held here
             if rollout_source is not None:
                 if hit["reason"] == "manual":
                     rollout_source.poll(force_attach=True)
@@ -2048,7 +2159,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 with ctx.locked():
                     auto_switch = bool(ctx.load_state().settings().get("auto_switch", True))
                 if (status > 0 and status not in _ABORT_EXITS and switches < max_switches
-                        and auto_switch):
+                        and auto_switch and (tool != "claude" or _capture_claude_resume())):
                     ua = (usage_mod.claude_user_agent(getattr(ctx, "claude_bin", None))
                           if tool == "claude" else None)  # subprocess — before the state flock
                     with ctx.locked():
@@ -2065,14 +2176,13 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                                         ).get("error") == "forbidden" if active else False
                     switched = False
                     if dec.action == "switch":
-                        live_identity = _claude_live_identity()  # only for an approved seat hop
                         with ctx.locked():
                             state = ctx.load_state()
                             landing = choose(state, tool, exclude=auth_failed)
                             if (state.settings().get("auto_switch", True)
                                     and state.active(tool) == active and landing.available
                                     and landing.email == dec.email):
-                                _commit_switch(state, dec.email, live_identity)
+                                _commit_switch(state, dec.email)
                                 switched = True
                     if switched:
                         mark_session(ctx.data_dir, tool, dec.email)
@@ -2100,7 +2210,6 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             # The callback already classified the banner, selected this exact landing seat, and
             # checked the budget while the child was alive. Commit that decision without choose() or
             # another usage fetch on the corpse.
-            live_identity = _claude_live_identity()  # profile request — before the flock
             committed = False
             handoff_blocked = ""
             with ctx.locked():
@@ -2112,7 +2221,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 elif state.active(tool) != hit["active"]:
                     handoff_blocked = "another switch changed the active seat before the handoff completed"
                 else:
-                    _commit_switch(state, hit["email"], live_identity)
+                    _commit_switch(state, hit["email"])
                     committed = True
             if not committed:
                 notify(f"{tool} {handoff_blocked}")
@@ -2142,40 +2251,18 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 handoff.resolve(ctx, key_request)
             except Exception:
                 pass
-        # On exit, reconcile the active account's creds (the just-run seat may carry a rotated token).
-        #  - codex: it maintained its own home via CODEX_HOME → mirror the home into ~/.codex so
-        #    plain codex / the GUI follow the active account.
-        #  - claude: sync the live keychain item back into the account's snapshot.
-        # The Claude sync-back is NOT optional: Claude rotates refresh tokens mid-session, and the
-        # live copy is the freshest one (see switch.sync_back's module docstring). Deferring it to
-        # "whenever the next switch happens" loses those bytes outright if an out-of-band login
-        # replaces the live item first — the stored snapshot then holds a superseded refresh token
-        # and the seat silently stops working. What we DO skip is the cost: when the live blob is
-        # byte-identical to the stored snapshot there is nothing to preserve, so the common
-        # no-rotation launch never pays for the Claude profile request.
         try:
             if key_runtime is not None or pin:
-                pass  # no OAuth blob belongs to a key child, including failed spawn/prepare paths
+                pass
             elif tool == "codex":
                 with ctx.locked():
                     st = ctx.load_state()
                     active = st.active(tool)
                     if active:
-                        blob = ctx.snapshot_get("codex", active)   # home = source of truth
+                        blob = ctx.snapshot_get("codex", active)
                         if blob:
-                            ctx.set_live("codex", blob)             # mirror → ~/.codex
-            else:
-                with ctx.locked():
-                    st = ctx.load_state()
-                    active = st.active(tool)
-                    # Cheap local keychain reads only — no CLI, no network, no identity probe.
-                    rotated = bool(active) and ctx.cred[tool].get_live() != ctx.snapshot_get(
-                        tool, active)
-                if rotated:
-                    live_identity = _claude_live_identity()  # HTTP — never under the flock
-                    with ctx.locked():
-                        st = ctx.load_state()
-                        if sync_back(ctx, st, tool, live_identity=live_identity):
-                            st.save()
+                            ctx.set_live("codex", blob)
+            elif child_started:
+                _sync_claude_home(launch_email)
         except Exception:
             pass

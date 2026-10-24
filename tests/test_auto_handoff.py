@@ -94,7 +94,7 @@ def test_handoff_rechecks_changes_during_probe(ctx, monkeypatch, change):
 def test_claude_handoff_checks_identity_and_switches(ctx, monkeypatch, email):
     summary = seed(ctx, "claude", spare_count=1)
     from acctsw.identity import ClaudeLiveIdentity
-    monkeypatch.setattr(bridge.identity_mod, "claude_live_identity", lambda c:
+    monkeypatch.setattr(bridge.identity_mod, "claude_live_identity", lambda c, **kw:
                         ClaudeLiveIdentity(blob=c.cred["claude"].get_live(), email=email))
     probe(monkeypatch)
     result = bridge._auto_switch_after_usage(ctx, summary)

@@ -292,3 +292,11 @@ def test_redirected_home_or_config_cannot_modify_user_files(ctx, link_home):
     with pytest.raises(ValueError, match="private directory|shared links"):
         keyhome.prepare(ctx, seat["id"])
     assert target.read_text() == "personal settings"
+
+
+def test_claude_key_home_cannot_inherit_subscription_storage_override(ctx):
+    runtime = keyhome.prepare(ctx, add(ctx, "anthropic", harness="claude")["id"])
+    child = keyhome.build_env(ctx, runtime, env={"CLAUDE_SECURESTORAGE_CONFIG_DIR": "/shared-oauth"})
+    assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" not in child
+    assert child["CLAUDE_CONFIG_DIR"] == str(runtime.home)
+    assert runtime.home.parent != ctx.claude_home("person@test").parent

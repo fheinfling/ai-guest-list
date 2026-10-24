@@ -308,7 +308,7 @@ def test_successful_poll_rereads_claude_plan(ctx):
     acct.add(ctx, state, "claude", email="c@x.com")
     assert state.get_seat("claude", "c@x.com")["plan"] == "Max"
 
-    ctx.cred["claude"].set_live(make_claude_blob("pro"))
+    ctx.claude_cred("c@x.com").set_live(make_claude_blob("pro"))
     U.refresh(ctx, state, "claude", force=True, user_agent="claude-code/x",
               get=fake_get({P.CLAUDE_USAGE_URL: (200, claude_ok_body())}))
     assert state.get_seat("claude", "c@x.com")["plan"] == "Pro"

@@ -58,6 +58,8 @@ otherwise the heal simply waits for the next launch.
 """
 from __future__ import annotations
 
+from .util import email_key
+
 import contextlib
 import errno
 import fcntl
@@ -70,6 +72,7 @@ import socket
 import stat
 import sys
 import time
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -112,7 +115,7 @@ def _slug(email: str) -> str:
     prefix (~1e-8 for a handful of seats), while every extra character spends the path budget that
     a deep ``$HOME`` needs far more often.
     """
-    return hashlib.sha256(email.casefold().encode("utf-8")).hexdigest()[:8]
+    return hashlib.sha256(email_key(email).encode("utf-8")).hexdigest()[:8]
 
 
 def home_dir(email: str, root: Path | None = None) -> Path:
@@ -610,11 +613,12 @@ def _real_sidecars(entry: Path) -> list[Path]:
     return out
 
 
-def _heal(home: Path, real: Path) -> None:
+def _heal(home: Path, real: Path, *,
+          private: Callable[[str], bool] = frozenset({"auth.json", *DAEMON_RUNTIME}).__contains__) -> None:
     """Give the home back its invariant: only auth.json is real, nothing dangles (rules 2 & 3)."""
     for entry in sorted(home.iterdir()):
         name = entry.name
-        if name == "auth.json" or ORPHAN_MARK in name or _never_shared(name):
+        if ORPHAN_MARK in name or private(name):
             continue                      # per-account token / inert parked copy / this seat's daemon
         if entry.is_symlink():
             if not entry.exists():

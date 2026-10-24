@@ -110,6 +110,28 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+class HttpReply(tuple):
+    """Two-value transport result with only a parsed, non-sensitive retry delay attached."""
+    def __new__(cls, status, body, headers):
+        import math
+        import time
+        from email.utils import parsedate_to_datetime
+        reply = super().__new__(cls, (status, body))
+        reply.retry_after = None
+        value = headers.get('Retry-After') if headers else None
+        if value is not None:
+            try:
+                seconds = float(value)
+            except (ValueError, TypeError):
+                try:
+                    seconds = parsedate_to_datetime(value).timestamp() - time.time()
+                except (ValueError, TypeError, OverflowError):
+                    return reply
+            if math.isfinite(seconds) and seconds >= 0:
+                reply.retry_after = seconds
+        return reply
+
+
 def _default_get(url: str, headers: dict, timeout: float) -> tuple[int, str]:
     req = urllib.request.Request(url, headers=headers, method="GET")
     try:
@@ -117,14 +139,14 @@ def _default_get(url: str, headers: dict, timeout: float) -> tuple[int, str]:
         open_request = (urllib.request.build_opener(_NoRedirect()).open
                         if url == P.CLAUDE_PROFILE_URL else urllib.request.urlopen)
         with open_request(req, timeout=timeout) as resp:
-            return resp.status, resp.read().decode("utf-8", "replace")
+            return HttpReply(resp.status, resp.read().decode("utf-8", "replace"), resp.headers)
     except urllib.error.HTTPError as e:
         body = ""
         try:
             body = e.read().decode("utf-8", "replace")
         except Exception:
             pass
-        return e.code, body
+        return HttpReply(e.code, body, e.headers)
     except (urllib.error.URLError, OSError, TimeoutError):
         return 0, ""  # network failure
 
@@ -608,6 +630,9 @@ FALSE_ALARM_MAX_PCT = 90.0
 
 def _seat_blob(ctx, state, tool: str, email: str) -> str | None:
     """Freshest credentials that can be proved to belong to the requested seat."""
+    if tool == "claude":
+        from . import claudehome
+        return claudehome.load(ctx, email)
     snapshot = ctx.snapshot_get(tool, email)
     if state.active(tool) != email:
         return snapshot
@@ -738,6 +763,9 @@ def _detached_blob(ctx, state, tool: str, email: str, *, active: bool) -> str | 
     private home.  Claude's blob carries no identity; its live bytes are usable only when they match
     the named snapshot.  The bridge reconciles a changed Claude login before reaching this helper.
     """
+    if tool == "claude":
+        from . import claudehome
+        return claudehome.load(ctx, email)
     snapshot = ctx.snapshot_get(tool, email)
     if not active:
         return snapshot
