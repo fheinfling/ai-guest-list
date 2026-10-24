@@ -86,8 +86,10 @@ def test_version_and_install_release_flow():
     import acctsw
     import tomllib
 
-    assert acctsw.__version__ == "1.4.0"
-    assert tomllib.loads((REPO / "pyproject.toml").read_text())["project"]["version"] == "1.4.0"
+    # Signed builds start at 1.4.0; the current version only has to be consistent and at least that.
+    version = tomllib.loads((REPO / "pyproject.toml").read_text())["project"]["version"]
+    assert acctsw.__version__ == version
+    assert tuple(map(int, version.split("."))) >= (1, 4, 0)
     readme = (REPO / "README.md").read_text()
     assert "1.4.0" in readme and "signed and notarized" in readme
     assert "older builds" in readme and "Open Anyway" in readme

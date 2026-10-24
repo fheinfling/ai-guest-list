@@ -6,6 +6,7 @@ import argparse
 import io
 from pathlib import Path, PurePosixPath
 import plistlib
+import re
 import struct
 import subprocess
 import sys
@@ -55,14 +56,56 @@ def bundle_paths(app: Path) -> list[Path]:
     return [path for path in paths if not path.is_symlink()]
 
 
+PRIVATE_KEY = re.compile(rb"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----")
+TEST_SUITE_DIRS = {"test", "tests", "idle_test"}
+
+
+def stdlib_test_member(name: str) -> bool:
+    """A CPython test suite: the top-level ``test`` package or a ``<pkg>/test(s)`` subpackage."""
+    parts = PurePosixPath(name).parts[:-1]
+    return bool(parts) and (parts[0] == "test" or any(p in TEST_SUITE_DIRS for p in parts[1:]))
+
+
+def archive_findings(source, label: str, depth: int = 0) -> list[str]:
+    """Stdlib test suites and private-key blocks hidden in (nested) archives."""
+    if depth > 8:
+        raise ValueError(f"archive nesting too deep to inspect safely: {label}")
+    found = []
+    with zipfile.ZipFile(source) as archive:
+        for entry in archive.infolist():
+            if entry.is_dir():
+                continue
+            name = f"{label}!{entry.filename}"
+            if depth == 0 and stdlib_test_member(entry.filename):
+                found.append(f"stdlib test suite: {name}")
+                continue
+            with archive.open(entry) as stream:
+                data = stream.read()
+            if PRIVATE_KEY.search(data):
+                found.append(f"private key block: {name}")
+            elif data[:4] in ZIP_MAGICS:
+                found.extend(archive_findings(io.BytesIO(data), name, depth + 1))
+    return found
+
+
 def scan_bundle(app: Path) -> None:
     found = []
+    content = []
+    lib = app / "Contents" / "Resources" / "lib"
     for path in bundle_paths(app):
+        if path.is_dir() and path.name in TEST_SUITE_DIRS and lib in path.parents:
+            content.append(f"stdlib test suite: {path}")
         if path.is_file():
             with path.open("rb") as stream:
                 magic = stream.read(4)
             if magic in ZIP_MAGICS or path.suffix.lower() == ".zip" or zipfile.is_zipfile(path):
                 found.extend(archive_machos(path, str(path)))
+                content.extend(archive_findings(path, str(path)))
+            elif PRIVATE_KEY.search(path.read_bytes()):
+                content.append(f"private key block: {path}")
+    if content:
+        raise ValueError("bundle ships content that must never be released (exclude it in "
+                         "setup.py):\n" + "\n".join(content))
     if found:
         raise ValueError("Mach-O hidden inside zip; run scripts/strip-bundle.py on the app "
                          "before smoke testing to remove .dSYM debug bundles. If native code "
