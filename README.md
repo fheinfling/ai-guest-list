@@ -142,13 +142,11 @@ seats**.
 1. Grab the latest `AI-Guest-List-v*.zip` from [**Releases**](https://github.com/fheinfling/ai-guest-list/releases/latest).
 2. Unzip, drag **AI Guest List.app** to `/Applications`, and open it.
 
-> **Unsigned-app note.** The app isn't signed/notarized yet, so macOS Gatekeeper blocks the first
-> launch. After installing (brew or zip), either:
-> - run `xattr -dr com.apple.quarantine "/Applications/AI Guest List.app"` (easiest), or
-> - approve it: **macOS 15 (Sequoia)+** — open the app once, dismiss the dialog, then **System
->   Settings → Privacy & Security** → scroll down → **Open Anyway** (right-click → Open no longer
->   bypasses Gatekeeper on 15+); **macOS 14 and earlier** — right-click the app in `/Applications` →
->   **Open** → **Open**.
+> Releases from **1.4.0** on are Developer ID signed and notarized, with the notarization ticket
+> stapled to the app. Open them normally; no `xattr` command or “Open Anyway” workaround is needed.
+> For older builds, macOS may require **System Settings → Privacy & Security → Open Anyway**.
+> Upgrade with `brew upgrade --cask ai-guest-list` or download the latest zip. This version has no
+> in-app updater.
 
 **Upgrading:** `brew upgrade --cask ai-guest-list` replaces the app on disk, but a menubar app that
 is already running keeps the engine it started with. **Quit it from the menubar and open it again**

@@ -1,0 +1,1 @@
+anchor apple generic and identifier "com.fheinfling.aiguestlist" and certificate leaf[field.1.2.840.113635.100.6.1.13] and certificate leaf[subject.OU] = "4U8Z955749"

@@ -1,28 +1,33 @@
 name: release
 
 # Cut a release by pushing a tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
-# This builds the unsigned .app on a macOS runner and attaches it to a GitHub Release.
+# This builds and attests the unsigned .app zip, then attaches it to a draft release.
 # The tag's X.Y.Z MUST match acctsw/__init__.py __version__ (the job verifies and fails otherwise).
-# A second job then auto-bumps the Homebrew cask in fheinfling/homebrew-tap to this release.
+# Local signing publishes the draft; only publication triggers the Homebrew tap bump.
 
 on:
   push:
     tags: ["v*"]
+  release:
+    types: [published]
 
 permissions:
-  contents: write        # create the GitHub Release + upload the asset
+  contents: read
 
 jobs:
   build-and-release:
+    if: github.event_name == 'push'
     runs-on: macos-14
-    outputs:
-      sha256: ${{ steps.checksum.outputs.sha256 }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0        # full history → git rev-list --count gives the build number
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.11"
 
@@ -55,73 +60,98 @@ jobs:
           . .venv/bin/activate
           python scripts/build-web.py
           python setup.py py2app
+          python scripts/strip-bundle.py "dist/AI Guest List.app"
+
+      - name: Reject native code hidden in bundled archives
+        run: python scripts/release-bundle.py scan "dist/AI Guest List.app"
 
       - name: Smoke-test packaged app
         run: python scripts/smoke-bundle.py
 
       - name: Zip the .app
         run: |
-          ditto -c -k --keepParent "dist/AI Guest List.app" "AI-Guest-List-${GITHUB_REF_NAME}.zip"
+          ditto -c -k --norsrc --keepParent "dist/AI Guest List.app" "AI-Guest-List-${GITHUB_REF_NAME}-unsigned.zip"
+          shasum -a 256 "AI-Guest-List-${GITHUB_REF_NAME}-unsigned.zip"
 
-      - name: Compute asset sha256
-        id: checksum
-        run: |
-          set -euo pipefail
-          SHA="$(shasum -a 256 "AI-Guest-List-${GITHUB_REF_NAME}.zip" | awk '{print $1}')"
-          echo "sha256=$SHA" | tee -a "$GITHUB_OUTPUT"
+      - name: Attest unsigned zip provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-path: AI-Guest-List-${{ github.ref_name }}-unsigned.zip
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3 (pinned SHA; Dependabot keeps it current)
         with:
           name: ${{ github.ref_name }}
+          draft: true
           generate_release_notes: true
-          files: AI-Guest-List-${{ github.ref_name }}.zip
+          files: AI-Guest-List-${{ github.ref_name }}-unsigned.zip
           body: |
-            Unsigned build — macOS Gatekeeper blocks the first launch. After installing
-            (`brew install --cask fheinfling/tap/ai-guest-list` or this zip), either:
-            - `xattr -dr com.apple.quarantine "/Applications/AI Guest List.app"`, or
-            - approve it: on macOS 15+ open the app once, then System Settings →
-              Privacy & Security → "Open Anyway" (right-click → Open no longer works on 15+);
-              on macOS 14 and earlier, right-click → Open → Open.
+            Draft awaiting local Developer ID signing and notarization.
 
   update-tap:
-    # Bump the Homebrew cask in fheinfling/homebrew-tap to point at this release.
-    needs: build-and-release
+    # No dependency on the push-only build job: publishing is a separate event.
+    if: github.event_name == 'release' && github.event.action == 'published' && !github.event.release.prerelease
     runs-on: ubuntu-latest
     permissions:
       contents: read      # tap pushes use TAP_PUSH_TOKEN, not GITHUB_TOKEN
     steps:
+      - name: Verify published assets
+        id: published
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::unexpected tag format"; exit 1; }
+          ASSET="AI-Guest-List-${TAG}.zip"
+          ASSET_DIR="$(mktemp -d)"
+          trap 'rm -rf "$ASSET_DIR"' EXIT
+          gh release download "$TAG" --repo fheinfling/ai-guest-list --pattern "$ASSET" --pattern latest.json --dir "$ASSET_DIR"
+          SHA256="$(shasum -a 256 "$ASSET_DIR/$ASSET" | awk '{print $1}')"
+          python3 - "$ASSET_DIR/latest.json" "$SHA256" "$TAG" <<'PYEOF'
+          import json, sys
+          manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+          if manifest["sha256"] != sys.argv[2] or manifest["version"] != sys.argv[3][1:]:
+              sys.exit("published zip sha256/version does not match latest.json")
+          PYEOF
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+
       - name: Checkout homebrew-tap
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: fheinfling/homebrew-tap
           token: ${{ secrets.TAP_PUSH_TOKEN }}
 
       - name: Bump cask version + sha256
         env:
-          SHA256: ${{ needs.build-and-release.outputs.sha256 }}
+          SHA256: ${{ steps.published.outputs.sha256 }}
+          TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          VER="${GITHUB_REF_NAME#v}"
+          VER="${TAG#v}"
           CASK="Casks/ai-guest-list.rb"
-          [[ "$SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::bad sha256 output from build job: '$SHA256'"; exit 1; }
+          [[ "$SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::bad sha256 from published asset: '$SHA256'"; exit 1; }
           [[ "$VER" =~ ^[0-9A-Za-z.+-]+$ ]]  || { echo "::error::unexpected version format: '$VER'"; exit 1; }
           sed -i -E "s|^([[:space:]]*version[[:space:]]+\").*(\")$|\1${VER}\2|"    "$CASK"
           sed -i -E "s|^([[:space:]]*sha256[[:space:]]+\").*(\")$|\1${SHA256}\2|"  "$CASK"
           # Fail loudly if the sed patterns stopped matching the cask's formatting:
           grep -Fq "version \"${VER}\""    "$CASK"
           grep -Fq "sha256 \"${SHA256}\""  "$CASK"
+          # This version has no in-app updater; Homebrew must keep managing upgrades.
+          sed -i -E '/^[[:space:]]*auto_updates[[:space:]]/d' "$CASK"
           git diff -- "$CASK"
 
       - name: Commit and push
+        env:
+          TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
           if git diff --quiet; then
-            echo "Cask already up to date for ${GITHUB_REF_NAME} — nothing to push."
+            echo "Cask already up to date for ${TAG} — nothing to push."
             exit 0
           fi
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Casks/ai-guest-list.rb
-          git commit -m "ai-guest-list ${GITHUB_REF_NAME#v}"
+          git commit -m "ai-guest-list ${TAG#v}"
           git push

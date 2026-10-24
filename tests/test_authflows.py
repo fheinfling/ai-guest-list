@@ -316,11 +316,6 @@ def test_native_signin_passes_requested_seat_to_terminal(ctx, monkeypatch):
     assert launched == [((ctx, "claude"), {"seat": B})]
 
 
-def test_patch_version():
-    from acctsw import __version__
-    assert __version__ == "1.3.1"
-
-
 @pytest.mark.parametrize("stored", ["{}", "[]", "null", "broken", '{"claudeAiOauth":{"refreshToken":3}}'])
 def test_unknown_claude_credentials_do_not_prove_sharing(ctx, fakes, stored):
     seed(ctx, "claude", B)
