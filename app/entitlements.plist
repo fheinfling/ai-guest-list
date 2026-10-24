@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Embedded CPython's ctypes/libffi and PyObjC create executable callback stubs.
+         Permit those allocations, including paths that do not use MAP_JIT.
+         https://pyobjc.readthedocs.io/en/latest/notes/codesigning.html
+         Library validation stays enabled: all bundled Mach-O code is re-signed
+         with the same Developer ID team. No debugger or JIT-only exception needed. -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+</dict>
+</plist>
