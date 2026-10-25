@@ -117,6 +117,53 @@ def clear_session(data_dir: Path, tool: str) -> None:
         pass
 
 
+def _thread_file(data_dir: Path, tool: str, pid: int) -> Path:
+    return Path(data_dir) / f"thread-{tool}-{pid}.json"
+
+
+def claim_thread(data_dir: Path, tool: str, thread: str) -> None:
+    """Record the conversation this supervisor's child is writing.
+
+    Two ``codex exec`` jobs in one directory look alike from the sessions tree. A supervisor that
+    has identified its own thread publishes it here, so a sibling attaching later can rule it out
+    instead of resuming someone else's conversation after a hop.
+    """
+    pid = os.getpid()
+    process_start = _START_CACHE.get(pid)
+    if process_start is None:
+        process_start = _proc_start(pid) or ""
+        _START_CACHE[pid] = process_start
+    write_json(_thread_file(data_dir, tool, pid),
+               {"pid": pid, "process_start": process_start, "thread": thread}, mode=0o600)
+
+
+def release_thread(data_dir: Path, tool: str) -> None:
+    try:
+        _thread_file(data_dir, tool, os.getpid()).unlink()
+    except OSError:
+        pass
+
+
+def threads_claimed_by_others(data_dir: Path, tool: str) -> set[str]:
+    """Threads claimed by OTHER live supervisors (dead or PID-recycled claims are ignored)."""
+    out: set[str] = set()
+    for path in Path(data_dir).glob(f"thread-{tool}-*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            pid = int(data["pid"])
+            thread = data["thread"]
+        except (OSError, ValueError, TypeError, KeyError):
+            continue
+        if pid == os.getpid() or not isinstance(thread, str) or not _alive(pid):
+            continue
+        stored_start = data.get("process_start")
+        start = _proc_start(pid)
+        if start == "" or (start and stored_start and not same_proc_start(stored_start, start)):
+            continue
+        out.add(thread)
+    return out
+
+
 def session_mtime_ns(data_dir: Path, tool: str) -> int:
     """Signature of the heartbeat files' mtimes, or 0 when absent. A change-signal for the menubar:
     a session starting or ending writes/removes this file WITHOUT touching state.json's ``rev``
