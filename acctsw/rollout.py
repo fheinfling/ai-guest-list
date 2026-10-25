@@ -134,7 +134,8 @@ def session_meta(path: Path) -> dict | None:
 
 
 def find_session_file(roots: Iterable[Path], *, before: dict[Path, int], cwd: str,
-                      since_ns: int) -> tuple[Path | None, bool]:
+                      since_ns: int,
+                      accept: Callable[[dict], bool] | None = None) -> tuple[Path | None, bool]:
     """Which rollout file is OUR child writing? — snapshot-then-diff, then match on cwd.
 
     ``before`` is a ``scan_rollouts`` taken just before spawning, so candidates are files that
@@ -145,6 +146,10 @@ def find_session_file(roots: Iterable[Path], *, before: dict[Path, int], cwd: st
 
     The single-foreign-candidate fallback covers ``codex resume --last`` on a thread first started
     somewhere else: exactly one file is moving, so it is ours despite the cwd mismatch.
+
+    ``accept`` replaces the cwd rule when the caller knows more about its child (an exec job's
+    originator, its known thread id, threads other supervisors already claimed): only accepted
+    files are candidates at all, and there is no foreign fallback.
     """
     floor = since_ns - _SINCE_SLACK_NS
     matches: list[tuple[Path, int]] = []
@@ -156,6 +161,10 @@ def find_session_file(roots: Iterable[Path], *, before: dict[Path, int], cwd: st
         if prev is not None and mtime <= prev:
             continue
         meta = session_meta(path)
+        if accept is not None:
+            if meta and accept(meta):
+                matches.append((path, mtime))
+            continue
         (matches if meta and meta.get("cwd") == cwd else others).append((path, mtime))
     if matches:
         best = max(matches, key=lambda pm: pm[1])[0]
@@ -254,12 +263,14 @@ class RolloutWatcher:
     """
 
     def __init__(self, roots: Iterable[Path], *, cwd: str, started_at: datetime,
-                 before: dict[Path, int], clock: Callable[[], float] = time.monotonic):
+                 before: dict[Path, int], clock: Callable[[], float] = time.monotonic,
+                 accept: Callable[[dict], bool] | None = None):
         self._roots = [Path(r) for r in roots]
         self._cwd = cwd
         self._started_at = started_at
         self._before = dict(before)
         self._clock = clock
+        self._accept = accept
         self._since_ns = int(started_at.timestamp() * 1_000_000_000)
         self._next_scan: float | None = None
         self._inode: int | None = None
@@ -284,7 +295,7 @@ class RolloutWatcher:
             return
         self._next_scan = now_t + ATTACH_SCAN_INTERVAL_S
         path, unambiguous = find_session_file(self._roots, before=self._before, cwd=self._cwd,
-                                              since_ns=self._since_ns)
+                                              since_ns=self._since_ns, accept=self._accept)
         if path is None:
             return
         if path == self.attached:
@@ -299,6 +310,16 @@ class RolloutWatcher:
         self.unambiguous = unambiguous
         self.meta = session_meta(path) or {}
         self._seek_tail(path)
+
+    def discover(self) -> None:
+        """Retry attaching NOW, past the scan rate limit, without reading (so no signal is lost).
+        A no-op once the attachment is unambiguous."""
+        try:
+            if self.attached is None or not self.unambiguous:
+                self._next_scan = None
+                self._try_attach()
+        except Exception:
+            pass
 
     def _seek_tail(self, path: Path) -> None:
         """Position at the start of the last ``TAIL_BYTES``, aligned to a line boundary."""

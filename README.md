@@ -27,7 +27,8 @@ If you pay for more than one AI-coding subscription — say two Codex seats, or 
 you've hit this: mid-task, the active account says *"you've reached your usage limit"* and you're
 stuck until it resets. **ai guest list** treats each paid subscription as a **seat** on a guest list.
 When the seat you're on runs out, it quietly **hops you to another seat of the same tool and resumes
-the exact session** (`codex resume` / `claude --resume`) — so your agent keeps working. When every
+the exact session** (`codex resume` / `claude --resume`; an unattended `codex exec` job continues
+with `codex exec resume`) — so your agent keeps working. When every
 seat is resting, it tells you which one **unlocks soonest** — or, if you've added an API key as a
 seat, offers to carry on at pay-per-token rates once you approve it.
 

@@ -52,7 +52,7 @@ from pathlib import Path
 from typing import Callable
 from uuid import uuid4
 
-from . import handoff, keyhome, keyseats, pricing, providers
+from . import codexexec, handoff, keyhome, keyseats, pricing, providers
 from . import identity as identity_mod
 from . import rollout
 from . import session as session_mod
@@ -834,6 +834,157 @@ def pty_spawn(argv: list, on_output: Callable[[bytes], bool],
         return 0
 
 
+def pipe_spawn(argv: list, on_output: Callable[[bytes], bool],
+               on_tick: Callable[[], bool] | None = None,
+               tick_interval: float = TICK_INTERVAL_S, *, env: dict | None = None,
+               stdin_null: bool = False) -> int:
+    """``pty_spawn``'s contract for a NON-interactive child (``codex exec``), without a PTY.
+
+    A PTY breaks exec jobs: a piped prompt (``cx exec - < spec.md``) never delivers EOF through the
+    master, so codex waits for the rest of its prompt forever; output gets CRLF translation; and
+    codex can no longer tell that stdin is piped. Here the child inherits our stdin (or /dev/null
+    for a resumed job, whose prompt is in argv and whose stdin was consumed by the first child),
+    and its stdout and stderr each go through their own pipe, copied byte for byte to ours and
+    teed to ``on_output``. The heartbeat and the stop path are the same as ``pty_spawn``'s.
+
+    The child shares our process group, so a terminal Ctrl-C reaches it directly. A SIGINT sent to
+    the supervisor alone is forwarded; the supervisor itself never dies of it mid-copy.
+    """
+    stdin_fd = _real_fd(sys.stdin)
+    targets = {}
+    for stream, fallback in ((sys.stdout, 1), (sys.stderr, 2)):
+        fd = _real_fd(stream)
+        targets[stream] = fallback if fd is None else fd
+    devnull = os.open(os.devnull, os.O_RDONLY) if stdin_null or stdin_fd is None else None
+    child_stdin = devnull if devnull is not None else stdin_fd
+    out_r, out_w = os.pipe()
+    err_r, err_w = os.pipe()
+    try:
+        pid = os.fork()
+    except OSError:
+        for fd in (out_r, out_w, err_r, err_w, devnull):
+            if fd is not None:
+                os.close(fd)
+        raise
+    if pid == 0:  # pragma: no cover - replaced by exec
+        try:
+            if child_stdin != 0:
+                os.dup2(child_stdin, 0)
+            os.dup2(out_w, 1)
+            os.dup2(err_w, 2)
+            for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGPIPE):
+                signal.signal(sig, signal.SIG_DFL)
+            # The pipe ends are non-inheritable (PEP 446), so exec closes every other copy.
+            os.execvpe(argv[0], argv, harden_env(env))
+        finally:
+            os._exit(127)
+    for fd in (out_w, err_w, devnull):
+        if fd is not None:
+            os.close(fd)
+    route = {out_r: targets[sys.stdout], err_r: targets[sys.stderr]}
+    watch = [out_r, err_r]
+    terminating = False
+    stop_requested = False
+    reaped = None
+    previous = {}
+
+    def _stop_child():
+        nonlocal terminating
+        terminating = True
+        return _terminate(pid, None, drain=tuple(watch))
+
+    def _on_term(sig, _frm):
+        nonlocal reaped
+        if terminating:
+            return
+        try:
+            reaped = _stop_child()
+        except Exception:
+            pass
+        signal.signal(sig, signal.SIG_DFL)
+        os.kill(os.getpid(), sig)
+
+    def _on_int(_sig, _frm):
+        # A Ctrl-C at the terminal already reached the child (same foreground process group);
+        # only a SIGINT aimed at the supervisor alone needs passing on.
+        for fd in {stdin_fd, *targets.values()} - {None}:
+            try:
+                if os.isatty(fd) and os.tcgetpgrp(fd) == os.getpgrp():
+                    return
+            except OSError:
+                continue
+        try:
+            os.kill(pid, signal.SIGINT)
+        except OSError:
+            pass
+
+    try:
+        for sig, handler in ((signal.SIGTERM, _on_term), (signal.SIGHUP, _on_term),
+                             (signal.SIGINT, _on_int)):
+            try:
+                previous[sig] = signal.signal(sig, handler)
+            except (ValueError, OSError):
+                pass
+        next_tick = time.monotonic() + tick_interval
+        while watch:
+            timeout = None if on_tick is None else max(0.0, next_tick - time.monotonic())
+            try:
+                rlist, _, _ = select.select(watch, [], [], timeout)
+            except InterruptedError:
+                continue
+            except OSError:
+                break
+            for fd in rlist:
+                try:
+                    data = os.read(fd, 65536)
+                except OSError:
+                    data = b""
+                if not data:
+                    watch.remove(fd)
+                    os.close(fd)
+                    continue
+                try:
+                    os.write(route[fd], data)
+                except OSError:
+                    # Our reader went away (`cx exec … | head`). Close this pipe so the child
+                    # meets EPIPE on its next write, exactly as it would without us.
+                    watch.remove(fd)
+                    os.close(fd)
+                    continue
+                if on_output(data):
+                    stop_requested = True
+                    break
+            if stop_requested:
+                break
+            if on_tick is not None and time.monotonic() >= next_tick:
+                next_tick = time.monotonic() + tick_interval
+                if on_tick():
+                    stop_requested = True
+                    break
+        if stop_requested:
+            return _stop_child()
+    finally:
+        for sig, prev in previous.items():
+            try:
+                signal.signal(sig, prev)
+            except (ValueError, OSError):
+                pass
+        for fd in watch:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        watch.clear()
+
+    if reaped is not None:
+        return reaped
+    try:
+        _, status = os.waitpid(pid, 0)
+        return _exitcode(status)
+    except ChildProcessError:
+        return 0
+
+
 def _tty_alive(fd: int) -> bool:
     """False once the terminal behind ``fd`` has been revoked (its window was closed)."""
     try:
@@ -843,13 +994,15 @@ def _tty_alive(fd: int) -> bool:
         return False
 
 
-def _terminate(pid: int, master_fd: int | None = None) -> int:
+def _terminate(pid: int, master_fd: int | None = None, drain: tuple = ()) -> int:
     """Stop the child (SIGTERM→SIGKILL) and reap it. Returns its exit/signal status.
 
     We signal the child's whole PROCESS GROUP: ``pty.fork`` makes the child a session leader, so
     its children (e.g. a shell's subprocesses) share its pgid and must be killed too — otherwise
     an orphan keeps the pty open and we'd hang. Takes ownership of master_fd, if supplied.
     Shutdown output is discarded: forwarding to a closed/stalled terminal can itself block.
+    ``drain`` fds (a pipe child's stdout/stderr) are read and discarded the same way, but stay
+    owned by the caller: a child blocked writing to a full pipe could never act on SIGTERM.
     """
     def _signal(sig):
         try:
@@ -885,22 +1038,34 @@ def _terminate(pid: int, master_fd: int | None = None) -> int:
             delay = min(0.05, max(0, deadline - time.monotonic()))
             if not delay:
                 return None
-            if master_fd is None:
+            fds = ([master_fd] if master_fd is not None else []) + [fd for fd in drain
+                                                                     if fd not in drained]
+            if not fds:
                 time.sleep(delay)
                 continue
             try:
-                readable, _, _ = select.select([master_fd], [], [], delay)
-                if readable and not os.read(master_fd, 65536):
-                    # EOF; keep the fd until the grace ends but avoid spinning.
-                    time.sleep(delay)
+                readable, _, _ = select.select(fds, [], [], delay)
+                for fd in readable:
+                    if not os.read(fd, 65536):
+                        if fd == master_fd:
+                            # EOF; keep the fd until the grace ends but avoid spinning.
+                            time.sleep(delay)
+                        else:
+                            drained.add(fd)
             except (BlockingIOError, InterruptedError):
                 continue
             except OSError:
                 time.sleep(delay)
 
+    drained: set = set()
     try:
         if master_fd is not None:
             os.set_blocking(master_fd, False)
+        for fd in drain:
+            try:
+                os.set_blocking(fd, False)
+            except OSError:
+                drained.add(fd)
         # About five seconds for the TUI to save its session, without an early SIGHUP.
         for sig, grace in ((signal.SIGTERM, 5.0), (signal.SIGKILL, 1.0)):
             _signal(sig)
@@ -1064,6 +1229,16 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
     if not pin and not state.accounts(tool):
         raise NoSeats(f"no {tool} seats yet — add one first")
     seen_manual_switch = state.data["tools"][tool].get("manual_switch")
+    # `codex exec` is unattended: a hop must relaunch it as `codex exec … resume <thread> <prompt>`
+    # on pipes, never the TUI `codex resume` (which waits forever for a keyboard nobody is at).
+    exec_job = codexexec.parse(args) if tool == "codex" else None
+    exec_thread = exec_job.thread if exec_job is not None else None
+    exec_claimed = None
+    exec_stay_notified = False
+    exec_spawn = pipe_spawn if spawn is pty_spawn else spawn
+    if exec_job is not None:
+        exec_cwd = os.path.join(os.getcwd(), os.path.expanduser(exec_job.cwd or "."))
+        exec_cwds = {os.path.abspath(exec_cwd), os.path.realpath(exec_cwd)}
 
     # NB: legacy-Headroom cleanup deliberately lives in `cli._cmd_run`, BEFORE the app-running split
     # — the passthrough and NoSeats branches above return without ever reaching this far, so cleaning
@@ -1132,6 +1307,59 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
     claude_before = None
     child_started = False
     key_cold_start = False
+
+    exec_claims = {"at": None, "threads": set()}
+
+    def _exec_accept(meta: dict) -> bool:
+        """Which rollout is this exec job's? Structured fields only, never the child's output."""
+        if exec_thread:
+            return meta.get("id") == exec_thread   # a resumed job keeps its thread id
+        if not (codexexec.is_exec_meta(meta) and meta.get("cwd") in exec_cwds):
+            return False
+        # Sibling claims cost a `ps` each; read them at most once per discovery scan.
+        if exec_claims["at"] is None or time.monotonic() - exec_claims["at"] >= 1.0:
+            exec_claims["threads"] = session_mod.threads_claimed_by_others(ctx.data_dir, tool)
+            exec_claims["at"] = time.monotonic()
+        return meta.get("id") not in exec_claims["threads"]
+
+    def _exec_thread_known(*, look: bool = False) -> str | None:
+        """This job's thread, once identified; claimed so a sibling job never resumes it.
+
+        ``look`` re-runs discovery past its rate limit: a hop decision must not fail just because
+        the child's first rollout line landed inside the scan cooldown."""
+        nonlocal exec_thread, exec_claimed
+        if look and not exec_thread and rollout_source is not None:
+            rollout_source.discover()
+        if not exec_thread and rollout_source is not None and rollout_source.unambiguous:
+            thread = rollout_source.meta.get("id")
+            if rollout_source.attached is not None and isinstance(thread, str) and thread:
+                exec_thread = thread
+        if exec_thread and exec_claimed != exec_thread:
+            try:
+                session_mod.claim_thread(ctx.data_dir, tool, exec_thread)
+                exec_claimed = exec_thread
+            except OSError:
+                pass
+        return exec_thread
+
+    def _exec_blocker() -> str | None:
+        """Why this exec job cannot be carried to another seat right now, else None."""
+        if exec_job is None:
+            return None
+        if exec_job.blocker:
+            return exec_job.blocker
+        if not _exec_thread_known(look=True):
+            return "acctsw couldn't tell which codex session is this job's"
+        return None
+
+    def _exec_stay(why: str) -> None:
+        nonlocal exec_stay_notified
+        if exec_stay_notified:
+            return
+        exec_stay_notified = True
+        hint = f" (or `codex exec resume {exec_thread}`)" if exec_thread else ""
+        notify(f"codex exec: this job can't move to another seat — {why}. It keeps its seat; "
+               f"if it stops on the limit, re-run it{hint}")
 
     def _remember_key_session(thread, path):
         nonlocal key_session
@@ -1235,6 +1463,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         nonlocal key_request, key_seat, key_attempted
         if key_attempted:
             return key_request is not None
+        if exec_job is not None and exec_job.blocker:
+            return False   # a paid seat could only ever restart this job, never continue it
         with ctx.locked():
             st = ctx.load_state()
             if not _key_eligible(st, cold_start=cold_start):
@@ -1356,6 +1586,11 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
 
     def _key_command() -> list:
         argv = build_cmd(ctx, tool, [])
+        options = ["--model", key_runtime.model]
+        if tool == "codex":
+            options += ["-c", "model_provider=" + json.dumps(key_runtime.model_provider)]
+        if exec_job is not None and key_session:
+            return exec_job.resume_argv(argv[0], key_session[0], drop_model=True, extra=options)
         if key_session:
             argv += ["resume" if tool == "codex" else "--resume", key_session[0]]
         else:
@@ -1371,9 +1606,6 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     next(rest, None)
                 elif not arg.startswith("--model="):
                     argv.append(arg)
-        options = ["--model", key_runtime.model]
-        if tool == "codex":
-            options += ["-c", "model_provider=" + json.dumps(key_runtime.model_provider)]
         boundary = argv.index("--") if "--" in argv else len(argv)
         argv[boundary:boundary] = options
         return argv
@@ -1719,6 +1951,12 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     notify("claude: couldn't identify this session for resume — staying on this seat")
                     clear()
                     return False
+                exec_why = _exec_blocker()
+                if exec_why:
+                    _undo_realign()
+                    _exec_stay(exec_why)
+                    clear()
+                    return False
                 hit.update({
                     "reason": reason,
                     "email": landing,
@@ -1816,6 +2054,9 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     # Re-read at the last boundary, with no work between this check and spawn.
                     if not _key_approval_current(cold_start=key_cold_start):
                         return EXIT_GAVE_UP
+                    if exec_job is not None:
+                        return exec_spawn(argv, lambda chunk: False, on_tick=key_tick, env=key_env,
+                                          stdin_null=bool(key_session))
                     return spawn(argv, lambda chunk: False, on_tick=key_tick, env=key_env)
                 finally:
                     if source is not None:
@@ -1826,9 +2067,14 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                         except Exception:
                             notify(f"{tool}: couldn't make the resume copy; your work is still saved "
                                    f"in {key_runtime.home}")
-            argv = resume_cmd(ctx, tool) if resuming else build_cmd(ctx, tool, args)
-            if resuming and resume_thread:
-                argv = [argv[0], "resume" if tool == "codex" else "--resume", resume_thread]
+            if exec_job is not None and resuming:
+                # Every hop path checked _exec_blocker() first, so the thread is known here; and
+                # resume_argv refuses rather than ever building the TUI's `codex resume`.
+                argv = exec_job.resume_argv(build_cmd(ctx, tool, [])[0], exec_thread)
+            else:
+                argv = resume_cmd(ctx, tool) if resuming else build_cmd(ctx, tool, args)
+                if resuming and resume_thread:
+                    argv = [argv[0], "resume" if tool == "codex" else "--resume", resume_thread]
             if tool == "claude":
                 claudesync.converge(ctx)
                 claudehome.prepare_all(ctx)
@@ -1861,9 +2107,9 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             rollout_source = None
             if tool == "codex":
                 roots = rollout.sessions_roots(ctx, launch_email)
-                rollout_source = rollout.RolloutWatcher(roots, cwd=launch_cwd,
-                                                        started_at=spawn_at,
-                                                        before=rollout.scan_rollouts(roots))
+                rollout_source = rollout.RolloutWatcher(
+                    roots, cwd=launch_cwd, started_at=spawn_at, before=rollout.scan_rollouts(roots),
+                    accept=_exec_accept if exec_job is not None else None)
             tick = {
                 "state_mtime": 0,             # last seen st_mtime_ns of state.json (cheap change gate)
                 "seen_rev": None,             # last seen state revision (mtime can move without data)
@@ -1901,6 +2147,12 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     if (target and target != launch_email and target == snap.active(tool)
                             and snap.get_seat(tool, target) is not None
                             and ctx.snapshot_get(tool, target)):
+                        exec_why = _exec_blocker()
+                        if exec_why:
+                            # Not even an explicit choice may kill a job we could not continue.
+                            _exec_stay(exec_why)
+                            tick["gui_switch_notified"] = True
+                            return False
                         # The user chose this exact seat; auto-switch preferences and the
                         # automatic hop budget do not veto an explicit manual action.
                         hit.update(reason="manual", email=target, active=launch_email,
@@ -2010,6 +2262,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     if _tick_decide(reason="limit", hard=sig.hard, reset_at=sig.reset_at,
                                     source=("hard" if sig.hard else "usage"), detail=sig.detail):
                         return True
+                if exec_job is not None and exec_claimed is None:
+                    _exec_thread_known()   # claim it as soon as it is ours, before a sibling looks
                 # (c) engine state, then (d) the clock: a seat that frees while we are stuck must
                 # actually carry the session over, not merely be announced.
                 return _tick_state() or _tick_recover()
@@ -2091,8 +2345,17 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 status = spawn(argv, on_output, on_tick=_tick, env=_claude_env(ctx, launch_email))
                 _sync_claude_home(launch_email)
                 _capture_claude_resume()
+            elif exec_job is not None:
+                status = exec_spawn(argv, on_output, on_tick=_tick, stdin_null=resuming)
             else:
                 status = spawn(argv, on_output, on_tick=_tick)  # NO lock held here
+            if rollout_source is not None and exec_job is not None:
+                # codex exec writes its limit line and quits, often inside one heartbeat. Read the
+                # rest of its log now, so the exit paths below see it and know the thread.
+                for sig in rollout_source.poll(force_attach=True):
+                    if sig.kind != "healthy":
+                        tick["last_structured"] = sig
+                _exec_thread_known()
             if rollout_source is not None:
                 if hit["reason"] == "manual":
                     rollout_source.poll(force_attach=True)
@@ -2173,7 +2436,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 with ctx.locked():
                     auto_switch = bool(ctx.load_state().settings().get("auto_switch", True))
                 if (status > 0 and status not in _ABORT_EXITS and switches < max_switches
-                        and auto_switch and (tool != "claude" or _capture_claude_resume())):
+                        and auto_switch and (tool != "claude" or _capture_claude_resume())
+                        and _exec_blocker() is None):
                     ua = (usage_mod.claude_user_agent(getattr(ctx, "claude_bin", None))
                           if tool == "claude" else None)  # subprocess — before the state flock
                     with ctx.locked():
@@ -2257,6 +2521,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         # Clear before credential reconciliation so observers never report a session whose child has
         # already exited merely because sync-back is waiting on the state lock or filesystem.
         clear_session(ctx.data_dir, tool)
+        if exec_claimed is not None:
+            session_mod.release_thread(ctx.data_dir, tool)
         if key_request is not None:
             try:
                 # Ctrl-C or an exceptional spawn must not leave a live invitation behind. Use the
