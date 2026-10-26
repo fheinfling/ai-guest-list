@@ -16,6 +16,8 @@ import json
 import os
 from pathlib import Path
 
+from . import __version__
+from .engine import CAPABILITIES, compare
 from .procenv import proc_start, same_proc_start
 from .util import iso, now, write_json
 
@@ -82,6 +84,10 @@ def mark_session(data_dir: Path, tool: str, email: str, *, pin: str | None = Non
         "pid": pid,
         "process_start": process_start,
         "started_at": iso(now()),
+        # Which engine supervises this terminal. The app shares this store with every terminal,
+        # so it must be able to see one still running an older engine (see stale_engines).
+        "engine": __version__,
+        "capabilities": list(CAPABILITIES),
     }
     if pin is not None:
         data.update(pin=pin, paid=True, end_requested=False,
@@ -268,9 +274,35 @@ def _read_session(path: Path, *, strict: bool = False) -> dict | None:
         discard()
         return None
     public = {"email": email, "pid": pid, "started_at": started_at}
+    # Absent from a heartbeat written before engines stamped themselves (necessarily older).
+    if isinstance(data.get("engine"), str):
+        public["engine"] = data["engine"]
+        caps = data.get("capabilities")
+        public["capabilities"] = caps if isinstance(caps, list) else []
     if isinstance(data.get("pin"), str):
         public.update({k: data.get(k) for k in ("pin", "paid", "key_seat", "end_requested")})
     return public
+
+
+def stale_engines(data_dir: Path, live: dict[str, list[dict]] | None = None) -> list[dict]:
+    """Live supervisors running an engine older than (or missing features of) this one.
+
+    Each is ``{"tool", "pid", "engine"}``; ``engine`` is None for a heartbeat from before engines
+    stamped themselves, which is necessarily older. Restarting the terminal is the fix: the
+    supervisor keeps its engine for its whole life, whatever the wrapper now points at.
+    ``live`` reuses records a caller already read ({tool: active_sessions(...)}), sparing the
+    per-record ``ps``.
+    """
+    from . import TOOLS
+    out = []
+    for tool in TOOLS:
+        records = live[tool] if live is not None and tool in live else active_sessions(data_dir, tool)
+        for record in records:
+            version = record.get("engine")
+            if version is None or compare({"version": version,
+                                           "capabilities": record.get("capabilities")}):
+                out.append({"tool": tool, "pid": record["pid"], "engine": version})
+    return out
 
 
 def request_end(ctx, tool: str, pin: str) -> bool:

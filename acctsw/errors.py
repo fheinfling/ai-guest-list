@@ -28,3 +28,7 @@ class CredentialIdentityMismatch(AcctswError):
 
 class UnsafeCodexMirror(AcctswError):
     """The shared Codex mirror was resolved to one of acctsw's private seat homes."""
+
+
+class EngineTooOld(AcctswError):
+    """state.json was last managed by an engine that requires a newer one to move credentials."""

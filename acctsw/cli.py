@@ -326,6 +326,15 @@ def _cmd_run(ctx: Context, ns) -> int:
     args = list(ns.args or [])
     if args and args[0] == "--":  # argparse REMAINDER keeps a leading separator
         args = args[1:]
+    # A newer engine manages this store: supervising would move logins in our older format
+    # (how a stale checkout once signed every Claude session out). Fall back to the stock tool,
+    # which uses the login as-is, and say how to fix it instead of corrupting anything.
+    blocked = ctx.credential_writer_block()
+    if blocked:
+        if args and (args[0] == "--key" or args[0].startswith("--key=")):
+            raise AcctswError(blocked)
+        notify(f"not supervising: {blocked}")
+        return exec_stock(ctx, ns.tool, args)
     # A launcher option precedes agent arguments. Leave later --key text (including prompts
     # after --) alone; it is not permission to spend. Never forward our option to stock codex.
     key = None
@@ -449,7 +458,9 @@ def main(argv: list[str] | None = None) -> int:
     if ns.capabilities:
         # A feature handshake, not a version comparison: development builds can share a version
         # while exposing different options. Keep this before Context/Keychain/store access.
-        print(json.dumps({"capabilities": ["run-key-v1", "isolated-signin-v1"]}))
+        # The version rides along so the app can tell an older engine from a missing feature.
+        from .engine import identity
+        print(json.dumps(identity()))
         return EXIT_OK
     if not ns.command:
         parser.print_help()

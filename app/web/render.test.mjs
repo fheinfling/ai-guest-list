@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   buildHTML, dotState, dotKey, doorKey, doorMark, creditLeft, pct, fmtCountdown, needsHello,
-  buildSettings, buildAddSeat, reduceReply, supervisionBanner, fmtUsageAge, fmtSessionAge, updateClockText,
+  buildSettings, buildAddSeat, reduceReply, supervisionBanner, engineBanner, fmtUsageAge, fmtSessionAge, updateClockText,
 } from "./render.mjs";
 
 const mkAdd = (over = {}) => ({ step: "provider", provider: null, name: "", method: "browser", token: "", ...over });
@@ -2092,4 +2092,20 @@ test("sign-in buttons carry escaped seat identity on the row and attention promp
     assert.ok(html.includes(`${target}>sign in again`));
     assert.ok(html.includes(`${target}>sign in to`));
   }
+});
+
+test("engine drift warnings render as alerts, with the consented fix only for the wrapper", () => {
+  const st = state({ engine_warnings: [
+    { kind: "wrapper", action: "adopt_engine", text: "terminals run an older engine: <bin>/acctsw is acctsw 1.1.2" },
+    { kind: "sessions", text: "2 terminal sessions run an older engine (1.1.2)" },
+  ] });
+  const banner = engineBanner(st);
+  assert.equal((banner.match(/role="alert"/g) || []).length, 2);
+  assert.match(banner, /&lt;bin&gt;\/acctsw is acctsw 1\.1\.2/);
+  assert.equal((banner.match(/data-action="engine-adopt"/g) || []).length, 1);
+  assert.ok(buildHTML(st).includes(banner));
+  // Shown even with supervision opted out: cx/cl still run the same wrapper.
+  assert.ok(buildHTML(state({ settings: { theme: "light", supervise_shell: false },
+                              engine_warnings: st.engine_warnings })).includes(banner));
+  assert.equal(engineBanner(state({})), "");
 });

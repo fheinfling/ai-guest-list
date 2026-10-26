@@ -21,6 +21,7 @@ from pathlib import Path
 
 from . import TOOLS, __version__
 from . import accounts as acct
+from . import engine as engine_mod
 from .context import Context
 from .identity import claude_profile_email, live_email
 from .switch import sync_back
@@ -312,17 +313,59 @@ def _wrapper_stale(body: str) -> bool:
         return False
 
 
+# How ensure_launchers identifies the engine behind a wrapper it did not just write. A module global
+# so the test suite can stub it out once (conftest) and no test runs a fake wrapper by accident.
+_probe_engine = engine_mod.probe
+
+# The last drift report from ensure_launchers: None when the wrapper runs this engine (or could not
+# be identified). Kept in memory, not state.json: it describes this app process's view of one file
+# and is refreshed by every bootstrap/repair, so a stale report can't outlive a fix by more than that.
+_WRAPPER_DRIFT: dict | None = None
+
+
+def wrapper_drift() -> dict | None:
+    """The cached report of a preserved ``acctsw`` wrapper that runs an older engine than the app."""
+    return _WRAPPER_DRIFT
+
+
+def _check_engine(target: Path, body: str, *, own_bundle: bool, probe) -> dict | None:
+    """Probe the engine a kept wrapper really runs; never decide freshness from its text alone.
+
+    Regexes over a wrapper only know the shapes we wrote: a hand-written ``exec "$VENV/bin/python"``
+    or a checkout that was simply never pulled looks perfectly healthy, yet ran a 1.1 engine that
+    signed every Claude session out while sharing the app's store. Returns a drift report (see
+    ``engine.compare``) with ``heal`` set when the wrapper is one the app owns — it execs a py2app
+    bundle interpreter and the app itself runs from a bundle — so rewriting it to the current
+    bundle cannot redirect anyone's source checkout.
+    """
+    found = probe(target)
+    drift = engine_mod.compare(found)
+    if drift is None:
+        return None
+    exe = _wrapper_exe(body)
+    return {**drift, "path": str(target), "exe": exe, "app_version": __version__,
+            "heal": bool(own_bundle and exe and _is_bundle_python(exe))}
+
+
 def ensure_launchers(*, bin_dir: Path | None = None, python: str | None = None,
                      pkg_root: Path | None = None, aliases: bool = True,
-                     wire_rc: bool = True) -> tuple[bool, list[str]]:
+                     wire_rc: bool = True, probe=None,
+                     adopt: bool = False) -> tuple[bool, list[str]]:
     """Make cx/cl usable end-to-end with zero manual steps: (re)write the bin wrappers if missing or
     stale, and (when ``wire_rc``) wire the shell rc (PATH + codex/claude aliases). Idempotent and
     cheap — safe to call on every app launch so a fresh install "just works", a deleted rc block
     self-heals, and a wrapper baked with a broken interpreter gets corrected. Good recognized
     wrappers missing PYTHONUTF8 get it on their existing exec line, preserving their interpreter
-    and PYTHONPATH so a menubar launch cannot silently switch a checkout to the bundle. Returns
-    (changed, messages)."""
+    and PYTHONPATH so a menubar launch cannot silently switch a checkout to the bundle.
+
+    A kept ``acctsw`` wrapper is also probed (``probe``, default ``engine.probe``) for the engine
+    version it actually runs. An app-owned bundle wrapper on an older engine is healed; a foreign
+    one (checkout, hand-written) is kept and reported through ``wrapper_drift`` for the app to
+    surface, unless ``adopt`` — the user's explicit "use the app's engine" — asks to replace it
+    (the old body is kept as ``acctsw.bak``). Returns (changed, messages)."""
+    global _WRAPPER_DRIFT
     bin_dir = bin_dir or BIN_DIR
+    probe = probe or _probe_engine
     # Interpreter for the wrappers. When called from the menubar app (no python passed), sys.executable
     # is the py2app BUNDLE interpreter — the only 3.11 we can rely on (a cask user's system `python3`
     # is macOS's 3.9, which can't run our 3.11 code). `_wrapper_script` runs it with PYTHONHOME set to
@@ -330,6 +373,7 @@ def ensure_launchers(*, bin_dir: Path | None = None, python: str | None = None,
     python = python or sys.executable
     pkg_root = pkg_root or Path(__file__).resolve().parent.parent
     changed, msgs = False, []
+    drift = None
     for name in BIN_NAMES:
         target = bin_dir / name
         desired = _wrapper_script(name, python, pkg_root, bin_dir)
@@ -358,13 +402,29 @@ def ensure_launchers(*, bin_dir: Path | None = None, python: str | None = None,
                     target.chmod(target.stat().st_mode | stat.S_IXUSR)
                     changed = True
                     msgs.append(f"made executable {target}")
-                continue
-            verb = "healed"
+                if name != "acctsw" or body == desired:
+                    continue
+                # cx/cl delegate to this wrapper, so it alone decides which engine terminals run.
+                drift = _check_engine(target, body, own_bundle=_is_bundle_python(python),
+                                      probe=probe)
+                if drift is None:
+                    continue
+                if not (drift["heal"] or adopt):
+                    msgs.append(f"kept {target}: it runs acctsw {drift['version']}, "
+                                f"older than this app's {__version__}")
+                    continue
+                if adopt:
+                    shutil.copy2(target, target.with_name(target.name + ".bak"))
+                drift = None
+                verb = "updated"
+            else:
+                verb = "healed"
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(desired, encoding="utf-8")
         target.chmod(0o755)
         changed = True
         msgs.append(f"{verb} {target}")
+    _WRAPPER_DRIFT = drift
     if wire_rc:
         did, msg = ensure_shell_setup(bin_dir, aliases=aliases)
         msgs.append(msg)

@@ -327,6 +327,7 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
             self._auto_handoff_warnings = set()
             self._last_state_sig = None          # (state rev, session heartbeat mtimes)
             self._acctWarned = set()              # shared-account warnings already toasted this session
+            self._engineWarned = set()            # app/engine drift warnings already toasted
             self._login_baseline = {}             # tool → (op, digest of live creds at that login launch)
             self._login_seq = 0                   # monotonic login op id (see the login handler)
             self._key_notices = KeySwitchNotices()
@@ -676,6 +677,7 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
             self._pushResult(result)
             self._updateDot(result.get("state"))
             self._notifyAccountWarnings(result)
+            self._notifyEngineWarnings(result)
             # A backgrounded add still deserves the "seat added" nudge the main path fires. The notify
             # flag is already in the result's own snapshot — no need to re-read state from disk.
             notify_on = ((result.get("state") or {}).get("settings") or {}).get("notify", True)
@@ -775,6 +777,18 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
                     self._acctWarned.add(w)
                     self._notify("heads up — seats share one account", w)
 
+        @objc.python_method
+        def _notifyEngineWarnings(self, result):
+            """Toast each app/engine drift warning ONCE per session. A terminal on an older engine
+            shares this app's store and can sign every session out, so it must not wait for the
+            popover to be opened; the persistent banner (render.mjs engineBanner) carries the fix."""
+            for w in ((result.get("state") or {}).get("engine_warnings") or []):
+                text = w.get("text") if isinstance(w, dict) else None
+                if text and text not in self._engineWarned:
+                    self._engineWarned.add(text)
+                    self._notify("heads up — terminals run an older engine"
+                                 if w.get("kind") != "app" else "AI Guest List is out of date", text)
+
         # --- JS → Python (WKScriptMessageHandler) -------------------------------------------
         def userContentController_didReceiveScriptMessage_(self, _ucc, message):
             try:
@@ -828,6 +842,11 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
                     objc.selector(self.addBg_, signature=b"v@:@"), msg)
                 return
 
+            if action == "adopt_engine":
+                # Probes the existing wrapper (a subprocess) before replacing it; keep AppKit free.
+                self.performSelectorInBackground_withObject_(
+                    objc.selector(self.adoptEngineBg_, signature=b"v@:@"), msg)
+                return
             if action == "switch":
                 # Claude identity can take seconds; keep paints and usage updates responsive.
                 self.performSelectorInBackground_withObject_(
@@ -872,6 +891,15 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
             result["key_action"] = msg.get("action")
             result["key_request_id"] = msg.get("key_request_id")
             result["key_target_id"] = msg.get("id")
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
+
+        def adoptEngineBg_(self, msg):
+            try:
+                result = dict(bridge.handle(self.ctx, msg))
+            except Exception as exc:
+                _log_exception(exc)
+                result = {"ok": False, "error": str(exc).strip() or exc.__class__.__name__}
             self.performSelectorOnMainThread_withObject_waitUntilDone_(
                 objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
 

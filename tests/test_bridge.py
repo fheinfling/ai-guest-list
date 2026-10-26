@@ -520,3 +520,49 @@ def test_no_headroom_surface_in_snapshot(ctx):
     assert bridge.handle(ctx, {"action": "set_savings_level", "value": "max"})["ok"] is False
     assert bridge.handle(ctx, {"action": "headroom_install"})["ok"] is False
     assert bridge.handle(ctx, {"action": "toggle", "key": "headroom", "value": True})["ok"] is False
+
+
+# --- app/engine drift surfaces in the popover --------------------------------------------
+
+def test_snapshot_has_no_engine_warnings_when_everything_is_current(ctx):
+    from acctsw import session
+    session.mark_session(ctx.data_dir, "claude", "a@x.com")
+    assert bridge.snapshot_state(ctx)["engine_warnings"] == []
+
+
+def test_snapshot_warns_about_a_stale_wrapper_and_old_supervisors(ctx, monkeypatch):
+    from acctsw import session
+    from acctsw.util import write_json
+    monkeypatch.setattr(inst, "_WRAPPER_DRIFT", {
+        "reason": "older", "version": "1.1.2", "missing": [], "path": "/u/.local/bin/acctsw",
+        "exe": "$VENV/bin/python", "app_version": "1.4.2", "heal": False})
+    monkeypatch.setattr(session, "_alive", lambda pid: True)
+    monkeypatch.setattr(session, "_proc_start", lambda pid: "Stable Start")
+    write_json(ctx.data_dir / "session-claude-4242.json",   # a pre-stamp (1.1.x) supervisor
+               {"email": "a@x.com", "pid": 4242, "process_start": "Stable Start",
+                "started_at": "2026-10-01"})
+    warnings = {w["kind"]: w for w in bridge.snapshot_state(ctx)["engine_warnings"]}
+    assert "1.1.2" in warnings["wrapper"]["text"] and warnings["wrapper"]["action"] == "adopt_engine"
+    assert warnings["sessions"]["text"].startswith("1 terminal session runs an older engine")
+
+
+def test_snapshot_warns_when_this_app_is_older_than_the_store(ctx):
+    ctx.state_file.write_text(json.dumps({"engine": {"newest_writer": "99.0", "min_writer": "99.0"}}))
+    warnings = bridge.snapshot_state(ctx)["engine_warnings"]
+    assert [w["kind"] for w in warnings] == ["app"]
+    assert "99.0" in warnings[0]["text"]
+
+
+def test_adopt_engine_replaces_the_stale_wrapper_with_consent(ctx, monkeypatch):
+    bindir = inst.BIN_DIR
+    bindir.mkdir(parents=True)
+    body = '#!/bin/sh\nPYTHONUTF8=1 exec "$VENV/bin/python" -m acctsw "$@"\n'
+    (bindir / "acctsw").write_text(body)
+    (bindir / "acctsw").chmod(0o755)
+    monkeypatch.setattr(inst, "_probe_engine", lambda exe: {"version": "1.1.2", "capabilities": []})
+    inst.ensure_launchers(wire_rc=False)   # the launch bootstrap: kept + reported
+    assert [w["kind"] for w in bridge.snapshot_state(ctx)["engine_warnings"]] == ["wrapper"]
+    result = bridge.handle(ctx, {"action": "adopt_engine"})
+    assert result["ok"] and result["state"]["engine_warnings"] == []
+    assert (bindir / "acctsw.bak").read_text() == body
+    assert (bindir / "acctsw").read_text() == inst.engine_script()

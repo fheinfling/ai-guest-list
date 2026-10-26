@@ -323,6 +323,7 @@ def ensure_home(ctx, email: str, *, promote: bool = False, capture: bool = False
             raise MissingSnapshot(f"stored creds for claude:{email} not found — re-add this seat")
         # A child or another supervisor may have installed credentials during preparation.
         if item.get_live() is None:
+            ctx.require_credential_writer()
             item.set_live(blob)
             if not capture and proven and ctx.snapshot_get("claude", email) == plan[0]:
                 ctx.snapshot_set("claude", email, blob)
@@ -334,6 +335,7 @@ def save(ctx, email: str, blob: str) -> None:
     """An identified fresh login explicitly replaces this seat's credentials, never another's."""
     # The snapshot is saved by the caller first, so a crash cannot lose the captured login.
     ensure_home(ctx, email, capture=True)
+    ctx.require_credential_writer()
     ctx.claude_cred(email).set_live(blob)
     for marker in (".acctsw-quarantined", ".acctsw-unverified"):
         (ctx.claude_home(email) / marker).unlink(missing_ok=True)

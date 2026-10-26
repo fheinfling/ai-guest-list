@@ -11,8 +11,13 @@ Holds only metadata — NEVER credentials (those live in the Keychain). Shape::
       "keys": {"<id>": <key-seat metadata>},
       "settings": {"auto_switch": true, "same_tool_only": true, "notify": true,
                    "restart_app": false, "celebrations": true, "supervise_shell": true,
-                   "theme": "light", "confirm_key_switch": true, "key_fallback": false}
+                   "theme": "light", "confirm_key_switch": true, "key_fallback": false},
+      "engine": {"last_writer": "<version>", "newest_writer": "<version>",
+                 "min_writer": "<version>"}
     }
+
+``engine`` is stamped by every save (see ``State.save``/``writer_block``). It is absent from
+files written before the stamp existed, which every reader must keep accepting.
 
 A ``Seat`` is::
 
@@ -22,14 +27,63 @@ A ``Seat`` is::
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import TOOLS
+from . import TOOLS, __version__
+from .engine import older_than, parse_version
+from .errors import EngineTooOld
 from .util import now, iso, write_json
 
 STATE_VERSION = 1
+
+# The oldest engine allowed to MOVE CREDENTIALS (switch seats, write a live login) in a store this
+# engine has written. Every save records max(stored, this) in ``engine.min_writer``, so the floor
+# only ever rises, even when an older-but-guarded engine saves afterwards. Bump it in the same
+# change that makes an incompatible credential/Keychain format: a guarded engine below the floor
+# then refuses to write its old format over the new one (the 1.1.x engine wrote Claude's item
+# base64 and signed every session out). Engines from before this guard ignore the stamp — the
+# app's wrapper/session drift warnings cover those. 1.3.1: raw-JSON Claude items (#63),
+# per-account Claude homes (1.3.0) and isolated sign-in (1.3.1).
+MIN_CREDENTIAL_WRITER = "1.3.1"
+
+# Escape hatch for a deliberate downgrade. Moving credentials with an engine the store says is too
+# old is exactly the corruption the guard exists to stop, so it is never implied.
+ALLOW_OLD_ENGINE_ENV = "ACCTSW_ALLOW_OLD_ENGINE"
+
+
+def _newer(a, b):
+    """The newer of two version strings; an unparseable value never wins over a known one."""
+    pa, pb = parse_version(a), parse_version(b)
+    if pa is None:
+        return b
+    if pb is None:
+        return a
+    return a if pa >= pb else b
+
+
+def writer_block(data: dict, *, version: str = __version__) -> str | None:
+    """Why an engine at ``version`` must not move credentials in this store, or None if it may.
+
+    Pure and cheap (one dict read) so every credential write can afford it."""
+    stamp = data.get("engine") if isinstance(data, dict) else None
+    if not isinstance(stamp, dict):
+        return None  # written before the stamp existed: nothing newer has claimed this store
+    floor = stamp.get("min_writer")
+    if not older_than(version, floor):
+        return None
+    if os.environ.get(ALLOW_OLD_ENGINE_ENV) == "1":
+        return None
+    from pathlib import Path as _P
+    where = _P(__file__).resolve().parent.parent
+    newest = stamp.get("newest_writer") or floor
+    return (f"this engine (acctsw {version}, from {where}) is older than the one that manages "
+            f"your seats ({newest}), which needs at least {floor} to move logins safely, so it "
+            f"won't switch seats or write credentials. Update it — `git pull` in that source "
+            f"checkout, or reinstall AI Guest List and run `acctsw install` — then restart this "
+            f"terminal. (A deliberate downgrade can set {ALLOW_OLD_ENGINE_ENV}=1.)")
 
 
 def _label_from_email(email: str) -> str:
@@ -99,7 +153,21 @@ class State:
         # older state, then arrived after a newer mutation like an add) instead of clobbering the
         # fresh view. Bumped under the same lock every mutation holds.
         self.data["rev"] = int(self.data.get("rev", 0)) + 1
+        # Who wrote this store. The floor and the newest writer only rise, so an older engine's
+        # save (even a harmless settings toggle) can't erase a newer engine's claim.
+        stamp = self.data.get("engine") if isinstance(self.data.get("engine"), dict) else {}
+        self.data["engine"] = {
+            "last_writer": __version__,
+            "newest_writer": _newer(stamp.get("newest_writer"), __version__),
+            "min_writer": _newer(stamp.get("min_writer"), MIN_CREDENTIAL_WRITER),
+        }
         write_json(self.path, self.data, mode=0o600)
+
+    def require_credential_writer(self) -> None:
+        """Raise ``EngineTooOld`` before this engine moves credentials into a newer engine's store."""
+        reason = writer_block(self.data)
+        if reason:
+            raise EngineTooOld(reason)
 
     # --- accessors ---------------------------------------------------------------------------
     def settings(self) -> dict[str, Any]:

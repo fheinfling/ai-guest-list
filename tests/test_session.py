@@ -228,3 +228,33 @@ def test_clearing_older_terminal_does_not_delete_latest_legacy_record(ctx, monke
     session.clear_session(ctx.data_dir, "codex")
     assert _path(ctx).exists()
     assert session.active_session(ctx.data_dir, "codex")["pid"] == 202
+
+
+# --- which engine supervises each terminal (app/engine drift) ------------------------------
+
+def test_mark_session_stamps_the_supervising_engine(ctx):
+    from acctsw import __version__, engine
+    session.mark_session(ctx.data_dir, "claude", "a@x.com")
+    record = session.active_session(ctx.data_dir, "claude")
+    assert record["engine"] == __version__
+    assert record["capabilities"] == list(engine.CAPABILITIES)
+    assert session.stale_engines(ctx.data_dir) == []
+
+
+def test_stale_engines_finds_older_and_pre_stamp_supervisors(ctx, monkeypatch):
+    from acctsw import __version__
+    monkeypatch.setattr(session, "_alive", lambda pid: True)
+    monkeypatch.setattr(session, "_proc_start", lambda pid: "Stable Start")
+    base = {"email": "a@x.com", "process_start": "Stable Start", "started_at": "2026-10-01"}
+    # A 1.1.x supervisor never stamped itself; another stamped an older version.
+    write_json(ctx.data_dir / "session-claude-101.json", {**base, "pid": 101})
+    write_json(ctx.data_dir / "session-claude-102.json",
+               {**base, "pid": 102, "engine": "1.3.0", "capabilities": []})
+    write_json(ctx.data_dir / "session-codex-103.json",
+               {**base, "pid": 103, "engine": __version__,
+                "capabilities": list(session.CAPABILITIES)})
+    stale = sorted(session.stale_engines(ctx.data_dir), key=lambda s: s["pid"])
+    assert stale == [{"tool": "claude", "pid": 101, "engine": None},
+                     {"tool": "claude", "pid": 102, "engine": "1.3.0"}]
+    # Callers that already read the sessions pass them in instead of re-running ps.
+    assert session.stale_engines(ctx.data_dir, {"claude": [], "codex": []}) == []

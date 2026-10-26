@@ -88,6 +88,9 @@ MAX_FALSE_ALARMS = 3  # dismissed stdout matches per run before stdout scanning 
 PROBE_COOLDOWN_S = 30.0  # after a dismissed or inconclusive match, skip re-probing usage for this
                          # long: a TUI redraws the same prose every frame, and without a cooldown
                          # each redraw would force-hit the usage endpoint
+RELOGIN_COOLDOWN_S = 600.0  # a signed-out Claude child is restarted on its SAME seat at most once
+                           # per seat in this window; a banner that returns sooner means the restore
+                           # did not take, so it goes down the ordinary dead-seat path instead
 # A stdout limit-signal is dismissed as a false positive (model prose, not a real banner) when the
 # usage endpoint says the active seat's busiest window is still below this (owned by usage, which
 # uses the same bar to clear stale reactive flags; re-exported for _seat_confirmed_healthy/tests).
@@ -156,6 +159,26 @@ AUTH_DEAD_PATTERNS = {
     "claude": [*_AUTH_DEAD_SHARED, r"oauth token (?:has )?expired"],
 }
 
+# Claude Code's own "this process has no usable credential" banners all share one shape,
+# "<reason> · (Please )?run /login": "Not logged in · Please run /login" (reply) and "… · Run /login"
+# (status area), "Login expired · …" (Claude wiped the item's tokens after an invalid_grant), "OAuth
+# token revoked · …", older builds' "Missing API key · Run /login". Unlike the patterns above it
+# usually means the credential LOCATION this child reads is missing or unreadable (another tool
+# rewrote or deleted the item, a race, a locked keychain), not that the account's tokens died — so
+# it gets its own remedy first (restore the seat's login, restart on the same seat; see run()).
+# The model can quote this wording, so the match is the banner's SHAPE, not its words: a short
+# reason, a punctuation separator, then "run /login", standing alone — at a line start (after TUI
+# glyphs like ⏺/⎿) or behind a status-line column gap — and ending the line or the column. Prose
+# ("you're not logged in, please run /login to …", a quoted `Not logged in · Run /login`) always has
+# a neighbour on one side. Whitespace runs between words tolerate terminal wrapping, and the
+# separator is any short run of glyphs ("·", "•", "|", a dash) since "·" is not guaranteed to survive
+# every terminal — but never sentence punctuation or quotes, which is what prose puts there.
+_CLAUDE_LOGGED_OUT = re.compile(
+    r"(?:^|[^\S\n]{2})[^\w\n'\"`]{0,8}?[a-z][\w'-]*(?:\s+[a-z][\w'-]*){0,4}"
+    r"\s*[^\w\s:;,.!?'\"`()\[\]]{1,3}\s*"
+    r"(?:please\s+)?run\s+/\s*login(?=[^\S\n]*$|[^\S\n]{2})",
+    re.IGNORECASE | re.MULTILINE)
+
 # Compile once at import — detect_* runs once per PTY output chunk (a hot interactive path).
 _LIMIT_RE = {t: [re.compile(p, re.IGNORECASE) for p in pats] for t, pats in LIMIT_PATTERNS.items()}
 _AUTH_RE = {t: [re.compile(p, re.IGNORECASE) for p in pats] for t, pats in AUTH_DEAD_PATTERNS.items()}
@@ -218,6 +241,14 @@ def detect_refresh_revoked(tool: str, text: str) -> bool:
     # Wrapping can occur between any words, not just before "revoked".
     lines = re.sub(r"(?<=\S)[ \t]*\r?\n[ \t]*(?=\w)", " ", clean)
     return tool == "codex" and bool(_CODEX_REFRESH_REVOKED.search(lines))
+
+
+def detect_logged_out(tool: str, text: str) -> bool:
+    """True when recent Claude output shows Claude Code's own "Not logged in · … /login" banner.
+
+    Escapes become a SPACE here, not nothing: a TUI that positions words with cursor moves must not
+    glue them together, and the pattern's whitespace runs absorb the extra spaces."""
+    return tool == "claude" and bool(_CLAUDE_LOGGED_OUT.search(_ANSI.sub(" ", text)))
 
 
 def detect_hard_limit(tool: str, text: str) -> bool:
@@ -561,6 +592,101 @@ def handle_auth_dead(ctx: Context, state, tool: str, *, exclude: set | frozenset
     active = state.active(tool)
     skip = set(exclude) | ({active} if active else set())
     return _hop_or_give_up(state, tool, exclude=skip, active=active)
+
+
+def _claude_login_usable(blob: str | None) -> bool:
+    """A Claude credential item Claude Code can sign in with: raw JSON carrying both OAuth tokens."""
+    try:
+        oauth = json.loads(blob)["claudeAiOauth"]
+    except (TypeError, ValueError, KeyError):
+        return False
+    return isinstance(oauth, dict) and all(
+        isinstance(oauth.get(k), str) and oauth[k] for k in ("accessToken", "refreshToken"))
+
+
+def _claude_login_wiped(blob: str | None) -> bool:
+    """Claude's own verdict on the bytes it held: after an invalid_grant it blanks the tokens in
+    place (refreshToken "", expiresAt 0) — so whatever it last had there is known dead."""
+    try:
+        return json.loads(blob)["claudeAiOauth"]["refreshToken"] == ""
+    except (TypeError, ValueError, KeyError):
+        return False
+
+
+def plan_claude_login(ctx: Context, state, email: str) -> tuple[str, str, str | None] | None:
+    """A child on ``email`` says it is not logged in. Which login of this seat could it use, and
+    what would putting it back where THAT child reads it (the seat home's private item, keyed by
+    the exact CLAUDE_CONFIG_DIR the launcher hands it) take? Returns ``(how, blob, raw)``:
+
+    - ``"intact"``: the home item is readable and usable as is — only the child's view is stale;
+    - ``"repair"``: the home item decodes to a usable login but is not stored as the raw JSON
+      Claude Code parses (e.g. an old engine's base64) — rewrite the same login raw;
+    - ``"restore"``: the home item is missing, wiped or unreadable as a login — reinstall the seat's
+      snapshot;
+
+    and ``raw`` is the item's stored bytes now, for apply's compare-and-swap. None when the seat has
+    no usable login: removed/quarantined, or no snapshot that is provably not stale. Caller holds
+    ctx.locked(); this only reads (a base64 item is healed by the read itself, as everywhere).
+
+    Claude rotates refresh tokens, so a snapshot taken before the child last refreshed carries a
+    consumed refresh token, and installing it would end in another invalid_grant — after which
+    Claude blanks the item for every process sharing it. Hence the home item always wins when it is
+    usable, and a snapshot is offered only when it is not older (by ``expiresAt``) than the last
+    usable copy this process saw in that home; when Claude itself wiped the item it must be strictly
+    newer, since the bytes Claude last held there are the ones it just proved dead. The caller still
+    has to verify the snapshot against the usage endpoint before installing it."""
+    if state.get_seat("claude", email) is None \
+            or (ctx.claude_home(email) / ".acctsw-quarantined").exists():
+        return None
+    from . import claudesync
+    item = ctx.claude_cred(email)
+    raw = item.keychain.get_raw(item.service, item.account)
+    current = item.get_live()
+    if _claude_login_usable(current):
+        return ("intact" if raw == current else "repair"), current, raw
+    blob = ctx.snapshot_get("claude", email)
+    if not _claude_login_usable(blob):
+        return None
+    seen = claudesync.tracker(ctx).seen.get(email)
+    last = seen.blob if seen and _claude_login_usable(seen.blob) else None
+    wiped = _claude_login_wiped(current)
+    if last is not None and last != blob:
+        mine, theirs = claudesync.expiry(blob), claudesync.expiry(last)
+        if mine is None or theirs is None or mine < theirs or (wiped and mine == theirs):
+            return None
+    elif wiped:
+        return None   # Claude blanked exactly these bytes (or ones we never saw): nothing fresher
+    return "restore", blob, raw
+
+
+def apply_claude_login(ctx: Context, email: str, how: str, blob: str, raw: str | None) -> bool:
+    """Write a planned login into the seat's home item as raw JSON. Caller holds ctx.locked().
+
+    A cooperative compare-and-swap (as claudesync does — the Keychain has none against Claude):
+    if the item changed since it was planned, a fresh /login or a sibling's write landed, and it
+    is used as is rather than overwritten with our copy. True when the item now holds a usable
+    login."""
+    item = ctx.claude_cred(email)
+    stored = item.keychain.get_raw(item.service, item.account)
+    if stored == blob:
+        return True
+    if how == "intact" or stored != raw:
+        return _claude_login_usable(item.get_live())
+    item.set_live(blob)
+    return True
+
+
+def _verify_claude_login(blob: str, get, ua: str | None) -> str:
+    """One usage call with the login's access token: "ok" proves it, "dead" (401 on a token still
+    in its lifetime, or 403) disproves it, anything else — an access token past its expiry that
+    Claude would simply refresh, network, 429 — is "unknown". No refresh token is ever spent."""
+    try:
+        u = usage_mod._fetch_for("claude", blob, get, ua)
+    except Exception:
+        return "unknown"
+    if u.ok:
+        return "ok"
+    return "dead" if u.error in ("unauthorized", "forbidden") else "unknown"
 
 
 def handle_exhausted(ctx: Context, state, tool: str, *, get=usage_mod._default_get,
@@ -1293,6 +1419,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             claudehome.merge_config(ctx, email)
 
     auth_failed: set = set()   # seats whose token died THIS run — skip them for the rest of it
+    relogin_at: dict = {}      # seat → monotonic time of its last same-seat login restore (loop guard)
+    relaunch_seat = None       # set by a login restore: the next child runs on THIS seat, not active
 
     # A key is a separate runtime, NEVER an OAuth account installed behind state.active(). Keep
     # the pending consent separate from the runtime too: neither config nor env exists pre-approval.
@@ -2011,6 +2139,57 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             _start_capacity_watcher(active)
             return False
 
+        def _relogin(clear: Callable[[], None]) -> bool | None:
+            """Claude printed its own "… · run /login" banner. That is usually the child's credential
+            LOCATION (gone, rewritten, unreadable), not a dead account, and a hop would abandon a
+            perfectly good seat. So put the seat's login back where the child reads it and restart
+            it on the SAME seat with resume. True: stop for that restart (``hit`` filled). False:
+            the login is back but the child is left alone, said why once. None: not ours to fix —
+            the seat has no usable login (none stored, a stale or disproved one, an unreadable
+            keychain), it already got a restore within RELOGIN_COOLDOWN_S (so it did not take), or
+            the relaunch budget is spent — so the caller takes the ordinary dead-seat path.
+
+            Claude re-reads its item about every 30s and adopts a changed one on a 401, but its
+            status-area notice only clears on its own credentials-changed event, so the banner stays
+            up either way: the restart is what reliably brings the session back. The write happens
+            before the stop checks, so even a child we may not restart finds its login there."""
+            seat = launch_email
+            last = relogin_at.get(seat)
+            if (not seat or switches >= max_switches
+                    or (last is not None and time.monotonic() - last < RELOGIN_COOLDOWN_S)):
+                return None
+            relogin_at[seat] = time.monotonic()   # one attempt per window, whatever it finds
+            try:
+                with ctx.locked():
+                    plan = plan_claude_login(ctx, ctx.load_state(), seat)
+                if plan is None:
+                    return None
+                how, blob, raw = plan
+                # The state flock is never held across this network call (locked()'s contract).
+                verdict = _verify_claude_login(
+                    blob, get, usage_mod.claude_user_agent(getattr(ctx, "claude_bin", None)))
+                # A disproved token is a dead seat whatever its location; a snapshot we would WRITE
+                # needs positive proof, since a stale one can cost every process on this seat.
+                if verdict == "dead" or (how == "restore" and verdict != "ok"):
+                    return None
+                with ctx.locked():
+                    if not apply_claude_login(ctx, seat, how, blob, raw):
+                        return None
+            except Exception:
+                return None   # e.g. a locked keychain: nothing a restart can fix
+            clear()
+            why = ("auto-switch is off, so restart claude to pick it up"
+                   if not _auto_switch_is_on() else
+                   None if _capture_claude_resume() else
+                   "this session couldn't be identified for resume; restart claude yourself")
+            if why:
+                # Left alive: its redraws of the same banner must not re-decide every frame.
+                scan["next_probe"] = time.monotonic() + PROBE_COOLDOWN_S
+                notify(f"claude: {seat} was signed out of this session — its login is back; {why}")
+                return False
+            hit.update({"reason": "relogin", "email": seat, "active": seat, "hard": False})
+            return True
+
         while True:
             if key_runtime is not None:
                 # Interactive key sessions remain PTY sessions. app-server cannot own a TUI, and
@@ -2079,7 +2258,10 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 claudesync.converge(ctx)
                 claudehome.prepare_all(ctx)
             with ctx.locked():
-                launch_email = ctx.load_state().active(tool)
+                st = ctx.load_state()
+                launch_email = (relaunch_seat if relaunch_seat and st.get_seat(tool, relaunch_seat)
+                                else st.active(tool))
+                relaunch_seat = None
                 # A click between the previous handoff and this launch may have moved active.
                 # Keep the child's actual credentials and its recorded launch seat together.
                 _activate_home(launch_email)
@@ -2089,7 +2271,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             # deliberately leave this child alive, preventing the post-exit safety net from turning
             # that same banner into a re-derived hop after the child later exits on its own.
             hit = {
-                "reason": None,       # None | "manual" | "limit" | "auth" | "revoked"
+                "reason": None,       # None | "manual" | "limit" | "auth" | "revoked" | "relogin"
                 "email": None,        # exact pre-flight landing seat
                 "active": None,       # seat the still-live child was using
                 "hard": False,
@@ -2280,6 +2462,19 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 hard = detect_hard_limit(tool, text)
                 if hard:
                     reason = "limit"
+                elif detect_logged_out(tool, text):
+                    # Claude's own banner shape, so like the codex revocation above it is read even
+                    # with prose scanning off; a restore that did not take falls through to "auth".
+                    hit["handled"] = True
+                    if hit["reason"] == "relogin":
+                        return True   # already stopping for the restart; redraws change nothing
+                    if time.monotonic() < scan["next_probe"]:
+                        buf.clear()
+                        return False
+                    restarted = _relogin(buf.clear)
+                    if restarted is not None:
+                        return restarted
+                    reason = "auth"
                 else:
                     if not scan["on"]:
                         return False
@@ -2385,6 +2580,16 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 if _activate_key():
                     continue
                 return EXIT_GAVE_UP
+
+            if hit["reason"] == "relogin":
+                # Same seat, same session: the login is back where this child reads it, so only
+                # the process restarts. It counts against the relaunch budget like any hop.
+                notify(f"claude: {launch_email} was signed out of this session — restored its "
+                       f"login, resuming your work ✨")
+                relaunch_seat = launch_email
+                switches += 1
+                resuming = True
+                continue
 
             if hit["reason"] == "manual":
                 # The child has flushed its session. Re-read the selection so rapid clicks

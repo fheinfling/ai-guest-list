@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import json
 import os
 import pwd
 import shutil
@@ -214,8 +215,29 @@ class Context:
             return True
         return False
 
+    def credential_writer_block(self) -> str | None:
+        """Why a newer engine's store forbids this engine to move credentials, or None.
+
+        Reads state.json directly (no defaults, no lock) so even a hot path can afford it. A
+        missing or unreadable store is not a newer engine's claim; its own readers report that.
+        """
+        from .state import writer_block
+        try:
+            data = json.loads(self.state_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return writer_block(data)
+
+    def require_credential_writer(self) -> None:
+        """Raise ``EngineTooOld`` instead of writing credentials over a newer engine's store."""
+        from .errors import EngineTooOld
+        reason = self.credential_writer_block()
+        if reason:
+            raise EngineTooOld(reason)
+
     def set_live(self, tool: str, blob: str) -> None:
         """Write canonical credentials, refusing a managed private home as the mirror target."""
+        self.require_credential_writer()
         if tool == "codex" and self._codex_mirror_is_private_home():
             raise UnsafeCodexMirror(
                 "refusing to write the shared Codex mirror through a private account home; "

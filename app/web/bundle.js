@@ -231,6 +231,17 @@ function supervisionBanner(state) {
   return "";
 }
 
+// App/engine drift: a terminal on an older engine shares this app's store and can sign every
+// session out. Shown whatever the supervision setting — `cx`/`cl` run the same wrapper either way.
+// The wrapper warning offers its consented fix; the others name theirs in the text.
+function engineBanner(state) {
+  const warnings = Array.isArray(state?.engine_warnings) ? state.engine_warnings : [];
+  return warnings.filter((w) => w && w.text).map((w) => `<div class="supervision-banner supervision-banner--error" role="alert">
+      <span>${esc(w.text)}</span>${w.action === "adopt_engine" ? `
+      <button data-action="engine-adopt">use this app's engine</button>` : ""}
+    </div>`).join("");
+}
+
 // --- add-a-seat sub-view (spec §9) — a pushed screen like settings, NOT a modal ----------------
 // Four steps: provider → details → connecting → done. The provider accent (teal Codex / coral
 // Claude) rides a single `--accent` CSS var on the root, so step markup never branches on tool.
@@ -673,7 +684,7 @@ function buildHTML(state) {
     <details class="header-menu"><summary class="ibtn" aria-label="app menu" title="app menu">⋯</summary><nav class="menu-panel"><button data-action="settings">settings</button><button data-action="quit">quit ai guest list</button></nav></details></div></header>
     <div class="ambient-stage">${prompts}${paid ? paidUseControl(state) : `<div class="availability">${glance ? roster : ambientVerdict(state)}</div>`}${compact ? `<section class="roster-compact" aria-label="seat availability" tabindex="0">${rosterTable(state, true)}</section>` : ""}</div>
     <details class="guest-drawer"><summary class="drawer-handle"><span>${glance ? "seat options" : "guest list"}</span>${glance ? "" : `<span class="drawer-count">${seats.length + (state?.keys?.length || 0)} seats</span>`}<span class="chevron" aria-hidden="true">⌃</span></summary>
-      <div class="drawer-content"><div class="main-body">${supervisionBanner(state)}${toolGroup("codex", state?.tools?.codex, (state?.keys || []).filter((k) => k.harness === "codex"))}${toolGroup("claude", state?.tools?.claude, (state?.keys || []).filter((k) => k.harness === "claude"))}
+      <div class="drawer-content"><div class="main-body">${engineBanner(state)}${supervisionBanner(state)}${toolGroup("codex", state?.tools?.codex, (state?.keys || []).filter((k) => k.harness === "codex"))}${toolGroup("claude", state?.tools?.claude, (state?.keys || []).filter((k) => k.harness === "claude"))}
       ${!seats.length && !state?.keys?.length ? `<p class="empty">use ＋ above to add a subscription or API key.</p>` : ""}${moved}
       </div></div></details></div>`;
 }
@@ -1274,6 +1285,7 @@ document.addEventListener("click", (e) => {
     case "settings": screen = "settings"; render(); break;
     case "settings-back": screen = "main"; render(); break;
     case "supervision-on": send("toggle", { key: "supervise_shell", value: true }); break;
+    case "engine-adopt": send("adopt_engine"); break;
     case "set_theme": send("set_theme", { value }); break;
     case "set_strategy": send("set_strategy", { value }); break;
     case "quit": send("quit"); break;

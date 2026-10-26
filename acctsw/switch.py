@@ -72,6 +72,9 @@ def switch(ctx: Context, state: State, tool: str, email: str, *, sync: bool = Tr
     """
     if email not in state.accounts(tool):
         raise UnknownSeat(f"no seat '{email}' for {tool}")
+    # Before sync-back: that already writes a snapshot. A newer engine's store is not ours to
+    # rewrite in an older credential format (see state.MIN_CREDENTIAL_WRITER).
+    state.require_credential_writer()
 
     # 1. sync-back outgoing (no-op if switching to the same / no active seat)
     if sync:
