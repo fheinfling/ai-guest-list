@@ -68,7 +68,9 @@ connect through the official tools.
   hops to a healthy same-tool seat and resumes your work; clear "sign in again" message when none is
   ready. Limits are read from Codex's own session events and the usage API's own flags — not from
   screen text — so a reworded banner can't fool it. And if a seat is put to rest while you're working
-  on it (the menubar's usage poll notices first), the *running* session hops too.
+  on it (the menubar's usage poll notices first), the *running* session hops too. A Claude session
+  that shows "Not logged in · Please run /login" gets its seat's verified login back and resumes on
+  the same seat; a seat with no usable login hops like a revoked one.
 - **Live headroom in the bar** — how much of the 5-hour and weekly window each seat has **left**,
   read from the official usage endpoints, one row per seat with the active ones first. Both
   windows stay visible, and an unknown or stale reading says so rather than showing a zero. Active seats
@@ -80,6 +82,8 @@ connect through the official tools.
   terminal sessions resume automatically. Nearly full seats stay active until a confirmed limit.
 - **Zero-touch setup** — installing the app wires `codex` / `claude` to the supervised launchers; when
   the app is closed ordinary work sessions run the stock tool. Sign-in and logout stay protected.
+  If your terminals or running sessions use an older engine than the app (e.g. a source checkout
+  that wasn't pulled), the popover says so, and an older engine never moves credentials.
 - **Add / remove seats** — official browser sign-in, plus a no-browser path for Codex (paste an
   `auth.json`). Claude is browser sign-in only: a `claude setup-token` is an env-var token, not the
   Keychain login the switcher reads. Credentials live only in the Keychain / the tools' own stores.
