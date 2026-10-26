@@ -52,6 +52,10 @@ def _isolate_tool_config_dirs(tmp_path, monkeypatch):
     # toggle/bootstrap writes inside tmp so no test ever inspects or edits the developer's shell rc.
     monkeypatch.setattr(install_mod, "BIN_DIR", tmp_path / "_home_local" / "bin")
     monkeypatch.setattr(install_mod.Path, "home", classmethod(lambda cls: tmp_path / "_home"))
+    # ensure_launchers probes a kept wrapper by RUNNING it. Tests opt in with an explicit `probe=`
+    # (fake wrappers in tmp only), so no test executes a fixture wrapper by accident.
+    monkeypatch.setattr(install_mod, "_probe_engine", lambda exe: None)
+    monkeypatch.setattr(install_mod, "_WRAPPER_DRIFT", None)
 
 
 @pytest.fixture(autouse=True)

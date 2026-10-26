@@ -13,6 +13,7 @@ from typing import Any
 
 from . import TOOLS, __version__, build_number
 from . import accounts as acct
+from . import engine as engine_mod
 from . import identity as identity_mod
 from . import install as install_mod
 from . import handoff as handoff_mod
@@ -87,11 +88,17 @@ def snapshot_state(ctx: Context) -> dict[str, Any]:
         seat["id"] for seat in data["keys"]
         if session_mod.active_session(ctx.data_dir, seat["harness"], email=seat["id"]) is not None
     ]
+    live = {tool: session_mod.active_sessions(ctx.data_dir, tool) for tool in ("codex", "claude")}
     data["pinned_sessions"] = [
         {**record, "tool": tool}
-        for tool in ("codex", "claude")
-        for record in session_mod.active_sessions(ctx.data_dir, tool) if record.get("pin")
+        for tool, records in live.items()
+        for record in records if record.get("pin")
     ]
+    # App/engine drift: the wrapper report is cached by the launch bootstrap (a probe is a
+    # subprocess, too slow for every snapshot); sessions and the store stamp are cheap reads.
+    data["engine_warnings"] = engine_mod.drift_warnings(
+        install_mod.wrapper_drift(), session_mod.stale_engines(ctx.data_dir, live),
+        ctx.credential_writer_block())
     # A removed key's live pin is still paid, visible and stoppable until its child exits.
     data["running_key_seats"] = list(dict.fromkeys([
         *data["running_key_seats"], *(r["email"] for r in data["pinned_sessions"])]))
@@ -532,6 +539,17 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
             if key == "supervise_shell":
                 result["message"] = f"terminal supervision is {'on' if val else 'off'}"
             return result
+
+        if action == "adopt_engine":
+            # The user's explicit consent to replace a foreign/stale `acctsw` wrapper (kept as
+            # acctsw.bak) with this app's engine. Never done implicitly: it may be a dev checkout.
+            try:
+                install_mod.ensure_launchers(wire_rc=False, adopt=True)
+            except Exception as exc:
+                detail = str(exc).strip() or exc.__class__.__name__
+                return {"ok": False, "error": f"couldn't update the terminal engine: {detail}",
+                        "state": snapshot_state(ctx)}
+            return {"ok": True, "state": snapshot_state(ctx)}
 
         if action == "set_theme":
             val = message.get("value")

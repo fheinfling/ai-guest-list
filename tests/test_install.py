@@ -828,3 +828,121 @@ def test_purge_removes_store_and_keychain(ctx, tmp_path):
     assert ctx.keychain.get(ctx.keychain_service, _backup_account("codex")) is None
     assert ctx.snapshot_get("codex", "orig@x.com") is None
     assert not ctx.data_dir.exists()
+
+
+# --- app/engine drift: probe the engine a kept wrapper runs, don't trust its text -------------
+
+def _probe_as(version, calls=None):
+    def probe(exe):
+        if calls is not None:
+            calls.append(exe)
+        return {"version": version, "capabilities": []}
+    return probe
+
+
+def _bundle_wrapper(tmp_path, name):
+    """A fully-formed (not regex-stale) wrapper for an existing bundle interpreter at tmp/name."""
+    exe = tmp_path / name / "Contents" / "MacOS" / "python"
+    exe.parent.mkdir(parents=True)
+    exe.write_text("")
+    return inst.engine_script(python=str(exe)), exe
+
+
+def test_hand_written_wrapper_on_older_engine_is_kept_and_reported(tmp_path, monkeypatch):
+    """The real machine: `exec "$VENV/bin/python" -m acctsw` from a never-pulled checkout ran
+    1.1.2 beside a 1.4.2 app. Nothing regex-visible is wrong with it, so only a probe can tell —
+    and a hand-maintained wrapper must be reported, not silently replaced."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    body = ('#!/bin/sh\nVENV="$HOME/GitHub/ai-guest-list/.venv"\n'
+            'PYTHONUTF8=1 exec "$VENV/bin/python" -m acctsw "$@"\n')
+    (bindir / "acctsw").write_text(body)
+    (bindir / "acctsw").chmod(0o755)
+    monkeypatch.setattr(inst.sys, "executable", "/Bundle.app/Contents/MacOS/python")
+    calls = []
+    changed, messages = inst.ensure_launchers(bin_dir=bindir, wire_rc=False,
+                                              probe=_probe_as("1.1.2", calls))
+    assert (bindir / "acctsw").read_text() == body
+    assert calls == [bindir / "acctsw"]
+    assert any("kept" in m and "1.1.2" in m for m in messages)
+    drift = inst.wrapper_drift()
+    assert drift["version"] == "1.1.2" and drift["reason"] == "older"
+    assert drift["path"] == str(bindir / "acctsw") and drift["exe"] == "$VENV/bin/python"
+    assert drift["heal"] is False
+
+
+def test_app_owned_bundle_wrapper_on_older_engine_is_healed(tmp_path, monkeypatch):
+    # e.g. an old copy of the app still in ~/Downloads wrote the wrapper; the app owns that shape.
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    old_body, _ = _bundle_wrapper(tmp_path, "Old Copy.app")
+    (bindir / "acctsw").write_text(old_body)
+    (bindir / "acctsw").chmod(0o755)
+    _, app_python = _bundle_wrapper(tmp_path, "AI Guest List.app")
+    monkeypatch.setattr(inst.sys, "executable", str(app_python))
+    changed, messages = inst.ensure_launchers(bin_dir=bindir, wire_rc=False,
+                                              probe=_probe_as("1.1.2"))
+    assert changed and any(m.startswith("updated") for m in messages)
+    assert str(app_python) in (bindir / "acctsw").read_text()
+    assert inst.wrapper_drift() is None
+    # Now current: the cheap path skips the probe entirely.
+    calls = []
+    assert inst.ensure_launchers(bin_dir=bindir, wire_rc=False,
+                                 probe=_probe_as("1.1.2", calls))[0] is False
+    assert calls == []
+
+
+def test_bundle_wrapper_is_not_redirected_by_a_source_run_app(tmp_path, monkeypatch):
+    # A developer running the app from a checkout must not repoint terminals at that checkout.
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    old_body, _ = _bundle_wrapper(tmp_path, "Old Copy.app")
+    (bindir / "acctsw").write_text(old_body)
+    (bindir / "acctsw").chmod(0o755)
+    monkeypatch.setattr(inst.sys, "executable", sys.executable)
+    inst.ensure_launchers(bin_dir=bindir, wire_rc=False, probe=_probe_as("1.1.2"))
+    assert (bindir / "acctsw").read_text() == old_body
+    assert inst.wrapper_drift()["heal"] is False
+
+
+@pytest.mark.parametrize("probed", [None, {"version": inst.__version__,
+                                           "capabilities": list(inst.engine_mod.CAPABILITIES)},
+                                    {"version": "99.0", "capabilities": []}])
+def test_current_newer_or_unknown_engine_is_not_drift(tmp_path, probed):
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    body = '#!/bin/sh\nPYTHONUTF8=1 exec /usr/bin/env python3 -m acctsw "$@"\n'
+    (bindir / "acctsw").write_text(body)
+    (bindir / "acctsw").chmod(0o755)
+    inst.ensure_launchers(bin_dir=bindir, wire_rc=False, probe=lambda exe: probed)
+    assert (bindir / "acctsw").read_text() == body
+    assert inst.wrapper_drift() is None
+
+
+def test_adopt_replaces_a_drifted_foreign_wrapper_and_keeps_a_backup(tmp_path):
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    body = '#!/bin/sh\nPYTHONUTF8=1 exec "$VENV/bin/python" -m acctsw "$@"\n'
+    (bindir / "acctsw").write_text(body)
+    (bindir / "acctsw").chmod(0o755)
+    probe = _probe_as("1.1.2")
+    inst.ensure_launchers(bin_dir=bindir, wire_rc=False, probe=probe)
+    assert inst.wrapper_drift() is not None
+    changed, _ = inst.ensure_launchers(bin_dir=bindir, wire_rc=False, probe=probe, adopt=True)
+    assert changed
+    assert (bindir / "acctsw.bak").read_text() == body
+    assert (bindir / "acctsw").read_text() == inst.engine_script()
+    assert os.access(bindir / "acctsw", os.X_OK)
+    assert inst.wrapper_drift() is None
+
+
+def test_drift_is_probed_by_running_the_wrapper(tmp_path):
+    """End to end with the real probe against a fake engine script: freshness comes from what the
+    wrapper actually runs, so a wrapper text we can't parse is still judged correctly."""
+    from tests.test_engine_drift import _fake_engine
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    _fake_engine(bindir / "acctsw", version="1.1.2")
+    inst.ensure_launchers(bin_dir=bindir, wire_rc=False, probe=inst.engine_mod.probe)
+    assert inst.wrapper_drift()["version"] == "1.1.2"
+    assert inst.wrapper_drift()["exe"] is None   # not a shape the old regex would recognise
