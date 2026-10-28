@@ -1,10 +1,15 @@
 # Releasing
 
-GitHub Actions builds an unsigned draft and its artifact attestation when you push a tag. The
-maintainer verifies provenance, signs and notarizes locally, tests the signed app, then explicitly
-publishes the draft. CI cannot run the signing script. The Developer ID private key stays in the
-login keychain, never in the repo or GitHub secrets. See [the workflow](../.github/workflows/release.yml) and
-[`scripts/release-sign.sh`](../scripts/release-sign.sh).
+Pushing a tag runs [the release workflow](../.github/workflows/release.yml) in three jobs:
+
+- **build** has no secrets. It verifies the tag, runs the tests, builds, strips, scans and
+  smoke-tests the app, and hands the unsigned zip and its SHA-256 to the next job.
+- **sign** runs in the `release` environment, the only place the signing secrets exist. GitHub
+  starts it only after the maintainer approves it, and only for `v*` tags, which only the
+  maintainer can create (tag ruleset). It runs the tag's own release scripts and GitHub's own
+  actions, nothing third-party, in a throwaway keychain that is deleted afterwards.
+- **publish** has no secrets. It attests the signed zip's provenance and attaches it, with
+  `latest.json`, to a **draft** release. Publishing the draft is a separate, explicit step.
 
 ## Versioning
 
@@ -19,22 +24,31 @@ login keychain, never in the repo or GitHub secrets. See [the workflow](../.gith
 
 ## One-time prerequisites
 
-- Use macOS with Xcode command-line tools, Python 3.11+, and the GitHub CLI (`gh auth login`).
-  `gh attestation verify --help` must support `--signer-workflow`, `--source-ref`, `--cert-identity`,
-  `--cert-oidc-issuer` and `--deny-self-hosted-runners`; upgrade `gh` if it does not.
-  Install the **Developer ID Application** certificate and its private key in the **login keychain**.
-  The signing script selects the last matching identity by SHA-1 fingerprint. Set `AGL_SIGN_ID`
-  to a specific fingerprint to override that selection; it must exist in the login keychain.
-- Store notarization credentials locally (replace the placeholders locally; enter the app-specific
-  password at the prompt, never in a file or command argument):
+The `release` environment (Settings › Environments) requires the maintainer's approval and only
+accepts `v*` tags. It holds five secrets:
 
-  ```sh
-  xcrun notarytool store-credentials app-signing-password --apple-id '<APPLE_ID>' --team-id '<TEAM_ID>'
-  ```
+| Secret | What it is |
+|---|---|
+| `MACOS_CERT_P12` | A **Developer ID Application** certificate and its private key, exported as `.p12`, base64-encoded |
+| `MACOS_CERT_PASSWORD` | The `.p12` export password |
+| `NOTARY_API_KEY` | An App Store Connect API key (`AuthKey_….p8`, the file's contents) with the Developer role |
+| `NOTARY_API_KEY_ID` | That key's ID |
+| `NOTARY_API_ISSUER` | The issuer ID shown above the keys in App Store Connect |
 
-  The profile name defaults to `app-signing-password`; override it with `AGL_NOTARY_PROFILE`.
-  No signing identity, certificate, password, or Apple ID belongs in Actions secrets.
-- The tap checkout still needs the `TAP_PUSH_TOKEN` secret described below.
+Use a certificate kept just for CI, so it can be revoked without touching the one on your Mac. Set
+the secrets from a trusted machine, never in a file in the repo:
+
+```sh
+base64 -i ci-signing.p12 | gh secret set MACOS_CERT_P12 --env release --repo fheinfling/ai-guest-list
+gh secret set MACOS_CERT_PASSWORD --env release --repo fheinfling/ai-guest-list
+gh secret set NOTARY_API_KEY --env release --repo fheinfling/ai-guest-list < AuthKey_XXXXXXXXXX.p8
+gh secret set NOTARY_API_KEY_ID --env release --repo fheinfling/ai-guest-list
+gh secret set NOTARY_API_ISSUER --env release --repo fheinfling/ai-guest-list
+```
+
+The certificate must belong to the team in `scripts/update-requirement.txt` (`<TEAM_ID>` below);
+the sign job refuses anything else. The tap job also needs the `TAP_PUSH_TOKEN` secret described
+under Notes.
 
 ## Cut a release
 
@@ -42,79 +56,68 @@ login keychain, never in the repo or GitHub secrets. See [the workflow](../.gith
    correct). Update the README and regenerate its screenshots after the version bump. Run the
    Python and web tests, then commit the release changes to `main` through the normal PR flow.
    If other work is in progress, prepare the release in a separate worktree based on `origin/main`.
-2. Tag and push, then wait for the `build-and-release` job:
+2. Tag and push:
    ```sh
    git fetch origin main
    git tag vX.Y.Z origin/main
    git push origin vX.Y.Z
    ```
-   CI keeps the macOS 14 / Python 3.11 universal build: tag verification, Python + web tests,
-   web build, py2app, debug-symbol stripping, archive scan, and bundle smoke test. It creates a
-   **draft** with generated notes and `AI-Guest-List-vX.Y.Z-unsigned.zip`. Before uploading the zip,
-   CI prints its SHA-256 and uses the SHA-pinned `actions/attest-build-provenance` action. Only the
-   build job has `id-token: write` and `attestations: write`; no Apple credentials are available to CI.
-   It does not update the tap.
-3. From a trusted checkout containing these scripts, sign locally and leave the draft unpublished:
+   The build job keeps the macOS 14 / Python 3.11 build: tag verification, Python + web tests, web
+   build, py2app, debug-symbol stripping, archive scan and bundle smoke test.
+3. When the build job is done, approve the sign job: open the run, **Review deployments**, tick
+   `release`, **Approve and deploy**. The sign job checks the zip's SHA-256 against the build job's
+   and validates the bundle and `Info.plist`. It then signs every Mach-O and nested bundle inside
+   out with the hardened runtime (`scripts/release-bundle.py sign`), verifies the designated
+   requirement, notarizes, staples and checks Gatekeeper. Finally it re-checks the extracted
+   download zip and writes `latest.json`.
+4. The publish job attests `AI-Guest-List-vX.Y.Z.zip` and creates the draft with generated notes.
+   Download the zip from the draft and check where it came from:
 
    ```sh
-   scripts/release-sign.sh vX.Y.Z --no-publish
+   gh attestation verify AI-Guest-List-vX.Y.Z.zip --repo fheinfling/ai-guest-list \
+     --cert-identity "https://github.com/fheinfling/ai-guest-list/.github/workflows/release.yml@refs/tags/vX.Y.Z" \
+     --cert-oidc-issuer https://token.actions.githubusercontent.com --deny-self-hosted-runners
    ```
 
-   Before accessing the signing identity or Apple services, the script verifies the downloaded zip's
-   attestation for `fheinfling/ai-guest-list`, `.github/workflows/release.yml`, the exact
-   `refs/tags/vX.Y.Z` source ref and certificate identity, GitHub's OIDC issuer, and GitHub-hosted
-   runners. It refuses missing CLI support, failed verification, or a missing unsigned zip and
-   prints the verified SHA-256. A signed draft asset can never replace the attested unsigned input.
-   Compare the verified digest with CI's job log.
-
-   The script validates the bundle, signs every Mach-O and nested bundle inside out with hardened
-   runtime, verifies the designated Developer ID requirement, notarizes, staples, and checks
-   Gatekeeper. It uploads `AI-Guest-List-vX.Y.Z.zip` and `latest.json`, removes the unsigned zip,
-   and keeps the generated notes. `--no-publish` leaves the draft unpublished for testing.
-4. Download the signed draft zip and test the signed app: launch it, check the settings version,
-   and exercise the normal menubar and terminal flows. Check Gatekeeper and the stapled ticket.
-   Verify the zip's SHA-256 against `latest.json`. The manifest contains only public release metadata.
-5. After testing, publish explicitly from the GitHub draft UI or locally:
+   Then test the signed app: launch it, check the settings version, and exercise the normal
+   menubar and terminal flows. Verify the zip's SHA-256 against `latest.json`. The manifest
+   contains only public release metadata.
+5. After testing, publish from the GitHub draft UI or locally:
 
    ```sh
    gh release edit vX.Y.Z --repo fheinfling/ai-guest-list --draft=false --latest
    ```
 
-   This publishes the tested bytes without signing again. `update-tap` runs only on the
-   **release published** event: it checks the published zip's SHA-256 against the manifest and
-   bumps the cask. Homebrew manages upgrades because this branch has no in-app updater; the job
-   removes any obsolete `auto_updates` declaration and the legacy unsigned-build `caveats` notice.
-   Verify that job succeeds.
-   Omitting `--no-publish` from a fresh local signing run also explicitly authorizes publication.
+   `update-tap` runs only on the **release published** event: it checks the published zip's
+   SHA-256 against the manifest and bumps the cask. Homebrew manages upgrades because this branch
+   has no in-app updater; the job removes any obsolete `auto_updates` declaration and the legacy
+   unsigned-build `caveats` notice. Verify that job succeeds.
 
 ## Recovery and local checks
 
-- Immediately after py2app, CI runs `python scripts/strip-bundle.py "dist/AI Guest List.app"`.
+- Immediately after py2app, the builds run `python scripts/strip-bundle.py "dist/AI Guest List.app"`.
   PyObjC ships `.dSYM` debug bundles containing DWARF-only Mach-O files that py2app can copy into
   `python311.zip`; these are never loaded at runtime. The idempotent strip step removes only
   `.dSYM/` members from ZIPs under `Contents/Resources/lib/` and `.dSYM` directories in the app.
-  CI then runs `python scripts/release-bundle.py scan "dist/AI Guest List.app"` to reject any
-  remaining native code hidden in archives before smoke testing and creating the draft.
-  Local builds need the same steps; the signing script fails closed and never strips files itself.
-- If signing or notarization fails, fix the reported problem and re-run the same command on the
-  draft. Notarization rejection prints the submission log command and retrieves the log. A zip
-  containing native code inside another zip is rejected before signing: rebuild with those binaries
-  unpacked. After a successful upload the unsigned asset is removed: publish the tested signed draft
-  directly, or re-run CI to regenerate the unsigned asset and attestation before signing again.
-  The script never edits a published release.
+  Then `python scripts/release-bundle.py scan "dist/AI Guest List.app"` rejects any remaining
+  native code hidden in archives. Local builds need the same steps; signing fails closed and never
+  strips files itself.
+- If signing or notarization fails, the run shows why (a rejected notarization prints Apple's log).
+  Fix the problem, then re-run the failed jobs; the sign job asks for approval again. A zip
+  containing native code inside another zip is rejected before signing: rebuild with those
+  binaries unpacked. The workflow never edits a published release.
 - To discard a draft, run `gh release delete vX.Y.Z --repo fheinfling/ai-guest-list --yes`.
   This leaves the tag in place; re-run the tag's workflow to recreate its draft. Avoid deleting a
   published release that installed apps or the tap already reference.
-- An offline signing check needs no GitHub or notary access:
+- To check the signing order and the designated requirement without any credentials, sign a build
+  ad hoc. The requirement check then fails, as it must for anything but the Developer ID team:
 
   ```sh
-  AGL_SIGN_ID=- AGL_SKIP_NOTARIZE=1 scripts/release-sign.sh vX.Y.Z --from-zip /tmp/test-app.zip
+  python scripts/release-bundle.py sign "dist/AI Guest List.app" --identity=- --adhoc \
+    --entitlements app/entitlements.plist
+  codesign --verify --deep --strict -R "=$(cat scripts/update-requirement.txt)" "dist/AI Guest List.app"
   ```
 
-  Both environment settings and `--from-zip` are required. Attestation verification is skipped with
-  an explicit message and no GitHub call. The script verifies the ad-hoc signatures,
-  then exits with failure at the Developer ID requirement, as expected. This mode cannot upload or
-  publish. Temporary working files are cleaned up on exit.
 - The shared updater requirement is in [`scripts/update-requirement.txt`](../scripts/update-requirement.txt).
   Any updater MUST enforce this designated requirement using codesign -R / SecStaticCode, in
   addition to the manifest SHA-256, before installing an update. A matching hash alone does not
@@ -130,7 +133,7 @@ login keychain, never in the repo or GitHub secrets. See [the workflow](../.gith
 ## Notes
 
 - **Bundle content gate.** `scripts/release-bundle.py scan` (run by PR CI on every build and by
-  release CI before attaching the draft) refuses CPython test suites (excluded in `setup.py`) and
+  the release build before signing) refuses CPython test suites (excluded in `setup.py`) and
   any PEM private-key block, in loose files or inside archives.
 - **README screenshots.** Regenerate with `.venv/bin/python scripts/screenshots.py` whenever the
   popover or settings view changes (and check the version in the settings footer). It seeds sample
@@ -138,8 +141,9 @@ login keychain, never in the repo or GitHub secrets. See [the workflow](../.gith
   from the app. They had: the shots advertised a "save credit" toggle for months after the feature
   was removed, captioned with a savings number the code itself disproved.
 - **Signed releases.** Starting with 1.4.0, published apps are Developer ID signed, notarized and
-  stapled. CI's unsigned zip exists only on the draft. Upgrade older builds through Homebrew or a
-  direct download; see [Install](../README.md#install).
+  stapled. The unsigned build never leaves Actions: it passes from the build job to the sign job as a
+  workflow artifact. Upgrade older builds through Homebrew or a direct download; see
+  [Install](../README.md#install).
 - **Homebrew tap.** The `update-tap` job authenticates with a fine-grained PAT stored as the
   `TAP_PUSH_TOKEN` Actions secret (scoped to `fheinfling/homebrew-tap`, **Contents: Read and write**).
   If the token expires the job fails with a 403 — rotate it by generating a new PAT and running

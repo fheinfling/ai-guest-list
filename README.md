@@ -153,6 +153,13 @@ seats**.
 > Upgrade with `brew upgrade --cask ai-guest-list` or download the latest zip. This version has no
 > in-app updater.
 
+Releases after 1.5.0 are signed on CI and carry a provenance attestation. To check that a zip was
+built and signed by this repo's release workflow:
+
+```sh
+gh attestation verify AI-Guest-List-vX.Y.Z.zip --repo fheinfling/ai-guest-list
+```
+
 **Upgrading:** `brew upgrade --cask ai-guest-list` replaces the app on disk, but a menubar app that
 is already running keeps the engine it started with. **Quit it from the menubar and open it again**
 after upgrading, so the terminal and the app agree on how the store is laid out.
