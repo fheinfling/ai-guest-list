@@ -1,9 +1,16 @@
 name: release
 
 # Cut a release by pushing a tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
-# This builds and attests the unsigned .app zip, then attaches it to a draft release.
-# The tag's X.Y.Z MUST match acctsw/__init__.py __version__ (the job verifies and fails otherwise).
-# Local signing publishes the draft; only publication triggers the Homebrew tap bump.
+# The tag's X.Y.Z MUST match acctsw/__init__.py __version__ (the build job verifies and fails otherwise).
+#
+#   build       no secrets. Tests, builds and scans the .app and hands the unsigned zip on as an artifact.
+#   sign        runs in the `release` environment, the only place the signing secrets exist. GitHub only
+#               starts it after the owner approves it, and only for v* tags (which only the owner can
+#               create). It runs the tag's own release scripts and no third-party actions: inside-out
+#               Developer ID signing with the hardened runtime, the designated requirement, notarization,
+#               stapling and Gatekeeper's check, in a throwaway keychain. It also writes latest.json.
+#   publish     no secrets. Attests provenance of the signed zip and attaches it with latest.json to a draft.
+#   update-tap  runs when the owner publishes the draft and bumps the Homebrew cask.
 
 on:
   push:
@@ -15,17 +22,16 @@ permissions:
   contents: read
 
 jobs:
-  build-and-release:
+  build:
     if: github.event_name == 'push'
     runs-on: macos-14
-    permissions:
-      contents: write
-      id-token: write
-      attestations: write
+    outputs:
+      sha256: ${{ steps.pack.outputs.sha256 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0        # full history → git rev-list --count gives the build number
+          persist-credentials: false
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -69,24 +75,179 @@ jobs:
         run: python scripts/smoke-bundle.py
 
       - name: Zip the .app
+        id: pack
         run: |
-          ditto -c -k --norsrc --keepParent "dist/AI Guest List.app" "AI-Guest-List-${GITHUB_REF_NAME}-unsigned.zip"
-          shasum -a 256 "AI-Guest-List-${GITHUB_REF_NAME}-unsigned.zip"
+          set -euo pipefail
+          ditto -c -k --norsrc --keepParent "dist/AI Guest List.app" unsigned.zip
+          echo "sha256=$(shasum -a 256 unsigned.zip | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
-      - name: Attest unsigned zip provenance
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          subject-path: AI-Guest-List-${{ github.ref_name }}-unsigned.zip
+          name: unsigned
+          path: unsigned.zip
+          retention-days: 30   # the sign job waits for approval, at most 30 days
 
-      - name: Create GitHub Release
+  sign:
+    needs: build
+    runs-on: macos-15
+    environment: release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false   # only the tag's release scripts, entitlements and requirement are used
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: unsigned
+          path: ${{ runner.temp }}/in
+
+      - name: Check it is the app the build job made
+        env:
+          EXPECTED: ${{ needs.build.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          echo "$EXPECTED  $RUNNER_TEMP/in/unsigned.zip" | shasum -a 256 -c
+          python scripts/release-bundle.py check-zip "$RUNNER_TEMP/in/unsigned.zip"
+          mkdir "$RUNNER_TEMP/app"
+          ditto -x -k "$RUNNER_TEMP/in/unsigned.zip" "$RUNNER_TEMP/app"
+          python - "$RUNNER_TEMP/app/AI Guest List.app" "$GITHUB_REF_NAME" scripts/update-manifest.py <<'PYEOF'
+          from pathlib import Path
+          import runpy, sys
+          app = Path(sys.argv[1])
+          if not app.is_dir() or list(app.parent.iterdir()) != [app]:
+              sys.exit("expected exactly one top-level AI Guest List.app")
+          runpy.run_path(sys.argv[3])["read_app"](app, sys.argv[2])
+          PYEOF
+
+      - name: Import the certificate into a throwaway keychain
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          KC="$RUNNER_TEMP/signing.keychain-db"
+          KC_PASS="$(openssl rand -base64 32)"
+          echo "::add-mask::$KC_PASS"
+          security create-keychain -p "$KC_PASS" "$KC"
+          security set-keychain-settings -lut 3600 "$KC"
+          security unlock-keychain -p "$KC_PASS" "$KC"
+          printf '%s' "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$CERT_PASSWORD" -f pkcs12 -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PASS" "$KC" > /dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          # By SHA-1, never by an ambiguous display name.
+          IDENTITY="$(security find-identity -v -p codesigning "$KC" | awk '/"Developer ID Application:/ { print $2; exit }')"
+          if [ -z "$IDENTITY" ]; then echo "::error::no Developer ID Application identity in MACOS_CERT_P12"; exit 1; fi
+          echo "IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+
+      - name: Sign inside out with the hardened runtime
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/app/AI Guest List.app"
+          python scripts/release-bundle.py sign "$APP" --identity="$IDENTITY" --entitlements app/entitlements.plist
+          # Any updater MUST enforce update-requirement.txt with codesign -R / SecStaticCode,
+          # in addition to manifest SHA-256. No in-app updater exists on this branch.
+          requirement="$(cat scripts/update-requirement.txt)"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign --verify --deep --strict -R "=$requirement" "$APP"
+          codesign -dvv "$APP" 2>&1 | grep -q '(runtime)' || { echo "::error::hardened runtime flag missing"; exit 1; }
+          ditto -c -k --norsrc --keepParent "$APP" "$RUNNER_TEMP/notarize.zip"
+
+      - name: Notarize and staple
+        env:
+          NOTARY_KEY: ${{ secrets.NOTARY_API_KEY }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_API_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.NOTARY_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          umask 077
+          KEY="$RUNNER_TEMP/notary.p8"
+          trap 'rm -f "$KEY"' EXIT
+          printf '%s\n' "$NOTARY_KEY" > "$KEY"
+          AUTH=(--key "$KEY" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER")
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" "${AUTH[@]}" --wait --timeout 30m --output-format json > notary.json || true
+          ID="$(plutil -extract id raw notary.json 2>/dev/null || echo '?')"
+          STATUS="$(plutil -extract status raw notary.json 2>/dev/null || echo 'no response')"
+          echo "submission $ID: $STATUS"
+          if [ "$STATUS" != "Accepted" ]; then
+            [ "$ID" != '?' ] && xcrun notarytool log "$ID" "${AUTH[@]}" || true
+            echo "::error::notarization $STATUS"
+            exit 1
+          fi
+          xcrun stapler staple "$RUNNER_TEMP/app/AI Guest List.app"
+          xcrun stapler validate "$RUNNER_TEMP/app/AI Guest List.app"
+
+      - name: Check the zip users will download
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/app/AI Guest List.app"
+          ASSET="AI-Guest-List-${GITHUB_REF_NAME}.zip"
+          spctl --assess --type execute --verbose=4 "$APP" 2>&1 | tee spctl.txt
+          if grep -q 'override=security disabled' spctl.txt; then
+            echo "::warning::Gatekeeper is off on this runner; relying on the codesign and stapler checks"
+          else
+            grep -q 'source=Notarized Developer ID' spctl.txt
+          fi
+          ditto -c -k --norsrc --keepParent "$APP" "$ASSET"
+          python scripts/release-bundle.py check-zip "$ASSET"
+          # Verify the bytes users will extract, including the stapled ticket.
+          mkdir "$RUNNER_TEMP/final-check"
+          ditto -x -k "$ASSET" "$RUNNER_TEMP/final-check"
+          requirement="$(cat scripts/update-requirement.txt)"
+          codesign --verify --deep --strict -R "=$requirement" "$RUNNER_TEMP/final-check/AI Guest List.app"
+          xcrun stapler validate "$RUNNER_TEMP/final-check/AI Guest List.app"
+          python scripts/update-manifest.py --zip "$ASSET" --app "$APP" --tag "$GITHUB_REF_NAME" --out latest.json
+          shasum -a 256 "$ASSET"
+
+      - name: Delete the keychain and key files
+        if: always()
+        run: |
+          KC="$RUNNER_TEMP/signing.keychain-db"   # set here too: the import step may have failed early
+          [ -e "$KC" ] && security delete-keychain "$KC" || true
+          rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/notary.p8"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signed
+          path: |
+            AI-Guest-List-${{ github.ref_name }}.zip
+            latest.json
+          retention-days: 1
+
+  publish:
+    needs: sign
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # create the draft release
+      id-token: write        # provenance attestation
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: signed
+
+      - name: Attest provenance of the signed zip
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: AI-Guest-List-${{ github.ref_name }}.zip
+
+      - name: Create the draft release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3 (pinned SHA; Dependabot keeps it current)
         with:
           name: ${{ github.ref_name }}
           draft: true
           generate_release_notes: true
-          files: AI-Guest-List-${{ github.ref_name }}-unsigned.zip
+          files: |
+            AI-Guest-List-${{ github.ref_name }}.zip
+            latest.json
           body: |
-            Draft awaiting local Developer ID signing and notarization.
+            Developer ID signed and notarized for macOS.
 
   update-tap:
     # No dependency on the push-only build job: publishing is a separate event.

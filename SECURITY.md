@@ -19,6 +19,7 @@ In scope:
 - Credential handling — exposure/leakage of keychain blobs or OAuth tokens (logs, temp files,
   argv, world-readable files).
 - The install/uninstall and shell-wiring paths, and the supervised launcher.
+- The build and release pipeline (`scripts/`, the GitHub workflows).
 - The one-time `cleanup_legacy` migration that strips leftover Headroom routing from
   `~/.codex/config.toml` and `~/.claude/settings.json` (see
   [`docs/SECURITY-headroom.md`](docs/SECURITY-headroom.md)) — in particular, anything that could
@@ -29,6 +30,14 @@ Out of scope:
 - The `headroom-ai` package itself — the "save credit" proxy was removed; we no longer install,
   start, or route traffic through it.
 - Social-engineering or physical access to an already-unlocked machine/keychain.
+
+## Release signing
+
+Releases are signed and notarized by the `release` workflow. Its signing job runs only for `v*` tags (which only the
+maintainer can create) and only after the maintainer approves it. It uses a Developer ID certificate kept just for
+CI and an App Store Connect API key, both stored as secrets of the `release` environment. No other job,
+pull request or fork can read them. Each release zip has a provenance attestation (`gh attestation verify`).
+See [`docs/RELEASING.md`](docs/RELEASING.md).
 
 ## Supported versions
 
