@@ -233,6 +233,7 @@ def tokens(monkeypatch):
         return have.get(email)
     monkeypatch.setattr(L, "_inplace_eligible", eligible)
     monkeypatch.setattr(L, "_inplace_seat", Seat)
+    monkeypatch.setattr(L, "_tier_pair", lambda *_a, **_k: None)   # no tier in the way
     return have
 
 
@@ -1617,3 +1618,368 @@ def test_pty_spawn_stops_watching_a_wake_fd_whose_writer_is_gone(monkeypatch):
     finally:
         os.close(wake_r)
     assert len(ticks) <= 2
+
+
+# --- cross-tier: ask about hops that restart only for the plan tier; models a seat lacks ---------
+
+class FakeTiers:
+    """seattier's frozen API, recording every request (the real one says False to a pair asked
+    before; the launcher must not lean on that to ask only once)."""
+
+    def __init__(self):
+        self.requests = []
+
+    def request(self, state, tool, a, b, at=None):
+        self.requests.append((a, b))
+        state.data["tools"][tool].setdefault("tier_requests", {})["|".join(sorted((a, b)))] = {
+            "at": iso(at), "status": "open"}
+        return True
+
+
+def _tier_blocks(monkeypatch, blocked=(C2,), pair=("max", "team")):
+    """Only the plan tier keeps the seats in ``blocked`` from serving in place; seen from the
+    other side the pair comes reversed."""
+    def tier_pair(_ctx, email, *, home_email):
+        if email not in blocked:
+            return None
+        return pair if email == C2 else pair[::-1]
+    monkeypatch.setattr(L, "_tier_pair", tier_pair)
+
+
+def test_a_hop_that_restarts_only_for_the_tier_asks_about_that_pair_once(seats, tokens,
+                                                                        monkeypatch):
+    """C2 could serve in place but for its plan tier: the hop restarts as before, and the user is
+    asked once whether such hops may go in place. The hop back across the same pair asks nothing
+    more."""
+    _drop(seats, C3)
+    tokens.pop(C2)
+    _tier_blocks(monkeypatch, blocked=(C1, C2))
+
+    def c1_back():
+        st = seats.load_state()
+        st.get_seat("claude", C1).pop("limited_until")
+        st.save()
+        swap.post("limit", C2)
+
+    tiers = FakeTiers()
+    swap = FakeSwap()
+    spawn = Spawn(([lambda: swap.post("limit", C1), None], 1), ([c1_back, None], 1), ([None], 0))
+    assert _run(seats, spawn, swap, seattier=tiers) == 0
+    assert spawn.stops == 2 and swap.homes == [C1, C2, C1]   # restarted, never waited
+    assert tiers.requests == [("max", "team")]
+    assert "max|team" in seats.load_state().data["tools"]["claude"]["tier_requests"]   # saved
+
+
+def test_no_tier_question_when_something_else_keeps_the_hop_from_going_in_place(
+        seats, tokens, monkeypatch):
+    _drop(seats, C3)
+    tokens.pop(C2)
+    _tier_blocks(monkeypatch, blocked=(C3,))
+    tiers = FakeTiers()
+    swap = FakeSwap()
+    spawn = Spawn(([lambda: swap.post("limit", C1), None], 1), ([None], 0))
+    assert _run(seats, spawn, swap, seattier=tiers) == 0
+    assert spawn.stops == 1 and tiers.requests == []
+
+
+def test_tier_pair_names_the_tiers_only_when_the_tier_alone_blocks(ctx, monkeypatch):
+    from acctsw import claudehome, seatswap
+    fake = types.SimpleNamespace(tier=lambda blob: blob)
+    monkeypatch.setitem(sys.modules, "acctsw.seattier", fake)
+    monkeypatch.setattr(acctsw, "seattier", fake, raising=False)
+    monkeypatch.setattr(claudehome, "load", lambda _ctx, email: {C1: "max", C2: "team"}[email])
+    why = {}
+    monkeypatch.setattr(seatswap, "eligible_reason",
+                        lambda _ctx, email, *, home_email: why.get(email), raising=False)
+    why[C2] = "tier"
+    assert L._tier_pair(ctx, C2, home_email=C1) == ("max", "team")
+    why[C2] = "expiring"
+    assert L._tier_pair(ctx, C2, home_email=C1) is None
+
+
+def test_a_model_the_borrowed_seat_lacks_goes_back_home_in_place(seats, tokens, marks):
+    """C2's plan refuses the session's model and home is usable again: replay at home, no
+    restart, and the user hears about it once per run."""
+    _drop(seats, C3)
+    swap = FakeSwap()
+    hits = []
+
+    def refused():
+        st = seats.load_state()
+        st.get_seat("claude", C1).pop("limited_until")
+        st.save()
+        hits.append(swap.post("model", C2, detail="model not available"))
+
+    spawn = Spawn(([lambda: swap.post("limit", C1), None, refused, None,
+                    lambda: swap.post("limit", C1), None, refused, None], 0))
+    notes = []
+    assert _run(seats, spawn, swap, notify=notes.append) == 0
+    assert spawn.stops == 0
+    assert all((h, Seat(C1, None)) in swap.answers for h in hits) and len(hits) == 2
+    assert swap.bound() is None and seats.load_state().active("claude") == C1
+    assert marks[-1] == (C1, C1)
+    assert sum("doesn't offer this session's model" in n for n in notes) == 1
+
+
+def test_a_model_refused_with_home_resting_restarts_on_that_seat_once_quiet(seats, tokens,
+                                                                            monkeypatch):
+    """Home rests: the error goes through, and once the child is quiet it restarts (resume) on
+    the borrowed seat's own login, so Claude Code picks a model that seat offers. Once."""
+    clock = Clock(monkeypatch)
+    swap = FakeSwap()
+    hits, seen = [], []
+
+    def refused():
+        hits.append(swap.post("model", C2, detail="model: claude-x not found"))
+
+    spawn = Spawn(([lambda: swap.post("limit", C1), None, refused, None, refused, None,
+                    lambda: seen.append(spawn.stops),
+                    lambda: clock.advance(L.HANDOVER_QUIET_S + 1)], 1), ([None], 0))
+    notes = []
+    assert _run(seats, spawn, swap, notify=notes.append) == 0
+    assert all((h, None) in swap.answers for h in hits) and len(hits) == 2
+    assert seen == [0] and spawn.stops == 1   # only once the child was quiet
+    assert spawn.calls[1][-2:] == ["--resume", _session(spawn)] and swap.homes == [C1, C2]
+    assert sum("doesn't offer this session's model" in n for n in notes) == 1
+
+
+def test_a_model_restart_happens_once_per_seat(seats, tokens, monkeypatch):
+    """C2 refuses the model twice in one run, borrowed both times: the second time the error
+    just goes through. No restart loop."""
+    clock = Clock(monkeypatch)
+    swap = FakeSwap()
+
+    def refused_when_quiet(seat):
+        def step():
+            swap.post("model", seat)
+            clock.advance(L.HANDOVER_QUIET_S + 1)
+        return step
+
+    def c2_back_c3_out():
+        st = seats.load_state()
+        st.get_seat("claude", C2).pop("limited_until")
+        st.save()
+        swap.post("limit", C3)
+
+    spawn = Spawn(([lambda: swap.post("limit", C1), None, refused_when_quiet(C2), None], 1),
+                  ([lambda: swap.post("limit", C2), None, refused_when_quiet(C3), None], 1),
+                  ([c2_back_c3_out, None, refused_when_quiet(C2), None,
+                    lambda: clock.advance(1000), None], 0))
+    notes = []
+    assert _run(seats, spawn, swap, max_switches=6, notify=notes.append) == 0
+    assert spawn.stops == 2 and swap.homes == [C1, C2, C3]
+    assert swap.answers[-2:] == [(Hit("limit", C3), Seat(C2, "tok-c2")),   # C2 borrowed again
+                                 (Hit("model", C2), None)]                  # and only passed on
+    assert sum("doesn't offer this session's model" in n for n in notes) == 1
+
+
+@pytest.mark.parametrize("broken", ["request", "eligibility", "save"])
+def test_a_tier_request_that_blows_up_never_stops_the_restart(seats, tokens, monkeypatch, broken):
+    _drop(seats, C3)
+    tokens.pop(C2)
+    _tier_blocks(monkeypatch)
+
+    tiers = FakeTiers()
+
+    def boom(*_a, **_k):
+        raise RuntimeError("state on fire")
+
+    if broken == "request":
+        monkeypatch.setattr(tiers, "request", boom)
+    elif broken == "eligibility":
+        monkeypatch.setattr(L, "_tier_pair", boom)
+    else:
+        from acctsw.state import State
+        save = State.save
+
+        def save_without_tier_requests(st):
+            if st.data["tools"]["claude"].get("tier_requests"):
+                boom()
+            save(st)
+        monkeypatch.setattr(State, "save", save_without_tier_requests)
+
+    swap = FakeSwap()
+    spawn = Spawn(([lambda: swap.post("limit", C1), None], 1), ([None], 0))
+    assert _run(seats, spawn, swap, seattier=tiers) == 0
+    assert spawn.stops == 1 and swap.homes == [C1, C2]
+
+
+@pytest.mark.parametrize("blocker", ["setting", "unused", "hop_budget", "no_proxy", "auth"])
+def test_no_tier_question_when_the_proxy_cannot_carry_the_hop(seats, tokens, monkeypatch,
+                                                            blocker):
+    _drop(seats, C3)
+    tokens.pop(C2)
+    _tier_blocks(monkeypatch)
+    tiers, swap = FakeTiers(), FakeSwap()
+    if blocker == "setting":
+        st = seats.load_state()
+        st.set_setting("in_place_switch", False)
+        st.save()
+    elif blocker == "unused":
+        swap.used = False
+    elif blocker == "hop_budget":
+        monkeypatch.setattr(L, "MAX_INPLACE_SWITCHES", 0)
+    step = (b"API Error: OAuth token has expired. Please obtain a new token.\n"
+            if blocker == "auth" else lambda: _rest(seats, C1))
+    spawn = Spawn(([step, None], 1), ([None], 0))
+    assert _run(seats, spawn, None if blocker == "no_proxy" else swap, seattier=tiers) == 0
+    assert spawn.stops == 1 and tiers.requests == []
+
+
+def test_no_tier_question_when_restart_budget_is_spent(seats, tokens, monkeypatch):
+    tokens.pop(C2)
+    _tier_blocks(monkeypatch)
+    tiers, swap = FakeTiers(), FakeSwap()
+    spawn = Spawn(([lambda: swap.post("limit", C1), None], 0))
+    assert _run(seats, spawn, swap, seattier=tiers, max_switches=0) == 0
+    assert spawn.stops == 0 and tiers.requests == []
+
+
+def test_tier_request_waits_for_the_independent_crossing_approval(seats, tokens, monkeypatch):
+    _drop(seats, C3)
+    tokens.pop(C2)
+    _tier_blocks(monkeypatch)
+    tiers, swap = FakeTiers(), FakeSwap()
+    kinds = FakeKinds({C1: "business", C2: "personal"})
+    before = []
+
+    def approve():
+        before.append((list(tiers.requests), spawn.stops, swap.bound()))
+        _approve(seats, C1, C2)
+
+    spawn = Spawn(([lambda: swap.post("limit", C1), None, approve, None], 1), ([None], 0))
+    assert _run(seats, spawn, swap, seatkind=kinds, seattier=tiers) == 0
+    assert before == [([], 0, None)]
+    assert spawn.stops == 1 and swap.homes == [C1, C2]
+    assert kinds.consumed == [(C1, C2)] and tiers.requests == [("max", "team")]
+
+
+@pytest.mark.parametrize("home_state", ["limited", "signed_out", "forbidden", "removed"])
+def test_model_replay_requires_a_usable_home(seats, tokens, monkeypatch, home_state):
+    clock = Clock(monkeypatch)
+    swap = FakeSwap()
+
+    def refuse():
+        st = seats.load_state()
+        home = st.get_seat("claude", C1)
+        if home_state != "limited":
+            home.pop("limited_until")
+        if home_state == "signed_out":
+            home["signin"] = {"signed_out": True}
+        elif home_state == "forbidden":
+            home["usage"] = {"error": "forbidden"}
+        elif home_state == "removed":
+            st.remove_seat("claude", C1)
+        st.save()
+        swap.post("model", C2)
+        clock.advance(L.HANDOVER_QUIET_S + 1)
+
+    spawn = Spawn(([lambda: swap.post("limit", C1), None, refuse], 1), ([None], 0))
+    assert _run(seats, spawn, swap) == 0
+    assert swap.answers[-1] == (Hit("model", C2), None)
+    assert spawn.stops == 1 and swap.homes == [C1, C2]
+    assert not seats.load_state().get_seat("claude", C2).get("limited_until")
+
+
+@pytest.mark.parametrize("blocker", ["in_flight", "recent_request", "output", "print",
+                                    "login", "resume", "budget"])
+def test_model_restart_obeys_handover_safety_checks(seats, tokens, monkeypatch, blocker):
+    clock = Clock(monkeypatch)
+    swap = FakeSwap()
+    args, kw = [], {}
+    if blocker == "print":
+        args = ["-p", "do it"]
+    elif blocker == "resume":
+        args = ["--resume", "abc", "--fork-session"]
+    elif blocker == "budget":
+        kw["max_switches"] = 0
+
+    def refuse():
+        clock.advance(L.HANDOVER_QUIET_S + 1)
+        if blocker == "in_flight":
+            swap.in_flight = 1
+        elif blocker == "recent_request":
+            swap.idle = 0
+        elif blocker == "login":
+            monkeypatch.setattr(L, "plan_claude_login", lambda *_a: None)
+        swap.post("model", C2)
+
+    steps = [lambda: swap.post("limit", C1), None, refuse, None]
+    if blocker == "output":
+        steps = [*steps[:2], lambda: clock.advance(L.HANDOVER_QUIET_S + 1),
+                 b"Still running a tool...", lambda: swap.post("model", C2), None]
+    spawn = Spawn((steps, 1))
+    assert run(seats, "claude", args, spawn=spawn, get=fake_get({}), notify=lambda _m: None,
+               swap_factory=lambda _ctx: swap, **kw) == 1
+    assert spawn.stops == 0 and swap.answers[-1] == (Hit("model", C2), None)
+
+
+def test_a_pending_model_restart_is_cancelled_when_the_bound_seat_changes(seats, tokens,
+                                                                       monkeypatch):
+    clock = Clock(monkeypatch)
+    swap = FakeSwap()
+
+    def move_on():
+        swap.maintain_moves_to = C3
+        clock.advance(L.HANDOVER_QUIET_S + 1)
+
+    spawn = Spawn(([lambda: swap.post("limit", C1), None,
+                    lambda: swap.post("model", C2), None, move_on, None], 0))
+    assert _run(seats, spawn, swap) == 0
+    assert spawn.stops == 0 and swap.bound() == C3
+
+
+def test_a_pending_model_restart_does_not_survive_another_child_restart(seats, tokens,
+                                                                     monkeypatch):
+    clock = Clock(monkeypatch)
+    swap = FakeSwap()
+    tokens.pop(C3)   # the next quota hit must restart onto C3
+
+    def borrow_c2_again():
+        st = seats.load_state()
+        st.get_seat("claude", C2).pop("limited_until")
+        st.save()
+        swap.post("limit", C3)
+        clock.advance(L.HANDOVER_QUIET_S + 1)
+
+    spawn = Spawn(([lambda: swap.post("limit", C1), None,
+                    lambda: swap.post("model", C2), None,
+                    lambda: swap.post("limit", C2), None], 1),
+                  ([borrow_c2_again, None], 0))
+    assert _run(seats, spawn, swap) == 0
+    assert spawn.stops == 1 and swap.homes == [C1, C3] and swap.bound() == C2
+
+
+def test_model_rejection_does_not_trigger_exit_time_limit_recovery(seats, tokens, monkeypatch):
+    swap = FakeSwap()
+    probed = []
+    monkeypatch.setattr(L, "handle_exhausted", lambda *_a, **_k: probed.append(True))
+    spawn = Spawn(([lambda: _click(seats, C2), None, lambda: swap.post("model", C2), None], 1))
+    assert _run(seats, spawn, swap) == 1
+    assert probed == [] and spawn.stops == 0 and swap.bound() is None
+
+
+@pytest.mark.parametrize("broken", ["selection", "seat", "notice"])
+def test_a_failing_model_decision_answers_and_keeps_the_child_alive(seats, tokens, monkeypatch,
+                                                                 broken):
+    swap = FakeSwap()
+
+    def boom(*_a, **_k):
+        raise RuntimeError("decision dependency failed")
+
+    def refuse():
+        if broken == "selection":
+            monkeypatch.setattr(L, "choose", boom)
+        elif broken == "seat":
+            monkeypatch.setattr(L, "_inplace_seat", boom)
+        swap.post("model", C2)
+
+    def notify(message):
+        if broken == "notice" and "doesn't offer this session's model" in message:
+            boom()
+
+    # A click leaves home usable; a limit leaves it resting and exercises the restart notice.
+    leave = (lambda: swap.post("limit", C1)) if broken == "notice" else lambda: _click(seats, C2)
+    spawn = Spawn(([leave, None, refuse, None], 0))
+    assert _run(seats, spawn, swap, notify=notify) == 0
+    assert swap.answers[-1] == (Hit("model", C2), None) and spawn.stops == 0
