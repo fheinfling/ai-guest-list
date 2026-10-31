@@ -236,6 +236,15 @@ class FakeProxy:
     def messages_seen(self):
         return self.seen
 
+    ok = 0
+    failures = 0
+
+    def intercepts_ok(self):
+        return self.ok
+
+    def upstream_failures(self):
+        return self.failures
+
 
 class Clock:
     def __init__(self):
@@ -262,7 +271,7 @@ def test_start_binds_home_passthrough_and_env_points_at_the_proxy(ctx):
     assert env["HTTPS_PROXY"] == env["https_proxy"] == "http://127.0.0.1:40404/s3cret"
     assert "ANTHROPIC_BASE_URL" not in env
     assert env["NO_PROXY"].split(",") == ["corp.example", "127.0.0.1", "localhost"]
-    assert env["no_proxy"] == "127.0.0.1,localhost"
+    assert env["no_proxy"] == env["NO_PROXY"]
     assert env["PATH"] == "/bin"
     swap.stop()
 
@@ -548,12 +557,14 @@ def test_preflight_verdict_is_cached_per_upstream_for_ten_minutes(ctx):
     proxy.preflight_reason = None
     assert swap.preflight() == "tls: certificate verify failed"   # a failure is cached too
     other = seatswap.SeatSwap(ctx, "home@x", proxy_factory=FakeProxy, upstream="https://gw.example",
-                              ca=FakeCA())
+                              ca=FakeCA(), environ={})
     assert other.preflight() is None                             # its own upstream, its own verdict
     cache = json.loads((ctx.data_dir / seatswap.PREFLIGHT_CACHE).read_text())
-    assert set(cache) == {seatswap.UPSTREAM, "https://gw.example"}
-    assert cache[seatswap.UPSTREAM] == {"ok": False, "reason": "tls: certificate verify failed",
-                                        "at": cache[seatswap.UPSTREAM]["at"]}
+    k_api = json.dumps([seatswap.UPSTREAM, None, "|", "", ""])
+    k_gw = json.dumps(["https://gw.example", None, "|", "", ""])
+    assert set(cache) == {k_api, k_gw}
+    assert cache[k_api] == {"ok": False, "reason": "tls: certificate verify failed",
+                            "at": cache[k_api]["at"]}
 
 
 def test_an_unreadable_preflight_cache_just_preflights(ctx):
@@ -668,7 +679,7 @@ def test_env_takes_anthropic_out_of_no_proxy_and_keeps_the_rest(ctx):
                                           "anthropic.com.evil.example", "pi.anthropic.com",
                                           "[::1]", "localhost",
                                           "127.0.0.1"]
-    assert env["no_proxy"] == "127.0.0.1,localhost"
+    assert env["no_proxy"] == env["NO_PROXY"]
 
 
 @pytest.mark.parametrize("environ, expected", [
