@@ -25,7 +25,7 @@ _TIMEOUT_S = 20
 _DAYS = 2
 _FALLBACK_ROOTS = "/etc/ssl/cert.pem"
 _KEYCHAINS = ("/Library/Keychains/System.keychain", "/System/Library/Keychains/SystemRootCertificates.keychain")
-_CERT_RE = re.compile(r"-----BEGIN (TRUSTED )?CERTIFICATE-----.*?-----END \1CERTIFICATE-----", re.S)
+_CERT_RE = re.compile(r"-----BEGIN (?P<t>TRUSTED )?CERTIFICATE-----.*?-----END (?(t)TRUSTED )CERTIFICATE-----", re.S)
 
 
 class SessionCAError(RuntimeError):
