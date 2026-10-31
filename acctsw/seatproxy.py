@@ -357,8 +357,9 @@ class SeatProxy:
             return self._seat
 
     def messages_seen(self) -> int:
-        """Client ``POST /v1/messages`` requests received so far (any status): proof the child
-        talks to the API through this proxy at all."""
+        """Client ``POST /v1/messages`` requests with Claude Code's own kind of login (bearer, no
+        API key) received so far, any status, injected or not: proof that Claude Code itself
+        talks to the API through this proxy. An API-key script in the child does not count."""
         with self._lock:
             return self._messages
 
@@ -448,10 +449,11 @@ class SeatProxy:
             reply.error(403, "permission_error", "seat proxy: unknown path")
             return True
         endpoint = path.split("?")[0]
-        if method == "POST" and endpoint == "/v1/messages":
+        oauth = _oauth_client(headers)
+        if method == "POST" and endpoint == "/v1/messages" and oauth:
             with self._lock:
                 self._messages += 1
-        inject = method == "POST" and endpoint in INJECT_PATHS and _oauth_client(headers)
+        inject = method == "POST" and endpoint in INJECT_PATHS and oauth
         seat = self.bound() if inject else None    # None: the client's headers go out untouched
         tried = [seat] if seat is not None else []
         length = len(body) if body or method in ("POST", "PUT", "PATCH") else None

@@ -353,12 +353,29 @@ def test_messages_seen_counts_client_message_posts():
     h.send("/v1/messages?beta=true")
     rules(h, a=429)
     h.send("/v1/messages")                          # a passed-through limit still counts
-    h.send("/v1/messages", auth=None, headers=[("x-api-key", "k")])
+    h.proxy.bind(HOME)
+    h.send("/v1/messages")                          # eligible but not injected (home): counts
     h.send("/v1/messages/count_tokens")
     h.send("/v1/messages", method="GET", body=b"")
     h.send(raw_target="/v1/messages")               # forbidden: never reached the proxy proper
     h.send("/api/oauth/profile")
     assert h.proxy.messages_seen() == 3
+
+
+@pytest.mark.parametrize("auth,extra", [
+    (None, [("x-api-key", "sk-ant-api03-user-script")]),
+    (f"Bearer {CLIENT_TOKEN}", [("x-api-key", "sk-ant-api03-both")]),
+    ("Basic dXNlcjpwYXNz", []),
+    (None, []),
+])
+def test_messages_seen_ignores_non_oauth_clients(auth, extra):
+    """An SDK script in the child must not prove that Claude Code talks through the proxy."""
+    h = Harness()
+    h.proxy.bind(B)
+    for _ in range(3):
+        resp, _ = h.send("/v1/messages", auth=auth, headers=extra)
+        assert resp.status == 200
+    assert h.proxy.messages_seen() == 0
 
 
 def test_unbound_proxy_is_pure_passthrough():

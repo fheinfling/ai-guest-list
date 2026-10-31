@@ -20,8 +20,8 @@
  {
   "label": "proxy: the path allowlist is dropped (every request carries the seat token)",
   "file": "acctsw/seatproxy.py",
-  "old": "inject = method == \"POST\" and endpoint in INJECT_PATHS and _oauth_client(headers)",
-  "new": "inject = _oauth_client(headers)",
+  "old": "inject = method == \"POST\" and endpoint in INJECT_PATHS and oauth",
+  "new": "inject = oauth",
   "test": [
    "tests/test_seatproxy.py::test_only_message_posts_carry_the_seat_token"
   ]
@@ -164,7 +164,7 @@
  {
   "label": "proxy #5: any client (API key, no auth) gets the seat token on message posts",
   "file": "acctsw/seatproxy.py",
-  "old": " and endpoint in INJECT_PATHS and _oauth_client(headers)",
+  "old": " and endpoint in INJECT_PATHS and oauth",
   "new": " and endpoint in INJECT_PATHS",
   "test": [
    "tests/test_seatproxy.py::test_only_oauth_bearer_clients_get_a_seat_token"
@@ -246,8 +246,8 @@
  {
   "label": "proxy: messages_seen counts count_tokens too",
   "file": "acctsw/seatproxy.py",
-  "old": "if method == \"POST\" and endpoint == \"/v1/messages\":",
-  "new": "if method == \"POST\" and endpoint in INJECT_PATHS:",
+  "old": "if method == \"POST\" and endpoint == \"/v1/messages\" and oauth:",
+  "new": "if method == \"POST\" and endpoint in INJECT_PATHS and oauth:",
   "test": [
    "tests/test_seatproxy.py::test_messages_seen_counts_client_message_posts"
   ]
@@ -268,6 +268,15 @@
   "new": "if True:",
   "test": [
    "tests/test_seatproxy.py::test_dropped_pooled_connection_is_discarded_before_use"
+  ]
+ },
+ {
+  "label": "proxy: messages_seen counts API-key requests (an SDK script proves the proxy is used)",
+  "file": "acctsw/seatproxy.py",
+  "old": "if method == \"POST\" and endpoint == \"/v1/messages\" and oauth:",
+  "new": "if method == \"POST\" and endpoint == \"/v1/messages\":",
+  "test": [
+   "tests/test_seatproxy.py::test_messages_seen_ignores_non_oauth_clients"
   ]
  }
 ]
