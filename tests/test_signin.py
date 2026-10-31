@@ -274,6 +274,29 @@ def test_launcher_refresh_classifies_and_gates_the_same_way(ctx):
     assert summary["claude"]["a@test"] == "cached"
 
 
+def test_launcher_capacity_check_classifies_and_gates_the_same_way(ctx):
+    """The launcher's wait/watcher sweep must not send dead tokens or re-read identical dead bytes."""
+    _seed_claude(ctx)   # b@test active
+    _sign_out(ctx, "a@test", home=EXPIRED_SNAPSHOT)
+    calls = []
+    sel = launcher._verify_capacity(ctx, "claude", _counting(calls), at=now(), force=True,
+                                    exclude={"b@test"}, ua="test")
+    assert sel.email is None and calls == []
+    seat = ctx.load_state().get_seat("claude", "a@test")
+    assert seat["signin"]["signed_out"] is True and seat["usage"]["error_streak"] == 0
+    attempted = _age_attempt(ctx, "a@test", launcher.POLL_MIN_FETCH_S * 4)
+    rev = ctx.load_state().data["rev"]
+    launcher._verify_capacity(ctx, "claude", _counting(calls), at=now(), force=False,
+                              exclude={"b@test"}, ua="test")
+    state = ctx.load_state()
+    assert state.data["rev"] == rev
+    assert state.get_seat("claude", "a@test")["usage"]["last_attempted_at"] == attempted
+    ctx.claude_cred("a@test").set_live(_claude(access="fresh", refresh="fresh-r"))
+    sel = launcher._verify_capacity(ctx, "claude", _counting(calls), at=now(), force=False,
+                                    exclude={"b@test"}, ua="test")
+    assert calls == ["Bearer fresh"] and sel.email == "a@test" and sel.available
+
+
 def test_codex_seat_with_its_login_removed_is_signed_out(ctx):
     for email in ("a@x.com", "b@x.com"):
         ctx.cred["codex"].set_live(make_codex_blob(email))

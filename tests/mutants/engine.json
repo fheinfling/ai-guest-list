@@ -159,5 +159,16 @@
    "file": "app/web/render.mjs",
    "old": "[\"ready\", \"active\"].includes(s.status) && !s.signed_out",
    "new": "[\"ready\", \"active\"].includes(s.status)",
-   "cmd": ["node", "--test", "--test-name-pattern=doorKey golden parity", "app/web/render.test.mjs"]}
+   "cmd": ["node", "--test", "--test-name-pattern=doorKey golden parity", "app/web/render.test.mjs"]},
+  {"label": "polling (launcher wait sweep): a signed-out seat is fetched anyway",
+   "file": "acctsw/launcher.py",
+   "old": "            u = (usage_mod.Usage(error=\"no_token\", fetched_at=iso(now())) if signin.signed_out\n                 else usage_mod._fetch_for(tool, blob, get, ua))",
+   "new": "            u = usage_mod._fetch_for(tool, blob, get, ua)",
+   "test": ["tests/test_signin.py::test_launcher_capacity_check_classifies_and_gates_the_same_way"]},
+
+  {"label": "polling (launcher wait sweep): identical dead bytes are re-read every sweep",
+   "file": "acctsw/launcher.py",
+   "old": "            if not force and usage_mod._dead_unchanged(prev, digest, at):\n                continue\n",
+   "new": "",
+   "test": ["tests/test_signin.py::test_launcher_capacity_check_classifies_and_gates_the_same_way"]}
 ]

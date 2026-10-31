@@ -308,20 +308,27 @@ def _verify_capacity(ctx: Context, tool: str, get, *, at, force: bool,
                                                 active=(state.active(tool) == email)):
                 continue
             blob = usage_mod._seat_blob(ctx, state, tool, email)
-            if blob:
-                pending.append((email, blob))
+            # Same verdict and dead-credential gate as the app's poll: a signed-out seat is
+            # recorded without a request, and identical dead bytes are not re-read until max backoff.
+            signin, digest = usage_mod._signin_for(ctx, tool, email, blob, at)
+            if not force and usage_mod._dead_unchanged(prev, digest, at):
+                continue
+            if blob or signin.signed_out:
+                pending.append((email, blob, signin, digest))
     results = []
-    for email, blob in pending:   # network — no lock held
+    for email, blob, signin, digest in pending:   # network — no lock held
         try:
             # Carry the EXACT blob the fetch used into store_fetch: it re-derives plan/account_id
             # from it, so a re-subscription is caught here too — not only on the menubar's poll.
-            results.append((email, blob, usage_mod._fetch_for(tool, blob, get, ua)))
+            u = (usage_mod.Usage(error="no_token", fetched_at=iso(now())) if signin.signed_out
+                 else usage_mod._fetch_for(tool, blob, get, ua))
+            results.append((email, blob, signin, digest, u))
         except Exception:
             pass  # a broken blob/transport must not kill the wait — the seat just isn't refreshed
     with ctx.locked():
         state = ctx.load_state()
         changed = False
-        for email, blob, u in results:
+        for email, blob, signin, digest, u in results:
             seat = state.get_seat(tool, email)
             if seat is None or usage_mod._seat_blob(ctx, state, tool, email) != blob:
                 continue  # removed, re-authenticated, or changed identity while the request ran
@@ -331,7 +338,8 @@ def _verify_capacity(ctx: Context, tool: str, get, *, at, force: bool,
             if previous_attempt and fetched_at and previous_attempt > fetched_at:
                 continue  # a newer GUI/launcher observation already superseded this result
             usage_mod.store_fetch(state, tool, email, u, at=at,
-                                  trust_reactive_lag=trust_reactive_lag, blob=blob)
+                                  trust_reactive_lag=trust_reactive_lag, blob=blob,
+                                  signin=signin, signin_digest=digest)
             changed = True
         # Trust the clock for markers the fetches did not re-stamp: clear EVERY seat whose rest has
         # expired by ``at`` (the old wait cleared only the one chosen seat, leaving stale siblings).
