@@ -58,6 +58,8 @@ class FakeSwap:
         self.used = True              # the child has sent /v1/messages through the proxy
         self.raising = set()          # method names that blow up
         self.tls_says_no = False      # a client in the child rejected the session CA
+        self.intercepts = 0           # handshakes with the session CA that went through
+        self.upstream_down = False    # the proxy has never got through to the API
         self.in_flight = 0            # the proxy's own view of the child's traffic
         self.idle = 999.0
         self.proxy = types.SimpleNamespace(in_flight=lambda: self.in_flight,
@@ -78,6 +80,12 @@ class FakeSwap:
 
     def tls_rejected(self):
         return self.tls_says_no
+
+    def intercepts_ok(self):
+        return self.intercepts
+
+    def upstream_failing(self, n=3):
+        return self.upstream_down
 
     def post(self, kind, seat, **kw):
         hit = Hit(kind, seat, **kw)
@@ -1328,6 +1336,13 @@ def test_a_cold_start_on_a_dead_seat_asks_and_waits_for_the_crossing(seats, toke
 
 # --- transport v2: a client that won't trust the session CA --------------------------------------
 
+def _transcript(ctx, session):
+    """Claude Code's transcript of ``session``: something was said in it, so it can be resumed."""
+    path = ctx._claude_real / "projects" / "-work" / f"{session}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"sessionId": "%s", "cwd": "/work"}\n' % session)
+
+
 def test_a_rejected_certificate_restarts_once_without_the_proxy(seats, tokens):
     """Nothing ever went through: Claude Code itself refused the CA. Restart it once on the same
     seat without the proxy env (resume) — and never again, however often it is asked."""
@@ -1335,16 +1350,117 @@ def test_a_rejected_certificate_restarts_once_without_the_proxy(seats, tokens):
     swap.used = False
 
     def rejected():
+        _transcript(seats, _session(spawn))   # the user had typed a prompt
         swap.tls_says_no = True
 
     spawn = Spawn(([rejected, None], 1), ([None, None, None], 0))
-    assert _run(seats, spawn, swap) == 0
+    notes = []
+    assert _run(seats, spawn, swap, notify=notes.append) == 0
     assert spawn.stops == 1 and len(spawn.calls) == 2
     assert spawn.calls[1][-2:] == ["--resume", _session(spawn)]
     assert spawn.envs[0]["HTTPS_PROXY"] == FakeSwap.PROXY_URL
     assert spawn.envs[1].get("HTTPS_PROXY") != FakeSwap.PROXY_URL
     assert spawn.wakes == [FakeSwap.wake_fd, None] and swap.stopped
     assert seats.load_state().active("claude") == C1
+    assert any("Claude Code didn't accept the session certificate, resuming" in n for n in notes)
+
+
+def test_a_brand_new_session_whose_certificate_is_rejected_starts_over_as_launched(seats, tokens):
+    """B2(a): nothing was said in it yet, so there is no transcript and `--resume` would fail.
+    Relaunch once with the original command, without the proxy, and say why."""
+    swap = FakeSwap()
+    swap.used = False
+    _transcript(seats, "someone-elses-session")
+
+    def rejected():
+        swap.tls_says_no = True
+
+    spawn = Spawn(([rejected, None], 1), ([None, None, None], 0))
+    notes = []
+    assert _run(seats, spawn, swap, notify=notes.append) == 0
+    assert spawn.stops == 1 and len(spawn.calls) == 2
+    assert spawn.calls[1] == spawn.calls[0]   # the original argv: same pinned id, no --resume
+    assert spawn.envs[1].get("HTTPS_PROXY") != FakeSwap.PROXY_URL and swap.stopped
+    assert notes[-1] == ("claude: restarted this session without seat switching because Claude "
+                         "Code didn't accept the session certificate ✨")
+
+
+def test_a_rejection_after_a_good_handshake_is_another_tool_and_never_restarts(seats, tokens):
+    """W1: a handshake with the session CA already went through, so the client refusing it is
+    some other tool in the session, even before Claude Code sent a message. No restart, only the
+    hops away from home stop."""
+    swap = FakeSwap()
+    swap.used = False
+    swap.intercepts = 1
+
+    def rejected():
+        swap.tls_says_no = True
+
+    spawn = Spawn(([rejected, None, None], 0))
+    notes = []
+    assert _run(seats, spawn, swap, notify=notes.append) == 0
+    assert spawn.stops == 0 and len(spawn.calls) == 1
+    assert sum("a tool in it doesn't accept the session certificate" in n for n in notes) == 1
+
+
+def test_an_unreachable_api_restarts_once_without_the_proxy(seats, tokens):
+    """W3: the proxy never got through to the API and Claude Code has sent nothing yet: restart
+    once without it (a brand-new session as launched), and never again."""
+    swap = FakeSwap()
+    swap.used = False
+
+    def down():
+        swap.upstream_down = True
+
+    spawn = Spawn(([down, None], 1), ([None, None, None], 0))
+    notes = []
+    assert _run(seats, spawn, swap, notify=notes.append) == 0
+    assert spawn.stops == 1 and len(spawn.calls) == 2
+    assert spawn.calls[1] == spawn.calls[0]
+    assert spawn.envs[1].get("HTTPS_PROXY") != FakeSwap.PROXY_URL and swap.stopped
+    assert any("couldn't reach Anthropic's API" in n for n in notes)
+
+
+def test_an_unreachable_api_restarts_once_even_after_messages_went_through(seats, tokens):
+    """W3: no request ever got through upstream, so every message the child sent failed: the
+    session is broken through the proxy. Restart once without it, resuming the conversation."""
+    swap = FakeSwap()
+
+    def down():
+        _transcript(seats, _session(spawn))
+        swap.upstream_down = True
+
+    spawn = Spawn(([down, None], 1), ([None, None, None], 0))
+    notes = []
+    assert _run(seats, spawn, swap, notify=notes.append) == 0
+    assert spawn.stops == 1 and len(spawn.calls) == 2
+    assert spawn.calls[1][-2:] == ["--resume", _session(spawn)]
+    assert spawn.envs[1].get("HTTPS_PROXY") != FakeSwap.PROXY_URL and swap.stopped
+    assert any("couldn't reach Anthropic's API, resuming" in n for n in notes)
+
+
+def test_in_place_off_still_goes_home_and_asks_maintain_for_no_third_seat(seats, tokens):
+    """W5: with hops off for this run, the child may still be carried back to its own login, and
+    maintain() may not pick a third seat."""
+    _drop(seats, C3)
+    swap = FakeSwap()
+    swap.intercepts = 1
+    hits, seen = [], []
+
+    def other_tool_rejects_and_home_rests_no_more():
+        swap.tls_says_no = True
+        st = seats.load_state()
+        st.get_seat("claude", C1).pop("limited_until")
+        st.save()
+
+    spawn = Spawn(([lambda: swap.post("limit", C1), None,
+                    other_tool_rejects_and_home_rests_no_more, None,
+                    lambda: (seen.append(swap.third_seat), hits.append(swap.post("limit", C2))),
+                    None], 0))
+    assert _run(seats, spawn, swap) == 0
+    assert swap.answers[0][1] == Seat(C2, "tok-c2") and spawn.stops == 0
+    assert seen == [False]
+    assert swap.answers[-1] == (hits[0], Seat(C1, None))
 
 
 def test_a_rejected_certificate_after_traffic_only_stops_the_hops(seats, tokens):

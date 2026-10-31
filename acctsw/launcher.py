@@ -1938,7 +1938,9 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         "tokens": {},       # seat -> the token last bound for it (an auth Hit re-reads against it)
         "dead": {},         # seat -> a token that got a 401: not served in place until it renews
         "handover": False,  # maintain() asked for a handover restart; waiting for a quiet child
-        "off": False,       # a client rejected the proxy's TLS: no more hops in place this run
+        "off": False,       # the proxy can't be trusted to carry the child: no hops away from home
+        "tls": False,       # a client rejected the proxy's TLS (handled once)
+        "upstream": False,  # the proxy never reached the API (handled once)
         "tls_restart": False,   # the one restart without the proxy env has been used
     }
     # Crossing business <-> personal needs the user's say-so. One request per move per session;
@@ -2122,6 +2124,13 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 resume_thread = candidates[0][1].get("sessionId")
             return bool(resume_thread)
 
+        def _claude_resumable() -> bool:
+            """Is there a conversation to resume? A brand-new session keeps the id it was pinned
+            to, but until something was said in it there is no transcript, and `--resume <id>`
+            would fail."""
+            return _capture_claude_resume() and any(
+                path.stem == resume_thread for path in _claude_transcripts(ctx))
+
         if initial_resting is not None:
             # No child has run yet. Even after waiting, honor the original invocation (including
             # a fresh prompt); only a handoff during a session should add resume.
@@ -2225,13 +2234,15 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         def _inplace_on(target: str | None = None) -> bool:
             """Can a hop be served in place at all right now? Only once the child has actually
             sent /v1/messages through the proxy (a client that ignores the base URL would be
-            billed to its own login whatever we bind), and within MAX_INPLACE_SWITCHES — except
-            that going back to the child's own login is always allowed."""
-            return (swap is not None and not inplace["off"]
-                    and (target == launch_email or inplace["hops"] < MAX_INPLACE_SWITCHES)
+            billed to its own login whatever we bind), and within MAX_INPLACE_SWITCHES while in
+            place is on for this run — except that going back to the child's own login is always
+            allowed."""
+            return (swap is not None
+                    and (target == launch_email
+                         or (not inplace["off"] and inplace["hops"] < MAX_INPLACE_SWITCHES))
                     and bool(_swapcall("proxy_used", default=False)))
 
-        def _hop_in_place(target: str, *, frm: str | None, spend: bool = True) -> str:
+        def _hop_in_place(target: str, *, frm: str | None) -> str:
             """Carry the LIVE child to ``target`` without a restart: point the proxy at that seat
             and commit the hop in state exactly as a restart would. HOPPED when done (answering
             the proxy Hit under decision, if any); NOT_SERVABLE when in place can't serve it
@@ -2241,8 +2252,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             commit itself failed (logged): a restart would only run into the same failure.
             Going back to the child's own login ignores the budget and the in_place_switch
             toggle: it is no switch at all, just the end of one.
-            ``spend=False`` is for the user's own click, which switch(manual=True) already
-            settled with seatkind."""
+            The user's own click spends too: one that crosses rode on a live approval, and a
+            "once" is gone after this move (a click that doesn't cross spends nothing)."""
             if not _inplace_on(target):
                 return NOT_SERVABLE
             seat = _proxy_seat(target)
@@ -2256,10 +2267,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                             target != launch_email
                             and not st.settings().get("in_place_switch", True)):
                         return NOT_SERVABLE
-                    if spend and not _spend_crossing(st, frm, target):
+                    if not _spend_crossing(st, frm, target):
                         return REFUSED
-                    if not spend:
-                        _withdraw_crossings(st)
                     switch(ctx, st, tool, target, sync=False, mirror=False, save=False)
                     st.data["last_switch_at"] = iso(now())
                     st.save()
@@ -2794,7 +2803,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                         return False
                     if not _seat_usable(target, frm=frm):
                         return False   # it rested or signed out since: nothing to take
-                served = _hop_in_place(target, frm=frm, spend=(reason != "manual"))
+                served = _hop_in_place(target, frm=frm)
                 if served in (HOPPED, STAY):
                     return False
                 if served == REFUSED:
@@ -2969,10 +2978,12 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     return False
                 before = running_seat()
                 # A handover is asked for afresh by every maintain(): None clears it.
-                # A third seat only while the in-place budget lasts (going home is always fine).
+                # A third seat only while in place is on and its budget lasts (going home is
+                # always fine).
                 inplace["handover"] = _swapcall(
                     "maintain", ctx,
-                    third_seat=inplace["hops"] < MAX_INPLACE_SWITCHES) == "handover"
+                    third_seat=(not inplace["off"]
+                                and inplace["hops"] < MAX_INPLACE_SWITCHES)) == "handover"
                 if running_seat() != before:
                     _follow_maintain(before, running_seat())
                 seat = running_seat()
@@ -3018,28 +3029,40 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 except Exception:
                     return False   # e.g. a locked keychain: no restart into "not logged in"
 
-            def _tls_rejected() -> bool:
-                """A client in the child refused the proxy's certificate. Hopping is over for this
-                run. If nothing ever went through the proxy, Claude Code itself is that client and
-                is talking to nobody: restart it once, without the proxy, on the same seat (with
-                resume). Otherwise it works and keeps running; only the hops stop. Never twice."""
-                if inplace["off"] or not _swapcall("tls_rejected", default=False):
+            def _proxy_trouble() -> bool:
+                """The proxy can't carry this child: a client in it refused the session
+                certificate, or the proxy never got through to the API. Hops away from home are
+                over for this run (each cause is handled once). If nothing of Claude Code's ever
+                went through, it is talking to nobody: restart it once, without the proxy, on the
+                same seat. An upstream that never once worked broke every request the child
+                sent, so it restarts the same way even after messages went through. A rejection
+                after a handshake that did succeed is some other tool in the session: never a
+                restart. Otherwise the child keeps running."""
+                if not inplace["tls"] and _swapcall("tls_rejected", default=False):
+                    inplace["tls"] = True
+                    why = "tls"
+                    other_tool = (_swapcall("intercepts_ok", default=0) or 0) > 0
+                elif not inplace["upstream"] and _swapcall("upstream_failing", default=False):
+                    inplace["upstream"] = True
+                    why, other_tool = "upstream", False
+                else:
                     return False
                 inplace["off"] = True
-                logging.getLogger(__name__).info("in-place switching off: TLS rejected")
-                if (not inplace["tls_restart"] and not _swapcall("proxy_used", default=False)
-                        and (tool != "claude" or _capture_claude_resume())):
+                logging.getLogger(__name__).info("in-place switching off: %s", why)
+                if (not other_tool and not inplace["tls_restart"]
+                        and (why == "upstream" or not _swapcall("proxy_used", default=False))):
                     inplace["tls_restart"] = True
-                    hit.update(reason="tls", email=launch_email, active=launch_email,
+                    hit.update(reason=why, email=launch_email, active=launch_email,
                                hard=False, handled=True)
                     return True
                 notify(f"{tool}: switching seats without a restart is off for this session "
-                       f"(a tool in it doesn't accept the switch's certificate)")
+                       + ("(a tool in it doesn't accept the session certificate)" if why == "tls"
+                          else "(the switch can't reach Anthropic's API)"))
                 return False
 
             def _tick() -> bool:
                 try:
-                    if swap is not None and (_tls_rejected() or _tick_swap()):
+                    if swap is not None and (_proxy_trouble() or _tick_swap()):
                         return True
                 except Exception:
                     # Belt and braces around the swap glue: whatever went wrong, the child lives.
@@ -3248,15 +3271,19 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 resuming = True
                 continue
 
-            if hit["reason"] == "tls":
-                # Claude Code would not accept the proxy's certificate, so nothing it sent ever
-                # arrived. Same seat, same session, now without the proxy — once per run.
-                notify(f"claude: restarting this session once without seat switching (it didn't "
-                       f"accept the switch's certificate), resuming your work ✨")
+            if hit["reason"] in ("tls", "upstream"):
+                # Claude Code would not accept the session certificate, or the proxy never got
+                # through: nothing it sent ever arrived. Same seat, now without the proxy — once
+                # per run. A session with a transcript resumes; a brand-new one has nothing to
+                # resume, so it starts again exactly as the user launched it.
+                resuming = _claude_resumable()
+                notify("claude: restarted this session without seat switching because "
+                       + ("Claude Code didn't accept the session certificate"
+                          if hit["reason"] == "tls" else "the switch couldn't reach Anthropic's API")
+                       + (", resuming your work ✨" if resuming else " ✨"))
                 _swapcall("stop")
                 swap = None
                 relaunch_seat = launch_email
-                resuming = True
                 continue
 
             if hit["reason"] == "handover":
@@ -3279,8 +3306,17 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                             or not ctx.snapshot_get(tool, target)):
                         notify(f"{tool}: selected seat is no longer available; resume after choosing a seat")
                         return status
-                    _commit_switch(state, target)
+                    # A click across business/personal rode on the user's approval: spend it.
+                    lapsed = not _spend_crossing(state, hit["frm"], target)
+                    if not lapsed:
+                        _commit_switch(state, target)
                     seen_manual_switch = state.data["tools"][tool].get("manual_switch")
+                if lapsed:
+                    # It lapsed while the child stopped: carry on where it was, and ask again.
+                    _ask_again(hit["frm"], target)
+                    relaunch_seat = hit["frm"]
+                    resuming = True
+                    continue
                 relaunch_seat = target
                 mark_session(ctx.data_dir, tool, target)
                 notify(f"{tool}: switching to {target}, resuming your work")

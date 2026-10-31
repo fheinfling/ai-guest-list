@@ -103,8 +103,8 @@
   {
     "label": "in-place: MAX_INPLACE_SWITCHES is not enforced",
     "file": "acctsw/launcher.py",
-    "old": "                    and (target == launch_email or inplace[\"hops\"] < MAX_INPLACE_SWITCHES)\n",
-    "new": "                    and True\n",
+    "old": "                         or (not inplace[\"off\"] and inplace[\"hops\"] < MAX_INPLACE_SWITCHES))",
+    "new": "                         or (not inplace[\"off\"] and True))",
     "test": [
       "tests/test_launcher_inplace.py::test_in_place_budget_is_enforced"
     ]
@@ -193,8 +193,8 @@
   {
     "label": "in-place: maintain()'s handover is ignored",
     "file": "acctsw/launcher.py",
-    "old": "                    third_seat=inplace[\"hops\"] < MAX_INPLACE_SWITCHES) == \"handover\"",
-    "new": "                    third_seat=inplace[\"hops\"] < MAX_INPLACE_SWITCHES) == \"never\"",
+    "old": "                                and inplace[\"hops\"] < MAX_INPLACE_SWITCHES)) == \"handover\"",
+    "new": "                                and inplace[\"hops\"] < MAX_INPLACE_SWITCHES)) == \"never\"",
     "test": [
       "tests/test_launcher_inplace.py::test_handover_restarts_on_the_bound_seats_own_login"
     ]
@@ -211,11 +211,12 @@
   {
     "label": "crossing: an in-place hop does not spend the approval it uses",
     "file": "acctsw/launcher.py",
-    "old": "                if spend and not _spend_crossing(st, frm, target):\n",
-    "new": "                if False:\n",
+    "old": "                    if not _spend_crossing(st, frm, target):\n                        return REFUSED\n",
+    "new": "                    if False:\n                        return REFUSED\n",
     "test": [
       "tests/test_launcher_inplace.py::test_real_rules_ask_then_carry_the_session_over_once_approved",
-      "tests/test_launcher_inplace.py::test_an_approval_refused_at_the_commit_never_kills_and_asks_again"
+      "tests/test_launcher_inplace.py::test_an_approval_refused_at_the_commit_never_kills_and_asks_again",
+      "tests/test_gaps_launcher.py::test_a_click_across_kinds_on_a_once_approval_spends_it"
     ]
   },
   {
@@ -611,8 +612,8 @@
   {
     "label": "round2 N6: going home is held to the in-place budget",
     "file": "acctsw/launcher.py",
-    "old": "                    and (target == launch_email or inplace[\"hops\"] < MAX_INPLACE_SWITCHES)\n",
-    "new": "                    and inplace[\"hops\"] < MAX_INPLACE_SWITCHES\n",
+    "old": "                    and (target == launch_email\n                         or (not inplace[\"off\"] and inplace[\"hops\"] < MAX_INPLACE_SWITCHES))",
+    "new": "                    and (not inplace[\"off\"] and inplace[\"hops\"] < MAX_INPLACE_SWITCHES)",
     "test": [
       "tests/test_launcher_inplace.py::test_going_home_ignores_the_budget_and_the_toggle"
     ]
@@ -668,7 +669,8 @@
     "old": "                        if kinds is not None and not kinds.approved(\n                                snap, tool, billed, target, now(), home=launch_email):",
     "new": "                        if False:",
     "test": [
-      "tests/test_launcher_inplace.py::test_a_click_across_kinds_asks_this_session_instead_of_moving_it"
+      "tests/test_launcher_inplace.py::test_a_click_across_kinds_asks_this_session_instead_of_moving_it",
+      "tests/test_gaps_launcher.py::test_a_codex_click_across_kinds_without_approval_asks_and_never_restarts"
     ]
   },
   {
@@ -683,7 +685,7 @@
   {
     "label": "maintain: a third seat is allowed whatever the in-place budget",
     "file": "acctsw/launcher.py",
-    "old": "                    third_seat=inplace[\"hops\"] < MAX_INPLACE_SWITCHES) == \"handover\"",
+    "old": "                    third_seat=(not inplace[\"off\"]\n                                and inplace[\"hops\"] < MAX_INPLACE_SWITCHES)) == \"handover\"",
     "new": "                    third_seat=True) == \"handover\"",
     "test": [
       "tests/test_launcher_inplace.py::test_maintain_may_pick_a_third_seat_only_while_the_budget_lasts"
@@ -701,7 +703,7 @@
   {
     "label": "tls: a rejected certificate is ignored",
     "file": "acctsw/launcher.py",
-    "old": "                    if swap is not None and (_tls_rejected() or _tick_swap()):",
+    "old": "                    if swap is not None and (_proxy_trouble() or _tick_swap()):",
     "new": "                    if swap is not None and _tick_swap():",
     "test": [
       "tests/test_launcher_inplace.py::test_a_rejected_certificate_restarts_once_without_the_proxy"
@@ -719,8 +721,8 @@
   {
     "label": "tls: a rejection restarts the child even though its traffic went through",
     "file": "acctsw/launcher.py",
-    "old": "                if (not inplace[\"tls_restart\"] and not _swapcall(\"proxy_used\", default=False)\n",
-    "new": "                if (not inplace[\"tls_restart\"]\n",
+    "old": "                        and (why == \"upstream\" or not _swapcall(\"proxy_used\", default=False))):",
+    "new": "                        and True):",
     "test": [
       "tests/test_launcher_inplace.py::test_a_rejected_certificate_after_traffic_only_stops_the_hops"
     ]
@@ -728,8 +730,8 @@
   {
     "label": "tls: hops in place go on after a rejection",
     "file": "acctsw/launcher.py",
-    "old": "            return (swap is not None and not inplace[\"off\"]\n",
-    "new": "            return (swap is not None\n",
+    "old": "                         or (not inplace[\"off\"] and inplace[\"hops\"] < MAX_INPLACE_SWITCHES))",
+    "new": "                         or inplace[\"hops\"] < MAX_INPLACE_SWITCHES)",
     "test": [
       "tests/test_launcher_inplace.py::test_a_rejected_certificate_after_traffic_only_stops_the_hops"
     ]
@@ -786,6 +788,115 @@
     "new": "                    if not os.read(wake_fd, 4096):   # a doorbell only: the bytes carry nothing\n                        pass",
     "test": [
       "tests/test_launcher_inplace.py::test_pty_spawn_stops_watching_a_wake_fd_whose_writer_is_gone"
+    ]
+  },
+  {
+    "label": "B2(a): a brand-new session whose certificate is rejected is resumed (and fails)",
+    "file": "acctsw/launcher.py",
+    "old": "                resuming = _claude_resumable()\n",
+    "new": "                resuming = True\n",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_brand_new_session_whose_certificate_is_rejected_starts_over_as_launched"
+    ]
+  },
+  {
+    "label": "B2(a): any transcript counts as this session's",
+    "file": "acctsw/launcher.py",
+    "old": "                path.stem == resume_thread for path in _claude_transcripts(ctx))",
+    "new": "                True for path in _claude_transcripts(ctx))",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_brand_new_session_whose_certificate_is_rejected_starts_over_as_launched"
+    ]
+  },
+  {
+    "label": "B2(a): a session with a transcript starts afresh instead of resuming",
+    "file": "acctsw/launcher.py",
+    "old": "                path.stem == resume_thread for path in _claude_transcripts(ctx))",
+    "new": "                False for path in _claude_transcripts(ctx))",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_rejected_certificate_restarts_once_without_the_proxy"
+    ]
+  },
+  {
+    "label": "B2(a): the restart notice blames a tool again",
+    "file": "acctsw/launcher.py",
+    "old": "                       + (\"Claude Code didn't accept the session certificate\"",
+    "new": "                       + (\"a tool in it didn't accept the switch's certificate\"",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_brand_new_session_whose_certificate_is_rejected_starts_over_as_launched"
+    ]
+  },
+  {
+    "label": "W1: a rejection after a good handshake still restarts the child",
+    "file": "acctsw/launcher.py",
+    "old": "                    other_tool = (_swapcall(\"intercepts_ok\", default=0) or 0) > 0\n",
+    "new": "                    other_tool = False\n",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_rejection_after_a_good_handshake_is_another_tool_and_never_restarts"
+    ]
+  },
+  {
+    "label": "W3: an unreachable API is ignored",
+    "file": "acctsw/launcher.py",
+    "old": "                elif not inplace[\"upstream\"] and _swapcall(\"upstream_failing\", default=False):\n",
+    "new": "                elif False:\n",
+    "test": [
+      "tests/test_launcher_inplace.py::test_an_unreachable_api_restarts_once_without_the_proxy"
+    ]
+  },
+  {
+    "label": "proxy trouble: hops away from home go on after it",
+    "file": "acctsw/launcher.py",
+    "old": "                inplace[\"off\"] = True\n                logging.getLogger(__name__).info(\"in-place switching off: %s\", why)",
+    "new": "                logging.getLogger(__name__).info(\"in-place switching off: %s\", why)",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_rejected_certificate_after_traffic_only_stops_the_hops"
+    ]
+  },
+  {
+    "label": "W5: hops off also stops going home",
+    "file": "acctsw/launcher.py",
+    "old": "            return (swap is not None\n                    and (target == launch_email\n",
+    "new": "            return (swap is not None and not inplace[\"off\"]\n                    and (target == launch_email\n",
+    "test": [
+      "tests/test_launcher_inplace.py::test_in_place_off_still_goes_home_and_asks_maintain_for_no_third_seat"
+    ]
+  },
+  {
+    "label": "W5: maintain may pick a third seat with hops off",
+    "file": "acctsw/launcher.py",
+    "old": "                    third_seat=(not inplace[\"off\"]\n                                and inplace[\"hops\"]",
+    "new": "                    third_seat=(True\n                                and inplace[\"hops\"]",
+    "test": [
+      "tests/test_launcher_inplace.py::test_in_place_off_still_goes_home_and_asks_maintain_for_no_third_seat"
+    ]
+  },
+  {
+    "label": "LOW: a codex click across kinds commits without spending its approval",
+    "file": "acctsw/launcher.py",
+    "old": "                    lapsed = not _spend_crossing(state, hit[\"frm\"], target)\n",
+    "new": "                    lapsed = False\n",
+    "test": [
+      "tests/test_gaps_launcher.py::test_a_codex_click_across_kinds_spends_the_once_approval_at_the_commit",
+      "tests/test_gaps_launcher.py::test_a_codex_click_whose_approval_lapses_while_stopping_resumes_where_it_was"
+    ]
+  },
+  {
+    "label": "LOW: a codex click whose approval lapsed restarts on the clicked seat anyway",
+    "file": "acctsw/launcher.py",
+    "old": "                if lapsed:\n",
+    "new": "                if False:\n",
+    "test": [
+      "tests/test_gaps_launcher.py::test_a_codex_click_whose_approval_lapses_while_stopping_resumes_where_it_was"
+    ]
+  },
+  {
+    "label": "W3: an unreachable API after messages went through only stops the hops",
+    "file": "acctsw/launcher.py",
+    "old": "                        and (why == \"upstream\" or not _swapcall(\"proxy_used\", default=False))):",
+    "new": "                        and not _swapcall(\"proxy_used\", default=False)):",
+    "test": [
+      "tests/test_launcher_inplace.py::test_an_unreachable_api_restarts_once_even_after_messages_went_through"
     ]
   }
 ]
