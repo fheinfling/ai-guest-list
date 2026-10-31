@@ -67,8 +67,9 @@ def switch(ctx: Context, state: State, tool: str, email: str, *, sync: bool = Tr
 
     ``sync=False`` skips sync-back from the stock mirror. Both supervised tools maintain their
     own homes; ``mirror=False`` also leaves stock credentials alone (supervised Claude hops).
-    ``manual=True`` records a request for supervised sessions to resume on the selected seat, and
-    answers any business/personal crossing question onto it: the user chose it.
+    ``manual=True`` records a request for supervised sessions to resume on the selected seat. It
+    answers the business/personal question for sessions whose move does not cross and raises one
+    (``seatkind.request``, session id = the supervisor's pid) for each session it would cross.
     ``save=False`` lets a lock-owning caller persist additional hop metadata in the same write.
     """
     if email not in state.accounts(tool):
@@ -102,7 +103,6 @@ def switch(ctx: Context, state: State, tool: str, email: str, *, sync: bool = Tr
             state.data["tools"][tool]["captured_stock_digest"] = _claude_digest(blob)
 
     # 3. record active
-    previous = state.active(tool)
     state.set_active(tool, email)
     state.set_last_on_floor(tool, email, iso(now()))
     if manual:
@@ -113,14 +113,23 @@ def switch(ctx: Context, state: State, tool: str, email: str, *, sync: bool = Tr
         state.data["tools"][tool]["manual_switch"] = {
             "id": int(state.data.get("rev", 0)) + 1, "email": email,
         }
-        # The user picked this seat: that answers any open business/personal question onto it,
-        # from the seat the app was on and from every seat a terminal bills. The launcher moves
-        # its child on this click without asking; no approval is left to authorize a later
-        # automatic crossing.
+        # The user picked this seat. For a terminal whose move onto it does not cross business/
+        # personal (or takes it back to its own home seat) that answers any open question; such
+        # terminals move on this click. A terminal it WOULD cross is asked instead: the click
+        # names a seat, not every running session's account. No approval is left behind.
         from . import seatkind
         from .session import active_sessions
-        origins = {previous, *(s["email"] for s in active_sessions(ctx.data_dir, tool))}
-        for origin in sorted(o for o in origins if o and o != email):
-            seatkind.chosen(state, tool, origin, email)
+        sessions = sorted(active_sessions(ctx.data_dir, tool), key=lambda s: s["pid"])
+        asks = []
+        for record in sessions:
+            origin, home = record["email"], record.get("home") or record["email"]
+            if origin == email:
+                continue
+            if seatkind.crosses(state, tool, origin, email, home=home):
+                asks.append((origin, str(record["pid"]), home))
+            else:
+                seatkind.chosen(state, tool, origin, email)
+        for origin, sid, home in asks:   # after chosen(), which closes a direction's requests
+            seatkind.request(state, tool, origin, email, sid, home=home)
     if save:
         state.save()
