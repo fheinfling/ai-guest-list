@@ -395,7 +395,7 @@ def test_a_version_timeout_falls_back_to_the_path_alone(ctx, tmp_path, monkeypat
     env = _fake_claude(tmp_path)
     monkeypatch.setattr(seatswap, "VERSION_TIMEOUT_S", 0.0001)
     (tmp_path / "bin" / "claude").write_text("#!/bin/sh\nsleep 2\n")
-    key = seatswap._claude_key(env)
+    key = seatswap._claude_key(ctx, env)
     assert key == str((tmp_path / "bin" / "claude").resolve())
 
 
@@ -477,20 +477,86 @@ def test_upstream_failing_needs_a_streak_and_no_prior_success(ctx):
     assert not swap.upstream_failing()
     proxy.failures = 3
     assert swap.upstream_failing() and not swap.upstream_failing(4) and swap.upstream_failing(1)
-    proxy.failures, proxy.seen = 0, 5
+    proxy.failures, proxy.successes = 0, 5
     assert not swap.upstream_failing()      # a working session is latched...
     proxy.failures = 9
     assert not swap.upstream_failing()      # ...so a later streak is not "never worked"
     swap.stop()
 
 
+def test_messages_seen_alone_is_not_an_upstream_success(ctx):
+    swap, proxy, _ = make(ctx)
+    proxy.seen, proxy.failures = 4, 3
+    assert swap.upstream_failing()
+    swap.stop()
+
+
+def test_upstream_failing_marks_the_preflight_cache_failed_once(ctx):
+    swap, proxy, _ = make(ctx)
+    assert swap.preflight() is None                       # caches ok
+    proxy.failures = 3
+    assert swap.upstream_failing()
+    assert swap.preflight() == "upstream failing: no request succeeded"
+    path = ctx.data_dir / seatswap.PREFLIGHT_CACHE
+    stamp = json.loads(path.read_text())
+    swap.upstream_failing()
+    assert json.loads(path.read_text()) == stamp
+    assert swap.preflight() == "upstream failing: no request succeeded"   # marked only once
+    swap.stop()
+
+
+def test_a_reject_after_a_good_handshake_is_another_tool_and_not_remembered(ctx, tmp_path):
+    env = _fake_claude(tmp_path)
+    swap, proxy, _ = make(ctx, environ=env)
+    proxy.ok = 1
+    swap._on_tls_reject("alert unknown ca")
+    assert swap.tls_rejected()
+    assert not (ctx.data_dir / seatswap.VERDICT_FILE).exists()
+    assert seatswap.gate(ctx, env, cwd=tmp_path) is None
+    swap.stop()
+
+
 def test_maintain_latches_that_the_upstream_worked(ctx):
     swap, proxy, _ = make(ctx)
-    proxy.failures, proxy.seen = 0, 1
+    proxy.successes = 1
     swap.maintain()
-    proxy.failures = 5
+    proxy.successes, proxy.failures = 0, 5
     assert not swap.upstream_failing()
     swap.stop()
+
+
+def test_the_verdict_is_keyed_on_the_launchers_claude_not_path(ctx, tmp_path, monkeypatch):
+    env = _fake_claude(tmp_path)
+    other = tmp_path / "other"
+    other.mkdir()
+    exe = other / "claude"
+    exe.write_text("#!/bin/sh\necho 9\n")
+    exe.chmod(0o755)
+    monkeypatch.setattr(ctx, "claude_bin", str(exe), raising=False)
+    swap, _, _ = make(ctx, environ=env)
+    swap._on_tls_reject("x")
+    [key] = json.loads((ctx.data_dir / seatswap.VERDICT_FILE).read_text())
+    assert key.startswith(str(exe.resolve()))
+    swap.stop()
+
+
+def test_gate_does_not_run_claude_without_a_live_verdict(ctx, tmp_path, monkeypatch):
+    env = _fake_claude(tmp_path)
+    calls = []
+    monkeypatch.setattr(seatswap, "_claude_key", lambda *a: calls.append(1) or "k")
+    assert seatswap.gate(ctx, env, cwd=tmp_path) is None
+    (ctx.data_dir / seatswap.VERDICT_FILE).write_text(json.dumps({"k": iso(now() - timedelta(days=8))}))
+    assert seatswap.gate(ctx, env, cwd=tmp_path) is None
+    assert calls == []
+    (ctx.data_dir / seatswap.VERDICT_FILE).write_text(json.dumps({"k": iso(now())}))
+    assert seatswap.gate(ctx, env, cwd=tmp_path) == "client rejected the session certificate"
+    assert calls == [1]
+
+
+@pytest.mark.parametrize("name", ["NO_PROXY", "no_proxy"])
+def test_a_process_no_proxy_star_gates_off(ctx, tmp_path, name):
+    assert seatswap.gate(ctx, {name: "corp, *"}, cwd=tmp_path) == "NO_PROXY=* bypasses the proxy"
+    assert seatswap.gate(ctx, {name: "corp"}, cwd=tmp_path) is None
 
 
 def test_no_proxy_is_merged_deduplicated_and_written_to_both(ctx):

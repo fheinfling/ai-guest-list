@@ -238,6 +238,10 @@ class FakeProxy:
 
     ok = 0
     failures = 0
+    successes = 0
+
+    def upstream_successes(self):
+        return self.successes
 
     def intercepts_ok(self):
         return self.ok
