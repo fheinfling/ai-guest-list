@@ -1627,3 +1627,315 @@ def test_tcp_blind_tunnel_to_another_host(loopback_only, session_ca):
         proxy.stop()
         echo.close()
     assert b"".join(received) == payload
+
+
+# --- round 3: what a TLS failure means, counters -----------------------------------------------
+
+class _FailingCtx:
+    """A server context whose handshake fails with ``exc``."""
+
+    def __init__(self, exc):
+        self.exc = exc
+
+    def wrap_socket(self, sock, server_side):
+        raise self.exc
+
+
+def _ssl_error(reason):
+    e = SP.ssl.SSLError(1, f"[SSL: {reason}] handshake failed")
+    e.reason = reason
+    return e
+
+
+def _handshake_outcome(proxy, events=("tls_reject", "tls_handshake_failed")):
+    """CONNECT to the API and wait until the proxy has logged how the handshake ended."""
+    done = threading.Semaphore(0)
+    log = proxy._log_fn
+    proxy._log_fn = lambda event, **f: (log(event, **f), event in events and done.release())
+    sock, status, _ = _connect(proxy, "api.anthropic.com:443")
+    sock.close()
+    assert status == 200 and done.acquire(timeout=10)
+
+
+@pytest.mark.parametrize("reason", ["TLSV1_ALERT_UNKNOWN_CA", "SSLV3_ALERT_BAD_CERTIFICATE",
+                                    "SSLV3_ALERT_CERTIFICATE_UNKNOWN",
+                                    "SSLV3_ALERT_UNSUPPORTED_CERTIFICATE", "TLSV1_ALERT_ACCESS_DENIED"])
+def test_certificate_alerts_are_a_tls_reject(reason):
+    rejects = []
+    ca = SimpleCA(_FailingCtx(_ssl_error(reason)))
+    proxy = SeatProxy(lambda hit: None, ca=ca, on_tls_reject=rejects.append)
+    _handshake_outcome(proxy)
+    assert rejects == [reason] and proxy.intercepts_ok() == 0
+
+
+@pytest.mark.parametrize("exc", [SP.ssl.SSLEOFError(8, "EOF occurred in violation of protocol"),
+                                 _ssl_error("HTTP_REQUEST"), _ssl_error("WRONG_VERSION_NUMBER")])
+def test_other_handshake_failures_are_not_a_tls_reject(exc):
+    rejects, logs = [], []
+    proxy = SeatProxy(lambda hit: None, ca=SimpleCA(_FailingCtx(exc)), on_tls_reject=rejects.append,
+                      log=lambda event, **f: logs.append(event))
+    _handshake_outcome(proxy)
+    assert rejects == [] and "tls_handshake_failed" in logs and "tls_reject" not in logs
+
+
+@pytest.mark.parametrize("first", [b"GET / HTTP/1.1\r\nHost: api.anthropic.com\r\n\r\n", b""])
+def test_plain_http_or_a_hang_up_after_connect_is_not_a_tls_reject(first, session_ca):
+    rejects = []
+    proxy = SeatProxy(lambda hit: None, ca=session_ca, on_tls_reject=rejects.append)
+    sock, status, _ = _connect(proxy, "api.anthropic.com:443")
+    with sock:
+        assert status == 200
+        if first:
+            sock.sendall(first)
+        else:
+            sock.shutdown(socket.SHUT_WR)
+        while sock.recv(65536):    # the proxy gives up on the handshake and closes
+            pass
+    assert rejects == [] and proxy.intercepts_ok() == 0
+
+
+class SimpleCA:
+    def __init__(self, ctx):
+        self.ctx = ctx
+
+    def server_context(self):
+        return self.ctx
+
+
+def test_intercepts_ok_counts_completed_handshakes_only(session_ca):
+    h = Harness()
+    h.proxy._ca = session_ca
+    for _ in range(2):
+        sock, status, _ = _connect(h.proxy, "api.anthropic.com:443")
+        conn = http.client.HTTPConnection("api.anthropic.com", 443, timeout=10)
+        conn.sock = _tls(sock, session_ca)
+        resp, _ = _oauth_post(conn)
+        conn.close()
+        assert (status, resp.status) == (200, 200)
+    sock, _, _ = _connect(h.proxy, "api.anthropic.com:443")
+    with pytest.raises(SP.ssl.SSLError):
+        _tls(sock, None)
+    sock.close()
+    assert h.proxy.intercepts_ok() == 2
+
+
+def test_upstream_failures_count_in_a_row_and_reset_on_an_answer():
+    h = Harness()
+    h.t.fail = [OSError("connection refused"), SP.ssl.SSLError(1, "certificate verify failed")]
+    assert [h.send()[0].status for _ in range(2)] == [502, 502]
+    assert h.proxy.upstream_failures() == 2
+    h.send()
+    assert h.proxy.upstream_failures() == 0
+
+
+def test_upstream_failures_ignore_a_stale_pooled_retry_and_failures_after_the_send():
+    h = Harness()
+    h.t.idle.append(FakeConn(h.t, True))
+    h.t.fail = [OSError("stale"), OSError("refused")]    # the pooled socket, then the fresh one
+    assert h.send()[0].status == 502
+    assert h.proxy.upstream_failures() == 1
+    h.send()
+    h.t.fail_response = [ConnectionResetError("reset while waiting for the answer")]
+    assert h.send()[0].status == 502
+    assert h.proxy.upstream_failures() == 0    # it was reached: not a connect failure
+
+
+# --- round 3: WebSocket upgrades inside the intercepted tunnel --------------------------------
+
+WS_KEY = "dGhlIHNhbXBsZSBub25jZQ=="
+
+
+class WsUpstream:
+    """api.anthropic.com for an upgrade, over TLS from the session CA: reads one request head byte
+    by byte (bytes sent with it stay unread), answers ``reply`` in one write (one TLS record), then
+    echoes with an ``echo:`` prefix until the far side closes."""
+
+    def __init__(self, monkeypatch, ca, reply: bytes):
+        self.ca = ca
+        self.reply = reply
+        self.heads: list[str] = []
+        self.received = b""
+        self.addresses: list = []
+        monkeypatch.setattr(socket, "create_connection", self.create_connection)
+
+    def create_connection(self, address, *args, **kwargs):
+        self.addresses.append(tuple(address))
+        a, b = socket.socketpair()
+        threading.Thread(target=self._serve, args=(b,), daemon=True).start()
+        return a
+
+    def _serve(self, raw):
+        try:
+            with self.ca.server_context().wrap_socket(raw, server_side=True) as sock:
+                head = b""
+                while b"\r\n\r\n" not in head:
+                    data = sock.recv(1)
+                    if not data:
+                        return
+                    head += data
+                self.heads.append(head.decode("latin-1"))
+                sock.sendall(self.reply)
+                while data := sock.recv(65536):
+                    self.received += data
+                    sock.sendall(b"echo:" + data)
+        except OSError:
+            pass
+
+
+def _ws_proxy(session_ca, **kwargs):
+    proxy = SeatProxy(lambda hit: None, ca=session_ca, **kwargs)
+    proxy._transport.ssl = SP.ssl.create_default_context(cafile=session_ca.ca_path)
+    proxy.bind(B)
+    return proxy
+
+
+def _ws_open(proxy, session_ca, target="/api/ws/speech_to_text/voice_stream?language=en", early=b""):
+    sock, status, _ = _connect(proxy, "api.anthropic.com:443")
+    assert status == 200
+    tls = _tls(sock, session_ca)
+    head = [f"GET {target} HTTP/1.1", "Host: api.anthropic.com", "Connection: Upgrade",
+            "Upgrade: websocket", "Sec-WebSocket-Version: 13", f"Sec-WebSocket-Key: {WS_KEY}",
+            f"Authorization: Bearer {CLIENT_TOKEN}", "anthropic-beta: oauth-2025-04-20",
+            "Proxy-Authorization: Basic c3RyYXk6aGVhZGVy"]
+    tls.sendall(("\r\n".join(head) + "\r\n\r\n").encode() + early)    # one TLS record
+    return tls
+
+
+def _read_until(sock, marker: bytes) -> bytes:
+    """What arrives until ``marker`` or the end of the stream (a TLS read on a socketpair the far end
+    closed can end in EPIPE instead of EOF)."""
+    got = b""
+    while marker not in got:
+        try:
+            data = sock.recv(65536)
+        except (BrokenPipeError, ConnectionResetError):
+            break
+        if not data:
+            break
+        got += data
+    return got
+
+
+SWITCH = (b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+          b"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n")
+
+
+def test_websocket_upgrade_is_relayed_verbatim_and_spliced(monkeypatch, no_proxy_env, session_ca):
+    up = WsUpstream(monkeypatch, session_ca, SWITCH + b"first-frame")
+    proxy = _ws_proxy(session_ca)
+    proxy._upstream_failures = 2                   # an answered upgrade resets the count
+    with _ws_open(proxy, session_ca, early=b"early-frame") as tls:
+        got = _read_until(tls, b"echo:early-frame")
+        head, _, rest = got.partition(b"\r\n\r\n")
+        assert head.startswith(b"HTTP/1.1 101 ")
+        for line in (b"Upgrade: websocket", b"Connection: Upgrade", b"Sec-WebSocket-Accept: "):
+            assert line in head
+        # Bytes the TLS layer had already decrypted on either side: copied before select() waits.
+        assert rest == b"first-frame" + b"echo:early-frame"
+        tls.sendall(b"later")
+        assert _read_until(tls, b"echo:later").endswith(b"echo:later")
+    [sent] = up.heads
+    assert sent.startswith("GET /api/ws/speech_to_text/voice_stream?language=en HTTP/1.1\r\n")
+    for line in ("Host: api.anthropic.com", "Connection: Upgrade", "Upgrade: websocket",
+                 f"Sec-WebSocket-Key: {WS_KEY}", f"Authorization: Bearer {CLIENT_TOKEN}"):
+        assert line + "\r\n" in sent
+    assert "proxy-authorization" not in sent.lower()
+    assert B.token not in sent                     # an upgrade never carries a seat token
+    assert up.addresses == [("api.anthropic.com", 443)]
+    assert proxy.messages_seen() == 0 and proxy.upstream_failures() == 0
+
+
+def test_a_refused_upgrade_is_relayed_and_the_connection_closes(monkeypatch, no_proxy_env, session_ca):
+    body = b'{"type":"error","error":{"type":"permission_error"}}'
+    up = WsUpstream(monkeypatch, session_ca, b"HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\n"
+                    b"Connection: keep-alive\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n"
+                    + body)
+    proxy = _ws_proxy(session_ca)
+    with _ws_open(proxy, session_ca) as tls:
+        got = _read_until(tls, b"\x00never")      # until the proxy closes: the upstream does not
+    head, _, rest = got.partition(b"\r\n\r\n")
+    assert head.startswith(b"HTTP/1.1 403 ") and rest == body
+    assert b"keep-alive" not in head.lower()
+    assert len(up.heads) == 1
+
+
+@pytest.mark.parametrize("failure", ["refused", "untrusted"])
+def test_an_unreachable_upgrade_upstream_answers_502_and_counts(failure, monkeypatch, no_proxy_env,
+                                                                 session_ca):
+    up = WsUpstream(monkeypatch, session_ca, SWITCH)
+    proxy = _ws_proxy(session_ca)
+    if failure == "refused":
+        def refuse(*_args, **_kwargs):
+            raise ConnectionRefusedError("refused")
+        monkeypatch.setattr(socket, "create_connection", refuse)
+    else:
+        proxy._transport.ssl = SP.ssl.create_default_context()    # does not trust the fake API
+    with _ws_open(proxy, session_ca) as tls:
+        got = _read_until(tls, b"\x00never")
+    assert got.startswith(b"HTTP/1.1 502 ")
+    assert proxy.upstream_failures() == 1 and up.heads == []
+
+
+def test_an_upgrade_needs_an_origin_form_target(monkeypatch, no_proxy_env, session_ca):
+    up = WsUpstream(monkeypatch, session_ca, SWITCH)
+    proxy = _ws_proxy(session_ca)
+    with _ws_open(proxy, session_ca, target="http://api.anthropic.com/api/ws") as tls:
+        got = _read_until(tls, b"\x00never")
+    assert got.startswith(b"HTTP/1.1 403 ") and up.addresses == []
+
+
+# --- round 3: tunnels ----------------------------------------------------------------------------
+
+def test_connect_200_has_no_content_length(monkeypatch, session_ca):
+    FarEnd(monkeypatch)
+    proxy = SeatProxy(lambda hit: None, ca=session_ca)
+    for target in ("example.com:443", "api.anthropic.com:443"):
+        sock, status, head = _connect(proxy, target)
+        sock.close()
+        assert status == 200 and "content-length" not in head.lower()
+
+
+def test_a_quiet_tunnel_is_not_cut(monkeypatch):
+    monkeypatch.setattr(SP, "CLIENT_IDLE_TIMEOUT", 0.1)
+    FarEnd(monkeypatch)
+    proxy = SeatProxy(lambda hit: None)
+    sock, status, _ = _connect(proxy, "example.com:443")
+    with sock:
+        assert status == 200
+        time.sleep(0.6)                   # several idle timeouts of a keep-alive client connection
+        assert _echo(sock, b"still here") == b"still here"
+
+
+def test_a_tunnel_peer_that_stops_reading_ends_the_tunnel(monkeypatch):
+    monkeypatch.setattr(SP, "TUNNEL_SEND_TIMEOUT", 0.3)
+    far_ends = []
+
+    def create_connection(address, *args, **kwargs):
+        a, b = socket.socketpair()
+        far_ends.append(b)
+        return a
+    monkeypatch.setattr(socket, "create_connection", create_connection)
+    proxy = SeatProxy(lambda hit: None)
+    sock, status, _ = _connect(proxy, "example.com:443")    # and never reads again
+    with sock:
+        assert status == 200
+        far = far_ends[0]
+        far.settimeout(10)
+        with pytest.raises((BrokenPipeError, ConnectionResetError)):
+            for _ in range(100000):
+                far.sendall(b"x" * 65536)
+        far.close()
+
+
+def test_upstream_proxy_connect_brackets_ipv6_literals(monkeypatch, no_proxy_env):
+    proxy = SeatProxy(lambda hit: None, upstream_proxy="http://corp.proxy:3128")
+    far = FarEnd(monkeypatch, proxy_reply=b"HTTP/1.1 200 Connection established\r\n\r\n")
+    sock, status, _ = _connect(proxy, "[2001:db8::1]:443")
+    with sock:
+        assert status == 200 and _echo(sock, b"v6") == b"v6"
+    [connect] = far.connects
+    assert connect.startswith("CONNECT [2001:db8::1]:443 HTTP/1.1\r\nHost: [2001:db8::1]:443\r\n")
+
+
+def test_the_listener_queues_a_burst_of_connections():
+    assert SP._Server.request_queue_size >= 128
