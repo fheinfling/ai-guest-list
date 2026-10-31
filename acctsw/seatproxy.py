@@ -1,13 +1,25 @@
 """Local seat proxy: a running Claude Code session continues on another seat without a restart.
 
 Each launcher run owns one :class:`SeatProxy`, a ``ThreadingHTTPServer`` on ``127.0.0.1:0``. The
-child gets ``ANTHROPIC_BASE_URL=<start()>``, a URL whose path is a random per-run secret; a request
-for any other path gets a 403. Every request is forwarded to ``upstream`` with the client's own
-headers, except ``POST /v1/messages`` and ``POST /v1/messages/count_tokens``: those carry the token
-of the BOUND seat when it has one. A seat without a token is the client's own login (the home seat),
-so a proxy bound to home is a pure passthrough. Only a request that authenticates the way Claude
-Code's own login does (``Authorization: Bearer``, no ``x-api-key``) is ever given a seat token: an
-SDK script or MCP server in the child inherits the base URL too and must reach upstream unchanged.
+child gets ``HTTPS_PROXY=<start()>``, ``http://acctsw:<secret>@127.0.0.1:<port>``, so Claude Code
+keeps talking to api.anthropic.com itself and stays a first-party client. The listener accepts
+``CONNECT host:port`` with that Basic ``Proxy-Authorization`` (anything else: 407, then close):
+
+- ``CONNECT api.anthropic.com:443`` (the upstream's own host and port) with a per-run ``ca``: the
+  client's TLS is terminated with ``ca.server_context()`` and its requests are served below. A
+  client that rejects the certificate reports through ``on_tls_reject(reason)``, once.
+- any other host, or no ``ca``: a blind byte tunnel. Never decrypted.
+
+Both go out directly or through ``upstream_proxy`` (the user's own proxy) by CONNECT, unless the
+launcher's ``NO_PROXY`` exempts the host. Plain requests under the random path ``/<secret>/`` are
+still served the same way (the base-URL transport, kept for tests); any other path gets a 403.
+
+Every decrypted request is forwarded to ``upstream`` with the client's own headers, except
+``POST /v1/messages`` and ``POST /v1/messages/count_tokens``: those carry the token of the BOUND
+seat when it has one. A seat without a token is the client's own login (the home seat), so a proxy
+bound to home is a pure passthrough. Only a request that authenticates the way Claude Code's own
+login does (``Authorization: Bearer``, no ``x-api-key``, ``oauth-`` in ``anthropic-beta``) is ever
+given a seat token: SDK scripts and MCP servers in the child inherit the proxy too.
 
 Before the first response byte reaches the client, two upstream answers are replayed instead of
 passed on, at most once per seat credential:
@@ -32,6 +44,7 @@ import json
 import os
 import secrets
 import select
+import socket
 import ssl
 import threading
 import time
@@ -52,6 +65,7 @@ MAX_TRIES = 8                  # upstream sends per request, whatever ``decide``
 UPSTREAM_TIMEOUT = 660.0       # long thinking pauses between SSE events
 CLIENT_IDLE_TIMEOUT = 900.0    # an idle keep-alive client connection frees its thread after this
 CHUNK = 65536
+PROXY_USER = "acctsw"
 
 
 @dataclass(frozen=True)
@@ -144,14 +158,45 @@ def _tls_context() -> ssl.SSLContext:
     return ctx
 
 
-def _tunnel_proxy(scheme: str, host: str) -> str | None:
-    """The ``HTTPS_PROXY``/``HTTP_PROXY`` to tunnel through, unless ``NO_PROXY`` exempts ``host``.
+def _parse_proxy(proxy: str | None, host: str) -> tuple[str, int, dict] | None:
+    """``(host, port, CONNECT headers)`` of ``proxy`` for reaching ``host``, or None to go direct
+    (no proxy, or the launcher's own ``NO_PROXY`` exempts ``host``).
 
-    Environment only: the macOS system proxy settings are not consulted."""
-    env = urllib.request.getproxies_environment()
-    if urllib.request.proxy_bypass_environment(host, env):
+    The proxy is passed in, never read from ``HTTPS_PROXY``: in the child that names this proxy."""
+    if not proxy or urllib.request.proxy_bypass_environment(host, urllib.request.getproxies_environment()):
         return None
-    return env.get(scheme) or env.get("all") or None
+    p = urlsplit(proxy if "://" in proxy else f"http://{proxy}")
+    if not p.hostname:
+        return None
+    headers = {}
+    if p.username:
+        cred = f"{unquote(p.username)}:{unquote(p.password or '')}".encode()
+        headers["Proxy-Authorization"] = "Basic " + base64.b64encode(cred).decode()
+    return p.hostname, p.port or 8080, headers
+
+
+def _connect_via(proxy: tuple[str, int, dict] | None, host: str, port: int, timeout: float) -> socket.socket:
+    """A TCP connection to ``host:port``: direct, or a CONNECT tunnel through ``proxy``."""
+    if proxy is None:
+        return socket.create_connection((host, port), timeout=timeout)
+    sock = socket.create_connection((proxy[0], proxy[1]), timeout=timeout)
+    try:
+        lines = [f"CONNECT {host}:{port} HTTP/1.1", f"Host: {host}:{port}"]
+        lines += [f"{k}: {v}" for k, v in proxy[2].items()]
+        sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1"))
+        head = b""
+        while b"\r\n\r\n" not in head:
+            data = sock.recv(1)    # byte by byte: what follows the reply belongs to the tunnel
+            if not data or len(head) > 65536:
+                raise OSError("upstream proxy closed during CONNECT")
+            head += data
+        status = head.split(b"\r\n", 1)[0].split()
+        if len(status) < 2 or status[1] != b"200":
+            raise OSError(f"upstream proxy refused CONNECT: {head.split(b'\r\n', 1)[0][:100]!r}")
+        return sock
+    except BaseException:
+        sock.close()
+        raise
 
 
 def _dropped(conn) -> bool:
@@ -168,7 +213,7 @@ def _dropped(conn) -> bool:
 class _Upstream:
     """Keep-alive connections to one origin, through a CONNECT tunnel when a proxy is configured."""
 
-    def __init__(self, url: str, timeout: float = UPSTREAM_TIMEOUT):
+    def __init__(self, url: str, timeout: float = UPSTREAM_TIMEOUT, proxy: str | None = None):
         u = urlsplit(url)
         if u.scheme not in ("http", "https") or not u.hostname:
             raise ValueError(f"upstream must be an http(s) URL, got {url!r}")
@@ -179,15 +224,8 @@ class _Upstream:
         self.base = u.path.rstrip("/")
         self.timeout = timeout
         self.ssl = _tls_context() if self.https else None
-        self.tunnel: tuple[str, int, dict] | None = None
-        proxy = _tunnel_proxy(u.scheme, self.host)
-        if proxy:
-            p = urlsplit(proxy if "://" in proxy else f"http://{proxy}")
-            headers = {}
-            if p.username:
-                cred = f"{unquote(p.username)}:{unquote(p.password or '')}".encode()
-                headers["Proxy-Authorization"] = "Basic " + base64.b64encode(cred).decode()
-            self.tunnel = (p.hostname, p.port or 8080, headers)
+        self.proxy = proxy
+        self.tunnel = _parse_proxy(proxy, self.host)
         self._idle: list[http.client.HTTPConnection] = []
         self._lock = threading.Lock()
 
@@ -217,6 +255,10 @@ class _Upstream:
     def release(self, conn) -> None:
         with self._lock:
             self._idle.append(conn)
+
+    def open_tunnel(self, host: str, port: int) -> socket.socket:
+        """A raw connection to any ``host:port`` for a blind tunnel, through the same proxy."""
+        return _connect_via(_parse_proxy(self.proxy, host), host, port, self.timeout)
 
     def close(self) -> None:
         with self._lock:
@@ -265,9 +307,13 @@ class _Reply:
 
 
 def _oauth_client(headers) -> bool:
-    """Whether the client authenticates like Claude Code's own login: a bearer token, no API key."""
+    """Whether the request comes from Claude Code's own OAuth login: a bearer token, no API key, and
+    an ``anthropic-beta`` that opts into OAuth (a bearer alone could be any gateway client)."""
     auth = _header(headers, "authorization") or ""
-    return auth[:7].lower() == "bearer " and _header(headers, "x-api-key") is None
+    items = headers.items() if hasattr(headers, "items") else headers
+    beta = ",".join(v for k, v in items if k.lower() == "anthropic-beta").lower()
+    return (auth[:7].lower() == "bearer " and _header(headers, "x-api-key") is None
+            and "oauth-" in beta)
 
 
 def _forward_headers(headers, token: str | None, netloc: str, length: int | None) -> dict:
@@ -295,11 +341,16 @@ def _response_headers(resp) -> list[tuple[str, str]]:
 
 class SeatProxy:
     def __init__(self, decide: Callable[[Hit], Seat | None], *, upstream="https://api.anthropic.com",
+                 ca=None, upstream_proxy: str | None = None,
+                 on_tls_reject: Callable[[str], None] | None = None,
                  decide_timeout=10.0, log: Callable[..., None] = _noop):
         self._decide = decide
         self._decide_timeout = decide_timeout
         self._log_fn = log
-        self._transport = _Upstream(upstream)
+        self._transport = _Upstream(upstream, proxy=upstream_proxy)
+        self._ca = ca                      # a SessionCA: server_context() for the intercepted host
+        self._on_tls_reject = on_tls_reject
+        self._tls_rejected = False
         self._secret = secrets.token_urlsafe(24)
         self._lock = threading.Lock()
         self._decide_lock = threading.Lock()
@@ -315,7 +366,8 @@ class SeatProxy:
     # -- lifecycle --
 
     def start(self) -> str:
-        """Listen on 127.0.0.1 (ephemeral port) and return the base URL for the child.
+        """Listen on 127.0.0.1 (ephemeral port) and return the proxy URL for the child's
+        ``HTTPS_PROXY``: ``http://acctsw:<secret>@127.0.0.1:<port>``.
 
         Raises ``OSError`` when the port cannot be bound; the caller falls back to restarts."""
         if self._server is not None:
@@ -339,7 +391,34 @@ class SeatProxy:
         self._log("proxy_stop")
 
     def _base_url(self) -> str:
-        return f"http://127.0.0.1:{self._server.server_address[1]}/{self._secret}"
+        return f"http://{PROXY_USER}:{self._secret}@127.0.0.1:{self._server.server_address[1]}"
+
+    @property
+    def _authority(self) -> str:
+        """``host:port`` of the one origin whose CONNECTs are decrypted."""
+        return f"{self._transport.host}:{self._transport.port}"
+
+    def _proxy_auth_ok(self, value: str | None) -> bool:
+        scheme, _, b64 = (value or "").strip().partition(" ")
+        try:
+            given = base64.b64decode(b64.strip(), validate=True)
+        except ValueError:
+            return False
+        return scheme.lower() == "basic" and secrets.compare_digest(
+            given, f"{PROXY_USER}:{self._secret}".encode())
+
+    def _intercepts(self, host: str, port: int) -> bool:
+        return self._ca is not None and f"{host}:{port}" == self._authority
+
+    def _tls_reject(self, reason: str) -> None:
+        with self._lock:
+            first, self._tls_rejected = not self._tls_rejected, True
+        self._log("tls_reject", reason=reason)
+        if first and self._on_tls_reject is not None:
+            try:
+                self._on_tls_reject(reason)
+            except Exception as e:
+                self._log("tls_reject_callback_error", error=self._redact(f"{e.__class__.__name__}: {e}"))
 
     # -- seat binding and activity --
 
@@ -410,14 +489,18 @@ class SeatProxy:
 
     # -- request handling (socket-free: the server below only parses and calls this) --
 
-    def handle(self, method: str, target: str, headers, body: bytes, wfile) -> bool:
+    def handle(self, method: str, target: str, headers, body: bytes, wfile, *,
+               authority: str | None = None) -> bool:
         """Serve one request; the response goes to ``wfile``. Returns whether the client connection
-        may be kept alive. Never raises for an upstream or handler fault: those answer 502."""
+        may be kept alive. Never raises for an upstream or handler fault: those answer 502.
+
+        ``authority`` is the ``host:port`` of the CONNECT a decrypted request arrived on; None for a
+        plain request, which must then carry the secret path."""
         reply = _Reply(wfile, head_only=method == "HEAD")
         with self._lock:
             self._active += 1
         try:
-            return self._handle(method, target, headers, body, reply)
+            return self._handle(method, target, headers, body, reply, authority)
         except Exception as e:
             client = [v for k, v in (headers.items() if hasattr(headers, "items") else headers)
                       if k.lower() in CLIENT_AUTH]
@@ -442,8 +525,17 @@ class SeatProxy:
             return None
         return rest if rest.startswith("/") else "/" + rest
 
-    def _handle(self, method: str, target: str, headers, body: bytes, reply: _Reply) -> bool:
-        path = self._route(target)
+    def _handle(self, method: str, target: str, headers, body: bytes, reply: _Reply,
+                authority: str | None) -> bool:
+        if authority is not None:
+            if authority != self._authority:
+                # Decrypted traffic for any other origin is never forwarded, let alone injected.
+                self._log("misdirected", authority=authority, method=method)
+                reply.error(421, "invalid_request_error", "seat proxy: misdirected request")
+                return False
+            path = target if target.startswith("/") else None
+        else:
+            path = self._route(target)
         if path is None:
             self._log("forbidden", method=method)
             reply.error(403, "permission_error", "seat proxy: unknown path")
@@ -589,10 +681,36 @@ class _Server(ThreadingHTTPServer):
         self.proxy._log("connection_error")
 
 
-def _make_handler(proxy: SeatProxy):
+def _pump(a: socket.socket, b: socket.socket, idle: float) -> None:
+    """Copy bytes both ways until both directions have ended (or nothing moves for ``idle``)."""
+    peer = {a: b, b: a}
+    open_ = [a, b]
+    while open_:
+        ready, _, _ = select.select(open_, [], [], idle)
+        if not ready:
+            return
+        for src in ready:
+            data = src.recv(CHUNK)
+            if data:
+                peer[src].sendall(data)
+                continue
+            open_.remove(src)
+            try:
+                peer[src].shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+
+def _make_handler(proxy: SeatProxy, authority: str | None = None):
+    """The request handler: the listener's own (``authority`` None: CONNECT plus secret-path
+    requests) or one for the decrypted requests on an intercepted CONNECT to ``authority``."""
+
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         timeout = CLIENT_IDLE_TIMEOUT
+        # Unbuffered on the raw listener socket: nothing past the CONNECT head may be read ahead,
+        # those bytes belong to the tunnel or the TLS handshake.
+        rbufsize = 0 if authority is None else -1
 
         def log_message(self, *_args):
             pass
@@ -608,8 +726,19 @@ def _make_handler(proxy: SeatProxy):
                 self.close_connection = True
                 _Reply(self.wfile).error(413, "request_too_large", "seat proxy: request too large")
                 return
-            if not proxy.handle(self.command, self.path, self.headers, body, self.wfile):
+            if not proxy.handle(self.command, self.path, self.headers, body, self.wfile,
+                                authority=authority):
                 self.close_connection = True
+
+        def _read(self, n: int) -> bytes:
+            parts = []
+            while n > 0:
+                data = self.rfile.read(n)
+                if not data:
+                    raise ValueError("request body cut short")
+                parts.append(data)
+                n -= len(data)
+            return b"".join(parts)
 
         def _body(self) -> bytes | None:
             if (self.headers.get("transfer-encoding") or "").lower() == "chunked":
@@ -623,12 +752,64 @@ def _make_handler(proxy: SeatProxy):
                     total += size
                     if total > MAX_BODY:
                         return None
-                    parts.append(self.rfile.read(size))
+                    parts.append(self._read(size))
                     self.rfile.readline(1024)
             n = int(self.headers.get("content-length") or 0)
             if n > MAX_BODY:
                 return None
-            return self.rfile.read(n) if n > 0 else b""
+            return self._read(n) if n > 0 else b""
+
+        def _answer(self, status: int, reason: str, extra: str = "") -> None:
+            self.wfile.write(f"HTTP/1.1 {status} {reason}\r\n{extra}content-length: 0\r\n\r\n".encode())
+            self.wfile.flush()
+
+        def do_CONNECT(self):
+            self.close_connection = True    # the socket now belongs to the tunnel
+            if authority is not None:
+                return self._answer(405, "Method Not Allowed")
+            if not proxy._proxy_auth_ok(self.headers.get("proxy-authorization")):
+                proxy._log("proxy_auth_failed")
+                return self._answer(407, "Proxy Authentication Required",
+                                    f'proxy-authenticate: Basic realm="{PROXY_USER}"\r\nconnection: close\r\n')
+            host, _, port = self.path.rpartition(":")
+            host = host.strip("[]").lower()
+            if not host or not port.isdigit():
+                return self._answer(400, "Bad Request")
+            if proxy._intercepts(host, int(port)):
+                return self._intercept(f"{host}:{port}")
+            self._tunnel(host, int(port))
+
+        def _tunnel(self, host: str, port: int) -> None:
+            try:
+                far = proxy._transport.open_tunnel(host, port)
+            except OSError as e:
+                proxy._log("tunnel_error", host=host, port=port, error=f"{e.__class__.__name__}: {e}"[:200])
+                return self._answer(502, "Bad Gateway")
+            proxy._log("tunnel", host=host, port=port)
+            try:
+                self._answer(200, "Connection Established")
+                far.settimeout(None)
+                _pump(self.connection, far, CLIENT_IDLE_TIMEOUT)
+            except OSError:
+                pass
+            finally:
+                far.close()
+
+        def _intercept(self, target: str) -> None:
+            self._answer(200, "Connection Established")
+            try:
+                tls = proxy._ca.server_context().wrap_socket(self.connection, server_side=True)
+            except ssl.SSLError as e:
+                return proxy._tls_reject(f"{getattr(e, 'reason', None) or e}"[:200])
+            except OSError:
+                return
+            proxy._log("intercept", authority=target)
+            try:
+                _make_handler(proxy, target)(tls, self.client_address, self.server)
+            except OSError:
+                pass
+            finally:
+                tls.close()
 
         do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = _serve
 
