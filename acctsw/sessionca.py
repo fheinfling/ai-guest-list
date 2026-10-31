@@ -39,7 +39,7 @@ def _read_text(path: str | None) -> str | None:
         text = Path(path).read_text()
     except (OSError, UnicodeError):
         return None
-    return text if "BEGIN CERTIFICATE" in text else None
+    return text if _certs(text) else None
 
 
 def _join(*pems: str) -> str:
