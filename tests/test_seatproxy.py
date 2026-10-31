@@ -1968,3 +1968,88 @@ def test_a_tls_splice_ends_both_ways_when_either_side_ends(closing, session_ca):
     finally:
         for s in (client, box["tls"], f_proxy, f_user):
             s.close()
+
+
+# --- a client that rejects the CA by hanging up (Claude Code's Bun sends no alert) -------------
+
+def _watch(proxy):
+    """A semaphore released once per handshake outcome the proxy logs, and the rejects it reports."""
+    outcomes, rejects = threading.Semaphore(0), []
+    proxy._on_tls_reject = rejects.append
+    log = proxy._log_fn
+    proxy._log_fn = lambda event, **f: (log(event, **f),
+                                        event in ("tls_handshake_failed", "intercept") and outcomes.release())
+    return outcomes, rejects
+
+
+def _hello_then_hang_up(proxy, outcomes):
+    """Read the server's first flight (ServerHello onwards), then close without an alert."""
+    sock, status, _ = _connect(proxy, "api.anthropic.com:443")
+    with sock:
+        assert status == 200
+        incoming, outgoing = SP.ssl.MemoryBIO(), SP.ssl.MemoryBIO()
+        tls = SP.ssl.create_default_context().wrap_bio(incoming, outgoing, server_hostname="api.anthropic.com")
+        with pytest.raises(SP.ssl.SSLWantReadError):
+            tls.do_handshake()
+        sock.sendall(outgoing.read())
+        assert sock.recv(65536)[:1] == b"\x16"     # a TLS handshake record: the ServerHello
+    assert outcomes.acquire(timeout=10)
+
+
+def _complete_a_handshake(proxy, outcomes, session_ca):
+    sock, status, _ = _connect(proxy, "api.anthropic.com:443")
+    _tls(sock, session_ca).close()
+    assert status == 200 and outcomes.acquire(timeout=10)
+
+
+@pytest.mark.parametrize("hang_ups,fired", [(2, False), (3, True), (5, True)])
+def test_hang_ups_mid_handshake_count_as_a_reject(hang_ups, fired, session_ca):
+    proxy = SeatProxy(lambda hit: None, ca=session_ca)
+    outcomes, rejects = _watch(proxy)
+    for _ in range(hang_ups):
+        _hello_then_hang_up(proxy, outcomes)
+    assert rejects == (["eof x3"] if fired else [])
+
+
+def test_hang_ups_spread_beyond_the_window_do_not_count(monkeypatch, session_ca):
+    monkeypatch.setattr(SP, "EOF_REJECT_WINDOW", 0.3)
+    proxy = SeatProxy(lambda hit: None, ca=session_ca)
+    outcomes, rejects = _watch(proxy)
+    for _ in range(2):
+        _hello_then_hang_up(proxy, outcomes)
+    time.sleep(0.5)
+    _hello_then_hang_up(proxy, outcomes)
+    assert rejects == []
+    _hello_then_hang_up(proxy, outcomes)
+    _hello_then_hang_up(proxy, outcomes)
+    assert rejects == ["eof x3"]
+
+
+def test_a_completed_handshake_breaks_the_hang_up_streak(session_ca):
+    proxy = SeatProxy(lambda hit: None, ca=session_ca)
+    outcomes, rejects = _watch(proxy)
+    for _ in range(2):
+        _hello_then_hang_up(proxy, outcomes)
+    _complete_a_handshake(proxy, outcomes, session_ca)
+    _hello_then_hang_up(proxy, outcomes)
+    assert rejects == [] and proxy.intercepts_ok() == 1
+
+
+def test_after_a_completed_handshake_hang_ups_never_count(session_ca):
+    proxy = SeatProxy(lambda hit: None, ca=session_ca)
+    outcomes, rejects = _watch(proxy)
+    _complete_a_handshake(proxy, outcomes, session_ca)
+    for _ in range(4):
+        _hello_then_hang_up(proxy, outcomes)
+    assert rejects == []
+
+
+def test_repeated_plain_http_is_never_a_reject(session_ca):
+    proxy = SeatProxy(lambda hit: None, ca=session_ca)
+    outcomes, rejects = _watch(proxy)
+    for _ in range(4):
+        sock, status, _ = _connect(proxy, "api.anthropic.com:443")
+        with sock:
+            sock.sendall(b"GET / HTTP/1.1\r\nHost: api.anthropic.com\r\n\r\n")
+            assert outcomes.acquire(timeout=10)
+    assert rejects == []
