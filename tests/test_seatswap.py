@@ -7,6 +7,7 @@ from datetime import timedelta
 import pytest
 
 from acctsw import seatkind, seatswap
+from acctsw.seatproxy import Hit, Seat
 from acctsw.util import iso, now
 from tests.conftest import make_claude_blob
 
@@ -18,6 +19,7 @@ T = "claude"
 @pytest.fixture(autouse=True)
 def _no_machine_policy(tmp_path, monkeypatch):
     monkeypatch.setattr(seatswap, "MANAGED_SETTINGS", tmp_path / "_managed" / "managed-settings.json")
+    monkeypatch.setattr(seatswap, "MANAGED_SETTINGS_DIR", tmp_path / "_managed" / "managed-settings.d")
 
 
 def blob(token="tok", *, minutes=60, sub="max", expiry="set"):
@@ -53,9 +55,14 @@ def test_enabled_by_default(ctx, tmp_path):
     assert seatswap.enabled(ctx, {}, cwd=tmp_path)
 
 
-def test_env_switch_turns_it_off(ctx, tmp_path):
-    assert not seatswap.enabled(ctx, {"ACCTSW_IN_PLACE_SWITCH": "0"}, cwd=tmp_path)
-    assert seatswap.enabled(ctx, {"ACCTSW_IN_PLACE_SWITCH": "1"}, cwd=tmp_path)
+@pytest.mark.parametrize("value", ["0", "false", "FALSE", "no", "off", " Off "])
+def test_a_falsy_env_switch_turns_it_off(ctx, tmp_path, value):
+    assert not seatswap.enabled(ctx, {"ACCTSW_IN_PLACE_SWITCH": value}, cwd=tmp_path)
+
+
+@pytest.mark.parametrize("value", ["1", "true", "yes", ""])
+def test_a_truthy_or_empty_env_switch_leaves_it_on(ctx, tmp_path, value):
+    assert seatswap.enabled(ctx, {"ACCTSW_IN_PLACE_SWITCH": value}, cwd=tmp_path)
 
 
 def test_the_setting_turns_it_off(ctx, tmp_path):
@@ -158,12 +165,14 @@ def test_missing_item_or_token_is_not_eligible(ctx):
 class FakeProxy:
     def __init__(self, decide=None, **_kw):
         self.decide = decide
-        self.seat = seatswap._seat("", None)
+        self.seat = Seat("", None)
         self.stops = 0
         self.binds = []
         self.flight = 0
         self.idle = 60.0
         self.running = False
+        self.preflight_reason = None
+        self.seen = 0
 
     def start(self):
         self.running = True
@@ -185,6 +194,12 @@ class FakeProxy:
 
     def idle_for(self):
         return self.idle
+
+    def preflight(self):
+        return self.preflight_reason
+
+    def messages_seen(self):
+        return self.seen
 
 
 class Clock:
@@ -215,7 +230,7 @@ def test_start_binds_home_passthrough_and_env_points_at_the_proxy(ctx):
 
 
 def hit(email="home@x"):
-    return seatswap._types()[1]("limit", email, None, None, None)
+    return Hit("limit", email, None, None, None)
 
 
 def test_hit_round_trip_wakes_the_main_thread_and_binds_the_answer(ctx):
@@ -227,7 +242,7 @@ def test_hit_round_trip_wakes_the_main_thread_and_binds_the_answer(ctx):
     ready, _, _ = select.select([swap.wake_fd], [], [], 5)
     assert ready
     [h] = swap.pending()
-    target = seatswap._seat("b@x", "tok-b")
+    target = Seat("b@x", "tok-b")
     assert swap.answer(h, target)
     worker.join(5)
     assert got["seat"] == target and proxy.bound() == target
@@ -239,7 +254,7 @@ def test_an_unanswered_hit_times_out_and_a_late_answer_is_refused(ctx):
     swap, proxy, _ = make(ctx, decide_timeout=0.05)
     h = hit()
     assert swap._decide(h) is None
-    assert not swap.answer(h, seatswap._seat("b@x", "tok-b"))
+    assert not swap.answer(h, Seat("b@x", "tok-b"))
     assert proxy.bound().email == "home@x"
     swap.stop()
 
@@ -255,10 +270,10 @@ def test_maintain_rebinds_a_newer_token_at_most_once_a_minute(ctx):
     put_seat(ctx, "home@x")
     put_seat(ctx, "b@x", token="old")
     swap, proxy, clock = make(ctx)
-    proxy.bind(seatswap._seat("b@x", "old"))
+    proxy.bind(Seat("b@x", "old"))
     ctx.claude_cred("b@x").set_live(blob("new"))
     assert swap.maintain() is None
-    assert proxy.bound() == seatswap._seat("b@x", "new")
+    assert proxy.bound() == Seat("b@x", "new")
     ctx.claude_cred("b@x").set_live(blob("newer"))
     clock.t += seatswap.MAINTAIN_EVERY_S - 1
     swap.maintain()
@@ -272,9 +287,9 @@ def test_maintain_goes_home_when_the_borrowed_token_lapses(ctx):
     put_seat(ctx, "home@x")
     put_seat(ctx, "b@x", token="b", minutes=10)
     swap, proxy, _ = make(ctx)
-    proxy.bind(seatswap._seat("b@x", "b"))
+    proxy.bind(Seat("b@x", "b"))
     assert swap.maintain() is None
-    assert proxy.bound() == seatswap._seat("home@x", None)
+    assert proxy.bound() == Seat("home@x", None)
 
 
 def test_maintain_moves_to_another_seat_when_home_is_resting(ctx):
@@ -283,9 +298,9 @@ def test_maintain_moves_to_another_seat_when_home_is_resting(ctx):
     put_seat(ctx, "c@x", token="c")
     rest(ctx, "home@x")
     swap, proxy, _ = make(ctx)
-    proxy.bind(seatswap._seat("b@x", "b"))
+    proxy.bind(Seat("b@x", "b"))
     swap.maintain()
-    assert proxy.bound() == seatswap._seat("c@x", "c")
+    assert proxy.bound() == Seat("c@x", "c")
 
 
 def test_maintain_asks_for_a_handover_only_once_idle(ctx):
@@ -293,7 +308,7 @@ def test_maintain_asks_for_a_handover_only_once_idle(ctx):
     put_seat(ctx, "b@x", token="b", minutes=10)
     rest(ctx, "home@x")
     swap, proxy, clock = make(ctx)
-    proxy.bind(seatswap._seat("b@x", "b"))
+    proxy.bind(Seat("b@x", "b"))
     proxy.flight = 1
     assert swap.maintain() is None
     proxy.flight, proxy.idle = 0, 1.0
@@ -301,7 +316,7 @@ def test_maintain_asks_for_a_handover_only_once_idle(ctx):
     proxy.idle = seatswap.HANDOVER_IDLE_S
     assert swap.maintain() == "handover"
     swap.set_home("b@x")
-    assert proxy.bound() == seatswap._seat("b@x", None)
+    assert proxy.bound() == Seat("b@x", None)
     assert swap.maintain() is None
 
 
@@ -311,7 +326,7 @@ def test_maintain_never_crosses_without_approval(ctx):
     put_seat(ctx, "p@x", plan="Max", token="p")
     rest(ctx, "home@x")
     swap, proxy, _ = make(ctx)
-    proxy.bind(seatswap._seat("b@x", "b"))
+    proxy.bind(Seat("b@x", "b"))
     assert swap.maintain() == "handover"
     assert proxy.bound().email == "b@x"
 
@@ -332,7 +347,7 @@ def test_pick_spends_a_once_approval_and_not_the_reverse(ctx):
     # Tier differs (team vs max) so it is not eligible in place even when approved.
     assert swap.pick(ctx, "home@x") is None
     ctx.claude_cred("w@x").set_live(blob("w", sub="max"))
-    assert swap.pick(ctx, "home@x") == seatswap._seat("w@x", "w")
+    assert swap.pick(ctx, "home@x") == Seat("w@x", "w")
     assert not seatkind.approved(ctx.load_state(), T, "home@x", "w@x")
     assert swap.pick(ctx, "home@x") is None
 
@@ -368,7 +383,7 @@ def test_constructed_without_a_home_until_set_home(ctx):
     assert swap.maintain() is None
     swap.set_home("a@x")
     assert swap.bound() == "a@x" and swap.proxy.bound().token is None
-    swap.bind(seatswap._seat("b@x", "tok-b"))
+    swap.bind(Seat("b@x", "tok-b"))
     assert swap.bound() == "b@x"
     swap.stop()
     swap.stop()
@@ -390,3 +405,107 @@ def test_a_proxy_that_cannot_bind_raises_and_leaks_nothing(ctx):
 def test_eligible_without_a_home_skips_only_the_tier_check(ctx):
     put_seat(ctx, "b@x", plan="Pro")
     assert seatswap.eligible(ctx, "b@x", home_email=None)
+
+
+# --- review round: gate sources, read errors, home, preflight -----------------------------------
+
+ROUTED = {"env": {"ANTHROPIC_BASE_URL": "https://gateway.example"}}
+
+
+@pytest.mark.parametrize("form", ["file", "relative", "json", "equals"])
+def test_child_settings_flag_gates(ctx, tmp_path, form):
+    (tmp_path / "s.json").write_text(json.dumps(ROUTED))
+    args = {"file": ["--settings", str(tmp_path / "s.json")],
+            "relative": ["-p", "hi", "--settings", "s.json"],
+            "json": ["--settings", json.dumps(ROUTED)],
+            "equals": [f"--settings={json.dumps(ROUTED)}"]}[form]
+    assert seatswap.gate(ctx, {}, cwd=tmp_path, args=args) == "--settings env ANTHROPIC_BASE_URL"
+    assert seatswap.enabled(ctx, {}, cwd=tmp_path, args=["--settings", '{"model": "x"}'])
+
+
+def test_an_unreadable_child_settings_flag_gates(ctx, tmp_path):
+    for args in (["--settings", str(tmp_path / "missing.json")], ["--settings", "{broken"],
+                 ["--settings"]):
+        assert seatswap.gate(ctx, {}, cwd=tmp_path, args=args) == "--settings unreadable"
+
+
+def test_managed_settings_drop_ins_gate(ctx, tmp_path):
+    drop = seatswap.MANAGED_SETTINGS_DIR
+    drop.mkdir(parents=True)
+    (drop / "00-ok.json").write_text(json.dumps({"model": "x"}))
+    assert seatswap.enabled(ctx, {}, cwd=tmp_path)
+    (drop / "10-gateway.json").write_text(json.dumps({"apiKeyHelper": "/bin/key"}))
+    assert seatswap.gate(ctx, {}, cwd=tmp_path) == "10-gateway.json apiKeyHelper"
+
+
+def _locked_keychain(monkeypatch, *emails):
+    from acctsw import claudehome
+    from acctsw.keychain import KeychainError
+    real = claudehome.load
+
+    def load(ctx, email):
+        if email in emails:
+            raise KeychainError("keychain read failed")
+        return real(ctx, email)
+    monkeypatch.setattr(claudehome, "load", load)
+
+
+@pytest.mark.parametrize("locked", ["seat", "home"])
+def test_a_keychain_error_is_not_eligible(ctx, monkeypatch, locked):
+    put_seat(ctx, "home@x")
+    put_seat(ctx, "b@x")
+    _locked_keychain(monkeypatch, "b@x" if locked == "seat" else "home@x")
+    assert seatswap.eligible(ctx, "b@x", home_email="home@x") is None
+
+
+def test_maintain_keeps_the_binding_when_the_keychain_is_unreadable(ctx, monkeypatch):
+    put_seat(ctx, "home@x")
+    put_seat(ctx, "b@x", token="b", minutes=60)
+    swap, proxy, clock = make(ctx)
+    proxy.bind(Seat("b@x", "b"))
+    _locked_keychain(monkeypatch, "b@x")
+    for _ in range(3):
+        assert swap.maintain() is None
+        clock.t += seatswap.MAINTAIN_EVERY_S
+    assert proxy.bound() == Seat("b@x", "b") and len(proxy.binds) == 2
+
+
+def test_maintain_goes_home_without_approval_even_across_kinds(ctx):
+    put_seat(ctx, "home@x", plan="Team")
+    put_seat(ctx, "p@x", plan="Max", token="p", minutes=10)
+    swap, proxy, _ = make(ctx)
+    proxy.bind(Seat("p@x", "p"))
+    assert swap.maintain() is None
+    assert proxy.bound() == Seat("home@x", None)
+
+
+def test_preflight_and_proxy_used_delegate(ctx):
+    swap, proxy, _ = make(ctx)
+    assert swap.preflight() is None and not swap.proxy_used()
+    proxy.preflight_reason, proxy.seen = "tls: certificate verify failed", 1
+    assert swap.preflight() == "tls: certificate verify failed" and swap.proxy_used()
+    swap.stop()
+
+
+def test_a_hit_after_stop_never_writes_to_a_reused_descriptor(ctx):
+    import os
+    swap, _, _ = make(ctx)
+    wake_w = swap._wake_w
+    swap.stop()
+    fds = []
+    try:
+        while True:   # take descriptors until the old write end's number is in use again
+            r, w = os.pipe()
+            fds += [r, w]
+            if wake_w in (r, w):
+                break
+        reader = r if w == wake_w else None
+        os.set_blocking(r, False)
+        assert swap._decide(hit()) is None
+        if reader is None:   # the old number came back as a read end: write to it must not occur
+            return
+        with pytest.raises(BlockingIOError):
+            os.read(reader, 1)
+    finally:
+        for fd in fds:
+            os.close(fd)

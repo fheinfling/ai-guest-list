@@ -435,6 +435,10 @@ def _auto_switch_after_usage(ctx: Context, summary: dict[str, Any], *,
             if tool == "claude" and (live_identity is None or live_identity.blob != outgoing_after
                                       or email_key(live_identity.email or "") != email_key(active)):
                 continue
+            # A business/personal crossing choose() let through was approved; this switch spends
+            # a "once" approval in the same write, exactly as the launcher's hops do.
+            if not seatkind.consume(state, tool, active, candidate, now()):
+                continue
             try:
                 do_switch(ctx, state, tool, candidate, sync=(tool != "claude"),
                           live_identity=live_identity)

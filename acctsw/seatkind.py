@@ -11,7 +11,10 @@ decides it the same way from data it already has:
 Every AUTOMATIC switch — in place or by restart — that moves a session between kinds, or involves
 an unknown kind, is a crossing. Two unknown seats cross too: unknown is never proof of sameness.
 A crossing is only taken with an approval for exactly that direction (``a>b`` never approves
-``b>a``). A manual switch in the app is the user's own choice and records its approval itself.
+``b>a``). A move back to the session's own home seat (the one it was launched on, whose login it
+holds) is never a crossing: pass ``home=`` and ``b == home`` is exempt. A manual switch in the app
+is the user's own choice: it answers the open questions onto its target (``chosen``) and leaves no
+approval behind that could later authorize an automatic crossing.
 
 State lives in ``tools.<tool>.crossings``::
 
@@ -71,9 +74,10 @@ def _peek(state, tool: str) -> dict:
     return store if isinstance(store, dict) else {}
 
 
-def crosses(state, tool: str, a: str | None, b: str | None) -> bool:
-    """Whether moving a session from seat ``a`` to seat ``b`` changes kind (or can't tell)."""
-    if not a or not b or a == b:
+def crosses(state, tool: str, a: str | None, b: str | None, *, home: str | None = None) -> bool:
+    """Whether moving a session from seat ``a`` to seat ``b`` changes kind (or can't tell).
+    Never when ``b`` is the session's ``home``: the session belongs to that account."""
+    if not a or not b or a == b or (home and b == home):
         return False
     ka = kind(state.get_seat(tool, a) or {})
     kb = kind(state.get_seat(tool, b) or {})
@@ -89,16 +93,21 @@ def _live(record, at: datetime) -> bool:
     return granted is not None and at - granted < ONCE_TTL
 
 
-def approved(state, tool: str, a: str | None, b: str | None, at: datetime | None = None) -> bool:
+def approved(state, tool: str, a: str | None, b: str | None, at: datetime | None = None, *,
+             home: str | None = None) -> bool:
     """True when ``a``→``b`` needs no question: not a crossing, or approved in this direction."""
-    if not crosses(state, tool, a, b):
+    if not crosses(state, tool, a, b, home=home):
         return True
     at = at or now()
     return _live((_peek(state, tool).get("approvals") or {}).get(_key(a, b)), at)
 
 
-def request(state, tool: str, a: str, b: str, session_id=None, at: datetime | None = None) -> bool:
-    """Ask the user about ``a``→``b`` for one session. False when that exact question is open."""
+def request(state, tool: str, a: str, b: str, session_id=None, at: datetime | None = None, *,
+            home: str | None = None) -> bool:
+    """Ask the user about ``a``→``b`` for one session. False when that exact question is open,
+    or when there is nothing to ask (not a crossing)."""
+    if not crosses(state, tool, a, b, home=home):
+        return False
     store = _store(state, tool)
     sid = None if session_id is None else str(session_id)
     for r in store["requests"]:
@@ -132,11 +141,12 @@ def deny(state, tool: str, a: str, b: str) -> None:
     _drop_requests(store, a, b)
 
 
-def consume(state, tool: str, a: str | None, b: str | None, at: datetime | None = None) -> bool:
+def consume(state, tool: str, a: str | None, b: str | None, at: datetime | None = None, *,
+            home: str | None = None) -> bool:
     """Spend the approval a switch ``a``→``b`` is about to use. Call it in the same locked write
     that commits the switch. Returns whether the switch may proceed: True for a non-crossing or a
     live approval ("once" is removed here, "always" stays), False when there is nothing to spend."""
-    if not crosses(state, tool, a, b):
+    if not crosses(state, tool, a, b, home=home):
         return True
     at = at or now()
     store = _peek(state, tool)
@@ -146,6 +156,18 @@ def consume(state, tool: str, a: str | None, b: str | None, at: datetime | None 
     if record["scope"] == "once":
         del store["approvals"][_key(a, b)]
     return True
+
+
+def chosen(state, tool: str, a: str, b: str) -> None:
+    """The user moved ``a``→``b`` by hand: that answers the open questions in that direction and
+    spends a "once" approval for it. Nothing is granted: a later automatic ``a``→``b`` still asks
+    (an "always" the user gave stays)."""
+    store = _peek(state, tool)
+    record = (store.get("approvals") or {}).get(_key(a, b))
+    if isinstance(record, dict) and record.get("scope") != "always":
+        del store["approvals"][_key(a, b)]
+    if isinstance(store.get("requests"), list):
+        _drop_requests(store, a, b)
 
 
 def withdraw(state, tool: str, session_id) -> None:
