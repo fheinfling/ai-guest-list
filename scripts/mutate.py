@@ -30,6 +30,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -41,6 +42,7 @@ INVALID_MARKERS = ("SyntaxError", "IndentationError", "ImportError while", "erro
 def _run(entry: dict) -> tuple[str, str]:
     path = ROOT / entry["file"]
     original = path.read_text()
+    stat = path.stat()
     if original.count(entry["old"]) != 1:
         return "NO-OP", f"'old' occurs {original.count(entry['old'])}x in {entry['file']}"
     try:
@@ -50,9 +52,15 @@ def _run(entry: dict) -> tuple[str, str]:
         else:
             cmd = [PY, "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider", "-p", "no:warnings",
                    *entry["test"]]
-        res = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=600)
+        # Python trusts a cached .pyc whose recorded source mtime (whole seconds) and size match.
+        # A same-size mutant written and restored within one second would otherwise leave its
+        # bytecode behind for every later run, so mutants compile into a throwaway cache only.
+        with tempfile.TemporaryDirectory(prefix="mutate-pycache-") as cache:
+            env = {**os.environ, "PYTHONPYCACHEPREFIX": cache}
+            res = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=600, env=env)
     finally:
         path.write_text(original)
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
     out = res.stdout + res.stderr
     if res.returncode == 5 or "no tests ran" in out:
         return "NO-TEST", "the selection matched nothing"
