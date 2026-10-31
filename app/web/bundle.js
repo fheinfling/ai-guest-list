@@ -59,8 +59,17 @@ function needsHello(seat) {
 
 // A signed-out seat has no usable credential: whatever usage it carries is meaningless, and it
 // must never read as ready or active. Old engines send only status/needs_login, so accept all.
+// When the engine sends signed_out it is authoritative: a revoked or forbidden subscription is
+// not signed out and keeps "check your subscription".
 function signedOut(seat) {
-  return seat?.signed_out === true || seat?.needs_login === true || needsHello(seat || {});
+  if (typeof seat?.signed_out === "boolean") return seat.signed_out;
+  return seat?.needs_login === true || needsHello(seat || {});
+}
+
+// The engine marks the seat in use with `active`, also when its status is "needs-login".
+// Signed-in seats and old engines also say so through status "active".
+function isActive(seat) {
+  return seat?.active === true || seat?.status === "active";
 }
 
 // Sign-in that is still good but runs out within days (the engine decides "soon" via signin_expiring).
@@ -191,11 +200,11 @@ function bar(seat, win, label) {
 function seatAction(tool, seat) {
   const add = (label) => `<button class="row-action" data-action="add" data-tool="${tool}" data-email="${esc(seat.email)}">${label}</button>`;
   if (signedOut(seat)) return add("sign in");
-  if (signinExpiring(seat)) return add("sign in again");
-  if (seat.status === "active") return "";
+  const again = signinExpiring(seat) ? add("sign in again") : "";
+  if (isActive(seat)) return again;
   const limited = seat.limited || ["resting", "queued"].includes(seat.status);
   const label = `switch to ${seat.name || seat.email}${limited ? "; this seat's limit applies immediately" : ""}`;
-  return `<button class="row-action" data-action="switch" data-tool="${tool}" data-email="${esc(seat.email)}" aria-label="${esc(label)}" title="${esc(label)}">${limited ? "switch anyway" : "switch"}</button>`;
+  return `<button class="row-action" data-action="switch" data-tool="${tool}" data-email="${esc(seat.email)}" aria-label="${esc(label)}" title="${esc(label)}">${limited ? "switch anyway" : "switch"}</button>${again}`;
 }
 
 function signinExpiryLine(seat, tag) {
@@ -208,10 +217,10 @@ function seatCard(tool, seat) {
   const reported = seat?.usage?.reported_windows;
   const weeklyOnly = tool === "codex" && Array.isArray(reported) && reported.includes("weekly") && !reported.includes("5h");
   const out = signedOut(seat);
-  const stateText = out ? (seat.status === "active" ? "on now · signed out" : "signed out")
+  const stateText = out ? (isActive(seat) ? "on now · signed out" : "signed out")
     : seat.status === "resting"
     ? `<span data-reset-at="${esc(seat.limited_until)}" data-clock-prefix="back in" title="${esc(fmtClock(seat.limited_until))}">back in ${fmtCountdown(seat.limited_until)}</span>`
-    : seat.status === "active" ? (seat.in_session ? "on the floor" : "selected")
+    : isActive(seat) ? (seat.in_session ? "on the floor" : "selected")
     : seat.status === "queued" ? "up next" : "ready";
   const error = seat.usage?.error;
   const issue = ({ rate_limited: "updates throttled; retrying automatically", network: "connection unavailable; retrying automatically",
@@ -647,8 +656,8 @@ function rosterTable(state, compact = false) {
         const subscriptions = seats.filter((seat) => seat.tool === tool);
         const keys = (state?.keys || []).filter((key) => key.harness === tool);
         if (!subscriptions.length && !keys.length) return "";
-        return `<tbody><tr><th class="roster-tool" scope="rowgroup" colspan="3">${esc(TOOL_META[tool]?.label || tool || "API key")} /</th></tr>${subscriptions.sort((a, b) => Number(b.status === "active") - Number(a.status === "active")).map((seat) => {
-        const active = seat.status === "active";
+        return `<tbody><tr><th class="roster-tool" scope="rowgroup" colspan="3">${esc(TOOL_META[tool]?.label || tool || "API key")} /</th></tr>${subscriptions.sort((a, b) => Number(isActive(b)) - Number(isActive(a))).map((seat) => {
+        const active = isActive(seat);
         const out = signedOut(seat);
         const status = out ? (active ? "on now · signed out" : "signed out") : active ? "active" : seat.status === "resting" ? "resting" : seat.status === "queued" ? "up next" : "ready";
         const windows = ["5h", "weekly"].map((win) => {
@@ -677,7 +686,7 @@ function rosterTable(state, compact = false) {
         // because it is the innermost [data-action], a click on it dispatches once, not twice.
         // Only a switch becomes a row target. A seat needing sign-in offers "sign in again", and
         // turning the whole row into a switch would fire the wrong action entirely.
-        const rowAction = action && !active && !out && !signinExpiring(seat)
+        const rowAction = action && !active && !out
           ? ` data-action="switch" data-tool="${esc(tool)}" data-email="${esc(seat.email)}"` : "";
         return `<tr class="${active && !out ? "roster-active" : ""}${out ? " roster-signedout" : ""}${rowAction ? " roster-actionable" : ""}"${rowAction}><th scope="row">${identity}<span class="roster-meta">${planChip(seat.plan)}<span class="roster-status">${status}</span></span>${!out && signinExpiring(seat) ? signinExpiryLine(seat, "span").replace('class="signin-expiry"', 'class="signin-expiry roster-meta"') : ""}${action}</th>${windows}</tr>`;
       }).join("")}${keys.map((key) => `<tr class="roster-key roster-actionable" data-action="key-terminal" data-id="${esc(key.id)}"><th scope="row"><span class="roster-inline"><span class="roster-identity" title="${esc(key.label)}">${esc(key.label)}</span>${spending.has(key.id) ? `<span class="roster-spending">spending now</span>` : ""}</span>${key.model ? `<span class="roster-meta" title="${esc(key.model)}">${esc(key.model)}</span>` : ""}<button class="row-action key-use" data-action="key-terminal" data-id="${esc(key.id)}" aria-label="${esc(`use ${key.label} in a new paid terminal`)}" title="use in a new paid terminal">new terminal</button></th><td class="roster-key-terms" colspan="2"><span class="key-terms">paid per token<span class="roster-meta">no app spend cap</span></span></td></tr>`).join("")}</tbody>`;

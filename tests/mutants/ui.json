@@ -57,7 +57,7 @@
  {
   "label": "signed-out active seat loses 'on now' honesty",
   "file": "app/web/render.mjs",
-  "old": "out ? (active ? \"on now · signed out\" : \"signed out\") : active ? \"active\"",
+  "old": "out ? (active ? \"on now \u00b7 signed out\" : \"signed out\") : active ? \"active\"",
   "new": "out ? \"signed out\" : active ? \"active\"",
   "cmd": [
    "node",
@@ -101,7 +101,7 @@
  {
   "label": "past roster reset renders 'in now'",
   "file": "app/web/render.mjs",
-  "old": "${resetIsPast(reset) ? \"resetting…\" : `in ${fmtCountdown(reset)}`}",
+  "old": "${resetIsPast(reset) ? \"resetting\u2026\" : `in ${fmtCountdown(reset)}`}",
   "new": "${`in ${fmtCountdown(reset)}`}",
   "cmd": [
    "node",
@@ -112,7 +112,7 @@
  {
   "label": "past window bar reset renders 'resets in now'",
   "file": "app/web/render.mjs",
-  "old": "${resetIsPast(reset) ? \"resetting…\" : `window resets in ${fmtCountdown(reset)}`}",
+  "old": "${resetIsPast(reset) ? \"resetting\u2026\" : `window resets in ${fmtCountdown(reset)}`}",
   "new": "${`window resets in ${fmtCountdown(reset)}`}",
   "cmd": [
    "node",
@@ -213,6 +213,61 @@
   "file": "app/web/render.mjs",
   "old": "seat?.signed_out === true ||",
   "new": "seat?.signed_out !== false ||",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "signedOut overrides signed_out:false with needs_login",
+  "file": "app/web/render.mjs",
+  "old": "if (typeof seat?.signed_out === \"boolean\") return seat.signed_out;",
+  "new": "if (seat?.signed_out === true) return true;",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "isActive ignores seat.active",
+  "file": "app/web/render.mjs",
+  "old": "seat?.active === true || seat?.status",
+  "new": "false || seat?.status",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "expiring seat loses its switch action",
+  "file": "app/web/render.mjs",
+  "old": "if (isActive(seat)) return again;",
+  "new": "if (isActive(seat) || again) return again;",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "expiring seat loses row switch target",
+  "file": "app/web/render.mjs",
+  "old": "const rowAction = action && !active && !out",
+  "new": "const rowAction = action && !active && !out && !signinExpiring(seat)",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "sign in again dropped beside switch",
+  "file": "app/web/render.mjs",
+  "old": "${limited ? \"switch anyway\" : \"switch\"}</button>${again}`",
+  "new": "${limited ? \"switch anyway\" : \"switch\"}</button>`",
   "cmd": [
    "node",
    "--test",
