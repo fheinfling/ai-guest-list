@@ -103,8 +103,8 @@
   {
     "label": "in-place: MAX_INPLACE_SWITCHES is not enforced",
     "file": "acctsw/launcher.py",
-    "old": "            return (swap is not None and inplace[\"hops\"] < MAX_INPLACE_SWITCHES\n",
-    "new": "            return (swap is not None\n",
+    "old": "                    and (target == launch_email or inplace[\"hops\"] < MAX_INPLACE_SWITCHES)\n",
+    "new": "                    and True\n",
     "test": [
       "tests/test_launcher_inplace.py::test_in_place_budget_is_enforced"
     ]
@@ -121,8 +121,8 @@
   {
     "label": "in-place: a landing that can't be served in place is reported as done (no restart fallback)",
     "file": "acctsw/launcher.py",
-    "old": "                if served == HOPPED:\n                    clear()\n                    return False\n                if served == REFUSED or",
-    "new": "                if served != REFUSED:\n                    clear()\n                    return False\n                if served == REFUSED or",
+    "old": "                if served == HOPPED:\n                    clear()\n                    return False\n                if served == STAY:",
+    "new": "                if served != REFUSED:\n                    clear()\n                    return False\n                if served == STAY:",
     "test": [
       "tests/test_launcher_inplace.py::test_ineligible_landing_falls_back_to_restart"
     ]
@@ -193,8 +193,8 @@
   {
     "label": "in-place: maintain()'s handover is ignored",
     "file": "acctsw/launcher.py",
-    "old": "                if _swapcall(\"maintain\", ctx) == \"handover\":",
-    "new": "                if _swapcall(\"maintain\", ctx) == \"never\":",
+    "old": "                inplace[\"handover\"] = _swapcall(\"maintain\", ctx) == \"handover\"",
+    "new": "                inplace[\"handover\"] = _swapcall(\"maintain\", ctx) == \"never\"",
     "test": [
       "tests/test_launcher_inplace.py::test_handover_restarts_on_the_bound_seats_own_login"
     ]
@@ -216,15 +216,6 @@
     "test": [
       "tests/test_launcher_inplace.py::test_real_rules_ask_then_carry_the_session_over_once_approved",
       "tests/test_launcher_inplace.py::test_an_approval_refused_at_the_commit_never_kills_and_asks_again"
-    ]
-  },
-  {
-    "label": "crossing: the user's own click spends an approval",
-    "file": "acctsw/launcher.py",
-    "old": "spend=(reason != \"manual\")",
-    "new": "spend=True",
-    "test": [
-      "tests/test_launcher_inplace.py::test_a_click_across_kinds_moves_in_place_without_spending_the_approval"
     ]
   },
   {
@@ -261,15 +252,6 @@
     "new": "                sel = choose(snap, tool, home=launch_email,\n",
     "test": [
       "tests/test_launcher_inplace.py::test_recovery_looks_for_a_landing_from_the_billed_seat"
-    ]
-  },
-  {
-    "label": "manual: a click is gated on an approval being on record",
-    "file": "acctsw/launcher.py",
-    "old": "                        return _take_choice(target, frm=billed, reason=\"manual\")\n",
-    "new": "                        if kinds is None or kinds.approved(snap, tool, billed, target, now()):\n                            return _take_choice(target, frm=billed, reason=\"manual\")\n",
-    "test": [
-      "tests/test_launcher_inplace.py::test_a_click_moves_even_when_no_approval_is_on_record"
     ]
   },
   {
@@ -376,7 +358,7 @@
   {
     "label": "review #2: a heartbeat-taken crossing does not ask again when refused",
     "file": "acctsw/launcher.py",
-    "old": "                if served == REFUSED:\n                    _refused(frm, target)\n                    return False\n                if reason == \"manual\"",
+    "old": "                if served == REFUSED:\n                    _ask_again(frm, target)\n                    return False\n                if reason == \"manual\"",
     "new": "                if served == REFUSED:\n                    return False\n                if reason == \"manual\"",
     "test": [
       "tests/test_launcher_inplace.py::test_an_approval_refused_at_the_commit_never_kills_and_asks_again"
@@ -466,8 +448,8 @@
   {
     "label": "review #7: the in_place_switch setting is not read at decision time",
     "file": "acctsw/launcher.py",
-    "old": "                if (st.get_seat(tool, target) is None\n                        or not st.settings().get(\"in_place_switch\", True)):",
-    "new": "                if (st.get_seat(tool, target) is None):",
+    "old": "                            target != launch_email\n                            and not st.settings().get(\"in_place_switch\", True)):",
+    "new": "                            False):",
     "test": [
       "tests/test_launcher_inplace.py::test_switching_the_setting_off_mid_run_stops_hops_in_place_at_once"
     ]
@@ -511,10 +493,181 @@
   {
     "label": "review LOW: a handover restarts under a busy child",
     "file": "acctsw/launcher.py",
-    "old": "                if (time.monotonic() - tick[\"last_output\"] < HANDOVER_QUIET_S\n                        or _exec_blocker()",
-    "new": "                if (False\n                        or _exec_blocker()",
+    "old": "                if time.monotonic() - tick[\"last_output\"] < HANDOVER_QUIET_S:\n                    return False\n",
+    "new": "",
     "test": [
       "tests/test_launcher_inplace.py::test_handover_waits_while_the_child_is_busy"
+    ]
+  },
+  {
+    "label": "round2 N2: an exception in the in-place commit escapes (or restarts) instead of staying",
+    "file": "acctsw/launcher.py",
+    "old": "            except Exception:\n                logging.getLogger(__name__).info(\"in-place hop to %s failed\", target,",
+    "new": "            except ArithmeticError:\n                logging.getLogger(__name__).info(\"in-place hop to %s failed\", target,",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_failing_in_place_commit_stays_put_and_never_restarts"
+    ]
+  },
+  {
+    "label": "round2 N2: a failed commit (STAY) falls through to a restart",
+    "file": "acctsw/launcher.py",
+    "old": "                if served == STAY:\n                    _undo_realign()",
+    "new": "                if False:\n                    _undo_realign()",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_failing_in_place_commit_stays_put_and_never_restarts"
+    ]
+  },
+  {
+    "label": "round2 N2: a decision raising from the child's output unwinds the spawn",
+    "file": "acctsw/launcher.py",
+    "old": "                tick[\"last_output\"] = time.monotonic()\n                return _guarded(_on_output, chunk)",
+    "new": "                tick[\"last_output\"] = time.monotonic()\n                return _on_output(chunk)",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_decision_that_raises_never_unwinds_the_child"
+    ]
+  },
+  {
+    "label": "round2 N2: a decision raising from the state tick unwinds the spawn",
+    "file": "acctsw/launcher.py",
+    "old": "                return _guarded(_tick_state) or _guarded(_tick_recover)",
+    "new": "                return _tick_state() or _guarded(_tick_recover)",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_decision_that_raises_never_unwinds_the_child"
+    ]
+  },
+  {
+    "label": "round2 N3: an auth signal is moved in place instead of restarted",
+    "file": "acctsw/launcher.py",
+    "old": "                served = (_hop_in_place(landing, frm=active) if reason == \"limit\"\n                          else NOT_SERVABLE)",
+    "new": "                served = _hop_in_place(landing, frm=active)",
+    "test": [
+      "tests/test_launcher_inplace.py::test_an_auth_banner_restarts_instead_of_moving_in_place"
+    ]
+  },
+  {
+    "label": "round2 N4: an approved crossing is taken with auto-switch off",
+    "file": "acctsw/launcher.py",
+    "old": "                    if not _auto_switch_is_on():\n                        return False\n                    if not _seat_usable(target, frm=frm):",
+    "new": "                    if not _seat_usable(target, frm=frm):",
+    "test": [
+      "tests/test_launcher_inplace.py::test_an_approved_crossing_waits_while_auto_switch_is_off"
+    ]
+  },
+  {
+    "label": "round2 N4: an approved crossing is taken onto a seat that rested since",
+    "file": "acctsw/launcher.py",
+    "old": "                    if not _seat_usable(target, frm=frm):\n                        return False   # it rested",
+    "new": "                    if False:\n                        return False   # it rested",
+    "test": [
+      "tests/test_launcher_inplace.py::test_an_approved_crossing_to_a_seat_that_rested_since_is_not_taken"
+    ]
+  },
+  {
+    "label": "round2 N5: a handover asked for once stays armed after maintain() stops asking",
+    "file": "acctsw/launcher.py",
+    "old": "                inplace[\"handover\"] = _swapcall(\"maintain\", ctx) == \"handover\"",
+    "new": "                inplace[\"handover\"] = inplace[\"handover\"] or _swapcall(\"maintain\", ctx) == \"handover\"",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_handover_request_lapses_when_maintain_stops_asking"
+    ]
+  },
+  {
+    "label": "round2 N5: a handover ignores the proxy's own traffic",
+    "file": "acctsw/launcher.py",
+    "old": "                    return proxy.in_flight() == 0 and proxy.idle_for() >= HANDOVER_QUIET_S",
+    "new": "                    return True",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_handover_waits_for_the_proxy_to_be_quiet"
+    ]
+  },
+  {
+    "label": "round2 N5: a print run is handed over",
+    "file": "acctsw/launcher.py",
+    "old": "                if (claude_print or switches >= max_switches or not _quiet()",
+    "new": "                if (switches >= max_switches or not _quiet()",
+    "test": [
+      "tests/test_launcher_inplace.py::test_no_handover_restart_for_a_print_run"
+    ]
+  },
+  {
+    "label": "round2 N5: a handover restarts onto a seat without a loadable login",
+    "file": "acctsw/launcher.py",
+    "old": "                        or _exec_blocker() is not None or not _login_loadable(seat)",
+    "new": "                        or _exec_blocker() is not None",
+    "test": [
+      "tests/test_launcher_inplace.py::test_no_handover_onto_a_seat_without_a_loadable_login"
+    ]
+  },
+  {
+    "label": "round2 N5: a handover restarts even though home is usable in place",
+    "file": "acctsw/launcher.py",
+    "old": "                if _seat_usable(launch_email, frm=seat) \\\n                        and _hop_in_place(launch_email, frm=seat) == HOPPED:",
+    "new": "                if False:",
+    "test": [
+      "tests/test_launcher_inplace.py::test_handover_prefers_home_over_a_restart"
+    ]
+  },
+  {
+    "label": "round2 N6: going home is held to the in-place budget",
+    "file": "acctsw/launcher.py",
+    "old": "                    and (target == launch_email or inplace[\"hops\"] < MAX_INPLACE_SWITCHES)\n",
+    "new": "                    and inplace[\"hops\"] < MAX_INPLACE_SWITCHES\n",
+    "test": [
+      "tests/test_launcher_inplace.py::test_going_home_ignores_the_budget_and_the_toggle"
+    ]
+  },
+  {
+    "label": "round2 N6: going home is held to the in_place_switch toggle",
+    "file": "acctsw/launcher.py",
+    "old": "                            target != launch_email\n                            and not st.settings()",
+    "new": "                            True\n                            and not st.settings()",
+    "test": [
+      "tests/test_launcher_inplace.py::test_going_home_ignores_the_budget_and_the_toggle"
+    ]
+  },
+  {
+    "label": "round2 N7a: a cold start launches on a dead seat when every other seat crosses",
+    "file": "acctsw/launcher.py",
+    "old": "                initial_resting = Decision(\"give_up\", None, None)\n",
+    "new": "                pass\n",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_cold_start_on_a_dead_seat_asks_and_waits_for_the_crossing"
+    ]
+  },
+  {
+    "label": "round2 N7b: the wait gives up right after it asked",
+    "file": "acctsw/launcher.py",
+    "old": "        if sel.email is None and not asking:\n",
+    "new": "        if sel.email is None:\n",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_cold_start_on_a_dead_seat_asks_and_waits_for_the_crossing"
+    ]
+  },
+  {
+    "label": "round2 N7b: an open question is polled every POLL_INTERVAL_S, not every few seconds",
+    "file": "acctsw/launcher.py",
+    "old": "min(CROSSING_POLL_S if asking else POLL_INTERVAL_S, remaining)",
+    "new": "min(POLL_INTERVAL_S, remaining)",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_cold_start_on_a_dead_seat_asks_and_waits_for_the_crossing"
+    ]
+  },
+  {
+    "label": "round2 N12: a click claude can't take swallows the rest of the tick",
+    "file": "acctsw/launcher.py",
+    "old": "                        elif _take_choice(target, frm=billed, reason=\"manual\"):\n                            return True\n",
+    "new": "                        else:\n                            return _take_choice(target, frm=billed, reason=\"manual\")\n",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_click_still_lets_the_heartbeat_see_a_rest_in_the_same_write"
+    ]
+  },
+  {
+    "label": "round2 N8: a click that crosses for this session moves it without asking",
+    "file": "acctsw/launcher.py",
+    "old": "                        if kinds is not None and not kinds.approved(\n                                snap, tool, billed, target, now(), home=launch_email):",
+    "new": "                        if False:",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_click_across_kinds_asks_this_session_instead_of_moving_it"
     ]
   }
 ]
