@@ -65,7 +65,7 @@
  {
   "label": "quarantine marker ignored",
   "file": "acctsw/seatswap.py",
-  "old": "    if (ctx.claude_home(email) / \".acctsw-quarantined\").exists():\n        return None\n    blob = _load(ctx, email)",
+  "old": "    if (ctx.claude_home(email) / \".acctsw-quarantined\").exists():\n        return None, \"seat\"\n    blob = _load(ctx, email)",
   "new": "    blob = ctx.claude_cred(email).get_live()",
   "test": [
    "tests/test_seatswap.py::test_quarantined_seat_is_not_eligible"
@@ -224,7 +224,7 @@
  {
   "label": "UI needs-you item not rendered",
   "file": "app/web/render.mjs",
-  "old": "${prompts}${crossingRequests(state)}${paid",
+  "old": "${prompts}${crossingRequests(state)}${tierRequests(state)}${paid",
   "new": "${prompts}${paid",
   "cmd": [
    "node",
@@ -1017,6 +1017,393 @@
   "new": "    if words & PERSONAL:\n        return \"personal\"\n    if words & BUSINESS:\n        return \"business\"",
   "test": [
    "tests/test_seatkind.py::test_kind_reads_the_words_in_free_form_plan_names"
+  ]
+ },
+ {
+  "label": "tier: equal/unknown tiers need an answer",
+  "file": "acctsw/seattier.py",
+  "old": "if not a_tier or not b_tier or a_tier == b_tier:\n        return True",
+  "new": "if not a_tier or not b_tier:\n        return True",
+  "test": [
+   "tests/test_seattier.py::test_allowed_when_equal_or_unknown_or_setting_or_pair_approval"
+  ]
+ },
+ {
+  "label": "tier: unknown tier needs an answer",
+  "file": "acctsw/seattier.py",
+  "old": "if not a_tier or not b_tier or a_tier == b_tier:\n        return True",
+  "new": "if a_tier == b_tier:\n        return True",
+  "test": [
+   "tests/test_seattier.py::test_allowed_when_equal_or_unknown_or_setting_or_pair_approval"
+  ]
+ },
+ {
+  "label": "tier: setting ignored",
+  "file": "acctsw/seattier.py",
+  "old": "if state.settings().get(SETTING) is True:\n        return True",
+  "new": "if False:\n        return True",
+  "test": [
+   "tests/test_seattier.py::test_allowed_when_equal_or_unknown_or_setting_or_pair_approval"
+  ]
+ },
+ {
+  "label": "tier: truthy setting accepted",
+  "file": "acctsw/seattier.py",
+  "old": ".get(SETTING) is True:",
+  "new": ".get(SETTING):",
+  "test": [
+   "tests/test_seattier.py::test_the_setting_must_be_exactly_true"
+  ]
+ },
+ {
+  "label": "tier: pair key is directional",
+  "file": "acctsw/seattier.py",
+  "old": "return \"|\".join(sorted((a, b)))",
+  "new": "return \"|\".join((a, b))",
+  "test": [
+   "tests/test_seattier.py::test_allowed_when_equal_or_unknown_or_setting_or_pair_approval"
+  ]
+ },
+ {
+  "label": "tier: any approval allows any pair",
+  "file": "acctsw/seattier.py",
+  "old": "return isinstance(_peek(state, tool, \"tier_approvals\").get(pair(a_tier, b_tier)), dict)",
+  "new": "return bool(_peek(state, tool, \"tier_approvals\"))",
+  "test": [
+   "tests/test_seattier.py::test_allowed_when_equal_or_unknown_or_setting_or_pair_approval",
+   "tests/test_seattier.py::test_a_pair_approval_allows_only_that_pair"
+  ]
+ },
+ {
+  "label": "tier: asked again after an answer",
+  "file": "acctsw/seattier.py",
+  "old": "    if key in store:\n        return False\n",
+  "new": "",
+  "test": [
+   "tests/test_seattier.py::test_request_is_asked_once_per_pair_and_never_after_no"
+  ]
+ },
+ {
+  "label": "tier: asked although allowed",
+  "file": "acctsw/seattier.py",
+  "old": "if allowed(state, tool, a_tier, b_tier) or not a_tier or not b_tier:",
+  "new": "if not a_tier or not b_tier:",
+  "test": [
+   "tests/test_seattier.py::test_nothing_to_ask_when_allowed_or_unknown"
+  ]
+ },
+ {
+  "label": "tier: deny keeps the approval",
+  "file": "acctsw/seattier.py",
+  "old": "    _store(state, tool, \"tier_approvals\").pop(key, None)\n",
+  "new": "",
+  "test": [
+   "tests/test_seattier.py::test_approving_closes_the_question_and_deny_revokes"
+  ]
+ },
+ {
+  "label": "tier: deny not remembered",
+  "file": "acctsw/seattier.py",
+  "old": "\"status\": \"denied\"}",
+  "new": "\"status\": \"open\"}",
+  "test": [
+   "tests/test_seattier.py::test_request_is_asked_once_per_pair_and_never_after_no"
+  ]
+ },
+ {
+  "label": "tier: approve-all does not set the setting",
+  "file": "acctsw/seattier.py",
+  "old": "    state.set_setting(SETTING, True)\n",
+  "new": "",
+  "test": [
+   "tests/test_seattier.py::test_approve_all_sets_the_setting_and_clears_questions"
+  ]
+ },
+ {
+  "label": "tier: pending lists allowed pairs",
+  "file": "acctsw/seattier.py",
+  "old": "and not allowed(state, tool, a, b)):",
+  "new": "):",
+  "test": [
+   "tests/test_seattier.py::test_pending_ignores_a_request_that_became_allowed"
+  ]
+ },
+ {
+  "label": "tier: pending lists denied pairs",
+  "file": "acctsw/seattier.py",
+  "old": "rec.get(\"status\") == \"open\" and",
+  "new": "rec.get(\"status\") and",
+  "test": [
+   "tests/test_seattier.py::test_request_is_asked_once_per_pair_and_never_after_no"
+  ]
+ },
+ {
+  "label": "eligible: tier mismatch ignored",
+  "file": "acctsw/seatswap.py",
+  "old": "if not ok:\n                return None, \"tier\"",
+  "new": "if False:\n                return None, \"tier\"",
+  "test": [
+   "tests/test_seattier.py::test_tier_mismatch_is_refused_by_default_and_named_as_tier"
+  ]
+ },
+ {
+  "label": "eligible: allow_tier=False falls through to state",
+  "file": "acctsw/seatswap.py",
+  "old": "ok = allow_tier if allow_tier is not None else",
+  "new": "ok = allow_tier or",
+  "test": [
+   "tests/test_seattier.py::test_allow_tier_true_lets_it_through_and_false_refuses_despite_approval"
+  ]
+ },
+ {
+  "label": "eligible: tier refusal named seat",
+  "file": "acctsw/seatswap.py",
+  "old": "return None, \"tier\"",
+  "new": "return None, \"seat\"",
+  "test": [
+   "tests/test_seattier.py::test_tier_mismatch_is_refused_by_default_and_named_as_tier"
+  ]
+ },
+ {
+  "label": "eligible: seat refusal named tier",
+  "file": "acctsw/seatswap.py",
+  "old": "if not isinstance(token, str) or not token:\n        return None, \"seat\"",
+  "new": "if not isinstance(token, str) or not token:\n        return None, \"tier\"",
+  "test": [
+   "tests/test_seattier.py::test_reason_is_seat_when_something_else_blocks_and_tier_is_not_blamed"
+  ]
+ },
+ {
+  "label": "bridge: cross-tier setting not toggleable",
+  "file": "acctsw/bridge.py",
+  "old": "\"in_place_switch\", \"in_place_cross_tier\",",
+  "new": "\"in_place_switch\",",
+  "test": [
+   "tests/test_seattier.py::test_the_cross_tier_setting_is_a_default_off_toggle"
+  ]
+ },
+ {
+  "label": "bridge: bad tier answers accepted",
+  "file": "acctsw/bridge.py",
+  "old": "if not a or not b or a == b or \"|\" in a or \"|\" in b:",
+  "new": "if not a or not b or \"|\" in a or \"|\" in b:",
+  "test": [
+   "tests/test_seattier.py::test_bad_tier_answers_are_refused"
+  ]
+ },
+ {
+  "label": "bridge: unknown scope accepted",
+  "file": "acctsw/bridge.py",
+  "old": "if action == \"approve_tier\" and scope not in (\"pair\", \"all\"):",
+  "new": "if False:",
+  "test": [
+   "tests/test_seattier.py::test_bad_tier_answers_are_refused"
+  ]
+ },
+ {
+  "label": "bridge: pair scope sets the global setting",
+  "file": "acctsw/bridge.py",
+  "old": "                else:\n                    seattier.approve(state, tool, a, b)",
+  "new": "                else:\n                    seattier.approve_all(state)",
+  "test": [
+   "tests/test_seattier.py::test_approve_tier_pair_scope_records_the_pair_and_answers"
+  ]
+ },
+ {
+  "label": "tier: approval also approves the crossing",
+  "file": "acctsw/seattier.py",
+  "old": "    _store(state, tool, \"tier_approvals\")[key] = {\"at\": iso(at or now())}\n",
+  "new": "    _store(state, tool, \"tier_approvals\")[key] = {\"at\": iso(at or now())}\n    from . import seatkind\n    seatkind.approve(state, tool, a_tier, b_tier, \"always\")\n",
+  "test": [
+   "tests/test_seattier.py::test_a_tier_approval_does_not_approve_a_business_personal_crossing"
+  ]
+ },
+ {
+  "label": "bridge: tier requests missing from snapshot",
+  "file": "acctsw/bridge.py",
+  "old": "for r in seattier.pending(state, tool)",
+  "new": "for r in []",
+  "test": [
+   "tests/test_seattier.py::test_snapshot_lists_open_tier_requests"
+  ]
+ },
+ {
+  "label": "UI tier question not rendered",
+  "file": "app/web/render.mjs",
+  "old": "${crossingRequests(state)}${tierRequests(state)}",
+  "new": "${crossingRequests(state)}",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "UI tier answer not wired",
+  "file": "app/web/bundle.js",
+  "old": "send(scope === \"deny\" ? \"deny_tier\" : \"approve_tier\"",
+  "new": "send(\"approve_tier\"",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "UI cross-tier toggle missing",
+  "file": "app/web/render.mjs",
+  "old": "s.in_place_cross_tier === true)}",
+  "new": "false)}",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "tier: default permits all plans",
+  "file": "acctsw/state.py",
+  "old": "\"in_place_cross_tier\": False,",
+  "new": "\"in_place_cross_tier\": True,",
+  "test": [
+   "tests/test_seattier.py::test_the_cross_tier_setting_is_a_default_off_toggle"
+  ]
+ },
+ {
+  "label": "tier: seat plan ignored",
+  "file": "acctsw/seattier.py",
+  "old": "raw = seat_or_blob.get(\"plan\")",
+  "new": "raw = None",
+  "test": [
+   "tests/test_seattier.py::test_tier_reads_seats_blobs_and_plain_plans"
+  ]
+ },
+ {
+  "label": "tier: blob plan ignored",
+  "file": "acctsw/seattier.py",
+  "old": "raw = oauth.get(\"subscriptionType\") if isinstance(oauth, dict) else None",
+  "new": "raw = None",
+  "test": [
+   "tests/test_seattier.py::test_tier_reads_seats_blobs_and_plain_plans"
+  ]
+ },
+ {
+  "label": "tier: labels not normalized",
+  "file": "acctsw/seattier.py",
+  "old": "return raw.strip().lower() if isinstance(raw, str) and raw.strip() else None",
+  "new": "return raw if isinstance(raw, str) and raw.strip() else None",
+  "test": [
+   "tests/test_seattier.py::test_tier_reads_seats_blobs_and_plain_plans"
+  ]
+ },
+ {
+  "label": "tier: invalid blob becomes a known plan",
+  "file": "acctsw/seattier.py",
+  "old": "except ValueError:\n                data = None",
+  "new": "except ValueError:\n                data = {\"claudeAiOauth\": {\"subscriptionType\": \"max\"}}",
+  "test": [
+   "tests/test_seattier.py::test_tier_reads_seats_blobs_and_plain_plans"
+  ]
+ },
+ {
+  "label": "tier: approval timestamp ignored",
+  "file": "acctsw/seattier.py",
+  "old": "_store(state, tool, \"tier_approvals\")[key] = {\"at\": iso(at or now())}",
+  "new": "_store(state, tool, \"tier_approvals\")[key] = {\"at\": iso(now())}",
+  "test": [
+   "tests/test_seattier.py::test_pair_approval_persists_with_its_timestamp_and_is_tool_specific"
+  ]
+ },
+ {
+  "label": "tier: one tool approval affects another",
+  "file": "acctsw/seattier.py",
+  "old": "_peek(state, tool, \"tier_approvals\").get(pair(a_tier, b_tier))",
+  "new": "_peek(state, \"claude\", \"tier_approvals\").get(pair(a_tier, b_tier))",
+  "test": [
+   "tests/test_seattier.py::test_pair_approval_persists_with_its_timestamp_and_is_tool_specific"
+  ]
+ },
+ {
+  "label": "tier: request timestamp ignored",
+  "file": "acctsw/seattier.py",
+  "old": "store[key] = {\"at\": iso(at or now()), \"status\": \"open\"}",
+  "new": "store[key] = {\"at\": iso(now()), \"status\": \"open\"}",
+  "test": [
+   "tests/test_seattier.py::test_pending_requests_persist_and_sort_by_time"
+  ]
+ },
+ {
+  "label": "tier: newest question first",
+  "file": "acctsw/seattier.py",
+  "old": "return sorted(out, key=lambda r: (str(r[\"at\"]), r[\"a\"], r[\"b\"]))",
+  "new": "return sorted(out, key=lambda r: (str(r[\"at\"]), r[\"a\"], r[\"b\"]), reverse=True)",
+  "test": [
+   "tests/test_seattier.py::test_pending_requests_persist_and_sort_by_time"
+  ]
+ },
+ {
+  "label": "tier: approve all forgets answers when disabled",
+  "file": "acctsw/seattier.py",
+  "old": "rec[\"status\"] = \"approved\"",
+  "new": "rec[\"status\"] = \"open\"",
+  "test": [
+   "tests/test_seattier.py::test_approve_all_sets_the_setting_and_clears_questions"
+  ]
+ },
+ {
+  "label": "tier: approve all also approves crossings",
+  "file": "acctsw/seattier.py",
+  "old": "state.set_setting(SETTING, True)",
+  "new": "state.set_setting(SETTING, True)\n    from . import seatkind\n    for tool in state.data[\"tools\"]:\n        for a in state.accounts(tool):\n            for b in state.accounts(tool):\n                seatkind.approve(state, tool, a, b, \"always\")",
+  "test": [
+   "tests/test_seattier.py::test_a_tier_approval_does_not_approve_a_business_personal_crossing"
+  ]
+ },
+ {
+  "label": "eligible: true override ignored",
+  "file": "acctsw/seatswap.py",
+  "old": "ok = allow_tier if allow_tier is not None else seattier.allowed(",
+  "new": "ok = seattier.allowed(",
+  "test": [
+   "tests/test_seattier.py::test_allow_tier_true_lets_it_through_and_false_refuses_despite_approval"
+  ]
+ },
+ {
+  "label": "eligible: unreadable mistaken for tier mismatch",
+  "file": "acctsw/seatswap.py",
+  "old": "except _Unreadable:\n        return \"unreadable\"",
+  "new": "except _Unreadable:\n        return \"tier\"",
+  "test": [
+   "tests/test_seattier.py::test_unreadable_credentials_are_not_a_tier_refusal"
+  ]
+ },
+ {
+  "label": "selection: tier permission required for restart",
+  "file": "acctsw/selection.py",
+  "old": "if e not in exclude\n",
+  "new": "if e not in exclude\n                and s.get(\"plan\") == (state.get_seat(tool, origin) or {}).get(\"plan\")\n",
+  "test": [
+   "tests/test_seattier.py::test_tier_permission_never_blocks_selection_or_a_restart_switch"
+  ]
+ },
+ {
+  "label": "bridge: pair delimiter accepted",
+  "file": "acctsw/bridge.py",
+  "old": "if not a or not b or a == b or \"|\" in a or \"|\" in b:",
+  "new": "if not a or not b or a == b:",
+  "test": [
+   "tests/test_seattier.py::test_bad_tier_answers_are_refused"
+  ]
+ },
+ {
+  "label": "UI tier labels not escaped",
+  "file": "app/web/render.mjs",
+  "old": "const pair = `${esc(r.a)}\\u2194${esc(r.b)}`;",
+  "new": "const pair = `${r.a}\\u2194${r.b}`;",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
   ]
  }
 ]

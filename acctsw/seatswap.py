@@ -60,7 +60,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
-from . import seatkind
+from . import seatkind, seattier
 from .keychain import KeychainError
 from .seatproxy import Seat
 from .selection import choose
@@ -312,11 +312,6 @@ def _oauth(blob: str | None) -> dict:
     return oauth if isinstance(oauth, dict) else {}
 
 
-def _tier(blob: str | None) -> str | None:
-    raw = _oauth(blob).get("subscriptionType")
-    return raw.strip().lower() if isinstance(raw, str) and raw.strip() else None
-
-
 class _Unreadable(Exception):
     """The Keychain (or a home directory) could not be read: no verdict either way."""
 
@@ -329,32 +324,56 @@ def _load(ctx, email: str) -> str | None:
         raise _Unreadable(str(exc)) from None
 
 
-def eligible(ctx, email: str, *, home_email: str | None) -> str | None:
+def eligible(ctx, email: str, *, home_email: str | None,
+             allow_tier: bool | None = None) -> str | None:
     """The access token to bill ``email`` in place of ``home_email``, or None if it can't be.
-    An unreadable Keychain is None too: nothing proves the seat can serve."""
+    An unreadable Keychain is None too: nothing proves the seat can serve. ``allow_tier``:
+    True lets a different plan tier through, False refuses it, None asks ``seattier.allowed``
+    (the setting and the pair approvals)."""
     try:
-        return _eligible(ctx, email, home_email=home_email)
+        return _check(ctx, email, home_email, allow_tier)[0]
     except _Unreadable:
         return None
 
 
-def _eligible(ctx, email: str, *, home_email: str | None) -> str | None:
+def eligible_reason(ctx, email: str, *, home_email: str | None,
+                    allow_tier: bool | None = None) -> str | None:
+    """Why ``eligible`` is None: ``"tier"`` when only the plan tier blocks it (the caller may
+    ask the user), else ``"seat"`` (quarantined, no token, expiring) or ``"unreadable"``.
+    None when the seat is eligible."""
+    try:
+        return _check(ctx, email, home_email, allow_tier)[1]
+    except _Unreadable:
+        return "unreadable"
+
+
+def _eligible(ctx, email: str, *, home_email: str | None,
+              allow_tier: bool | None = None) -> str | None:
+    return _check(ctx, email, home_email, allow_tier)[0]
+
+
+def _check(ctx, email: str, home_email: str | None,
+           allow_tier: bool | None) -> tuple[str | None, str | None]:
+    """``(token, None)`` or ``(None, reason)``."""
     from .usage import claude_token
     if (ctx.claude_home(email) / ".acctsw-quarantined").exists():
-        return None
+        return None, "seat"
     blob = _load(ctx, email)
     token = claude_token(blob) if blob else None
     if not isinstance(token, str) or not token:
-        return None
+        return None, "seat"
     expiry = _oauth(blob).get("expiresAt")
     if (not isinstance(expiry, (int, float)) or isinstance(expiry, bool)
             or expiry <= (now() + MIN_TTL).timestamp() * 1000):
-        return None
+        return None, "seat"
     if home_email and email != home_email:
-        tier, home_tier = _tier(blob), _tier(_load(ctx, home_email))
+        tier, home_tier = seattier.tier(blob), seattier.tier(_load(ctx, home_email))
         if tier and home_tier and tier != home_tier:
-            return None
-    return token
+            ok = allow_tier if allow_tier is not None else seattier.allowed(
+                ctx.load_state(), TOOL, tier, home_tier)
+            if not ok:
+                return None, "tier"
+    return token, None
 
 
 # --- the per-run glue ---------------------------------------------------------------------------

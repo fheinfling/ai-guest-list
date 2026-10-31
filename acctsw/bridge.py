@@ -22,7 +22,7 @@ from . import keyprove as keyprove_mod
 from . import paths as P
 from . import pricing as pricing_mod
 from . import providers as providers_mod
-from . import seatkind
+from . import seatkind, seattier
 from . import session as session_mod
 from . import usage as usage_mod
 from .context import Context
@@ -37,7 +37,7 @@ from .web_dot import dot_for, door_for
 # Settings the UI may toggle (boolean only) — a whitelist so a stray key can't clobber e.g. theme.
 TOGGLE_KEYS = {
     "auto_switch", "notify", "restart_app", "celebrations", "same_tool_only", "supervise_shell",
-    "confirm_key_switch", "key_fallback", "in_place_switch",
+    "confirm_key_switch", "key_fallback", "in_place_switch", "in_place_cross_tier",
 }
 
 KEY_ACTIONS = {"key_add", "key_remove", "key_validate", "key_prove", "models_list", "answer_key_switch",
@@ -114,6 +114,9 @@ def snapshot_state(ctx: Context) -> dict[str, Any]:
         key=lambda record: (record["created_at"], record["id"]),
     )
     data["pending_crossings"] = _pending_crossings(state, at)
+    data["pending_tier_requests"] = [
+        {**r, "tool": tool} for tool in TOOLS for r in seattier.pending(state, tool)
+    ]
     data["rev"] = int(state.data.get("rev", 0))  # monotonic; the UI drops a snapshot older than one it applied
     return data
 
@@ -618,6 +621,27 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
                     seatkind.approve(state, tool, a, b, scope)
                 else:
                     seatkind.deny(state, tool, a, b)
+                state.save()
+            return {"ok": True, "state": snapshot_state(ctx)}
+
+        if action in ("approve_tier", "deny_tier"):
+            tool, a, b = message["tool"], message.get("a"), message.get("b")
+            if tool not in TOOLS or not isinstance(a, str) or not isinstance(b, str):
+                return {"ok": False, "error": "bad tier request"}
+            a, b = a.strip().lower(), b.strip().lower()
+            if not a or not b or a == b or "|" in a or "|" in b:
+                return {"ok": False, "error": "bad tier request"}
+            scope = message.get("scope", "pair")
+            if action == "approve_tier" and scope not in ("pair", "all"):
+                return {"ok": False, "error": f"bad tier scope: {scope}"}
+            with ctx.locked():
+                state = ctx.load_state()
+                if action == "deny_tier":
+                    seattier.deny(state, tool, a, b)
+                elif scope == "all":
+                    seattier.approve_all(state)
+                else:
+                    seattier.approve(state, tool, a, b)
                 state.save()
             return {"ok": True, "state": snapshot_state(ctx)}
 

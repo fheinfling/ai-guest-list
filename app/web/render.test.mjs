@@ -2324,3 +2324,51 @@ test("crossing answers reach the bridge as approve_crossing / deny_crossing", ()
     { action: "deny_crossing", tool: "claude", from: "w@x", to: "p@x", scope: "deny" },
   ]);
 });
+
+// --- plan tiers ---------------------------------------------------------------------------------
+import { tierRequests } from "./render.mjs";
+
+test("settings offers the cross-tier toggle, off by default", () => {
+  const off = buildSettings({ settings: { theme: "light", strategy: "soonest_back" } });
+  assert.match(off, /switch without restarting across plan tiers/);
+  assert.match(off, /data-key="in_place_cross_tier" >/);
+  const on = buildSettings({ settings: { theme: "light", strategy: "soonest_back", in_place_cross_tier: true } });
+  assert.match(on, /data-action="toggle" data-key="in_place_cross_tier" checked/);
+});
+
+test("a pending tier request is a needs-you item with pair, all tiers and no", () => {
+  const req = { tool: "claude", a: "max", b: "team", at: "2026-10-31T10:00:00Z" };
+  const html = buildHTML(state({ pending_tier_requests: [req] }));
+  assert.match(html, /needs you/);
+  assert.match(html, /models may differ/);
+  assert.match(html, /until you say yes, these moves restart the session/);
+  assert.match(html, />always for max↔team</);
+  assert.match(html, />always for all tiers</);
+  for (const scope of ["pair", "all", "deny"]) {
+    assert.match(html, new RegExp(`data-action="tier-answer" data-scope="${scope}" data-tool="claude" data-a="max" data-b="team"`));
+  }
+  assert.equal(tierRequests(state({})), "");
+  assert.doesNotMatch(buildHTML(state({})), /tier-answer/);
+});
+
+test("tier plan labels and action attributes are escaped", () => {
+  const html = tierRequests({ pending_tier_requests: [{ tool: 'claude"', a: '<b>max</b>', b: 'team"' }] });
+  assert.match(html, /data-tool="claude&quot;"/);
+  assert.match(html, /data-a="&lt;b&gt;max&lt;\/b&gt;"/);
+  assert.match(html, /data-b="team&quot;"/);
+  assert.match(html, />always for &lt;b&gt;max&lt;\/b&gt;↔team&quot;</);
+  assert.doesNotMatch(html, /<b>/);
+});
+
+test("tier answers reach the bridge as approve_tier / deny_tier", () => {
+  const html = tierRequests({ pending_tier_requests: [{ tool: "claude", a: "max", b: "team" }] });
+  const buttons = [...html.matchAll(/data-action="tier-answer" data-scope="(\w+)" data-tool="([^"]+)" data-a="([^"]+)" data-b="([^"]+)"/g)];
+  assert.equal(buttons.length, 3);
+  const app = keyApp();
+  for (const [, scope, tool, a, b] of buttons) app.click({ action: "tier-answer", scope, tool, a, b });
+  assert.deepEqual(JSON.parse(JSON.stringify(app.sent.slice(-3))), [
+    { action: "approve_tier", tool: "claude", a: "max", b: "team", scope: "pair" },
+    { action: "approve_tier", tool: "claude", a: "max", b: "team", scope: "all" },
+    { action: "deny_tier", tool: "claude", a: "max", b: "team", scope: "deny" },
+  ]);
+});

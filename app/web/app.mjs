@@ -296,6 +296,11 @@ document.addEventListener("click", (e) => {
       send(scope === "deny" ? "deny_crossing" : "approve_crossing", { tool, from, to, scope });
       break;
     }
+    case "tier-answer": {
+      const { tool, a, b, scope } = el.dataset;
+      send(scope === "deny" ? "deny_tier" : "approve_tier", { tool, a, b, scope });
+      break;
+    }
     case "key-stop": send("toggle", { key: "key_fallback", value: false }); break;
     case "key-terminal":
       if (paidTerminal?.pending) break;

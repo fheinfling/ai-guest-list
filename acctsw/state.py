@@ -12,7 +12,7 @@ Holds only metadata — NEVER credentials (those live in the Keychain). Shape::
       "settings": {"auto_switch": true, "same_tool_only": true, "notify": true,
                    "restart_app": false, "celebrations": true, "supervise_shell": true,
                    "theme": "light", "confirm_key_switch": true, "key_fallback": false,
-                   "in_place_switch": true},
+                   "in_place_switch": true, "in_place_cross_tier": false},
       "engine": {"last_writer": "<version>", "newest_writer": "<version>",
                  "min_writer": "<version>"}
     }
@@ -113,6 +113,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "confirm_key_switch": True,  # consent for each hop onto metered API usage
     "key_fallback": False,    # metered seats must be explicitly opted into
     "in_place_switch": True,  # move a running claude between seats without restarting it
+    "in_place_cross_tier": False,  # ...also between plan tiers (Max/Pro/Team): models may differ
 }
 
 
