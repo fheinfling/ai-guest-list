@@ -414,7 +414,7 @@ def classify_signin(tool: str, blobs, at=None) -> SignIn:
 
 
 def claude_login_present(blob: str | None) -> bool:
-    """A Claude credential item Claude Code can sign in with: raw JSON carrying both OAuth tokens."""
+    """The two-token shape required by the snapshot restore safety checks."""
     try:
         oauth = json.loads(blob)["claudeAiOauth"]
     except (TypeError, ValueError, KeyError):
@@ -433,11 +433,11 @@ def claude_login_wiped(blob: str | None) -> bool:
 
 
 def claude_launch_login(current: str | None, read_snapshot: Callable[[], str | None],
-                        last: str | None) -> tuple[str, str] | None:
+                        last: str | None, at=None) -> tuple[str, str] | None:
     """Which login a launch on a seeded Claude home would run on: ``("home", current)``,
     ``("snapshot", snapshot)`` when the launcher would reinstall the seat's snapshot, or None when
     it has nothing it may use. ``current`` is the home item's bytes, ``last`` the last copy this
-    process saw there; the snapshot is read only when the home item is not a login.
+    process saw there; the snapshot is read only when the home item is not a usable login.
 
     Claude rotates refresh tokens, so a snapshot taken before the child last refreshed carries a
     consumed refresh token, and installing it would end in another invalid_grant — after which
@@ -448,7 +448,7 @@ def claude_launch_login(current: str | None, read_snapshot: Callable[[], str | N
 
     plan_claude_login acts on this, and the sign-in verdict reports it, so a seat reads signed in
     exactly when a launch on it would get a login."""
-    if claude_login_present(current):
+    if login_usable("claude", current, at):
         return "home", current
     snapshot = read_snapshot()
     if not claude_login_present(snapshot):
@@ -488,7 +488,7 @@ def _signin_for(ctx, tool: str, email: str, blob: str | None,
             return read[-1]
         seen = claudesync.tracker(ctx).seen.get(email)
         last = seen.blob if seen else None
-        launch = claude_launch_login(blob, snapshot, last)
+        launch = claude_launch_login(blob, snapshot, last, at)
         login = launch[1] if launch else None
         verdict = classify_signin(tool, [login], at)
         digest = (_credential_digest(blob) if len(read) == 1
@@ -1136,6 +1136,7 @@ def _recover_parked_codex(ctx, job: UsageFetchJob, *, post,
 
 def refresh_live(ctx, tool: str | None = None, *, only: str | None = None,
                  active_only: bool = False, force: bool = False,
+                 unreadable: set[tuple[str, str]] | None = None,
                  get: HttpGet = _default_get, post=_default_post,
                  min_seconds: int = USAGE_MIN_REFRESH_SECONDS,
                  active_min_seconds: int = P.USAGE_ACTIVE_REFRESH_SECONDS,
@@ -1146,6 +1147,7 @@ def refresh_live(ctx, tool: str | None = None, *, only: str | None = None,
     parallel so a slow provider cannot postpone the other provider's live card; each response is
     committed immediately under a fresh, short lock.  Parked seats follow afterward on the gentler
     cadence.  Commit revalidates the seat incarnation, credential bytes, and attempt ordering.
+    Seats whose reconciliation credentials were unreadable are left untouched for this poll.
     """
     from . import session
 
@@ -1164,6 +1166,9 @@ def refresh_live(ctx, tool: str | None = None, *, only: str | None = None,
                 continue
             active = email == active_email
             if active_only and not active:
+                continue
+            if unreadable and (t, email) in unreadable:
+                summary[t][email] = "unreadable"
                 continue
             interval = active_min_seconds if active else min_seconds
             previous = seat.get("usage") or {}

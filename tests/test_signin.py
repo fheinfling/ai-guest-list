@@ -653,3 +653,46 @@ def test_bridge_poll_delivers_each_notice_once_and_honours_the_setting(ctx, monk
     state.set_setting("notify", True)
     state.save()
     assert bridge.handle(ctx, {"action": "usage", "tool": "claude"})["signin_notices"] == []
+
+
+@pytest.mark.parametrize("access,refresh,expires,refresh_expires,usable", [
+    ("setup", "", 3600, None, True),
+    ("", "refresh", -3600, 3600, True),
+    ("", "refresh", -3600, None, True),
+    ("", "", 0, None, False),
+    ("setup", "", -3600, None, False),
+    ("", "refresh", -3600, -3600, False),
+])
+def test_partial_home_login_matches_launch_and_signin(ctx, monkeypatch, access, refresh,
+                                                      expires, refresh_expires, usable):
+    _seed_claude(ctx, ["a@test"])
+    at = now()
+    monkeypatch.setattr(U, "now", lambda: at)
+    blob = _claude(access, refresh, (at + timedelta(seconds=expires)).timestamp() * 1000,
+                   None if refresh_expires is None else
+                   (at + timedelta(seconds=refresh_expires)).timestamp() * 1000)
+    ctx.claude_cred("a@test").set_live(blob)
+    ctx.snapshot_set("claude", "a@test", EXPIRED_SNAPSHOT)
+    reads = []
+    original = ctx.snapshot_get
+    monkeypatch.setattr(ctx, "snapshot_get", lambda tool, email: reads.append(email) or original(tool, email))
+    verdict, _, login = U._signin_for(ctx, "claude", "a@test", blob, at)
+    assert verdict.signed_out is not usable
+    assert login == (blob if usable else None)
+    with ctx.locked():
+        plan = launcher.plan_claude_login(ctx, ctx.load_state(), "a@test")
+    if usable:
+        assert plan == ("intact", blob, blob)
+        assert reads == []
+        assert launcher.apply_claude_login(ctx, "a@test", "intact", "racing bytes", blob)
+    else:
+        assert reads == ["a@test", "a@test"]
+
+
+def test_home_login_uses_the_classification_clock(ctx):
+    _seed_claude(ctx, ["a@test"])
+    at = now() - timedelta(days=2)
+    blob = _claude(access="setup", refresh="", expires=(at + timedelta(hours=1)).timestamp() * 1000)
+    verdict, _, login = U._signin_for(ctx, "claude", "a@test", blob, at)
+    assert verdict.signed_out is False
+    assert login == blob

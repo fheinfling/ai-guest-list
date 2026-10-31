@@ -671,7 +671,7 @@ def apply_claude_login(ctx: Context, email: str, how: str, blob: str, raw: str |
     if stored == blob:
         return True
     if how == "intact" or stored != raw:
-        return usage_mod.claude_login_present(item.get_live())
+        return usage_mod.login_usable("claude", item.get_live())
     item.set_live(blob)
     return True
 

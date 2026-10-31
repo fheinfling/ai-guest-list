@@ -9,6 +9,7 @@ from acctsw import accounts as acct
 from acctsw import bridge
 from acctsw import install as inst
 from acctsw.state import State
+from acctsw.keychain import KeychainError
 from tests.conftest import make_claude_blob, make_codex_blob
 from acctsw.util import now, iso
 from acctsw.switch import switch
@@ -566,3 +567,107 @@ def test_adopt_engine_replaces_the_stale_wrapper_with_consent(ctx, monkeypatch):
     assert result["ok"] and result["state"]["engine_warnings"] == []
     assert (bindir / "acctsw.bak").read_text() == body
     assert (bindir / "acctsw").read_text() == inst.engine_script()
+
+
+@pytest.mark.parametrize("location", ["stock", "home", "snapshot"])
+@pytest.mark.parametrize("failure", ["keychain", "os"])
+def test_unreadable_claude_item_does_not_block_usage_or_codex_handoff(ctx, monkeypatch,
+                                                                    location, failure):
+    from copy import deepcopy
+    from acctsw.keychain import KeychainError
+    from tests.test_usage import claude_ok_body, codex_ok_body
+
+    _add(ctx, "spare@x.com")
+    _add(ctx, "active@x.com")
+    for email in ("healthy@claude", "locked@claude"):
+        ctx.cred["claude"].set_live(make_claude_blob().replace('"x"', json.dumps(email)))
+        acct.add(ctx, ctx.load_state(), "claude", email=email)
+    item = ctx.cred["claude"] if location == "stock" else ctx.claude_cred("locked@claude")
+    target = (item.service, item.account)
+    if location == "snapshot":
+        item.keychain.delete(item.service, item.account)
+        target = (ctx.keychain_service, ctx.snapshot_key("claude", "locked@claude"))
+    before = deepcopy(ctx.load_state().get_seat("claude", "locked@claude"))
+    stored = dict(ctx.keychain._store)
+    original = ctx.keychain.get_raw
+
+    def read(service, account):
+        if (service, account) == target:
+            raise (KeychainError if failure == "keychain" else OSError)("locked")
+        return original(service, account)
+
+    monkeypatch.setattr(ctx.keychain, "get_raw", read)
+    fetched = []
+
+    def get(url, headers, timeout):
+        fetched.append(headers.get("Authorization"))
+        if "anthropic" in url:
+            return 200, claude_ok_body()
+        limited = headers.get("ChatGPT-Account-Id") == "acct:active@x.com"
+        return 200, codex_ok_body(primary=100 if limited else 20,
+                                  p_reset=iso(now() + timedelta(hours=2)))
+
+    refresh = bridge.usage_mod.refresh_live
+    monkeypatch.setattr(bridge.usage_mod, "refresh_live", lambda *args, **kwargs:
+                        refresh(*args, **{**kwargs, "get": get, "user_agent": "test"}))
+    result = bridge.handle(ctx, {"action": "usage", "force": True})
+    assert result["ok"] is True
+    assert result["refresh"]["codex"] == {"spare@x.com": "ok", "active@x.com": "ok"}
+    assert result["refresh"]["claude"]["healthy@claude"] == "ok"
+    assert "Bearer healthy@claude" in fetched
+    assert result["auto_switch"]["to"] == "spare@x.com"
+    assert result["refresh"]["claude"]["locked@claude"] == "unreadable"
+    assert ctx.load_state().get_seat("claude", "locked@claude") == before
+    assert "Bearer locked@claude" not in fetched
+    assert ctx.keychain._store == stored
+
+
+@pytest.mark.parametrize("read_number", [1, 2, 3])
+@pytest.mark.parametrize("error_type", [OSError, KeychainError])
+def test_unreadable_handoff_receipt_keeps_selection(ctx, monkeypatch, read_number, error_type):
+    _add(ctx, "spare@x.com")
+    _add(ctx, "active@x.com")
+    state = ctx.load_state()
+    state.set_limited_until("codex", "active@x.com", iso(now() + timedelta(hours=2)), source="usage")
+    state.set_usage("codex", "active@x.com", {
+        "credential_digest": bridge._blob_digest(ctx.cred["codex"].get_live()),
+    })
+    state.save()
+    before = ctx.state_file.read_bytes()
+    original = ctx.snapshot_get
+    reads = 0
+
+    def read(tool, email):
+        nonlocal reads
+        if email == "spare@x.com":
+            reads += 1
+            if reads == read_number:
+                raise error_type("locked")
+        return original(tool, email)
+
+    monkeypatch.setattr(ctx, "snapshot_get", read)
+    monkeypatch.setattr(bridge.usage_mod, "refresh_live", lambda *args, **kwargs:
+                        {"codex": {"spare@x.com": "ok"}})
+    assert bridge._auto_switch_after_usage(ctx, {"codex": {"active@x.com": "ok"}}) is None
+    assert reads == read_number
+    assert ctx.state_file.read_bytes() == before
+
+
+@pytest.mark.parametrize("tool", ["codex", "claude"])
+def test_unreadable_reconciliation_does_not_abort_poll(ctx, monkeypatch, tool):
+    from acctsw.keychain import KeychainError
+    ctx.cred["claude"].set_live(make_claude_blob())
+    acct.add(ctx, ctx.load_state(), "claude", email="a@claude")
+    ctx.cred["claude"].set_live(make_claude_blob("pro"))
+    monkeypatch.setattr(bridge.identity_mod, "claude_live_identity", lambda *args, **kwargs:
+                        bridge.identity_mod.ClaudeLiveIdentity(ctx.cred["claude"].get_live(), None))
+
+    def unreadable(*args, **kwargs):
+        raise KeychainError("locked during reconciliation")
+
+    monkeypatch.setattr(acct, "reconcile_" + tool, unreadable)
+    calls = []
+    monkeypatch.setattr(bridge.usage_mod, "refresh_live", lambda *args, **kwargs:
+                        calls.append(True) or {})
+    assert bridge.handle(ctx, {"action": "usage"})["ok"] is True
+    assert calls == [True]

@@ -184,8 +184,8 @@
    "test": ["tests/test_signin.py::test_signed_in_means_a_launch_would_get_a_login"]},
   {"label": "launch login (B1): the verdict never reads the snapshot a launch would restore",
    "file": "acctsw/usage.py",
-   "old": "        launch = claude_launch_login(blob, snapshot, last)\n",
-   "new": "        launch = claude_launch_login(blob, lambda: None, last)\n",
+   "old": "        launch = claude_launch_login(blob, snapshot, last, at)\n",
+   "new": "        launch = claude_launch_login(blob, lambda: None, last, at)\n",
    "test": ["tests/test_signin.py::test_signed_in_means_a_launch_would_get_a_login"]},
   {"label": "launch login (B1): the poll fetches with the dead home item, not the login the verdict rests on",
    "file": "acctsw/usage.py",
@@ -256,5 +256,55 @@
    "file": "scripts/mutate.py",
    "old": "        except subprocess.TimeoutExpired:\n            return \"TIMEOUT\", f\"guard ran past {TIMEOUT_S}s\"\n",
    "new": "        except ZeroDivisionError:\n            return \"TIMEOUT\", f\"guard ran past {TIMEOUT_S}s\"\n",
-   "test": ["tests/test_mutate.py::test_a_guard_that_hangs_is_a_timeout_not_a_verdict"]}
+   "test": ["tests/test_mutate.py::test_a_guard_that_hangs_is_a_timeout_not_a_verdict"]},
+
+  {
+    "label": "launch login: a usable partial home login is rejected",
+    "file": "acctsw/usage.py",
+    "old": "    if login_usable(\"claude\", current, at):",
+    "new": "    if claude_login_present(current):",
+    "test": [
+      "tests/test_signin.py::test_partial_home_login_matches_launch_and_signin"
+    ]
+  },
+
+  {
+    "label": "launch login: classifier clock is ignored",
+    "file": "acctsw/usage.py",
+    "old": "        launch = claude_launch_login(blob, snapshot, last, at)\n",
+    "new": "        launch = claude_launch_login(blob, snapshot, last)\n",
+    "test": [
+      "tests/test_signin.py::test_home_login_uses_the_classification_clock"
+    ]
+  },
+
+  {
+    "label": "bridge: unreadable Claude preflight aborts the other seats",
+    "file": "acctsw/bridge.py",
+    "old": "                except usage_mod.UNREADABLE:\n                    # Locked/denied is unknown;",
+    "new": "                except ZeroDivisionError:\n                    # Locked/denied is unknown;",
+    "test": [
+      "tests/test_bridge.py::test_unreadable_claude_item_does_not_block_usage_or_codex_handoff"
+    ]
+  },
+
+  {
+    "label": "bridge: unreadable handoff receipt aborts the request",
+    "file": "acctsw/bridge.py",
+    "old": "        except usage_mod.UNREADABLE:\n            continue  # unknown credentials cannot authorize a handoff",
+    "new": "        except ZeroDivisionError:\n            continue  # unknown credentials cannot authorize a handoff",
+    "test": [
+      "tests/test_bridge.py::test_unreadable_handoff_receipt_keeps_selection"
+    ]
+  },
+
+  {
+    "label": "bridge: a failed reconciliation probe still permits writes to that seat",
+    "file": "acctsw/usage.py",
+    "old": "            if unreadable and (t, email) in unreadable:",
+    "new": "            if False:",
+    "test": [
+      "tests/test_bridge.py::test_unreadable_claude_item_does_not_block_usage_or_codex_handoff"
+    ]
+  }
 ]

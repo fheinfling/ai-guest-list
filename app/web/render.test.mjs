@@ -215,7 +215,7 @@ test("terminal ages expose long-lived sessions without inventing missing start t
   assert.equal(fmtSessionAge("invalid", at), "");
 });
 
-test("revoked entitlement retains the sign-in action on a non-active seat", () => {
+test("revoked entitlement asks for a subscription check on a non-active seat", () => {
   const html = buildHTML(state({ tools: {
     codex: { seats: [seat({
       status: "needs-login",
@@ -224,7 +224,8 @@ test("revoked entitlement retains the sign-in action on a non-active seat", () =
     })] },
     claude: { seats: [] },
   } }));
-  assert.match(html, /data-action="add" data-tool="codex" data-email="work@x.com">sign in</);
+  assert.match(html, /check your subscription to refresh usage/);
+  assert.doesNotMatch(html, /data-action="add" data-tool="codex" data-email="work@x.com">sign in</);
   assert.doesNotMatch(html, />log in</);
 });
 
@@ -2257,6 +2258,7 @@ test("active signed-out seat is keyed on seat.active, not status", () => {
   const table = rosterOf(html);
   assert.ok(table.indexOf("work@x.com") < table.indexOf("b@x.com") || table.indexOf("Work") < table.indexOf(">B<"), "active seat leads");
   assert.match(table, /on now · signed out/);
+  assert.doesNotMatch(table, /roster-active/);
 });
 
 test("expiring seat keeps its switch action beside sign in again", () => {
@@ -2278,3 +2280,31 @@ test("headline counts a signed_out seat as not ready even when its status says r
   assert.doesNotMatch(html, /you can keep working/);
   assert.match(html, /<span class="reading-value">0<\/span>/);
 });
+
+for (const auth of [
+  { status: "ready", auth_error: "refresh_token_revoked" },
+  { status: "needs-login", auth_error: "refresh_token_revoked" },
+  { status: "active", active: true, usage: { error: "unauthorized" } },
+]) test(`signed-in login failure offers sign in: ${auth.status}`, () => {
+  const s = seat({ ...auth, signed_out: false, needs_login: true });
+  const html = buildHTML(state({ tools: { codex: { seats: [s] }, claude: { seats: [] } } }));
+  assert.equal(signedOut(s), false);
+  assert.equal(usable(s), false);
+  for (const part of [rosterOf(html), html.slice(html.indexOf("<article"), html.indexOf("</article>"))]) {
+    assert.match(part, />sign-in needed</);
+    assert.match(part, /data-action="add"[^>]*>sign in<\/button>/);
+    assert.doesNotMatch(part, /signed out|data-action="switch"|class="roster-active"/);
+  }
+});
+
+for (const revoked of [{ entitlement_revoked: true }, { usage: { error: "forbidden" } }]) {
+  test(`revoked subscription has no sign-in affordance: ${JSON.stringify(revoked)}`, () => {
+    const s = seat({ signed_out: false, needs_login: true, signin_expiring: true,
+      signin_expires_at: inHours(1), ...revoked });
+    const html = buildHTML(claudeState(s));
+    for (const part of [rosterOf(html), html.slice(html.indexOf("<article"), html.indexOf("</article>"))]) {
+      assert.match(part, /check your subscription to refresh usage/);
+      assert.doesNotMatch(part, /sign-in needed|signed out|data-action="add"|data-action="switch"/);
+    }
+  });
+}

@@ -60,7 +60,15 @@ export function needsHello(seat) {
 // not signed out and keeps "check your subscription".
 export function signedOut(seat) {
   if (typeof seat?.signed_out === "boolean") return seat.signed_out;
-  return seat?.needs_login === true || needsHello(seat || {});
+  return !entitlementRevoked(seat) && (seat?.needs_login === true || needsHello(seat || {}));
+}
+
+function entitlementRevoked(seat) {
+  return seat?.entitlement_revoked === true || seat?.usage?.error === "forbidden";
+}
+
+function signinNeeded(seat) {
+  return seat?.needs_login === true && !entitlementRevoked(seat);
 }
 
 // The engine marks the seat in use with `active`, also when its status is "needs-login".
@@ -77,7 +85,7 @@ export function signinExpiring(seat, now = Date.now()) {
 
 // A seat that can actually take work: ready or on now, and signed in.
 export function usable(seat) {
-  return ["ready", "active"].includes(seat?.status) && !signedOut(seat);
+  return ["ready", "active"].includes(seat?.status) && !signinNeeded(seat) && !entitlementRevoked(seat) && !signedOut(seat);
 }
 
 // A window whose reset time already passed is mid-refresh, not "in now": say so neutrally.
@@ -196,6 +204,8 @@ function bar(seat, win, label) {
 // 0% and the reset countdown, so the label only has to carry "despite that".
 function seatAction(tool, seat) {
   const add = (label) => `<button class="row-action" data-action="add" data-tool="${tool}" data-email="${esc(seat.email)}">${label}</button>`;
+  if (entitlementRevoked(seat)) return "";
+  if (signinNeeded(seat)) return add("sign in");
   if (signedOut(seat)) return add("sign in");
   const again = signinExpiring(seat) ? add("sign in again") : "";
   if (isActive(seat)) return again;
@@ -214,13 +224,15 @@ function seatCard(tool, seat) {
   const reported = seat?.usage?.reported_windows;
   const weeklyOnly = tool === "codex" && Array.isArray(reported) && reported.includes("weekly") && !reported.includes("5h");
   const out = signedOut(seat);
-  const stateText = out ? (isActive(seat) ? "on now · signed out" : "signed out")
+  const stateText = entitlementRevoked(seat) ? "check your subscription to refresh usage"
+    : !out && signinNeeded(seat) ? "sign-in needed"
+    : out ? (isActive(seat) ? "on now · signed out" : "signed out")
     : seat.status === "resting"
     ? `<span data-reset-at="${esc(seat.limited_until)}" data-clock-prefix="back in" title="${esc(fmtClock(seat.limited_until))}">back in ${fmtCountdown(seat.limited_until)}</span>`
     : isActive(seat) ? (seat.in_session ? "on the floor" : "selected")
     : seat.status === "queued" ? "up next" : "ready";
   const error = seat.usage?.error;
-  const issue = ({ rate_limited: "updates throttled; retrying automatically", network: "connection unavailable; retrying automatically",
+  const issue = entitlementRevoked(seat) ? "check your subscription to refresh usage" : ({ rate_limited: "updates throttled; retrying automatically", network: "connection unavailable; retrying automatically",
     token_expired: `open ${TOOL_META[tool].label} to refresh usage`, unauthorized: "sign in to refresh usage", forbidden: "check your subscription to refresh usage", no_token: "sign in to refresh usage" })[error] || (error ? "usage update failed; retrying automatically" : "");
   const action = seatAction(tool, seat);
   return `<article class="seat seat--${esc(seat.status)}${out ? " seat--signedout" : ""}" data-card data-tool="${tool}" data-email="${esc(seat.email)}">
@@ -627,7 +639,7 @@ function ambientVerdict(state) {
   } else if (!ready.length) {
     headline = seats.every((seat) => ["resting", "queued"].includes(seat.status)) ? "every subscription is resting." : "your seats need attention.";
     const key = (state?.keys || [])[0];
-    const login = seats.find(signedOut);
+    const login = seats.find((seat) => !entitlementRevoked(seat) && (signedOut(seat) || signinNeeded(seat)));
     const reset = seats.map((seat) => seat.limited_until).filter((iso) => iso && Number.isFinite(Date.parse(iso))).sort((a,b) => Date.parse(a)-Date.parse(b))[0];
     if (key) {
       detail = `<p class="hero-support">${esc(key.label)} ${key.responses_verified === false || key.last_proof?.outcome === "incompatible" ? "may help with paid use; endpoint unproven." : "can keep you going with paid use."}</p>`;
@@ -656,7 +668,7 @@ function rosterTable(state, compact = false) {
         return `<tbody><tr><th class="roster-tool" scope="rowgroup" colspan="3">${esc(TOOL_META[tool]?.label || tool || "API key")} /</th></tr>${subscriptions.sort((a, b) => Number(isActive(b)) - Number(isActive(a))).map((seat) => {
         const active = isActive(seat);
         const out = signedOut(seat);
-        const status = out ? (active ? "on now · signed out" : "signed out") : active ? "active" : seat.status === "resting" ? "resting" : seat.status === "queued" ? "up next" : "ready";
+        const status = entitlementRevoked(seat) ? "check your subscription to refresh usage" : !out && signinNeeded(seat) ? "sign-in needed" : out ? (active ? "on now · signed out" : "signed out") : active ? "active" : seat.status === "resting" ? "resting" : seat.status === "queued" ? "up next" : "ready";
         const windows = ["5h", "weekly"].map((win) => {
           const reported = seat.usage?.reported_windows;
           const absent = Array.isArray(reported) && !reported.includes(win);
@@ -683,9 +695,9 @@ function rosterTable(state, compact = false) {
         // because it is the innermost [data-action], a click on it dispatches once, not twice.
         // Only a switch becomes a row target. A seat needing sign-in offers "sign in again", and
         // turning the whole row into a switch would fire the wrong action entirely.
-        const rowAction = action && !active && !out
+        const rowAction = action && !active && !out && !signinNeeded(seat)
           ? ` data-action="switch" data-tool="${esc(tool)}" data-email="${esc(seat.email)}"` : "";
-        return `<tr class="${active && !out ? "roster-active" : ""}${out ? " roster-signedout" : ""}${rowAction ? " roster-actionable" : ""}"${rowAction}><th scope="row">${identity}<span class="roster-meta">${planChip(seat.plan)}<span class="roster-status">${status}</span></span>${!out && signinExpiring(seat) ? signinExpiryLine(seat, "span").replace('class="signin-expiry"', 'class="signin-expiry roster-meta"') : ""}${action}</th>${windows}</tr>`;
+        return `<tr class="${active && !out && !signinNeeded(seat) && !entitlementRevoked(seat) ? "roster-active" : ""}${out ? " roster-signedout" : ""}${rowAction ? " roster-actionable" : ""}"${rowAction}><th scope="row">${identity}<span class="roster-meta">${planChip(seat.plan)}<span class="roster-status">${status}</span></span>${!out && signinExpiring(seat) ? signinExpiryLine(seat, "span").replace('class="signin-expiry"', 'class="signin-expiry roster-meta"') : ""}${action}</th>${windows}</tr>`;
       }).join("")}${keys.map((key) => `<tr class="roster-key roster-actionable" data-action="key-terminal" data-id="${esc(key.id)}"><th scope="row"><span class="roster-inline"><span class="roster-identity" title="${esc(key.label)}">${esc(key.label)}</span>${spending.has(key.id) ? `<span class="roster-spending">spending now</span>` : ""}</span>${key.model ? `<span class="roster-meta" title="${esc(key.model)}">${esc(key.model)}</span>` : ""}<button class="row-action key-use" data-action="key-terminal" data-id="${esc(key.id)}" aria-label="${esc(`use ${key.label} in a new paid terminal`)}" title="use in a new paid terminal">new terminal</button></th><td class="roster-key-terms" colspan="2"><span class="key-terms">paid per token<span class="roster-meta">no app spend cap</span></span></td></tr>`).join("")}</tbody>`;
       }).join("")}
     </table>`;
