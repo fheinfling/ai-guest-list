@@ -2112,9 +2112,9 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 st.data["last_switch_at"] = iso(now())
                 st.save()
             pending, inplace["hit"] = inplace["hit"], None
-            if pending is not None:
-                swap.answer(pending, seat)   # the proxy replays that very request on the new seat
-            else:
+            # The proxy replays the pending request on the new seat. An answer that came too late
+            # (the 429 already went through) is refused, so bind for the requests still to come.
+            if pending is None or not swap.answer(pending, seat):
                 swap.bind(seat)
             inplace["hops"] += 1
             inplace["hopped"] = True
@@ -2622,9 +2622,16 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 billed = running_seat()
                 seat = snap.get_seat(tool, billed) or {}
                 until = parse_iso(seat.get("limited_until"))
-                if (until is None or until <= now()
-                        or seat.get("limit_source") not in ("usage", "hard")):
-                    return False   # the seat we are on is not (credibly) out — nothing to recover
+                if until is None or until <= now():
+                    if crossing["requested"]:
+                        # Its own seat came back: the move this session asked about is moot.
+                        with ctx.locked():
+                            st = ctx.load_state()
+                            _withdraw_crossings(st)
+                            st.save()
+                    return False   # the seat we are on is not out (any more) — nothing to recover
+                if seat.get("limit_source") not in ("usage", "hard"):
+                    return False   # only our own weak guess says it is out
                 if switches >= max_switches and not (
                         swap is not None and inplace["hops"] < MAX_INPLACE_SWITCHES):
                     return False

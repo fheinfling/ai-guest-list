@@ -254,5 +254,70 @@
     "test": [
       "tests/test_launcher_inplace.py::test_maintain_moving_the_proxy_on_its_own_is_recorded_as_a_hop"
     ]
+  },
+  {
+    "label": "origin (a): the recovery pre-check looks for a landing from the active seat, not the billed one",
+    "file": "acctsw/launcher.py",
+    "old": "                sel = choose(snap, tool, origin=billed,\n",
+    "new": "                sel = choose(snap, tool,\n",
+    "test": [
+      "tests/test_launcher_inplace.py::test_recovery_looks_for_a_landing_from_the_billed_seat"
+    ]
+  },
+  {
+    "label": "manual (b): a click is gated on an approval being on record",
+    "file": "acctsw/launcher.py",
+    "old": "                        return _take_choice(target, frm=billed, reason=\"manual\")\n",
+    "new": "                        if kinds is None or kinds.approved(snap, tool, billed, target, now()):\n                            return _take_choice(target, frm=billed, reason=\"manual\")\n",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_click_moves_even_when_no_approval_is_on_record"
+    ]
+  },
+  {
+    "label": "withdraw (c): the question stays open after the session's own seat came back",
+    "file": "acctsw/launcher.py",
+    "old": "                    if crossing[\"requested\"]:\n                        # Its own seat came back: the move this session asked about is moot.\n",
+    "new": "                    if False:\n                        # Its own seat came back: the move this session asked about is moot.\n",
+    "test": [
+      "tests/test_launcher_inplace.py::test_the_question_is_withdrawn_when_the_sessions_own_seat_comes_back"
+    ]
+  },
+  {
+    "label": "approval (d): an approval waits out the blocked window instead of the next tick",
+    "file": "acctsw/launcher.py",
+    "old": "if pending is not None and kinds.approved(snap, tool, *pending, now()):",
+    "new": "if pending is not None and time.monotonic() >= tick[\"blocked_until\"] and kinds.approved(snap, tool, *pending, now()):",
+    "test": [
+      "tests/test_launcher_inplace.py::test_approved_crossing_is_taken_in_place_on_the_next_tick",
+      "tests/test_inplace_integration.py::test_a_crossing_asks_first_and_moves_on_the_tick_after_approval"
+    ]
+  },
+  {
+    "label": "handover (e): the restarted child's seat is never made the proxy's home",
+    "file": "acctsw/launcher.py",
+    "old": "                    swap.set_home(launch_email)\n",
+    "new": "",
+    "test": [
+      "tests/test_launcher_inplace.py::test_handover_restarts_on_the_bound_seats_own_login",
+      "tests/test_inplace_integration.py::test_a_target_whose_token_is_about_to_expire_is_reached_by_restart"
+    ]
+  },
+  {
+    "label": "answer: a refused (late) answer leaves the proxy on the old seat",
+    "file": "acctsw/launcher.py",
+    "old": "            if pending is None or not swap.answer(pending, seat):",
+    "new": "            if pending is None or not swap.answer(pending, seat) and False:",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_late_answer_still_moves_the_proxy_for_the_requests_to_come"
+    ]
+  },
+  {
+    "label": "integration: the real stack hops in place on a limit Hit",
+    "file": "acctsw/launcher.py",
+    "old": "                if _hop_in_place(landing, frm=active):\n",
+    "new": "                if False:\n",
+    "test": [
+      "tests/test_inplace_integration.py::test_limit_moves_the_live_child_to_a_same_kind_seat"
+    ]
   }
 ]

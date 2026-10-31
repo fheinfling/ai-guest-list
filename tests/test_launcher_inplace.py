@@ -52,6 +52,7 @@ class FakeSwap:
         self.homes = []
         self.maintain_result = None
         self.maintain_moves_to = None
+        self.refuse_answers = False   # every Hit timed out before the launcher answered
         self.stopped = False
         self._bound = None
 
@@ -78,9 +79,12 @@ class FakeSwap:
         self._bound = seat.email if seat.token else None
 
     def answer(self, hit, seat):
+        if self.refuse_answers:
+            return False
         self.answers.append((hit, seat))
         if seat is not None:
             self._take(seat)
+        return True
 
     def bind(self, seat):
         self.binds.append(seat)
@@ -208,6 +212,18 @@ def _rest(ctx, email, until=None, source="usage"):
     st.save()
 
 
+class Clock:
+    """The launcher's monotonic clock, advanced by hand (TICK_BLOCK_S waits in tests)."""
+
+    def __init__(self, monkeypatch):
+        self.offset = 0.0
+        monkeypatch.setattr(L, "time", types.SimpleNamespace(
+            monotonic=lambda: time.monotonic() + self.offset, sleep=time.sleep))
+
+    def advance(self, seconds):
+        self.offset += seconds
+
+
 def _drop(ctx, email):
     st = ctx.load_state()
     st.remove_seat("claude", email)
@@ -264,6 +280,17 @@ def test_a_second_limit_rests_the_bound_seat_not_the_launch_seat(seats, tokens):
     st = seats.load_state()
     assert st.get_seat("claude", C2)["limited_until"] is not None
     assert st.active("claude") == C3
+
+
+def test_a_late_answer_still_moves_the_proxy_for_the_requests_to_come(seats, tokens):
+    swap = FakeSwap()
+    swap.refuse_answers = True
+    spawn = Spawn(([lambda: swap.post("limit", C1)], 0))
+    notes = []
+    assert _run(seats, spawn, swap, notify=notes.append) == 0
+    assert swap.binds == [Seat(C2, "tok-c2")] and swap.bound() == C2
+    assert sum("takes over" in n for n in notes) == 1   # one hop, not a second to repair it
+    assert seats.load_state().active("claude") == C2
 
 
 def test_hits_queued_before_a_hop_replay_on_the_new_seat(seats, tokens):
@@ -654,6 +681,59 @@ def test_a_question_is_withdrawn_once_the_session_moves_elsewhere(seats, tokens,
     assert still_asked == []
 
 
+@pytest.mark.crossings
+def test_recovery_looks_for_a_landing_from_the_billed_seat(seats, tokens, monkeypatch):
+    """Another terminal moved ``active`` to personal c2 (resting) while this one is billed to
+    business c1. When business c3's rest runs out on the clock, recovery must ask from c1 (c3 is
+    same-kind), not from c2 (c3 would be a crossing, and the session would stay stuck)."""
+    clock = Clock(monkeypatch)
+    _plans(seats, **{C1: "team", C2: "max", C3: "team"})
+    _rest(seats, C2)
+    _rest(seats, C3, until=iso(now() + timedelta(seconds=0.4)))
+    swap = FakeSwap()
+
+    def other_terminal_moves_active():
+        st = seats.load_state()
+        st.set_active("claude", C2)
+        st.save()
+
+    def c3_rest_runs_out():
+        time.sleep(0.5)
+        clock.advance(L.TICK_BLOCK_S + 1)
+
+    spawn = Spawn(([lambda: swap.post("limit", C1), None, other_terminal_moves_active, None,
+                    c3_rest_runs_out], 0))
+    assert _run(seats, spawn, swap) == 0
+    assert swap.binds == [Seat(C3, "tok-c3")]
+    assert seats.load_state().active("claude") == C3
+
+
+@pytest.mark.crossings
+def test_the_question_is_withdrawn_when_the_sessions_own_seat_comes_back(seats, tokens,
+                                                                          monkeypatch):
+    from acctsw import seatkind
+    clock = Clock(monkeypatch)
+    _drop(seats, C3)
+    _plans(seats, **{C1: "team", C2: "max"})
+    swap = FakeSwap()
+    asked, still_asked = [], []
+
+    def c1_resets():
+        asked.extend(seatkind.pending(seats.load_state(), "claude"))
+        time.sleep(0.5)
+        clock.advance(L.TICK_BLOCK_S + 1)
+
+    spawn = Spawn(([lambda: swap.post("limit", C1,
+                                      reset_at=iso(now() + timedelta(seconds=0.4))), None,
+                    c1_resets,
+                    lambda: still_asked.extend(seatkind.pending(seats.load_state(), "claude"))],
+                   0))
+    assert _run(seats, spawn, swap) == 0
+    assert [(r["from"], r["to"]) for r in asked] == [(C1, C2)]
+    assert still_asked == [] and swap.binds == []
+    assert seats.load_state().active("claude") == C1
+
+
 # --- a seat the user picked -----------------------------------------------------------------------
 
 def _click(ctx, email):
@@ -688,3 +768,22 @@ def test_a_click_across_kinds_moves_in_place_without_spending_the_approval(seats
     assert _run(seats, spawn, swap) == 0
     assert swap.binds == [Seat(C2, "tok-c2")]
     assert seatkind.approved(seats.load_state(), "claude", C1, C2)
+
+
+@pytest.mark.crossings
+def test_a_click_moves_even_when_no_approval_is_on_record(seats, tokens):
+    """A manual switch is the user's choice: it is never gated on approved()/consume(), even when
+    no approval exists for it (an older app, or another session already spent it)."""
+    _plans(seats, **{C1: "team", C2: "max", C3: "max"})
+    swap = FakeSwap()
+
+    def click_without_approval():
+        with seats.locked():
+            st = seats.load_state()
+            st.set_active("claude", C2)
+            st.data["tools"]["claude"]["manual_switch"] = {"id": 999, "email": C2}
+            st.save()
+
+    spawn = Spawn(([click_without_approval, None], 0))
+    assert _run(seats, spawn, swap) == 0
+    assert swap.binds == [Seat(C2, "tok-c2")]
