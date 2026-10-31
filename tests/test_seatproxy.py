@@ -123,6 +123,8 @@ class FakeTransport:
 
     base = ""
     netloc = "api.anthropic.com"
+    host = "api.anthropic.com"
+    port = 443
 
     def __init__(self, fake: FA.FakeAnthropic):
         self.fake = fake
@@ -174,11 +176,11 @@ class Harness:
         return f"/{self.proxy._secret}{path}"
 
     def send(self, path="/v1/messages?beta=true", *, method="POST", body=MSG, headers=None,
-             raw_target=None, auth=f"Bearer {CLIENT_TOKEN}"):
+             raw_target=None, auth=f"Bearer {CLIENT_TOKEN}", beta="oauth-2025-04-20"):
         wire = Wire()
         self.t.wire = wire
-        hdrs = [("Content-Type", "application/json"), ("anthropic-beta", "oauth-2025-04-20"),
-                ("Content-Length", str(len(body)))]
+        hdrs = [("Content-Type", "application/json"), ("Content-Length", str(len(body)))]
+        hdrs += [("anthropic-beta", beta)] if beta is not None else []
         hdrs += [("Authorization", auth)] if auth is not None else []
         hdrs += list(headers or [])
         target = self.url(path) if raw_target is None else raw_target
@@ -329,6 +331,34 @@ def test_only_oauth_bearer_clients_get_a_seat_token(auth, extra):
     assert h.hits == [] and len(h.t.sent) == 1
 
 
+@pytest.mark.parametrize("beta", [None, "", "claude-code-20250219", "interleaved-thinking-2025-05-14",
+                                  "oauth", "prompt-caching-2024-07-31,oauthy"])
+def test_bearer_without_the_oauth_beta_is_not_claude_code(beta):
+    """A bearer token alone could be any gateway client; Claude Code's login opts into oauth-*."""
+    h = Harness()
+    h.proxy.bind(B)
+    h.fake.update({"next": [429]})
+    h.answers = [C]
+    resp, _ = h.send(beta=beta)
+    assert resp.status == 429
+    assert h.t.sent[0]["headers"]["Authorization"] == f"Bearer {CLIENT_TOKEN}"
+    assert h.hits == [] and len(h.t.sent) == 1
+    assert h.proxy.messages_seen() == 0
+
+
+@pytest.mark.parametrize("beta,extra", [
+    ("claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14", []),
+    ("OAuth-2025-04-20", []),
+    ("claude-code-20250219", [("anthropic-beta", "oauth-2025-04-20")]),   # split over two headers
+])
+def test_oauth_beta_anywhere_in_anthropic_beta_counts(beta, extra):
+    h = Harness()
+    h.proxy.bind(B)
+    h.send(beta=beta, headers=extra)
+    assert h.t.sent[0]["headers"]["Authorization"] == f"Bearer {B.token}"
+    assert h.proxy.messages_seen() == 1
+
+
 def test_bearer_scheme_is_case_insensitive():
     h = Harness()
     h.proxy.bind(B)
@@ -430,6 +460,26 @@ def test_limit_replays_on_the_decided_seat_and_binds_it():
     assert bearers(h)[-1] == tok(B.token) and len(h.hits) == 1
 
 
+@pytest.mark.parametrize("claim", ["five_hour", "seven_day", "seven_day_opus", None])
+def test_limit_hit_carries_the_representative_claim(claim):
+    h = Harness()
+    h.proxy.bind(A)
+    respond = h.fake.respond
+
+    def with_claim(*args):
+        ans = respond(*args)
+        ans.headers = [(k, v) for k, v in ans.headers
+                       if k != "anthropic-ratelimit-unified-representative-claim"]
+        if claim is not None and ans.status == 429:
+            ans.headers.append(("anthropic-ratelimit-unified-representative-claim", claim))
+        return ans
+    h.fake.respond = with_claim
+    rules(h, a=429)
+    h.answers = [B]
+    h.send()
+    assert [x.claim for x in h.hits] == [claim]
+
+
 def test_limit_on_home_replays_on_a_seat():
     h = Harness()
     h.proxy.bind(HOME)
@@ -477,18 +527,16 @@ def test_limit_without_an_answer_passes_the_429_through_verbatim():
 
 
 def test_decide_timeout_passes_the_limit_through():
-    gate = threading.Event()
-    h = Harness(lambda hit: (gate.wait(10), B)[1], timeout=0.2)
+    gate = threading.Event()    # decide answers only once the test lets it: never, in time
+    h = Harness(lambda hit: (gate.wait(60), B)[1], timeout=0.2)
     h.proxy.bind(A)
     rules(h, a=429)
     out = {}
     worker = threading.Thread(target=lambda: out.update(r=h.send()), daemon=True)
     try:
-        t0 = time.monotonic()
         worker.start()
-        worker.join(2.0)
+        worker.join(10)    # a hang guard, not a measurement: the request ends after 0.2s
         assert not worker.is_alive(), "a decide that never answers must not hold the request"
-        assert time.monotonic() - t0 < 2.0
     finally:
         gate.set()
         worker.join(5)
@@ -497,26 +545,27 @@ def test_decide_timeout_passes_the_limit_through():
     assert any(e == "decide_timeout" for e, _ in h.logs)
 
 
-def test_a_burst_waits_for_one_decide_timeout_only():
+def test_a_burst_waits_for_one_decide_timeout_only(monkeypatch):
+    # The proxy's clock stands still, so the stall window after the first timeout cannot lapse
+    # however slowly the other requests get scheduled; decide's own wait is real time.
+    import types
+    monkeypatch.setattr(SP, "time", types.SimpleNamespace(monotonic=lambda: 1000.0))
     gate = threading.Event()
-    h = Harness(lambda hit: (gate.wait(10), B)[1], timeout=0.4)
+    h = Harness(lambda hit: (gate.wait(60), B)[1], timeout=0.2)
     h.proxy.bind(A)
     rules(h, a=429)
     results = []
     workers = [threading.Thread(target=lambda: results.append(h.send()[0].status), daemon=True)
                for _ in range(3)]
     try:
-        t0 = time.monotonic()
         for w in workers:
             w.start()
         for w in workers:
-            w.join(3.0)
-        elapsed = time.monotonic() - t0
+            w.join(30)    # hang guard only
     finally:
         gate.set()
     assert results == [429, 429, 429]
     assert len(h.hits) == 1, "the rest of the burst must not queue behind another timeout"
-    assert elapsed < 1.0
 
 
 def test_decide_exception_passes_the_limit_through():
@@ -777,8 +826,7 @@ def no_proxy_env(monkeypatch):
 
 
 def test_upstream_tunnels_through_https_proxy(no_proxy_env):
-    no_proxy_env.setenv("HTTPS_PROXY", "http://user:p%40ss@proxy.corp:3128")
-    up = SP._Upstream("https://api.anthropic.com")
+    up = SP._Upstream("https://api.anthropic.com", proxy="http://user:p%40ss@proxy.corp:3128")
     conn, reused = up.acquire()
     assert not reused
     assert isinstance(conn, http.client.HTTPSConnection)
@@ -791,7 +839,7 @@ def test_no_proxy_bypasses_the_tunnel(no_proxy_env):
     no_proxy_env.setenv("HTTPS_PROXY", "http://proxy.corp:3128")
     no_proxy_env.setenv("HTTP_PROXY", "http://proxy.corp:3128")
     no_proxy_env.setenv("NO_PROXY", "127.0.0.1,localhost")
-    up = SP._Upstream("http://127.0.0.1:9999/base")
+    up = SP._Upstream("http://127.0.0.1:9999/base", proxy="http://proxy.corp:3128")
     conn, _ = up.acquire()
     assert type(conn) is http.client.HTTPConnection
     assert (conn.host, conn.port, conn._tunnel_host) == ("127.0.0.1", 9999, None)
@@ -799,6 +847,8 @@ def test_no_proxy_bypasses_the_tunnel(no_proxy_env):
 
 
 def test_no_proxy_configured_connects_directly(no_proxy_env):
+    # The child's HTTPS_PROXY names this proxy; the launcher's environment is never a source.
+    no_proxy_env.setenv("HTTPS_PROXY", "http://proxy.corp:3128")
     conn, _ = SP._Upstream("https://api.anthropic.com").acquire()
     assert (conn.host, conn.port, conn._tunnel_host) == ("api.anthropic.com", 443, None)
 
@@ -1035,7 +1085,7 @@ class Live:
         from urllib.parse import urlsplit
         conn = self.client()
         conn.request(method, urlsplit(self.base).path + path, body=body,
-                     headers={"content-type": "application/json",
+                     headers={"content-type": "application/json", "anthropic-beta": "oauth-2025-04-20",
                               "authorization": f"Bearer {CLIENT_TOKEN}", **(headers or {})})
         return conn, conn.getresponse()
 
@@ -1063,8 +1113,8 @@ def live(request, monkeypatch):
         srv = FA.serve(fake)
         proxy = SeatProxy(decide, upstream=f"http://127.0.0.1:{srv.server_address[1]}",
                           decide_timeout=2, log=log)
-        base = proxy.start()
-        u = urlsplit(base)
+        u = urlsplit(proxy.start())
+        base = f"http://127.0.0.1:{u.port}/{proxy._secret}"    # the secret-path transport
         box["live"] = Live(proxy, base, fake, lambda: http.client.HTTPConnection(u.hostname, u.port, timeout=10))
         try:
             yield box["live"]
@@ -1153,10 +1203,15 @@ def test_wire_oversized_body_is_refused(live, monkeypatch):
     assert resp.status == 413 and live.fake.requests == []
 
 
-def test_wire_stale_upstream_connection_is_replaced(live):
+def test_wire_stale_upstream_connection_is_replaced(live, monkeypatch):
     if live.upstream is None:
         pytest.skip("needs the socketpair upstream to drop its connections")
+    # The proxy pools the connection only after the client has its last byte: wait for that.
+    pooled = threading.Event()
+    release = live.proxy._transport.release
+    monkeypatch.setattr(live.proxy._transport, "release", lambda conn: (release(conn), pooled.set()))
     live.post("/v1/messages")[1].read()
+    assert pooled.wait(30)
     assert len(live.proxy._transport._idle) == 1
     live.upstream.drop_all()          # the upstream closed the idle keep-alive connection
     _, resp = live.post("/v1/messages")
@@ -1175,3 +1230,400 @@ def test_tcp_stop_closes_the_listener(monkeypatch):
     from urllib.parse import urlsplit
     with pytest.raises(OSError):
         _REAL_CREATE_CONNECTION((urlsplit(base).hostname, urlsplit(base).port), timeout=2)
+
+
+# --- CONNECT: the HTTPS_PROXY transport (socketpairs only) -------------------------------------
+
+class FakeCA:
+    """Stands in for ``sessionca.SessionCA``: a server context for api.anthropic.com from a
+    throwaway CA, ``ca_path`` for the client side to trust."""
+
+    def __init__(self, certs: dict):
+        self.certs = certs
+        self.ca_path = str(certs["ca"])
+
+    def server_context(self):
+        ctx = SP.ssl.SSLContext(SP.ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(self.certs["leaf"], self.certs["key"])
+        ctx.set_alpn_protocols(["http/1.1"])
+        return ctx
+
+
+@pytest.fixture(scope="module")
+def session_ca(tmp_path_factory):
+    return FakeCA(_make_certs(tmp_path_factory.mktemp("session-ca")))
+
+
+def _proxy_auth(proxy, user=SP.PROXY_USER, secret=None) -> str:
+    import base64
+    return "Basic " + base64.b64encode(f"{user}:{secret or proxy._secret}".encode()).decode()
+
+
+def _connect(proxy, target: str, auth: str | None = "ok"):
+    """CONNECT ``target`` on a socketpair to the proxy's listener handler: (socket, status, head)."""
+    sock = PairServer(SP._make_handler(proxy)).connect()._sock
+    sock.settimeout(10)
+    lines = [f"CONNECT {target} HTTP/1.1", f"Host: {target}"]
+    if auth is not None:
+        lines.append(f"Proxy-Authorization: {_proxy_auth(proxy) if auth == 'ok' else auth}")
+    sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
+    head = b""
+    while b"\r\n\r\n" not in head:
+        data = sock.recv(1)
+        if not data:
+            break
+        head += data
+    status = int(head.split()[1]) if head else 0
+    return sock, status, head.decode("latin-1")
+
+
+class FarEnd:
+    """Whatever ``socket.create_connection`` reaches: an echo server that records what it got,
+    optionally speaking the CONNECT handshake of an upstream proxy first."""
+
+    def __init__(self, monkeypatch, *, proxy_reply: bytes | None = None):
+        self.addresses: list = []
+        self.connects: list[str] = []
+        self.received = b""
+        self.proxy_reply = proxy_reply
+        monkeypatch.setattr(socket, "create_connection", self.create_connection)
+
+    def create_connection(self, address, *args, **kwargs):
+        self.addresses.append(tuple(address))
+        a, b = socket.socketpair()
+        threading.Thread(target=self._serve, args=(b,), daemon=True).start()
+        return a
+
+    def _serve(self, sock):
+        with sock:
+            if self.proxy_reply is not None:
+                head = b""
+                while b"\r\n\r\n" not in head:
+                    data = sock.recv(1)
+                    if not data:
+                        return
+                    head += data
+                self.connects.append(head.decode("latin-1"))
+                sock.sendall(self.proxy_reply)
+                if b" 200 " not in self.proxy_reply:
+                    return
+            while data := sock.recv(65536):
+                self.received += data
+                sock.sendall(data)
+
+
+def _echo(sock, payload: bytes) -> bytes:
+    sock.sendall(payload)
+    got = b""
+    while len(got) < len(payload):
+        data = sock.recv(65536)
+        if not data:
+            break
+        got += data
+    return got
+
+
+@pytest.mark.parametrize("auth", [None, "Basic", "Basic !!notbase64!!", "Bearer whatever",
+                                  "wrong-secret", "wrong-user"])
+def test_connect_requires_the_proxy_credentials(auth, monkeypatch, session_ca):
+    proxy = SeatProxy(lambda hit: None, ca=session_ca)
+    far = FarEnd(monkeypatch)
+    if auth == "wrong-secret":
+        auth = _proxy_auth(proxy, secret="x" + proxy._secret[1:])
+    elif auth == "wrong-user":
+        auth = _proxy_auth(proxy, user="someone")
+    sock, status, head = _connect(proxy, "example.com:443", auth=auth)
+    with sock:
+        assert status == 407
+        assert 'proxy-authenticate: Basic realm="acctsw"' in head
+        assert sock.recv(1) == b""        # and the connection is closed
+    sock, status, _ = _connect(proxy, "api.anthropic.com:443", auth=auth)
+    sock.close()
+    assert status == 407
+    assert far.addresses == []
+
+
+def test_start_url_carries_the_proxy_credentials(monkeypatch):
+    class Listener:
+        server_address = ("127.0.0.1", 4242)
+
+        def __init__(self, *_args):
+            pass
+
+        def serve_forever(self, **_kwargs):
+            pass
+
+        shutdown = server_close = lambda self: None
+    monkeypatch.setattr(SP, "_Server", Listener)
+    proxy = SeatProxy(lambda hit: None)
+    from urllib.parse import unquote, urlsplit
+    u = urlsplit(proxy.start())
+    proxy.stop()
+    assert (u.scheme, u.hostname, u.port, u.path) == ("http", "127.0.0.1", 4242, "")
+    assert proxy._proxy_auth_ok(_proxy_auth(proxy, user=unquote(u.username), secret=unquote(u.password)))
+
+
+def _tls(sock, ca: FakeCA | None):
+    ctx = SP.ssl.create_default_context(cafile=ca.ca_path if ca else None)
+    return ctx.wrap_socket(sock, server_hostname="api.anthropic.com")
+
+
+def _oauth_post(conn, path="/v1/messages?beta=true"):
+    conn.request("POST", path, body=MSG, headers={
+        "content-type": "application/json", "authorization": f"Bearer {CLIENT_TOKEN}",
+        "anthropic-beta": "oauth-2025-04-20"})
+    resp = conn.getresponse()
+    return resp, resp.read()
+
+
+def test_connect_to_the_api_is_decrypted_and_injected(session_ca):
+    h = Harness()
+    h.proxy._ca = session_ca
+    h.proxy.bind(B)
+    sock, status, _ = _connect(h.proxy, "api.anthropic.com:443")
+    assert status == 200
+    tls = _tls(sock, session_ca)
+    assert tls.selected_alpn_protocol() in (None, "http/1.1")
+    conn = http.client.HTTPConnection("api.anthropic.com", 443, timeout=10)
+    conn.sock = tls
+    for _ in range(2):                           # keep-alive inside the tunnel
+        resp, body = _oauth_post(conn)
+        assert resp.status == 200 and json.loads(body)["type"] == "message"
+    conn.close()
+    assert bearers(h) == [tok(B.token), tok(B.token)]
+    assert h.t.sent[0]["url"] == "/v1/messages?beta=true"
+    assert h.proxy.messages_seen() == 2
+
+
+def test_connect_to_the_api_limit_replays_inside_the_tunnel(session_ca):
+    h = Harness()
+    h.proxy._ca = session_ca
+    h.proxy.bind(A)
+    rules(h, a=429)
+    h.answers = [B]
+    sock, status, _ = _connect(h.proxy, "API.anthropic.com:443")
+    conn = http.client.HTTPConnection("api.anthropic.com", 443, timeout=10)
+    conn.sock = _tls(sock, session_ca)
+    resp, _ = _oauth_post(conn)
+    conn.close()
+    assert (status, resp.status) == (200, 200)
+    assert bearers(h) == [tok(A.token), tok(B.token)]
+
+
+@pytest.mark.parametrize("target,address", [("example.com:443", ("example.com", 443)),
+                                            ("statsig.anthropic.com:443", ("statsig.anthropic.com", 443)),
+                                            ("api.anthropic.com:8443", ("api.anthropic.com", 8443)),
+                                            ("[::1]:443", ("::1", 443))])
+def test_other_hosts_are_blind_tunnels_even_with_a_ca(target, address, monkeypatch, session_ca):
+    proxy = SeatProxy(lambda hit: None, ca=session_ca)
+    proxy.bind(B)
+    far = FarEnd(monkeypatch)
+    sock, status, _ = _connect(proxy, target)
+    payload = b"\x16\x03\x01\x00\x05hello, opaque bytes " + CLIENT_TOKEN.encode()
+    with sock:
+        assert status == 200
+        assert _echo(sock, payload) == payload
+    assert far.addresses == [address]
+    assert far.received == payload             # byte for byte: nothing decrypted, nothing injected
+
+
+def test_without_a_ca_the_api_is_tunnelled_too(monkeypatch):
+    proxy = SeatProxy(lambda hit: None)
+    far = FarEnd(monkeypatch)
+    sock, status, _ = _connect(proxy, "api.anthropic.com:443")
+    with sock:
+        assert status == 200 and _echo(sock, b"opaque") == b"opaque"
+    assert far.addresses == [("api.anthropic.com", 443)]
+
+
+def test_tunnel_chains_through_the_upstream_proxy(monkeypatch, no_proxy_env):
+    proxy = SeatProxy(lambda hit: None, upstream_proxy="http://corp%40user:pw@corp.proxy:3128")
+    far = FarEnd(monkeypatch, proxy_reply=b"HTTP/1.1 200 Connection established\r\n\r\n")
+    sock, status, _ = _connect(proxy, "example.com:443")
+    with sock:
+        assert status == 200 and _echo(sock, b"through two proxies") == b"through two proxies"
+    assert far.addresses == [("corp.proxy", 3128)]
+    [connect] = far.connects
+    assert connect.startswith("CONNECT example.com:443 HTTP/1.1\r\n")
+    assert "Proxy-Authorization: Basic Y29ycEB1c2VyOnB3" in connect    # corp@user:pw
+
+
+def test_tunnel_honours_the_launchers_no_proxy(monkeypatch, no_proxy_env):
+    no_proxy_env.setenv("NO_PROXY", "example.com")
+    proxy = SeatProxy(lambda hit: None, upstream_proxy="http://corp.proxy:3128")
+    far = FarEnd(monkeypatch)
+    sock, status, _ = _connect(proxy, "example.com:443")
+    sock.close()
+    assert status == 200 and far.addresses == [("example.com", 443)]
+
+
+def test_upstream_proxy_refusal_answers_502(monkeypatch, no_proxy_env):
+    proxy = SeatProxy(lambda hit: None, upstream_proxy="http://corp.proxy:3128")
+    far = FarEnd(monkeypatch, proxy_reply=b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\n\r\n")
+    sock, status, _ = _connect(proxy, "example.com:443")
+    sock.close()
+    assert status == 502 and len(far.connects) == 1
+
+
+def test_tls_reject_is_reported_once(session_ca):
+    rejects = []
+    h = Harness()
+    h.proxy._ca = session_ca
+    h.proxy._on_tls_reject = rejects.append
+    seen = threading.Semaphore(0)    # one release per rejected handshake the proxy has handled
+    log = h.proxy._log_fn
+    h.proxy._log_fn = lambda event, **f: (log(event, **f), event == "tls_reject" and seen.release())
+    for _ in range(2):
+        sock, status, _ = _connect(h.proxy, "api.anthropic.com:443")
+        assert status == 200
+        with pytest.raises(SP.ssl.SSLError):
+            _tls(sock, None)                     # the client does not trust the session CA
+        sock.close()
+    assert seen.acquire(timeout=30) and seen.acquire(timeout=30)
+    assert len(rejects) == 1 and rejects[0]
+    assert h.t.sent == []
+
+
+def test_decrypted_request_for_another_origin_is_refused():
+    h = Harness()
+    h.proxy.bind(B)
+    wire = Wire()
+    keep = h.proxy.handle("POST", "/v1/messages", [
+        ("Authorization", f"Bearer {CLIENT_TOKEN}"), ("anthropic-beta", "oauth-2025-04-20")],
+        MSG, wire, authority="example.com:443")
+    resp = parse(wire.getvalue())
+    assert resp.status == 421 and not keep
+    assert h.t.sent == [] and h.proxy.messages_seen() == 0
+
+
+def test_decrypted_request_needs_no_secret_path():
+    h = Harness()
+    h.proxy.bind(B)
+    wire = Wire()
+    h.proxy.handle("POST", "/v1/messages", [
+        ("Authorization", f"Bearer {CLIENT_TOKEN}"), ("anthropic-beta", "oauth-2025-04-20")],
+        MSG, wire, authority="api.anthropic.com:443")
+    assert parse(wire.getvalue()).status == 200
+    assert bearers(h) == [tok(B.token)]
+    wire = Wire()
+    h.proxy.handle("GET", "http://api.anthropic.com/v1/models", [], b"", wire,
+                   authority="api.anthropic.com:443")
+    assert parse(wire.getvalue(), "GET").status == 403
+
+
+# --- CONNECT over a real listener (skips where binding 127.0.0.1 is not allowed) ---------------
+
+@pytest.fixture
+def loopback_only(monkeypatch):
+    for var in PROXY_VARS:
+        monkeypatch.delenv(var, raising=False)
+
+    def local_only(address, *args, **kwargs):
+        assert address[0] in ("127.0.0.1", "localhost"), address
+        return _REAL_CREATE_CONNECTION(address, *args, **kwargs)
+    monkeypatch.setattr(socket, "create_connection", local_only)
+
+
+def _tcp_client(url: str, ca: FakeCA | None, *, auth: bool = True):
+    """An ``http.client`` HTTPS connection to api.anthropic.com through the proxy at ``url``,
+    the way any HTTPS_PROXY-aware client tunnels (CONNECT, then TLS inside)."""
+    import base64
+    from urllib.parse import unquote, urlsplit
+    u = urlsplit(url)
+    ctx = SP.ssl.create_default_context(cafile=ca.ca_path if ca else None)
+    conn = http.client.HTTPSConnection(u.hostname, u.port, timeout=10, context=ctx)
+    headers = {}
+    if auth:
+        cred = f"{unquote(u.username)}:{unquote(u.password)}".encode()
+        headers["Proxy-Authorization"] = "Basic " + base64.b64encode(cred).decode()
+    conn.set_tunnel("api.anthropic.com", 443, headers=headers)
+    return conn
+
+
+@needs_bind
+def test_tcp_connect_is_decrypted_and_injected(loopback_only, session_ca):
+    h = Harness()
+    h.proxy._ca = session_ca
+    h.proxy.bind(B)
+    url = h.proxy.start()
+    try:
+        conn = _tcp_client(url, session_ca)
+        for _ in range(2):
+            resp, body = _oauth_post(conn)
+            assert resp.status == 200 and json.loads(body)["type"] == "message"
+        conn.close()
+    finally:
+        h.proxy.stop()
+    assert bearers(h) == [tok(B.token), tok(B.token)]
+    assert h.proxy.messages_seen() == 2
+
+
+@needs_bind
+def test_tcp_connect_without_credentials_gets_407(loopback_only, session_ca):
+    h = Harness()
+    h.proxy._ca = session_ca
+    url = h.proxy.start()
+    try:
+        conn = _tcp_client(url, session_ca, auth=False)
+        with pytest.raises(OSError, match="407"):
+            conn.request("GET", "/")
+    finally:
+        h.proxy.stop()
+    assert h.t.sent == []
+
+
+@needs_bind
+def test_tcp_tls_reject_is_reported(loopback_only, session_ca):
+    rejects = []
+    rejected = threading.Event()
+    h = Harness()
+    h.proxy._ca = session_ca
+    h.proxy._on_tls_reject = lambda reason: (rejects.append(reason), rejected.set())
+    url = h.proxy.start()
+    try:
+        conn = _tcp_client(url, None)    # trusts only the system roots, not the session CA
+        with pytest.raises(SP.ssl.SSLError):
+            conn.request("GET", "/")
+        assert rejected.wait(30)
+    finally:
+        h.proxy.stop()
+    assert len(rejects) == 1 and h.t.sent == []
+
+
+@needs_bind
+def test_tcp_blind_tunnel_to_another_host(loopback_only, session_ca):
+    """CONNECT to a real local echo server: bytes pass through untouched, nothing is decrypted."""
+    import base64
+    from urllib.parse import unquote, urlsplit
+    echo = socket.socket()
+    echo.bind(("127.0.0.1", 0))
+    echo.listen(1)
+    received = []
+
+    def serve():
+        c, _ = echo.accept()
+        with c:
+            while data := c.recv(65536):
+                received.append(data)
+                c.sendall(data)
+    threading.Thread(target=serve, daemon=True).start()
+    proxy = SeatProxy(lambda hit: None, ca=session_ca)
+    proxy.bind(B)
+    u = urlsplit(proxy.start())
+    try:
+        sock = _REAL_CREATE_CONNECTION((u.hostname, u.port), timeout=10)
+        cred = base64.b64encode(f"{unquote(u.username)}:{unquote(u.password)}".encode()).decode()
+        target = f"127.0.0.1:{echo.getsockname()[1]}"
+        sock.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n"
+                     f"Proxy-Authorization: Basic {cred}\r\n\r\n".encode())
+        head = b""
+        while b"\r\n\r\n" not in head:
+            head += sock.recv(1)
+        assert head.startswith(b"HTTP/1.1 200 ")
+        payload = b"\x16\x03\x01 not decrypted " + CLIENT_TOKEN.encode()
+        assert _echo(sock, payload) == payload
+        sock.close()
+    finally:
+        proxy.stop()
+        echo.close()
+    assert b"".join(received) == payload

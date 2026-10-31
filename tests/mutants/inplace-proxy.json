@@ -278,5 +278,123 @@
   "test": [
    "tests/test_seatproxy.py::test_messages_seen_ignores_non_oauth_clients"
   ]
+ },
+ {
+  "label": "proxy N14: a bearer without an oauth- anthropic-beta is treated as Claude Code's login",
+  "file": "acctsw/seatproxy.py",
+  "old": "            and \"oauth-\" in beta)",
+  "new": "            )",
+  "test": [
+   "tests/test_seatproxy.py::test_bearer_without_the_oauth_beta_is_not_claude_code"
+  ]
+ },
+ {
+  "label": "proxy N14: only the first anthropic-beta header is read (oauth- in a second one missed)",
+  "file": "acctsw/seatproxy.py",
+  "old": "    beta = \",\".join(v for k, v in items if k.lower() == \"anthropic-beta\").lower()",
+  "new": "    beta = (_header(headers, \"anthropic-beta\") or \"\").lower()",
+  "test": [
+   "tests/test_seatproxy.py::test_oauth_beta_anywhere_in_anthropic_beta_counts"
+  ]
+ },
+ {
+  "label": "proxy N10: the limit Hit drops the representative claim",
+  "file": "acctsw/seatproxy.py",
+  "old": "_error_detail(data), _header(headers, \"anthropic-ratelimit-unified-representative-claim\"))",
+  "new": "_error_detail(data), None)",
+  "test": [
+   "tests/test_seatproxy.py::test_limit_hit_carries_the_representative_claim"
+  ]
+ },
+ {
+  "label": "proxy v2: a CONNECT to a non-anthropic host is decrypted",
+  "file": "acctsw/seatproxy.py",
+  "old": "return self._ca is not None and f\"{host}:{port}\" == self._authority",
+  "new": "return self._ca is not None",
+  "test": [
+   "tests/test_seatproxy.py::test_other_hosts_are_blind_tunnels_even_with_a_ca"
+  ]
+ },
+ {
+  "label": "proxy v2: a CONNECT without the proxy credentials is accepted",
+  "file": "acctsw/seatproxy.py",
+  "old": "if not proxy._proxy_auth_ok(self.headers.get(\"proxy-authorization\")):",
+  "new": "if False:",
+  "test": [
+   "tests/test_seatproxy.py::test_connect_requires_the_proxy_credentials"
+  ]
+ },
+ {
+  "label": "proxy v2: the proxy user name is not checked",
+  "file": "acctsw/seatproxy.py",
+  "old": "given, f\"{PROXY_USER}:{self._secret}\".encode())",
+  "new": "given.partition(b\":\")[2], self._secret.encode())",
+  "test": [
+   "tests/test_seatproxy.py::test_connect_requires_the_proxy_credentials"
+  ]
+ },
+ {
+  "label": "proxy v2: on_tls_reject is not called when the client rejects the session CA",
+  "file": "acctsw/seatproxy.py",
+  "old": "                self._on_tls_reject(reason)\n",
+  "new": "                pass\n",
+  "test": [
+   "tests/test_seatproxy.py::test_tls_reject_is_reported_once"
+  ]
+ },
+ {
+  "label": "proxy v2: on_tls_reject is called for every rejected handshake, not once",
+  "file": "acctsw/seatproxy.py",
+  "old": "if first and self._on_tls_reject is not None:",
+  "new": "if self._on_tls_reject is not None:",
+  "test": [
+   "tests/test_seatproxy.py::test_tls_reject_is_reported_once"
+  ]
+ },
+ {
+  "label": "proxy v2: blind tunnels ignore the upstream proxy",
+  "file": "acctsw/seatproxy.py",
+  "old": "return _connect_via(_parse_proxy(self.proxy, host), host, port, self.timeout)",
+  "new": "return _connect_via(None, host, port, self.timeout)",
+  "test": [
+   "tests/test_seatproxy.py::test_tunnel_chains_through_the_upstream_proxy"
+  ]
+ },
+ {
+  "label": "proxy v2: the API upstream ignores the upstream proxy",
+  "file": "acctsw/seatproxy.py",
+  "old": "self.tunnel = _parse_proxy(proxy, self.host)",
+  "new": "self.tunnel = None",
+  "test": [
+   "tests/test_seatproxy.py::test_upstream_tunnels_through_https_proxy"
+  ]
+ },
+ {
+  "label": "proxy v2: the launcher's NO_PROXY is not honoured for the upstream proxy",
+  "file": "acctsw/seatproxy.py",
+  "old": "if not proxy or urllib.request.proxy_bypass_environment(host, urllib.request.getproxies_environment()):",
+  "new": "if not proxy:",
+  "test": [
+   "tests/test_seatproxy.py::test_tunnel_honours_the_launchers_no_proxy",
+   "tests/test_seatproxy.py::test_no_proxy_bypasses_the_tunnel"
+  ]
+ },
+ {
+  "label": "proxy v2: a decrypted request for another origin is forwarded (and injected)",
+  "file": "acctsw/seatproxy.py",
+  "old": "            if authority != self._authority:\n",
+  "new": "            if False:\n",
+  "test": [
+   "tests/test_seatproxy.py::test_decrypted_request_for_another_origin_is_refused"
+  ]
+ },
+ {
+  "label": "proxy v2: a refused upstream-proxy CONNECT counts as a tunnel",
+  "file": "acctsw/seatproxy.py",
+  "old": "if len(status) < 2 or status[1] != b\"200\":",
+  "new": "if len(status) < 2:",
+  "test": [
+   "tests/test_seatproxy.py::test_upstream_proxy_refusal_answers_502"
+  ]
  }
 ]

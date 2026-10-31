@@ -285,7 +285,8 @@
   "old": "parts += [h for h in (\"127.0.0.1\", \"localhost\") if h not in parts]",
   "new": "parts += []",
   "test": [
-   "tests/test_seatswap.py::test_start_binds_home_passthrough_and_env_points_at_the_proxy"
+   "tests/test_seatswap.py::test_start_binds_home_passthrough_and_env_points_at_the_proxy",
+   "tests/test_seatswap.py::test_env_takes_anthropic_out_of_no_proxy_and_keeps_the_rest"
   ]
  },
  {
@@ -547,6 +548,186 @@
   "new": "        entry = next(iter(cache.values()), None)",
   "test": [
    "tests/test_seatswap.py::test_preflight_verdict_is_cached_per_upstream_for_ten_minutes"
+  ]
+ },
+ {
+  "label": "v2 env sets ANTHROPIC_BASE_URL",
+  "file": "acctsw/seatswap.py",
+  "old": "        out[\"HTTPS_PROXY\"] = out[\"https_proxy\"] = self.proxy_url\n",
+  "new": "        out[\"HTTPS_PROXY\"] = out[\"https_proxy\"] = out[\"ANTHROPIC_BASE_URL\"] = self.proxy_url\n",
+  "test": [
+   "tests/test_seatswap.py::test_env_routes_https_through_the_proxy_and_trusts_the_session_ca"
+  ]
+ },
+ {
+  "label": "v2 env leaves lowercase https_proxy to the user",
+  "file": "acctsw/seatswap.py",
+  "old": "        out[\"HTTPS_PROXY\"] = out[\"https_proxy\"] = self.proxy_url\n",
+  "new": "        out[\"HTTPS_PROXY\"] = self.proxy_url\n",
+  "test": [
+   "tests/test_seatswap.py::test_env_routes_https_through_the_proxy_and_trusts_the_session_ca"
+  ]
+ },
+ {
+  "label": "v2 env without the CA bundle",
+  "file": "acctsw/seatswap.py",
+  "old": "            out.update(self.ca.bundle_paths(base))",
+  "new": "            pass",
+  "test": [
+   "tests/test_seatswap.py::test_env_routes_https_through_the_proxy_and_trusts_the_session_ca"
+  ]
+ },
+ {
+  "label": "v2 NO_PROXY keeps anthropic entries",
+  "file": "acctsw/seatswap.py",
+  "old": "            parts = [p for p in parts if not _routes_api(p)]\n",
+  "new": "",
+  "test": [
+   "tests/test_seatswap.py::test_env_takes_anthropic_out_of_no_proxy_and_keeps_the_rest"
+  ]
+ },
+ {
+  "label": "v2 NO_PROXY matcher misses the port form",
+  "file": "acctsw/seatswap.py",
+  "old": "    host = host.split(\":\", 1)[0].lstrip(\"*\").lstrip(\".\")",
+  "new": "    host = host.lstrip(\"*\").lstrip(\".\")",
+  "test": [
+   "tests/test_seatswap.py::test_env_takes_anthropic_out_of_no_proxy_and_keeps_the_rest"
+  ]
+ },
+ {
+  "label": "v2 NO_PROXY matcher drops look-alike hosts",
+  "file": "acctsw/seatswap.py",
+  "old": "API_HOST == host or API_HOST.endswith(\".\" + host)",
+  "new": "API_HOST == host or API_HOST.endswith(host)",
+  "test": [
+   "tests/test_seatswap.py::test_env_takes_anthropic_out_of_no_proxy_and_keeps_the_rest"
+  ]
+ },
+ {
+  "label": "v2 user's proxy not chained",
+  "file": "acctsw/seatswap.py",
+  "old": "        self.upstream_proxy = _upstream_proxy(os.environ if environ is None else environ)",
+  "new": "        self.upstream_proxy = None",
+  "test": [
+   "tests/test_seatswap.py::test_the_users_own_proxy_becomes_the_upstream_proxy"
+  ]
+ },
+ {
+  "label": "v2 ALL_PROXY not considered",
+  "file": "acctsw/seatswap.py",
+  "old": "    for name in (\"HTTPS_PROXY\", \"https_proxy\", \"ALL_PROXY\", \"all_proxy\"):",
+  "new": "    for name in (\"HTTPS_PROXY\", \"https_proxy\"):",
+  "test": [
+   "tests/test_seatswap.py::test_the_users_own_proxy_becomes_the_upstream_proxy"
+  ]
+ },
+ {
+  "label": "v2 CA not handed to the proxy",
+  "file": "acctsw/seatswap.py",
+  "old": "                transport = {\"ca\": self.ca, \"upstream_proxy\"",
+  "new": "                transport = {\"ca\": None, \"upstream_proxy\"",
+  "test": [
+   "tests/test_seatswap.py::test_the_users_own_proxy_becomes_the_upstream_proxy"
+  ]
+ },
+ {
+  "label": "v2 tls reject not flagged",
+  "file": "acctsw/seatswap.py",
+  "old": "            self._tls_rejected = True\n",
+  "new": "",
+  "test": [
+   "tests/test_seatswap.py::test_a_client_rejecting_the_ca_flags_and_wakes_once"
+  ]
+ },
+ {
+  "label": "v2 tls reject does not wake",
+  "file": "acctsw/seatswap.py",
+  "old": "            self._log(\"seatswap: client rejected the session CA\", reason=str(reason)[:200])\n            try:\n                os.write(self._wake_w, b\"!\")",
+  "new": "            self._log(\"seatswap: client rejected the session CA\", reason=str(reason)[:200])\n            try:\n                pass",
+  "test": [
+   "tests/test_seatswap.py::test_a_client_rejecting_the_ca_flags_and_wakes_once"
+  ]
+ },
+ {
+  "label": "v2 stop leaves the CA dir",
+  "file": "acctsw/seatswap.py",
+  "old": "                if self.ca is not None:\n                    self.ca.close()\n            finally:\n                self._close_fds()",
+  "new": "                pass\n            finally:\n                self._close_fds()",
+  "test": [
+   "tests/test_seatswap.py::test_stop_closes_the_session_ca_once"
+  ]
+ },
+ {
+  "label": "v2 failed start leaks the CA",
+  "file": "acctsw/seatswap.py",
+  "old": "            if self.ca is not None and ca is None:\n                self.ca.close()\n",
+  "new": "",
+  "test": [
+   "tests/test_seatswap.py::test_a_proxy_that_cannot_start_closes_the_ca_it_was_given_by_the_factory"
+  ]
+ },
+ {
+  "label": "v2 openssl missing not gated",
+  "file": "acctsw/seatswap.py",
+  "old": "    if not os.access(OPENSSL, os.X_OK):",
+  "new": "    if False:",
+  "test": [
+   "tests/test_seatswap.py::test_missing_openssl_turns_it_off"
+  ]
+ },
+ {
+  "label": "v2 first-party base URL still gates",
+  "file": "acctsw/seatswap.py",
+  "old": "        if _set(env.get(name)) and not (name == \"ANTHROPIC_BASE_URL\" and _first_party(env[name])):",
+  "new": "        if _set(env.get(name)):",
+  "test": [
+   "tests/test_seatswap.py::test_a_first_party_base_url_does_not_gate"
+  ]
+ },
+ {
+  "label": "v2 any api.anthropic.com URL counts as first-party",
+  "file": "acctsw/seatswap.py",
+  "old": "        return parts.scheme == \"https\" and parts.hostname == API_HOST and parts.port in (None, 443)",
+  "new": "        return parts.hostname == API_HOST",
+  "test": [
+   "tests/test_seatswap.py::test_a_first_party_base_url_does_not_gate"
+  ]
+ },
+ {
+  "label": "v2 a look-alike host counts as first-party",
+  "file": "acctsw/seatswap.py",
+  "old": "parts.hostname == API_HOST and parts.port",
+  "new": "(parts.hostname or \"\").startswith(API_HOST) and parts.port",
+  "test": [
+   "tests/test_seatswap.py::test_a_first_party_base_url_does_not_gate"
+  ]
+ },
+ {
+  "label": "v2 preflight skips the local CA self-test",
+  "file": "acctsw/seatswap.py",
+  "old": "        local = self._ca_selftest()\n        if local:\n            return local\n",
+  "new": "",
+  "test": [
+   "tests/test_seatswap.py::test_preflight_self_test_fails_when_the_ca_is_not_the_servers"
+  ]
+ },
+ {
+  "label": "v2 self-test client trusts the system roots",
+  "file": "acctsw/seatswap.py",
+  "old": "            client_ctx = ssl.create_default_context(cadata=self.ca.ca_pem())   # nothing else",
+  "new": "            client_ctx = ssl.create_default_context()",
+  "test": [
+   "tests/test_seatswap.py::test_preflight_self_test_passes_with_the_session_ca"
+  ]
+ },
+ {
+  "label": "v2 self-test checks no hostname",
+  "file": "acctsw/seatswap.py",
+  "old": "client_ctx.wrap_socket(client_sock, server_hostname=API_HOST).close()",
+  "new": "client_ctx.wrap_socket(client_sock, server_hostname=\"other.example\").close()",
+  "test": [
+   "tests/test_seatswap.py::test_preflight_self_test_passes_with_the_session_ca"
   ]
  }
 ]
