@@ -148,5 +148,16 @@
    "file": "acctsw/bridge.py",
    "old": "    return notices if state.settings().get(\"notify\", True) else []",
    "new": "    return notices",
-   "test": ["tests/test_signin.py::test_bridge_poll_delivers_each_notice_once_and_honours_the_setting"]}
+   "test": ["tests/test_signin.py::test_bridge_poll_delivers_each_notice_once_and_honours_the_setting"]},
+  {"label": "door: a signed-out seat that still reads ready/active holds the door open",
+   "file": "acctsw/web_dot.py",
+   "old": "s.get(\"status\") in (\"ready\", \"active\") and not s.get(\"signed_out\")",
+   "new": "s.get(\"status\") in (\"ready\", \"active\")",
+   "test": ["tests/test_app_support.py::test_door_for_golden_fixture"]},
+
+  {"label": "door (JS mirror): doorKey lets a signed-out seat hold the door open",
+   "file": "app/web/render.mjs",
+   "old": "[\"ready\", \"active\"].includes(s.status) && !s.signed_out",
+   "new": "[\"ready\", \"active\"].includes(s.status)",
+   "cmd": ["node", "--test", "--test-name-pattern=doorKey golden parity", "app/web/render.test.mjs"]}
 ]

@@ -30,9 +30,10 @@ def dot_for(state: dict[str, Any]) -> str:
 
 def door_for(state: dict[str, Any]) -> str:
     """The menu-bar door (icon handoff): 'open' onto the disco when a model is free, 'shut' when every
-    seat is unavailable. Only ready/active statuses keep the door open, matching the header counts.
+    seat is unavailable. Only ready/active statuses keep the door open, matching the header counts,
+    and never a signed-out seat whatever its status says: it has no login to take the floor with.
     The door is shut ONLY when there are seats
     and none are free — a fresh install (no seats) stays 'open' (welcoming, matches the green dot)."""
     seats = _all_seats(state)
-    free = any(s.get("status") in ("ready", "active") for s in seats)
+    free = any(s.get("status") in ("ready", "active") and not s.get("signed_out") for s in seats)
     return "open" if (free or not seats) else "shut"
