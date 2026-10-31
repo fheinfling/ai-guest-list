@@ -319,5 +319,32 @@
     "test": [
       "tests/test_inplace_integration.py::test_limit_moves_the_live_child_to_a_same_kind_seat"
     ]
+  },
+  {
+    "label": "integration: SeatSwap.env does not point the child at the proxy",
+    "file": "acctsw/seatswap.py",
+    "old": "        out[\"ANTHROPIC_BASE_URL\"] = self.base_url\n",
+    "new": "",
+    "test": [
+      "tests/test_inplace_integration.py::test_limit_moves_the_live_child_to_a_same_kind_seat"
+    ]
+  },
+  {
+    "label": "integration: SeatSwap.answer() replays on a seat without binding it",
+    "file": "acctsw/seatswap.py",
+    "old": "            if seat is not None:\n                self.proxy.bind(seat)\n            ask.seat, ask.done = seat, True\n",
+    "new": "            ask.seat, ask.done = seat, True\n",
+    "test": [
+      "tests/test_inplace_integration.py::test_limit_moves_the_live_child_to_a_same_kind_seat"
+    ]
+  },
+  {
+    "label": "integration: the launcher gives a restarted child the old billed seat as home",
+    "file": "acctsw/launcher.py",
+    "old": "                    swap.set_home(launch_email)\n",
+    "new": "                    swap.set_home(running_seat())\n",
+    "test": [
+      "tests/test_inplace_integration.py::test_a_target_whose_token_is_about_to_expire_is_reached_by_restart"
+    ]
   }
 ]

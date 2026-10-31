@@ -144,13 +144,16 @@ def _session(spawn):
 def test_limit_moves_the_live_child_to_a_same_kind_seat(seats, proxies):
     ctx = seats(**{C1: "max", C2: "max"})
     reset = iso(now() + timedelta(hours=3))
-    marker = []
-    calls = []
-    spawn = Spawn(([lambda: calls.append(proxies[0].limit(reset_at=reset)),
-                    lambda: marker.append(session_mod.active_session(ctx.data_dir, "claude"))],
-                   0))
+    marker, bound_after_hit, calls = [], [], []
 
-    assert _run(ctx, spawn) == 0
+    def look():
+        marker.append(session_mod.active_session(ctx.data_dir, "claude"))
+        bound_after_hit.append(proxies[0].seat)
+
+    spawn = Spawn(([lambda: calls.append(proxies[0].limit(reset_at=reset)), look], 0))
+    notes = []
+
+    assert _run(ctx, spawn, notify=notes.append) == 0
 
     proxy = proxies[0]
     assert proxy.answered(calls[0]) == Seat(C2, f"tok-{C2}")    # replayed on c2
@@ -162,6 +165,9 @@ def test_limit_moves_the_live_child_to_a_same_kind_seat(seats, proxies):
     assert st.active("claude") == C2
     assert st.get_seat("claude", C1)["limited_until"] == reset
     assert marker[0]["email"] == C2 and marker[0]["home"] == C1
+    assert bound_after_hit == [Seat(C2, f"tok-{C2}")]   # answer() bound it, no second hop needed
+    assert proxy.binds[-1] == Seat(C2, f"tok-{C2}")
+    assert sum("takes over" in n for n in notes) == 1      # one hop, not a second to repair it
     assert proxy.stopped
 
 
@@ -197,8 +203,9 @@ def test_a_crossing_asks_first_and_moves_on_the_tick_after_approval(seats, proxi
 def test_a_target_whose_token_is_about_to_expire_is_reached_by_restart(seats, proxies):
     ctx = seats(**{C1: "max", C2: "max"})
     ctx.claude_cred(C2).set_live(_blob(C2, ttl=timedelta(minutes=5)))
-    calls = []
-    spawn = Spawn(([lambda: calls.append(proxies[0].limit())], 1), ([None], 0))
+    calls, at_launch = [], []
+    spawn = Spawn(([lambda: calls.append(proxies[0].limit())], 1),
+                  ([lambda: at_launch.append(proxies[0].seat)], 0))
 
     assert _run(ctx, spawn) == 0
 
@@ -206,7 +213,8 @@ def test_a_target_whose_token_is_about_to_expire_is_reached_by_restart(seats, pr
     assert proxy.answered(calls[0]) is None
     assert spawn.stops == 1 and spawn.calls[1][-2:] == ["--resume", _session(spawn)]
     assert ctx.load_state().active("claude") == C2
-    assert proxy.seat == Seat(C2, None)   # the new child holds c2's own login: passthrough
+    assert at_launch == [Seat(C2, None)]   # the new child holds c2's own login: passthrough
+    assert proxy.seat == Seat(C2, None)
 
 
 def test_a_click_moves_the_live_child_in_place(seats, proxies):
