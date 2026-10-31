@@ -12,6 +12,7 @@ import pytest
 
 from acctsw import accounts, bridge, claudesync, launcher, selection
 from acctsw import usage as U
+from acctsw.keychain import KeychainError, SecurityKeychain
 from acctsw.util import iso, now, parse_iso
 from tests.conftest import make_claude_blob, make_codex_blob
 from tests.test_usage import claude_ok_body, codex_ok_body
@@ -49,8 +50,21 @@ def _seed_claude(ctx, emails=("a@test", "b@test")):
 
 
 def _sign_out(ctx, email, snapshot=EXPIRED_SNAPSHOT, home=BLANKED):
-    ctx.claude_cred(email).set_live(home)
+    item = ctx.claude_cred(email)
+    if home is None:
+        item.keychain.delete(item.service, item.account)   # another tool removed the item
+    else:
+        item.set_live(home)
     ctx.snapshot_set("claude", email, snapshot)
+
+
+def _lock_keychain(ctx, monkeypatch, reads=lambda service: True):
+    """Reads of the chosen services fail the way the real backend fails on a locked keychain: the
+    real ``SecurityKeychain`` code runs a ``security`` that exits non-zero (not 44, not found)."""
+    real = ctx.keychain.get_raw
+    locked = SecurityKeychain("/usr/bin/false")
+    monkeypatch.setattr(ctx.keychain, "get_raw", lambda service, account: (
+        locked.get_raw(service, account) if reads(service) else real(service, account)))
 
 
 def _counting(calls, body=None):
@@ -138,21 +152,64 @@ def test_snapshot_is_consulted_only_when_the_home_copy_is_dead(ctx):
     reads = []
     original = ctx.snapshot_get
     ctx.snapshot_get = lambda tool, email: reads.append(email) or original(tool, email)
-    verdict, _ = U._signin_for(ctx, "claude", "a@test", LIVE_REFRESH)
-    assert verdict.signed_out is False and reads == []
+    verdict, _, login = U._signin_for(ctx, "claude", "a@test", LIVE_REFRESH)
+    assert verdict.signed_out is False and reads == [] and login == LIVE_REFRESH
     ctx.snapshot_set("claude", "a@test", EXPIRED_SNAPSHOT)
-    verdict, _ = U._signin_for(ctx, "claude", "a@test", BLANKED)
-    assert verdict.signed_out is True and reads == ["a@test"]
+    verdict, _, login = U._signin_for(ctx, "claude", "a@test", BLANKED)
+    assert verdict.signed_out is True and reads == ["a@test"] and login is None
 
 
-def test_an_unreadable_snapshot_is_no_proof_of_logout(ctx):
-    _seed_claude(ctx, ["a@test"])
+def test_outside_a_claude_home_a_usable_snapshot_backs_a_dead_blob_and_is_what_gets_sent(ctx):
+    ctx.cred["codex"].set_live(make_codex_blob("a@x.com"))
+    accounts.add(ctx, ctx.load_state(), "codex", email="a@x.com")
+    verdict, _, login = U._signin_for(ctx, "codex", "a@x.com", json.dumps({"tokens": {}}))
+    assert verdict.signed_out is False
+    assert login == ctx.snapshot_get("codex", "a@x.com")
 
-    def locked(tool, email):
-        raise RuntimeError("keychain locked")
-    ctx.snapshot_get = locked
-    verdict, digest = U._signin_for(ctx, "claude", "a@test", BLANKED)
-    assert verdict.signed_out is False and digest is None
+
+def _verdicts(ctx, email):
+    seat = ctx.load_state().get_seat("claude", email)
+    return seat.get("signin"), seat.get("usage")
+
+
+def test_an_unreadable_snapshot_is_no_proof_of_logout(ctx, monkeypatch):
+    """The home item is gone, so the verdict rests on the snapshot, and the keychain refuses to
+    read it: every poll path keeps the stored verdict, sends nothing and announces nothing."""
+    _seed_claude(ctx)
+    U.refresh_live(ctx, "claude", get=_counting([]), user_agent="test")
+    _sign_out(ctx, "a@test", home=None, snapshot=LIVE_REFRESH)
+    _lock_keychain(ctx, monkeypatch, reads=lambda service: service == ctx.keychain_service)
+    with pytest.raises(KeychainError):
+        U._signin_for(ctx, "claude", "a@test", None)
+    before = _verdicts(ctx, "a@test")
+    assert before[0]["signed_out"] is False
+    calls = []
+    summary = U.refresh_live(ctx, "claude", only="a@test", force=True, get=_counting(calls),
+                             user_agent="test")
+    assert summary["claude"]["a@test"] == "unreadable"
+    state = ctx.load_state()
+    assert U.refresh(ctx, state, "claude", only="a@test", force=True, get=_counting(calls),
+                     user_agent="test")["claude"]["a@test"] == "unreadable"
+    launcher._verify_capacity(ctx, "claude", _counting(calls), at=now(), force=True,
+                              exclude={"b@test"}, ua="test")
+    assert calls == [] and _verdicts(ctx, "a@test") == before
+    assert accounts.take_signin_notices(ctx.load_state())[0] == []
+
+
+def test_a_locked_keychain_signs_nobody_out(ctx, monkeypatch):
+    """Every credential read fails: no seat is announced signed out, the door is not shut."""
+    _seed_claude(ctx)
+    U.refresh_live(ctx, "claude", get=_counting([]), user_agent="test")
+    before = {e: _verdicts(ctx, e) for e in ("a@test", "b@test")}
+    _lock_keychain(ctx, monkeypatch)
+    calls = []
+    summary = U.refresh_live(ctx, "claude", force=True, get=_counting(calls), user_agent="test")
+    assert summary["claude"] == {"a@test": "unreadable", "b@test": "unreadable"}
+    sel = launcher._verify_capacity(ctx, "claude", _counting(calls), at=now(), force=True,
+                                    ua="test")
+    assert calls == [] and sel.email is not None
+    assert {e: _verdicts(ctx, e) for e in before} == before
+    assert accounts.take_signin_notices(ctx.load_state())[0] == []
 
 
 # --- polling ----------------------------------------------------------------------------------
@@ -170,6 +227,13 @@ def test_signed_out_seat_is_recorded_without_any_request_or_retry_streak(ctx):
     assert seat["usage"]["dead_credential_digest"]
 
 
+def test_a_signed_out_job_never_reaches_the_network_whatever_it_carries():
+    job = U.UsageFetchJob(tool="claude", email="a@test", blob=LIVE_REFRESH, credential_digest="",
+                          added_at=None, active=False, user_agent="test", signin=U.SignIn(True))
+    calls = []
+    assert U._fetch_job(job, _counting(calls)).usage.error == "no_token" and calls == []
+
+
 def test_dead_tokens_that_are_not_blank_never_reach_the_network(ctx):
     """A home item still holding tokens whose every expiry has passed: there is nothing to send."""
     _seed_claude(ctx)
@@ -180,15 +244,47 @@ def test_dead_tokens_that_are_not_blank_never_reach_the_network(ctx):
     assert _view(ctx, "claude", "a@test")["signed_out"] is True
 
 
-def test_blanked_home_with_a_recoverable_snapshot_is_not_signed_out(ctx):
-    """The launcher can put that login back (plan_claude_login), so the seat is not asked to sign in."""
+GOOD = _claude(access="good", refresh="good-r", expires=_ms(timedelta(hours=1)),
+               refresh_expires=_ms(timedelta(days=20)))
+OLD_SHAPE = json.dumps({"claudeAiOauth": {"accessToken": "old", "refreshToken": "old-r",
+                                          "expiresAt": _ms(timedelta(hours=1))}})
+NEWER = _claude(access="newer", refresh="newer-r", expires=_ms(timedelta(hours=2)),
+                refresh_expires=_ms(timedelta(days=20)))
+
+
+@pytest.mark.parametrize("home,snapshot,last,restorable", [
+    # Claude wiped the item early (invalid_grant): the snapshot is the very login it proved dead,
+    # even though its refreshTokenExpiresAt is still ahead.
+    (BLANKED, GOOD, GOOD, False),
+    # Wiped, and an old-shape snapshot (no refresh expiry) this process never saw in the home.
+    (BLANKED, OLD_SHAPE, None, False),
+    # Wiped, but the snapshot is strictly newer than what Claude held there: it may go back.
+    (BLANKED, NEWER, GOOD, True),
+    # Another tool deleted the item: the seat's snapshot goes back.
+    (None, GOOD, None, True),
+], ids=["wiped-same-bytes", "wiped-old-shape", "wiped-newer-snapshot", "item-deleted"])
+def test_signed_in_means_a_launch_would_get_a_login(ctx, home, snapshot, last, restorable):
+    """The seat's verdict is plan_claude_login's decision: signed in exactly when the launcher would
+    put a login back, and then the usage fetch sends that login, not the dead home item."""
     _seed_claude(ctx)
-    _sign_out(ctx, "a@test", snapshot=LIVE_REFRESH)
-    U.refresh_live(ctx, "claude", get=_counting([]), user_agent="test")
+    _sign_out(ctx, "a@test", snapshot=snapshot, home=home)
+    claudesync.tracker(ctx).seen.pop("a@test", None)
+    if last is not None:
+        claudesync.tracker(ctx).seen["a@test"] = claudesync.Seen(last, "a@test")
+    with ctx.locked():
+        plan = launcher.plan_claude_login(ctx, ctx.load_state(), "a@test")
+    assert (plan is not None) is restorable
+    calls = []
+    U.refresh_live(ctx, "claude", only="a@test", get=_counting(calls), user_agent="test")
     view = _view(ctx, "claude", "a@test")
-    assert view["signed_out"] is False and view["needs_login"] is False
-    assert parse_iso(view["signin_expires_at"]) > now() + timedelta(days=19)
-    assert selection.choose(ctx.load_state(), "claude", exclude={"b@test"}).email == "a@test"
+    assert view["signed_out"] is (not restorable)
+    chosen = selection.choose(ctx.load_state(), "claude", exclude={"b@test"}).email
+    if restorable:
+        token = json.loads(snapshot)["claudeAiOauth"]["accessToken"]
+        assert calls == [f"Bearer {token}"] and plan[:2] == ("restore", snapshot)
+        assert chosen == "a@test"
+    else:
+        assert calls == [] and chosen is None
 
 
 def _age_attempt(ctx, email, seconds, tool="claude"):
@@ -236,7 +332,7 @@ def test_a_fresh_login_resumes_polling_at_once(ctx):
 
 def test_a_changed_snapshot_alone_also_resumes(ctx):
     _seed_claude(ctx)
-    _sign_out(ctx, "a@test")
+    _sign_out(ctx, "a@test", home=None)
     U.refresh_live(ctx, "claude", only="a@test", get=_counting([]), user_agent="test")
     _age_attempt(ctx, "a@test", U.USAGE_MIN_REFRESH_SECONDS)
     ctx.snapshot_set("claude", "a@test", LIVE_REFRESH)
@@ -295,6 +391,73 @@ def test_launcher_capacity_check_classifies_and_gates_the_same_way(ctx):
     sel = launcher._verify_capacity(ctx, "claude", _counting(calls), at=now(), force=False,
                                     exclude={"b@test"}, ua="test")
     assert calls == ["Bearer fresh"] and sel.email == "a@test" and sel.available
+
+
+def test_launcher_capacity_check_drops_a_verdict_whose_snapshot_changed_mid_fetch(ctx):
+    """The verdict rested on the snapshot (home item gone). If the snapshot changes while the
+    request runs, the result describes credentials the seat no longer holds: nothing is stored."""
+    _seed_claude(ctx)
+    _sign_out(ctx, "a@test", home=None, snapshot=GOOD)
+    claudesync.tracker(ctx).seen.pop("a@test", None)
+    before = _verdicts(ctx, "a@test")
+
+    def get(url, headers, timeout):
+        ctx.snapshot_set("claude", "a@test", EXPIRED_SNAPSHOT)   # e.g. a sibling's write lands
+        return 200, claude_ok_body()
+    launcher._verify_capacity(ctx, "claude", get, at=now(), force=True,
+                              exclude={"b@test"}, ua="test")
+    assert _verdicts(ctx, "a@test") == before
+
+
+def test_launcher_capacity_check_reads_credentials_outside_the_state_lock(ctx, monkeypatch):
+    """Keychain reads are subprocesses: classifying the seats must not hold the cross-process
+    flock that the app's poll and every other launcher wait on."""
+    _seed_claude(ctx)
+    _sign_out(ctx, "a@test", home=None, snapshot=GOOD)
+    held = []
+    real = ctx.keychain.get_raw
+
+    def spy(service, account):
+        held.append(ctx._store_lock_held())
+        return real(service, account)
+    monkeypatch.setattr(ctx.keychain, "get_raw", spy)
+    first_fetch = []
+
+    def get(url, headers, timeout):
+        first_fetch.append(len(held))
+        return 200, claude_ok_body()
+    launcher._verify_capacity(ctx, "claude", get, at=now(), force=True, ua="test")
+    classify = held[:first_fetch[0]]
+    assert classify and not any(classify)
+
+
+def test_app_poll_drops_a_verdict_whose_snapshot_changed_mid_fetch(ctx):
+    _seed_claude(ctx)
+    _sign_out(ctx, "a@test", home=None, snapshot=GOOD)
+    claudesync.tracker(ctx).seen.pop("a@test", None)
+    before = _verdicts(ctx, "a@test")
+
+    def get(url, headers, timeout):
+        ctx.snapshot_set("claude", "a@test", EXPIRED_SNAPSHOT)
+        return 200, claude_ok_body()
+    summary = U.refresh_live(ctx, "claude", only="a@test", get=get, user_agent="test")
+    assert summary["claude"]["a@test"] == "stale" and _verdicts(ctx, "a@test") == before
+
+
+def test_an_authenticated_answer_clears_a_stored_signed_out(ctx):
+    """The launcher's in-session probe stores a fetch without a verdict of its own; a 200 there
+    proves the login works, so the seat must stop asking for a sign-in."""
+    state = _seed_claude(ctx)
+    _flag(state, "a@test", True)
+    u = U.fetch_claude("token", user_agent="test", get=lambda *_: (200, claude_ok_body()))
+    assert U.store_fetch(state, "claude", "a@test", u, blob=GOOD) == "ok"
+    signin = state.get_seat("claude", "a@test")["signin"]
+    assert signin["signed_out"] is False
+    assert parse_iso(signin["expires_at"]) > now() + timedelta(days=19)
+    failed = U.Usage(error="network", fetched_at=iso(now()))
+    _flag(state, "b@test", True)
+    U.store_fetch(state, "claude", "b@test", failed, blob=GOOD)
+    assert state.get_seat("claude", "b@test")["signin"]["signed_out"] is True
 
 
 def test_codex_seat_with_its_login_removed_is_signed_out(ctx):
@@ -451,17 +614,21 @@ def test_signed_out_is_announced_once_and_again_after_a_recovery(ctx):
     assert len(accounts.take_signin_notices(state)[0]) == 1
 
 
-def test_expiring_is_announced_once_per_expiry(ctx):
+def test_expiring_is_announced_once_until_the_seat_leaves_the_window(ctx):
     state = _seed_claude(ctx)
     soon = iso(now() + timedelta(days=1))
     _flag(state, "a@test", False, soon)
     notices, _ = accounts.take_signin_notices(state)
     assert len(notices) == 1 and "a@test" in notices[0]["text"]
     assert accounts.take_signin_notices(state) == ([], False)
-    _flag(state, "a@test", False, iso(now() + timedelta(days=2)))   # a fresh login, also near expiry
-    assert len(accounts.take_signin_notices(state)[0]) == 1
-    _flag(state, "a@test", False, iso(now() + timedelta(days=10)))  # outside the window: quiet
+    # The stated expiry moves within the window (another poll, a different credential's stamp):
+    # still the same news.
+    _flag(state, "a@test", False, iso(now() + timedelta(days=2)))
     assert accounts.take_signin_notices(state)[0] == []
+    _flag(state, "a@test", False, iso(now() + timedelta(days=10)))  # a fresh login: quiet, re-armed
+    assert accounts.take_signin_notices(state) == ([], True)
+    _flag(state, "a@test", False, iso(now() + timedelta(days=2)))   # ...and its own expiry nears
+    assert len(accounts.take_signin_notices(state)[0]) == 1
 
 
 def test_bridge_poll_delivers_each_notice_once_and_honours_the_setting(ctx, monkeypatch):

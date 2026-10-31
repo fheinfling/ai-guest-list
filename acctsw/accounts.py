@@ -363,8 +363,9 @@ def take_signin_notices(state: State,
     """Notifications for seats that just became signed out or entered the sign-in-expiring window,
     each raised once: the marks live on the seat in the persisted state, so neither a restart nor the
     next poll repeats them. A seat that recovers drops its signed-out mark so a later logout is news
-    again; the expiring mark is keyed on the expiry itself, so a fresh login re-arms it. Returns the
-    notices and whether any mark changed (the caller then saves state)."""
+    again; likewise the expiring mark is dropped only once the seat leaves the expiring window (a
+    fresh login), not whenever the stated expiry moves within it. Returns the notices and whether
+    any mark changed (the caller then saves state)."""
     at = at or now()
     notices: list[dict[str, str]] = []
     changed = False
@@ -381,13 +382,14 @@ def take_signin_notices(state: State,
                                         f"floor — sign in again to bring it back"})
             elif not signed_out:
                 marks.pop("signed_out", None)
-            stamp = iso(expires) if expires else None
-            if expiring and marks.get("expiring") != stamp:
-                marks["expiring"] = stamp
+            if expiring and not marks.get("expiring"):
+                marks["expiring"] = iso(expires)
                 notices.append({"title": f"{name}'s sign-in runs out soon ⏳",
                                 "text": f"{tool} · {email} stays signed in until "
                                         f"{expires.astimezone():%a %-d %b, %H:%M} — sign in again "
                                         f"before then to keep it on the guest list"})
+            elif not expiring:
+                marks.pop("expiring", None)
             if marks != before:
                 seat["signin_notified"] = marks
                 changed = True

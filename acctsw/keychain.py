@@ -40,12 +40,16 @@ def _decode(stored: str) -> str:
     return stored  # legacy plain
 
 
+# `security`'s exit status for errSecItemNotFound. The only failure that proves an item is absent.
+ITEM_NOT_FOUND = 44
+
+
 class KeychainBackend(Protocol):
     """Minimal generic-password store keyed by (service, account)."""
 
     def get(self, service: str, account: str) -> str | None: ...
     def set(self, service: str, account: str, secret: str) -> None: ...
-    def get_raw(self, service: str, account: str) -> str | None: ...
+    def get_raw(self, service: str, account: str) -> str | None: ...   # None only when absent
     def set_raw(self, service: str, account: str, value: str) -> None: ...
     def delete(self, service: str, account: str) -> bool: ...
 
@@ -70,8 +74,12 @@ class SecurityKeychain:
             [self._security, "find-generic-password", "-s", service, "-a", account, "-w"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
         )
-        if proc.returncode != 0:
+        if proc.returncode == ITEM_NOT_FOUND:
             return None
+        if proc.returncode != 0:
+            # A locked keychain, a denied prompt or a broken backend says nothing about the item:
+            # reporting it absent would read as a logout of every seat at once.
+            raise KeychainError("keychain read failed")
         # `-w` prints the password with a trailing newline.
         return proc.stdout.rstrip("\n")
 

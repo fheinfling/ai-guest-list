@@ -173,6 +173,17 @@ def test_security_get_of_a_missing_item_is_none(monkeypatch):
     assert SecurityKeychain().get(SVC, ACCT) is None
 
 
+@pytest.mark.parametrize("returncode", [1, 36, 51, 128])
+def test_security_read_failure_other_than_not_found_raises(monkeypatch, returncode):
+    """Only errSecItemNotFound (44) proves an item absent. A locked keychain or a denied prompt
+    must not read as a logout of every seat."""
+    _Security(monkeypatch, returncode=returncode)
+    with pytest.raises(KeychainError):
+        SecurityKeychain().get_raw(SVC, ACCT)
+    with pytest.raises(KeychainError):
+        SecurityKeychain().get(SVC, ACCT)
+
+
 def test_get_live_decodes_but_never_rewrites_a_hex_item_it_did_not_write():
     """`security -w` prints multi-line data as hex; rewriting it raw would just loop."""
     import binascii
