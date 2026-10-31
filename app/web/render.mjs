@@ -32,7 +32,7 @@ export function dotKey(state) {
 export function doorKey(state) {
   if (state?.door === "open" || state?.door === "shut") return state.door;
   const seats = ["codex", "claude"].flatMap((t) => state?.tools?.[t]?.seats || []);
-  const free = seats.some((s) => ["ready", "active"].includes(s.status));
+  const free = seats.some((s) => ["ready", "active"].includes(s.status) && !s.signed_out);
   return free || seats.length === 0 ? "open" : "shut";
 }
 
