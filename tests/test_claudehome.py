@@ -549,7 +549,10 @@ def test_default_context_uses_the_official_stock_item_and_injected_backend(ctx, 
     monkeypatch.setattr(context, "SecurityKeychain", lambda: ctx.keychain)
     monkeypatch.setattr(context, "which_tool", lambda _: None)
     monkeypatch.setattr(paths, "CLAUDE_CONFIG_DIR", ctx.claude_real)
-    for name in ("CLAUDE_CONFIG_DIR", "ACCTSW_CLAUDE_SHARED_EXPLICIT", "CLAUDE_SECURESTORAGE_CONFIG_DIR"):
+    # A supervised session exports the whole ACCTSW_CLAUDE_* set (STOCK_CONFIG is "" when the shared
+    # dir is implicit); running the suite from one must not leak that empty stock config in here.
+    for name in ("CLAUDE_CONFIG_DIR", "ACCTSW_CLAUDE_SHARED_EXPLICIT", "ACCTSW_CLAUDE_STOCK_CONFIG",
+                 "CLAUDE_SECURESTORAGE_CONFIG_DIR"):
         monkeypatch.delenv(name, raising=False)
     if explicit:
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(ctx.claude_real))

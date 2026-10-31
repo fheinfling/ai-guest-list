@@ -438,6 +438,19 @@ def _auto_switch_after_usage(ctx: Context, summary: dict[str, Any], *,
 LOGIN_SUBCMD = {tool: ["signin", tool] for tool in TOOLS}
 
 
+def _take_signin_notices(ctx: Context) -> list[dict[str, str]]:
+    """Sign-in notices this poll raised, each once ever (marks persist in state). With
+    notifications off they are still consumed, so turning them on later doesn't replay old news."""
+    if not acct.take_signin_notices(ctx.load_state())[1]:
+        return []   # the common case: nothing new, so no flock and no state write
+    with ctx.locked():
+        state = ctx.load_state()
+        notices, changed = acct.take_signin_notices(state)
+        if changed:
+            state.save()
+    return notices if state.settings().get("notify", True) else []
+
+
 def login_command(tool: str, method: str = "browser", *, seat: str | None = None) -> str:
     """Logical isolated sign-in command; Terminal resolves this installation's engine absolutely."""
     import shlex
@@ -652,7 +665,7 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
             )
             handoff = _auto_switch_after_usage(ctx, summary)
             return {"ok": True, "refresh": summary, "auto_switch": handoff,
-                    "state": snapshot_state(ctx)}
+                    "signin_notices": _take_signin_notices(ctx), "state": snapshot_state(ctx)}
 
         if action == "paste":
             # Codex no-browser path only: install a pasted auth.json, then register it as a seat.

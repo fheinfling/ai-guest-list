@@ -18,6 +18,10 @@ exactly as before.
 A confirmed Codex refresh-token revocation is stored separately as ``auth_error``. These seats
 remain unavailable until new credentials clear the flag; a successful usage poll cannot clear it.
 
+A seat the usage poll found signed out (``signin.signed_out``: no credential the app holds for it
+carries a usable login) is never a candidate either: landing on it can only show "Not logged in".
+A new login clears the verdict.
+
 Key fallback is a separate opt-in rule: metered seats only follow exhausted subscriptions of the
 same harness, and its result explains which gate prevented a candidate from being offered.
 """
@@ -52,7 +56,8 @@ def choose(state: State, tool: str, at: datetime | None = None,
     at = at or now()
     accounts = {e: s for e, s in state.accounts(tool).items()
                 if e not in exclude and not s.get("auth_error")
-                and (s.get("usage") or {}).get("error") != "forbidden"}
+                and (s.get("usage") or {}).get("error") != "forbidden"
+                and not (s.get("signin") or {}).get("signed_out")}
     if not accounts:
         return Selection(email=None, available=False, unlocks_at=None, all_limited=False)
 
