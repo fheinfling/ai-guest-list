@@ -759,15 +759,15 @@ def test_manual_switch_restarts_claude_without_the_swap(seats):
 
 @pytest.mark.crossings
 def test_a_click_across_kinds_moves_in_place_without_spending_the_approval(seats, tokens):
-    """switch(manual=True) approves the crossing once for every session billed to the old seat;
-    this session must not spend it, or a second terminal on c1 would find it gone."""
+    """A click is the user's choice: this session moves without needing or spending an approval.
+    switch(manual=True) leaves none behind (review LOW): a later AUTOMATIC c1->c2 still asks."""
     from acctsw import seatkind
     _plans(seats, **{C1: "team", C2: "max", C3: "max"})
     swap = FakeSwap()
     spawn = Spawn(([lambda: _click(seats, C2), None], 0))
     assert _run(seats, spawn, swap) == 0
     assert swap.binds == [Seat(C2, "tok-c2")]
-    assert seatkind.approved(seats.load_state(), "claude", C1, C2)
+    assert not seatkind.approved(seats.load_state(), "claude", C1, C2)
 
 
 @pytest.mark.crossings

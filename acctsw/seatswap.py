@@ -13,15 +13,20 @@ decision is made here, on the launcher's thread:
   rebound; a token about to lapse moves the session home, else to another seat, else asks for one
   "handover" restart once the proxy is idle. This app never refreshes a token itself.
 
-Gates (``gate``/``enabled``): the setting ``in_place_switch``, ``ACCTSW_IN_PLACE_SWITCH=0``, and any
-configuration that already routes or authenticates Claude differently (env or a Claude
-settings.json ``env`` naming a base URL, an API key or token, Bedrock/Vertex/Foundry, or an
-``apiKeyHelper``). Everything this module can't serve falls back to the restart path.
+Gates (``gate``/``enabled``): the setting ``in_place_switch``, a falsy ``ACCTSW_IN_PLACE_SWITCH``
+(0/false/no/off), and any configuration that already routes or authenticates Claude differently:
+the env, or the ``env``/``apiKeyHelper`` of a Claude settings source (user and project
+settings.json/settings.local.json, managed-settings.json and managed-settings.d/*.json, and the
+child's own ``--settings <file|json>``; one that can't be read gates too) naming a base URL, an API
+key or token, Bedrock/Vertex/Foundry, or a key helper. Everything this module can't serve falls
+back to the restart path.
 
 Eligibility (``eligible``): the seat's Keychain item (quarantined homes have none), its access
 token, and a stated ``expiresAt`` more than ``MIN_TTL`` ahead — an unknown expiry is not eligible —
-and the same ``subscriptionType`` as the home seat when both are known. Crossings between business
-and personal seats follow ``seatkind``: never without an approval for that direction.
+and the same ``subscriptionType`` as the home seat when both are known. A Keychain read error is
+not eligible either, but ``maintain`` keeps a binding it can't re-read rather than moving the
+session. Crossings between business and personal seats follow ``seatkind``: never without an
+approval for that direction, and never for a move back to the session's own home seat.
 
 Tokens live in memory only and are never logged.
 
@@ -30,7 +35,8 @@ Additions to the frozen interface (nothing in it changed): ``gate()`` names why 
 ``OSError`` from its bind propagates; the launcher then restarts instead); ``stop()`` is
 idempotent; ``bind(seat)`` rebinds without a hit; ``bound()`` is the billed seat's email (None
 before any bind); ``answer()`` returns whether the reply was accepted; ``pick()`` chooses (and by
-default spends the approval for) the next seat, by the same rules ``maintain`` uses.
+default spends the approval for) the next seat, by the same rules ``maintain`` uses;
+``preflight()`` and ``proxy_used()`` delegate to the proxy's ``preflight()``/``messages_seen()``.
 """
 from __future__ import annotations
 
@@ -44,6 +50,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import seatkind
+from .keychain import KeychainError
+from .seatproxy import Hit, Seat
 from .selection import choose
 from .util import now
 
@@ -55,40 +63,19 @@ SWITCH_ENV = "ACCTSW_IN_PLACE_SWITCH"
 GATE_ENV = ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
             "CLAUDE_CODE_OAUTH_TOKEN")
 GATE_FLAGS = ("CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY")
-# Claude Code's machine-wide policy file on macOS. Module-level so tests can point it elsewhere.
+# Claude Code's machine-wide policy on macOS: one file plus a drop-in directory of *.json.
+# Module-level so tests can point them elsewhere.
 MANAGED_SETTINGS = Path("/Library/Application Support/ClaudeCode/managed-settings.json")
+MANAGED_SETTINGS_DIR = Path("/Library/Application Support/ClaudeCode/managed-settings.d")
+FALSY = ("0", "false", "no", "off")
 
 
 def _noop(*_a, **_k) -> None:
     pass
 
 
-# The proxy module lands separately; these mirror its frozen shapes until it does.
-@dataclass(frozen=True)
-class _Seat:
-    email: str
-    token: str | None
-
-
-@dataclass(frozen=True)
-class _Hit:
-    kind: str
-    seat: str
-    reset_at: str | None
-    detail: str | None
-    claim: str | None
-
-
-def _types():
-    try:
-        from .seatproxy import Hit, Seat
-    except ImportError:
-        return _Seat, _Hit
-    return Seat, Hit
-
-
-def _seat(email: str, token: str | None):
-    return _types()[0](email, token)
+def _seat(email: str, token: str | None) -> Seat:
+    return Seat(email, token)
 
 
 # --- gates ------------------------------------------------------------------------------------
@@ -100,7 +87,7 @@ def _set(value: Any) -> bool:
 def _flag(value: Any) -> bool:
     if isinstance(value, bool):
         return value
-    return value is not None and str(value).strip().lower() not in ("", "0", "false", "no", "off")
+    return value is not None and str(value).strip().lower() not in ("", *FALSY)
 
 
 def _env_gate(env: dict) -> str | None:
@@ -119,7 +106,45 @@ def _settings_files(ctx, cwd: Path | None) -> list[Path]:
     if cwd is not None:
         files += [cwd / ".claude" / "settings.json", cwd / ".claude" / "settings.local.json"]
     files.append(MANAGED_SETTINGS)
+    try:
+        files += sorted(MANAGED_SETTINGS_DIR.glob("*.json"))
+    except OSError:
+        pass
     return files
+
+
+def _cli_settings(args, cwd: Path) -> list[tuple[str, dict | None]]:
+    """Every ``--settings <file|json>`` (or ``--settings=…``) in the child's argv, parsed. None
+    marks one this module cannot read: it may route Claude elsewhere, so it gates."""
+    out = []
+    args = [str(a) for a in (args or ())]
+    for i, arg in enumerate(args):
+        if arg == "--settings":
+            value = args[i + 1] if i + 1 < len(args) else ""
+        elif arg.startswith("--settings="):
+            value = arg.split("=", 1)[1]
+        else:
+            continue
+        text = value.strip()
+        try:
+            if text.startswith("{"):
+                data = json.loads(text)
+            else:
+                path = Path(text).expanduser()
+                data = json.loads((path if path.is_absolute() else cwd / path).read_text(
+                    encoding="utf-8"))
+        except (OSError, ValueError):
+            data = None
+        out.append(("--settings", data if isinstance(data, dict) else None))
+    return out
+
+
+def _settings_gate(where: str, data: dict) -> str | None:
+    if _set(data.get("apiKeyHelper")):
+        return f"{where} apiKeyHelper"
+    env = data.get("env")
+    found = _env_gate(env) if isinstance(env, dict) else None
+    return f"{where} env {found}" if found else None
 
 
 def _read_settings(path: Path) -> dict:
@@ -130,29 +155,33 @@ def _read_settings(path: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def gate(ctx, environ=os.environ, *, cwd: Path | str | None = None) -> str | None:
-    """Why in-place switching is off for a run started here, or None when it may run."""
-    if str(environ.get(SWITCH_ENV, "")).strip() == "0":
-        return f"{SWITCH_ENV}=0"
+def gate(ctx, environ=os.environ, *, cwd: Path | str | None = None, args=()) -> str | None:
+    """Why in-place switching is off for a run started here, or None when it may run. ``args``
+    is the child's argv (its ``--settings`` counts like any settings file)."""
+    switch = str(environ.get(SWITCH_ENV, "")).strip()
+    if switch.lower() in FALSY:
+        return f"{SWITCH_ENV}={switch}"
     if not ctx.load_state().settings().get("in_place_switch", True):
         return "setting off"
     found = _env_gate(environ)
     if found:
         return f"env {found}"
     cwd = Path(cwd) if cwd is not None else Path.cwd()
-    for path in _settings_files(ctx, cwd):
-        data = _read_settings(path)
-        if _set(data.get("apiKeyHelper")):
-            return f"{path.name} apiKeyHelper"
-        env = data.get("env")
-        found = _env_gate(env) if isinstance(env, dict) else None
+    for where, data in _cli_settings(args, cwd):
+        if data is None:
+            return f"{where} unreadable"
+        found = _settings_gate(where, data)
         if found:
-            return f"{path.name} env {found}"
+            return found
+    for path in _settings_files(ctx, cwd):
+        found = _settings_gate(path.name, _read_settings(path))
+        if found:
+            return found
     return None
 
 
-def enabled(ctx, environ=os.environ, *, cwd: Path | str | None = None) -> bool:
-    return gate(ctx, environ, cwd=cwd) is None
+def enabled(ctx, environ=os.environ, *, cwd: Path | str | None = None, args=()) -> bool:
+    return gate(ctx, environ, cwd=cwd, args=args) is None
 
 
 # --- eligibility --------------------------------------------------------------------------------
@@ -171,13 +200,32 @@ def _tier(blob: str | None) -> str | None:
     return raw.strip().lower() if isinstance(raw, str) and raw.strip() else None
 
 
-def eligible(ctx, email: str, *, home_email: str) -> str | None:
-    """The access token to bill ``email`` in place of ``home_email``, or None if it can't be."""
+class _Unreadable(Exception):
+    """The Keychain (or a home directory) could not be read: no verdict either way."""
+
+
+def _load(ctx, email: str) -> str | None:
     from . import claudehome
+    try:
+        return claudehome.load(ctx, email)
+    except (KeychainError, OSError) as exc:
+        raise _Unreadable(str(exc)) from None
+
+
+def eligible(ctx, email: str, *, home_email: str | None) -> str | None:
+    """The access token to bill ``email`` in place of ``home_email``, or None if it can't be.
+    An unreadable Keychain is None too: nothing proves the seat can serve."""
+    try:
+        return _eligible(ctx, email, home_email=home_email)
+    except _Unreadable:
+        return None
+
+
+def _eligible(ctx, email: str, *, home_email: str | None) -> str | None:
     from .usage import claude_token
     if (ctx.claude_home(email) / ".acctsw-quarantined").exists():
         return None
-    blob = claudehome.load(ctx, email)
+    blob = _load(ctx, email)
     token = claude_token(blob) if blob else None
     if not isinstance(token, str) or not token:
         return None
@@ -186,7 +234,7 @@ def eligible(ctx, email: str, *, home_email: str) -> str | None:
             or expiry <= (now() + MIN_TTL).timestamp() * 1000):
         return None
     if home_email and email != home_email:
-        tier, home_tier = _tier(blob), _tier(claudehome.load(ctx, home_email))
+        tier, home_tier = _tier(blob), _tier(_load(ctx, home_email))
         if tier and home_tier and tier != home_tier:
             return None
     return token
@@ -288,19 +336,28 @@ class SeatSwap:
         """The email requests are billed to now; None before anything was bound."""
         return self.proxy.bound().email or None
 
+    def preflight(self) -> str | None:
+        """Can the proxy reach the API (TLS included)? None when it can, else a short reason."""
+        return self.proxy.preflight()
+
+    def proxy_used(self) -> bool:
+        """Has the child sent a /v1/messages request through the proxy yet?"""
+        return self.proxy.messages_seen() > 0
+
     # proxy thread -> main thread ----------------------------------------------------------------
     def _decide(self, hit):
         """Runs on the proxy thread: hand the hit to the launcher and wait for its seat."""
         ask = _Ask(hit)
         with self._cv:
+            # Under the cv: stop() flips _closed under it before closing the pipe, so this write
+            # can never land on a closed (or reused) descriptor.
             if self._closed:
                 return None
             self._asks.append(ask)
-        try:
-            os.write(self._wake_w, b"!")
-        except OSError:
-            pass  # the pipe is full: a wake is already pending
-        with self._cv:
+            try:
+                os.write(self._wake_w, b"!")
+            except OSError:
+                pass  # the pipe is full: a wake is already pending
             self._cv.wait_for(lambda: ask.done or self._closed, timeout=self._timeout)
             if ask in self._asks:
                 self._asks.remove(ask)
@@ -344,27 +401,28 @@ class SeatSwap:
         skip = set(exclude) | {leaving}
         target = None
         if self.home not in skip and self.home in seats:
-            home = choose(state, TOOL, at, exclude=seats - {self.home}, origin=leaving)
+            home = choose(state, TOOL, at, exclude=seats - {self.home}, origin=leaving,
+                          home=self.home)
             if home.available and home.email == self.home:
                 target = _seat(self.home, None)
             skip.add(self.home)
         while target is None:
-            sel = choose(state, TOOL, at, exclude=skip, origin=leaving)
+            sel = choose(state, TOOL, at, exclude=skip, origin=leaving, home=self.home)
             if not (sel.available and sel.email):
                 return None
             token = eligible(ctx, sel.email, home_email=self.home)   # Keychain: no lock held
             if token:
                 target = _seat(sel.email, token)
             skip.add(sel.email)
-        if not seatkind.crosses(state, TOOL, leaving, target.email):
+        if not seatkind.crosses(state, TOOL, leaving, target.email, home=self.home):
             return target
         with ctx.locked():
             state = ctx.load_state()
             if consume:
-                if not seatkind.consume(state, TOOL, leaving, target.email, now()):
+                if not seatkind.consume(state, TOOL, leaving, target.email, now(), home=self.home):
                     return None
                 state.save()
-            elif not seatkind.approved(state, TOOL, leaving, target.email, now()):
+            elif not seatkind.approved(state, TOOL, leaving, target.email, now(), home=self.home):
                 return None
         return target
 
@@ -381,7 +439,14 @@ class SeatSwap:
         if t < self._next_read:
             return None
         self._next_read = t + MAINTAIN_EVERY_S
-        fresh = eligible(ctx, seat.email, home_email=self.home)
+        try:
+            fresh = _eligible(ctx, seat.email, home_email=self.home)
+        except _Unreadable as exc:
+            # A locked or failing Keychain says nothing about the seat: keep serving it and look
+            # again next minute. Never move or restart a session on a read error.
+            self._log("seatswap: keychain unreadable, binding kept", seat=seat.email,
+                      error=type(exc).__name__)
+            return None
         if fresh:
             if fresh != seat.token:
                 self.proxy.bind(_seat(seat.email, fresh))

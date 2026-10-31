@@ -68,7 +68,7 @@ def switch(ctx: Context, state: State, tool: str, email: str, *, sync: bool = Tr
     ``sync=False`` skips sync-back from the stock mirror. Both supervised tools maintain their
     own homes; ``mirror=False`` also leaves stock credentials alone (supervised Claude hops).
     ``manual=True`` records a request for supervised sessions to resume on the selected seat, and
-    approves (once) a business/personal crossing onto it: the user chose it.
+    answers any business/personal crossing question onto it: the user chose it.
     ``save=False`` lets a lock-owning caller persist additional hop metadata in the same write.
     """
     if email not in state.accounts(tool):
@@ -113,13 +113,14 @@ def switch(ctx: Context, state: State, tool: str, email: str, *, sync: bool = Tr
         state.data["tools"][tool]["manual_switch"] = {
             "id": int(state.data.get("rev", 0)) + 1, "email": email,
         }
-        # The user picked this seat, so moving onto it is no unasked business/personal crossing:
-        # approve it once from the seat the app was on and from every seat a terminal bills.
+        # The user picked this seat: that answers any open business/personal question onto it,
+        # from the seat the app was on and from every seat a terminal bills. The launcher moves
+        # its child on this click without asking; no approval is left to authorize a later
+        # automatic crossing.
         from . import seatkind
         from .session import active_sessions
         origins = {previous, *(s["email"] for s in active_sessions(ctx.data_dir, tool))}
         for origin in sorted(o for o in origins if o and o != email):
-            if seatkind.crosses(state, tool, origin, email):
-                seatkind.approve(state, tool, origin, email, "once", via="manual")
+            seatkind.chosen(state, tool, origin, email)
     if save:
         state.save()
