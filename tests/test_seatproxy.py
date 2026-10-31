@@ -2080,3 +2080,142 @@ def test_resets_mid_handshake_count_like_hang_ups(resets, fired):
         sock.close()
         assert status == 200 and outcomes.acquire(timeout=10)
     assert rejects == (["eof x3"] if fired else [])
+
+
+# --- a seat whose plan does not offer the session's model ------------------------------------
+
+NO_MODEL = "model: claude-opus-5-5 is not available on your plan"
+
+
+def sent_bearers(h: Harness) -> list[str | None]:
+    """The bearer of every upstream send, answered by the fake API or not."""
+    return [tok(r["headers"]["Authorization"].partition(" ")[2]) for r in h.t.sent]
+
+
+def _reject_model(h, *, status=404, kind="not_found_error", message=NO_MODEL, gzipped=False,
+                  tokens=(A.token,), error_headers=()):
+    """Seats holding ``tokens`` answer ``status`` with an error of ``kind``; everyone else as usual."""
+    real = h.fake.respond
+    rejected = {f"Bearer {t}" for t in tokens}
+
+    def respond(method, url, headers, body):
+        auth = {k.lower(): v for k, v in headers.items()}.get("authorization")
+        if auth not in rejected:
+            return real(method, url, headers, body)
+        data = json.dumps({"type": "error", "error": {"type": kind, "message": message}}).encode()
+        extra = []
+        if gzipped:
+            data, extra = gzip.compress(data), [("content-encoding", "gzip")]
+        return FA.Answer(status, [("content-type", "application/json"), *extra, *error_headers,
+                                  ("content-length", str(len(data)))], [data])
+    h.fake.respond = respond
+
+
+@pytest.mark.parametrize("answer", [HOME, B])
+@pytest.mark.parametrize("status", [400, 403, 404])
+@pytest.mark.parametrize("kind", ["not_found_error", "permission_error", "invalid_request_error"])
+def test_model_rejection_on_a_seat_replays_on_the_answer(status, kind, answer):
+    h = Harness()
+    h.proxy.bind(A)
+    _reject_model(h, status=status, kind=kind)
+
+    def decide(hit):
+        assert h.t.wire.getvalue() == b""    # even response headers must wait for the decision
+        return answer
+
+    h._decide = decide
+    resp, _ = h.send()
+    assert resp.status == 200
+    assert [(x.kind, x.seat, x.detail, x.reset_at) for x in h.hits] == [("model", A.email, NO_MODEL, None)]
+    assert sent_bearers(h) == [tok(A.token), tok(answer.token or CLIENT_TOKEN)]
+    assert h.proxy.bound() == answer
+
+
+@pytest.mark.parametrize("message", ["The MODEL you asked for does not exist", "x" * 300 + " model"])
+def test_model_rejection_matches_any_case_and_truncates_the_detail(message):
+    h = Harness()
+    h.proxy.bind(A)
+    _reject_model(h, message=message)
+    h.send()
+    assert [x.kind for x in h.hits] == ["model"] and h.hits[0].detail == message[:200]
+
+
+def test_model_rejection_without_an_answer_passes_through_verbatim():
+    h = Harness()
+    h.proxy.bind(A)
+    _reject_model(h, status=403, kind="permission_error")
+    resp, keep = h.send()
+    assert resp.status == 403 and keep
+    assert json.loads(resp.body)["error"]["message"] == NO_MODEL
+    assert [x.kind for x in h.hits] == ["model"] and sent_bearers(h) == [tok(A.token)]
+
+
+def test_a_gzipped_model_rejection_is_recognised_and_passed_on_compressed():
+    h = Harness()
+    h.proxy.bind(A)
+    _reject_model(h, gzipped=True)
+    resp, _ = h.send(headers=[("Accept-Encoding", "gzip")])
+    assert [(x.kind, x.detail) for x in h.hits] == [("model", NO_MODEL)]
+    assert json.loads(gzip.decompress(resp.body))["error"]["message"] == NO_MODEL
+
+
+def test_a_model_error_on_the_home_seat_is_the_clients():
+    h = Harness()
+    h.proxy.bind(HOME)
+    _reject_model(h, tokens=(CLIENT_TOKEN,))
+    h.answers = [B]
+    resp, _ = h.send()
+    assert resp.status == 404 and h.hits == [] and sent_bearers(h) == [tok(CLIENT_TOKEN)]
+
+
+@pytest.mark.parametrize("status,kind,message", [
+    (404, "not_found_error", "File not found"),                       # no "model"
+    (400, "invalid_request_error", "messages: field required"),
+    (400, "api_error", NO_MODEL),                                     # not a model-rejection type
+    (403, "authentication_error", NO_MODEL),
+    (500, "invalid_request_error", NO_MODEL),                         # not a model-rejection status
+    (409, "invalid_request_error", NO_MODEL),
+])
+def test_other_errors_are_not_a_model_rejection(status, kind, message):
+    h = Harness()
+    h.proxy.bind(A)
+    _reject_model(h, status=status, kind=kind, message=message)
+    h.answers = [B]
+    resp, _ = h.send()
+    assert resp.status == status and h.hits == [] and sent_bearers(h) == [tok(A.token)]
+    assert json.loads(resp.body)["error"]["message"] == message
+
+
+def test_a_model_rejection_is_not_a_limit():
+    h = Harness()
+    h.proxy.bind(A)
+    _reject_model(h)
+    h.answers = [B]
+    h.send()
+    [hit] = h.hits
+    assert hit.kind == "model" and hit.reset_at is None and hit.claim is None
+    assert [e for e, _ in h.logs if e == "hit"] and h.proxy.bound() == B
+
+
+def test_a_429_with_a_model_message_is_still_a_limit():
+    h = Harness()
+    h.proxy.bind(A)
+    _reject_model(h, status=429, error_headers=[("anthropic-ratelimit-unified-status", "rejected")])
+    h.answers = [B]
+    resp, _ = h.send()
+    assert resp.status == 200
+    assert [(hit.kind, hit.seat, hit.detail) for hit in h.hits] == [("limit", A.email, NO_MODEL)]
+    assert sent_bearers(h) == [tok(A.token), tok(B.token)]
+
+
+def test_a_model_rejection_after_the_response_started_is_not_replayed():
+    h = Harness()
+    h.proxy.bind(A)
+    _reject_model(h)
+    h.answers = [B]
+    reply = SP._Reply(Wire())
+    reply.started = True
+    h.proxy._handle("POST", h.url("/v1/messages"), [
+        ("Authorization", f"Bearer {CLIENT_TOKEN}"), ("anthropic-beta", "oauth-2025-04-20")],
+        MSG, reply, None)
+    assert h.hits == [] and sent_bearers(h) == [tok(A.token)]
