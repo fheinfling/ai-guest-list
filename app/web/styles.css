@@ -455,3 +455,7 @@ input:focus-visible ~ .sw, .free-control:focus-within, .proof-gate:focus-within 
 .row-action { display:inline-flex; margin-top:6px; }
 .roster-actionable { cursor:pointer; }
 .roster-actionable:hover > * { background:var(--surface); }
+.roster-signedout .roster-status { font-weight:650; color:#b4443a; }
+.theme-dark .roster-signedout .roster-status { color:#e8877d; }
+.roster-signedout .roster-identity { font-weight:650; }
+.signin-expiry { display:block; margin-top:2px; font-size:.75rem; line-height:1.3; }
