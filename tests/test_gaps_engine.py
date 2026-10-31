@@ -349,3 +349,13 @@ def test_an_automatic_handoff_across_kinds_spends_its_once_approval(ctx, monkeyp
     result = bridge._auto_switch_after_usage(ctx, summary)
     assert result and result["status"] == "switched" and result["to"] == "seat1@test.example"
     assert _approvals(ctx) == {}
+
+
+def test_error_streak_restarts_at_one_after_a_success(ctx):
+    _add(ctx, "a@x.com")
+    state = ctx.load_state()
+    U.store_fetch(state, "codex", "a@x.com",
+                  Usage(ok=True, fetched_at=iso(now()), windows={}))
+    assert state.get_seat("codex", "a@x.com")["usage"]["error_streak"] == 0
+    U.store_fetch(state, "codex", "a@x.com", Usage(error="network", fetched_at=iso(now())))
+    assert state.get_seat("codex", "a@x.com")["usage"]["error_streak"] == 1
