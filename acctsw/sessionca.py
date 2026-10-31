@@ -25,7 +25,7 @@ _TIMEOUT_S = 20
 _DAYS = 2
 _FALLBACK_ROOTS = "/etc/ssl/cert.pem"
 _KEYCHAINS = ("/Library/Keychains/System.keychain", "/System/Library/Keychains/SystemRootCertificates.keychain")
-_CERT_RE = re.compile(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", re.S)
+_CERT_RE = re.compile(r"-----BEGIN (TRUSTED )?CERTIFICATE-----.*?-----END \1CERTIFICATE-----", re.S)
 
 
 class SessionCAError(RuntimeError):
@@ -47,8 +47,8 @@ def _join(*pems: str) -> str:
 
 
 def _certs(text: str | None) -> list[str]:
-    """Certificate blocks only (never keys or other PEM types)."""
-    return _CERT_RE.findall(text or "")
+    """Certificate blocks (plain or OpenSSL TRUSTED) only; never keys or other PEM types."""
+    return [m.group(0) for m in _CERT_RE.finditer(text or "")]
 
 
 def _norm(block: str) -> str:

@@ -207,3 +207,15 @@ def test_keychain_failure_skipped(tmp_path, script):
     full = open(c.bundle_paths({})["SSL_CERT_FILE"]).read()
     assert c.ca_pem() in full and full.count("BEGIN CERTIFICATE") > 10
     c.close()
+
+
+def test_trusted_certificate_blocks_kept(tmp_path):
+    (tmp_path / "x").mkdir()
+    a = SessionCA(tmp_root=tmp_path / "x")
+    trusted = a.ca_pem().replace("CERTIFICATE", "TRUSTED CERTIFICATE")
+    key = "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n"
+    f = tmp_path / "ssl.pem"; f.write_text(key + trusted)
+    c = SessionCA(tmp_root=tmp_path, security=str(tmp_path / "nope"))
+    full = open(c.bundle_paths({"SSL_CERT_FILE": str(f)})["SSL_CERT_FILE"]).read()
+    assert trusted in full and "PRIVATE KEY" not in full
+    a.close(); c.close()
