@@ -29,8 +29,8 @@
  {
   "label": "our CA missing from full bundle",
   "file": "acctsw/sessionca.py",
-  "old": "_join(*parts, self._ca_pem)",
-  "new": "_join(*parts)",
+  "old": "texts.append(self._ca_pem)",
+  "new": "pass",
   "test": [
    "tests/test_sessionca.py::test_bundle_paths_merge"
   ]
@@ -47,8 +47,8 @@
  {
   "label": "default roots dropped from full bundle",
   "file": "acctsw/sessionca.py",
-  "old": "parts = [base] if base else []",
-  "new": "parts = []",
+  "old": "texts = [base, _keychain_roots(self._security)]",
+  "new": "texts = [_keychain_roots(self._security)]",
   "test": [
    "tests/test_sessionca.py::test_bundle_paths_default_roots"
   ]
@@ -114,6 +114,33 @@
   "new": "return",
   "test": [
    "tests/test_sessionca.py::test_missing_openssl_raises"
+  ]
+ },
+ {
+  "label": "keychain roots dropped",
+  "file": "acctsw/sessionca.py",
+  "old": "texts = [base, _keychain_roots(self._security)]",
+  "new": "texts = [base]",
+  "test": [
+   "tests/test_sessionca.py::test_keychain_roots_merged_and_deduped"
+  ]
+ },
+ {
+  "label": "duplicates kept",
+  "file": "acctsw/sessionca.py",
+  "old": "            if key not in seen:",
+  "new": "            if True:",
+  "test": [
+   "tests/test_sessionca.py::test_keychain_roots_merged_and_deduped"
+  ]
+ },
+ {
+  "label": "keychain failure not tolerated",
+  "file": "acctsw/sessionca.py",
+  "old": "    except (OSError, subprocess.SubprocessError):\n        return None\n    if r.returncode != 0:\n        return None\n    return r.stdout",
+  "new": "    except subprocess.SubprocessError:\n        return None\n    return r.stdout",
+  "test": [
+   "tests/test_sessionca.py::test_keychain_failure_skipped"
   ]
  }
 ]

@@ -150,7 +150,8 @@ def test_bundle_paths_merge(tmp_path, ca):
         c.close()
 
 
-def test_bundle_paths_default_roots(ca):
+def test_bundle_paths_default_roots(tmp_path):
+    ca = SessionCA(tmp_root=tmp_path, security=str(tmp_path / "nope"))
     out = ca.bundle_paths({"NODE_EXTRA_CA_CERTS": "/nonexistent"})
     node = open(out["NODE_EXTRA_CA_CERTS"]).read()
     assert node.strip() == ca.ca_pem().strip()
@@ -159,6 +160,7 @@ def test_bundle_paths_default_roots(ca):
     assert ca.ca_pem() in full
     ctx = ssl.create_default_context(cafile=out["SSL_CERT_FILE"])
     assert ctx.cert_store_stats()["x509_ca"] > 10
+    ca.close()
 
 
 def test_close_idempotent(tmp_path):
@@ -173,3 +175,35 @@ def test_missing_openssl_raises(tmp_path):
     with pytest.raises(SessionCAError):
         SessionCA(openssl="/nonexistent/openssl", tmp_root=tmp_path)
     assert not list(tmp_path.iterdir())
+
+
+def _fake_security(tmp_path, body, code=0):
+    p = tmp_path / "security"
+    p.write_text(f"#!/bin/sh\n{body}\nexit {code}\n")
+    p.chmod(0o755)
+    return str(p)
+
+
+def test_keychain_roots_merged_and_deduped(tmp_path):
+    (tmp_path / "x").mkdir()
+    a, b = SessionCA(tmp_root=tmp_path / "x"), SessionCA(tmp_root=tmp_path / "x")
+    key = "-----BEGIN EC PRIVATE KEY-----\nAAAA\n-----END EC PRIVATE KEY-----\n"
+    (tmp_path / "out.txt").write_text(a.ca_pem() + b.ca_pem() + key + a.ca_pem().replace("\n", "\r\n") + b.ca_pem())
+    sec = _fake_security(tmp_path, f"cat {tmp_path}/out.txt")
+    ssl_file = tmp_path / "ssl.pem"; ssl_file.write_text(b.ca_pem())
+    c = SessionCA(tmp_root=tmp_path, security=sec)
+    full = open(c.bundle_paths({"SSL_CERT_FILE": str(ssl_file)})["SSL_CERT_FILE"]).read()
+    assert a.ca_pem() in full and b.ca_pem() in full and c.ca_pem() in full
+    assert full.count("BEGIN CERTIFICATE") == 3
+    assert "PRIVATE KEY" not in full
+    for x in (a, b, c):
+        x.close()
+
+
+@pytest.mark.parametrize("script", ["echo boom >&2", "cat /nonexistent/x", "missing"])
+def test_keychain_failure_skipped(tmp_path, script):
+    sec = str(tmp_path / "nope") if script == "missing" else _fake_security(tmp_path, script, code=1)
+    c = SessionCA(tmp_root=tmp_path, security=sec)
+    full = open(c.bundle_paths({})["SSL_CERT_FILE"]).read()
+    assert c.ca_pem() in full and full.count("BEGIN CERTIFICATE") > 10
+    c.close()
