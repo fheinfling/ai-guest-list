@@ -1,0 +1,119 @@
+[
+ {
+  "label": "key files not deleted",
+  "file": "acctsw/sessionca.py",
+  "old": "p.suffix in (\".key\", \".csr\"",
+  "new": "p.suffix in (\".csr\"",
+  "test": [
+   "tests/test_sessionca.py::test_no_key_files_remain"
+  ]
+ },
+ {
+  "label": "bundle files world-readable",
+  "file": "acctsw/sessionca.py",
+  "old": "os.chmod(path, 0o600)",
+  "new": "os.chmod(path, 0o644)",
+  "test": [
+   "tests/test_sessionca.py::test_permissions"
+  ]
+ },
+ {
+  "label": "our CA missing from node bundle",
+  "file": "acctsw/sessionca.py",
+  "old": "_join(*([node_user] if node_user else []), self._ca_pem)",
+  "new": "_join(*([node_user] if node_user else []))",
+  "test": [
+   "tests/test_sessionca.py::test_bundle_paths_merge"
+  ]
+ },
+ {
+  "label": "our CA missing from full bundle",
+  "file": "acctsw/sessionca.py",
+  "old": "_join(*parts, self._ca_pem)",
+  "new": "_join(*parts)",
+  "test": [
+   "tests/test_sessionca.py::test_bundle_paths_merge"
+  ]
+ },
+ {
+  "label": "user NODE_EXTRA_CA_CERTS dropped",
+  "file": "acctsw/sessionca.py",
+  "old": "[node_user] if node_user else []",
+  "new": "[]",
+  "test": [
+   "tests/test_sessionca.py::test_bundle_paths_merge"
+  ]
+ },
+ {
+  "label": "default roots dropped from full bundle",
+  "file": "acctsw/sessionca.py",
+  "old": "parts = [base] if base else []",
+  "new": "parts = []",
+  "test": [
+   "tests/test_sessionca.py::test_bundle_paths_default_roots"
+  ]
+ },
+ {
+  "label": "ALPN allows h2",
+  "file": "acctsw/sessionca.py",
+  "old": "set_alpn_protocols([\"http/1.1\"])",
+  "new": "set_alpn_protocols([\"h2\", \"http/1.1\"])",
+  "test": [
+   "tests/test_sessionca.py::test_handshake_ok_with_http11_alpn"
+  ]
+ },
+ {
+  "label": "validity too long",
+  "file": "acctsw/sessionca.py",
+  "old": "_DAYS = 2",
+  "new": "_DAYS = 30",
+  "test": [
+   "tests/test_sessionca.py::test_ca_properties"
+  ]
+ },
+ {
+  "label": "leaf SAN missing",
+  "file": "acctsw/sessionca.py",
+  "old": "\\nsubjectAltName={san}",
+  "new": "",
+  "test": [
+   "tests/test_sessionca.py::test_leaf_san_and_validity"
+  ]
+ },
+ {
+  "label": "close not idempotent",
+  "file": "acctsw/sessionca.py",
+  "old": "        if self._closed:\n            return\n        self._closed = True\n        atexit.unregister(self.close)\n        if self._dir is not None:\n            shutil.rmtree(self._dir, ignore_errors=True)",
+  "new": "        self._closed = True\n        atexit.unregister(self.close)\n        if self._dir is not None:\n            shutil.rmtree(self._dir)",
+  "test": [
+   "tests/test_sessionca.py::test_close_idempotent"
+  ]
+ },
+ {
+  "label": "name constraints dropped",
+  "file": "acctsw/sessionca.py",
+  "old": "nameConstraints=critical,@nc\\n[nc]\\n",
+  "new": "\\n[nc]\\n",
+  "test": [
+   "tests/test_sessionca.py::test_name_constraints_present"
+  ]
+ },
+ {
+  "label": "CA pathlen dropped",
+  "file": "acctsw/sessionca.py",
+  "old": "CA:TRUE,pathlen:0",
+  "new": "CA:TRUE",
+  "test": [
+   "tests/test_sessionca.py::test_ca_properties"
+  ]
+ },
+ {
+  "label": "missing openssl swallowed",
+  "file": "acctsw/sessionca.py",
+  "old": "raise SessionCAError(f\"openssl unavailable: {type(e).__name__}\") from e",
+  "new": "return",
+  "test": [
+   "tests/test_sessionca.py::test_missing_openssl_raises"
+  ]
+ }
+]
