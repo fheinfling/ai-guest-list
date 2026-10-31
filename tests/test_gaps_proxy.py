@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import http.client
+import json
 import os
 import socket
 import stat
@@ -867,3 +868,20 @@ def test_start_and_stop_log_and_release_the_upstream(monkeypatch):
     events = [e for e, _ in h.logs]
     assert events.count("proxy_start") == 1 and events.count("proxy_stop") == 1
     assert h.t.idle == []
+
+
+def test_an_unbuffered_body_read_never_asks_for_more_than_a_chunk(monkeypatch):
+    # An unbuffered read allocates the size it asks for: asking for the whole remaining body on every
+    # call would allocate quadratically in the body size.
+    sizes = []
+    readinto = socket.SocketIO.readinto
+    monkeypatch.setattr(socket.SocketIO, "readinto", lambda self, b: (sizes.append(len(b)), readinto(self, b))[1])
+    body = json.dumps({"model": "m", "max_tokens": 5, "pad": "x" * (3 * SP.CHUNK),
+                       "messages": [{"role": "user", "content": "hi"}]}).encode()
+    h = Harness()
+    h.proxy.bind(B)
+    sock = _request(h.proxy, [*OAUTH_LINES, f"Content-Length: {len(body)}"], body)
+    with sock:
+        resp, _ = _read_response(sock)
+    assert resp.status == 200 and h.t.sent[0]["body"] == body
+    assert max(sizes) <= SP.CHUNK

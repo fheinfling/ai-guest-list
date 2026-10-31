@@ -1939,3 +1939,32 @@ def test_upstream_proxy_connect_brackets_ipv6_literals(monkeypatch, no_proxy_env
 
 def test_the_listener_queues_a_burst_of_connections():
     assert SP._Server.request_queue_size >= 128
+
+
+@pytest.mark.parametrize("closing", ["tls", "plain"])
+def test_a_tls_splice_ends_both_ways_when_either_side_ends(closing, session_ca):
+    """TLS cannot be half-closed here (SSLSocket.shutdown drops the TLS layer), so the end of either
+    side ends the splice, even while the other side stays open."""
+    c_user, c_proxy = socket.socketpair()
+    f_proxy, f_user = socket.socketpair()
+    box = {}
+    server = threading.Thread(target=lambda: box.update(
+        tls=session_ca.server_context().wrap_socket(c_proxy, server_side=True)), daemon=True)
+    server.start()
+    client = _tls(c_user, session_ca)
+    server.join(10)
+    pump = threading.Thread(target=SP._pump, args=(box["tls"], f_proxy), daemon=True)
+    pump.start()
+    try:
+        client.sendall(b"ping")
+        f_user.settimeout(10)
+        assert f_user.recv(4) == b"ping"
+        if closing == "tls":
+            client.close()
+        else:
+            f_user.shutdown(socket.SHUT_WR)
+        pump.join(5)
+        assert not pump.is_alive()
+    finally:
+        for s in (client, box["tls"], f_proxy, f_user):
+            s.close()
