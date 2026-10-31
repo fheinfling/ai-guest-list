@@ -668,5 +668,33 @@
   "test": [
    "tests/test_seatproxy.py::test_hang_ups_spread_beyond_the_window_do_not_count"
   ]
+ },
+ {
+  "label": "proxy r3: upstream_successes never counts an answer",
+  "file": "acctsw/seatproxy.py",
+  "old": "self._upstream_successes += 1 if ok else 0",
+  "new": "self._upstream_successes += 0",
+  "test": [
+   "tests/test_seatproxy.py::test_upstream_successes_count_every_answer_and_nothing_else",
+   "tests/test_seatproxy.py::test_websocket_upgrade_is_relayed_verbatim_and_spliced"
+  ]
+ },
+ {
+  "label": "proxy r3: upstream_successes counts failures too",
+  "file": "acctsw/seatproxy.py",
+  "old": "self._upstream_successes += 1 if ok else 0",
+  "new": "self._upstream_successes += 1",
+  "test": [
+   "tests/test_seatproxy.py::test_upstream_successes_count_every_answer_and_nothing_else"
+  ]
+ },
+ {
+  "label": "proxy r3: a reset mid-handshake is not counted like a hang-up",
+  "file": "acctsw/seatproxy.py",
+  "old": "                return proxy._handshake_failed(\"connection reset\", True)",
+  "new": "                return",
+  "test": [
+   "tests/test_seatproxy.py::test_resets_mid_handshake_count_like_hang_ups"
+  ]
  }
 ]

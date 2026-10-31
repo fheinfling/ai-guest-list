@@ -405,6 +405,7 @@ class SeatProxy:
         self._intercepts_ok = 0
         self._eofs: list[float] = []      # when recent handshakes ended in a hang-up (no alert)
         self._upstream_failures = 0
+        self._upstream_successes = 0
         self._secret = secrets.token_urlsafe(24)
         self._lock = threading.Lock()
         self._decide_lock = threading.Lock()
@@ -520,9 +521,15 @@ class SeatProxy:
         with self._lock:
             return self._upstream_failures
 
+    def upstream_successes(self) -> int:
+        """Upstream answers received so far, any HTTP status: proof the upstream path works."""
+        with self._lock:
+            return self._upstream_successes
+
     def _upstream_result(self, ok: bool) -> None:
         with self._lock:
             self._upstream_failures = 0 if ok else self._upstream_failures + 1
+            self._upstream_successes += 1 if ok else 0
 
     def preflight(self, timeout: float = 5.0) -> str | None:
         """Connect to the upstream the way real requests do (tunnel, TLS trust) and send a tokenless
@@ -947,6 +954,8 @@ def _make_handler(proxy: SeatProxy, authority: str | None = None):
                 reason = f"{getattr(e, 'reason', None) or e}"[:200]
                 eof = isinstance(e, ssl.SSLEOFError) or reason == "UNEXPECTED_EOF_WHILE_READING"
                 return proxy._handshake_failed(reason, eof)
+            except ConnectionResetError:
+                return proxy._handshake_failed("connection reset", True)    # a hang-up, like an EOF
             except OSError:
                 return
             with proxy._lock:
