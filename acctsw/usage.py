@@ -95,6 +95,10 @@ class UsageFetchJob:
     active: bool
     user_agent: str | None = None
     recover_codex: bool = False
+    # The seat's sign-in verdict and the digest of every credential it was read from. A signed-out
+    # job never reaches the network: there is no token to send.
+    signin: "SignIn | None" = None
+    signin_digest: str | None = None
 
 
 @dataclass(frozen=True)
@@ -318,6 +322,107 @@ def _claude_access_token_expired(blob: str) -> bool:
     return (isinstance(refresh, str) and bool(refresh)
             and isinstance(expiry, (int, float)) and not isinstance(expiry, bool)
             and 0 < expiry <= now().timestamp() * 1000)
+
+
+# --- sign-in classification -------------------------------------------------------------------
+
+def _epoch_ms(value: Any) -> float | None:
+    """A positive finite millisecond timestamp, else None (0/absent/garbage means 'not stated')."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if 0 < value < float("inf") else None
+
+
+def _live_token(token: Any, expires_ms: Any, at) -> bool:
+    """A non-empty token that no stated expiry has passed. An unstated expiry is not proof of death,
+    matching ``_claude_access_token_expired``'s clock boundary."""
+    expiry = _epoch_ms(expires_ms)
+    return (isinstance(token, str) and bool(token)
+            and (expiry is None or expiry > at.timestamp() * 1000))
+
+
+def login_usable(tool: str, blob: str | None, at=None) -> bool:
+    """Whether a credential blob still carries a login its tool can work with, read locally.
+
+    Claude owns token renewal, so an expired access token beside a live refresh token is routine and
+    usable. Unusable: no blob, unparsable, or (Claude) neither a live access token nor a refresh token
+    whose ``refreshTokenExpiresAt`` (ms epoch) is still ahead — exactly what Claude leaves behind when
+    a refresh token runs out (tokens blanked, ``expiresAt`` 0). Codex: neither an access token nor a
+    refresh token (an API-key login counts as usable)."""
+    at = at or now()
+    try:
+        data = json.loads(blob)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    if tool == "codex":
+        tokens = data.get("tokens")
+        tokens = tokens if isinstance(tokens, dict) else {}
+        return any(isinstance(v, str) and v for v in (
+            tokens.get("access_token"), tokens.get("refresh_token"), data.get("OPENAI_API_KEY")))
+    oauth = data.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return False
+    return (_live_token(oauth.get("accessToken"), oauth.get("expiresAt"), at)
+            or _live_token(oauth.get("refreshToken"), oauth.get("refreshTokenExpiresAt"), at))
+
+
+def signin_expires_at(tool: str, blob: str | None):
+    """When this login stops renewing itself: Claude's ``refreshTokenExpiresAt``. Codex's auth file
+    states no refresh expiry, so it has none."""
+    if tool != "claude":
+        return None
+    try:
+        oauth = json.loads(blob)["claudeAiOauth"]
+    except (json.JSONDecodeError, TypeError, KeyError):
+        return None
+    expiry = _epoch_ms(oauth.get("refreshTokenExpiresAt")) if isinstance(oauth, dict) else None
+    if expiry is None:
+        return None
+    from datetime import datetime, timezone
+    try:
+        return datetime.fromtimestamp(expiry / 1000, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+@dataclass(frozen=True)
+class SignIn:
+    signed_out: bool
+    expires_at: str | None = None   # ISO; the precedence-first usable login's refresh expiry
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"signed_out": self.signed_out, "expires_at": self.expires_at}
+
+
+def classify_signin(tool: str, blobs, at=None) -> SignIn:
+    """Signed out only when NO credential the app could use for the seat carries a usable login.
+    ``blobs`` are in the engine's own precedence (the seat's home/live copy first, then its snapshot),
+    so the expiry reported is the one the next launch would run on."""
+    at = at or now()
+    for blob in blobs:
+        if login_usable(tool, blob, at):
+            expires = signin_expires_at(tool, blob)
+            return SignIn(False, iso(expires) if expires else None)
+    return SignIn(True)
+
+
+def _signin_for(ctx, tool: str, email: str, blob: str | None,
+                at=None) -> tuple[SignIn, str | None]:
+    """Classify a seat from the blob a poll already read, consulting its snapshot only when that
+    blob is unusable (a usable snapshot means the launcher can still put the login back). Returns
+    the verdict and a digest of every credential it read, so a later poll can tell whether anything
+    changed. An unreadable snapshot is no proof of logout: the seat is then left signed in."""
+    at = at or now()
+    if login_usable(tool, blob, at):
+        return classify_signin(tool, [blob], at), _credential_digest(blob)
+    try:
+        snapshot = ctx.snapshot_get(tool, email)
+    except Exception:
+        return SignIn(False), None
+    blobs = [blob, snapshot]
+    return classify_signin(tool, blobs, at), _credential_digest(json.dumps(blobs))
 
 
 @lru_cache(maxsize=8)
@@ -617,6 +722,14 @@ USAGE_MIN_REFRESH_SECONDS = P.USAGE_MIN_REFRESH_SECONDS
 # cannot keep painting frozen bars forever.
 MAX_TRUSTED_AGE_S = 900
 
+# A login whose refresh token runs out within this window is shown (and notified once) as expiring,
+# so the person can sign in again before the seat drops off the guest list.
+SIGNIN_WARN_S = 3 * 86400
+
+# A seat with no usable credential is not a transient failure: retrying cannot fix it, only a new
+# login can. Such seats are re-read when their credential bytes change, or at MAX_BACKOFF_SECONDS.
+DEAD_CREDENTIAL_ERRORS = frozenset({"no_token"})
+
 # Default cooldown when a limit is known but no authoritative reset is (shared with the launcher,
 # which re-exports it; defined here so usage's own limit-flagging can use it without a cycle).
 DEFAULT_COOLDOWN = timedelta(hours=5)
@@ -680,7 +793,9 @@ def _backoff_seconds(prev_usage: dict | None, base: int, *, active: bool = False
     re-validated promptly instead of remaining hidden behind an hour-long historical error streak.
     """
     streak = int((prev_usage or {}).get("error_streak", 0) or 0)
-    if streak <= 0:
+    if streak <= 0 or (prev_usage or {}).get("error") in DEAD_CREDENTIAL_ERRORS:
+        # A dead credential is only re-READ at the base cadence (a local Keychain/file read, never
+        # the network); _dead_unchanged then skips it unless its bytes changed.
         wait = base
     else:
         # A visible popover asks healthy active seats for a fresher cadence (30s), but an error must
@@ -701,6 +816,19 @@ def _due(prev_usage: dict | None, at, base: int, *, active: bool = False) -> boo
     if prev is None:
         return True
     return (at - prev).total_seconds() >= _backoff_seconds(prev_usage, base, active=active)
+
+
+def _dead_unchanged(prev_usage: dict | None, digest: str | None, at) -> bool:
+    """True while a seat that had no usable token still holds the very same credential bytes: there
+    is nothing new to try until MAX_BACKOFF_SECONDS has passed. Any change (a fresh login, Claude
+    renewing a blank access token) makes the seat due again at once."""
+    from .util import parse_iso
+    prev = prev_usage or {}
+    if (prev.get("error") not in DEAD_CREDENTIAL_ERRORS or digest is None
+            or prev.get("dead_credential_digest") != digest):
+        return False
+    last = parse_iso(prev.get("last_attempted_at"))
+    return last is not None and (at - last).total_seconds() < MAX_BACKOFF_SECONDS
 
 
 def refresh(ctx, state, tool: str | None = None, *, only: str | None = None,
@@ -733,10 +861,17 @@ def refresh(ctx, state, tool: str | None = None, *, only: str | None = None,
                 summary[t][email] = "cached"
                 continue
             blob = _seat_blob(ctx, state, t, email)
-            if not blob:
+            signin, digest = _signin_for(ctx, t, email, blob, at)
+            if not force and _dead_unchanged(prev_usage, digest, at):
+                summary[t][email] = "cached"
+                continue
+            if signin.signed_out:
+                u = Usage(error="no_token", fetched_at=iso(at))
+            elif not blob:
                 summary[t][email] = "no_creds"
                 continue
-            u = _fetch_for(t, blob, get, ua)
+            else:
+                u = _fetch_for(t, blob, get, ua)
             # NOTE (KR-B2): Codex's refresh tokens are single-use; rotating the active auth.json
             # can invalidate Codex's own session, so active seats remain observers. Parked seats
             # differ: no child renews their expired token, leaving usage too stale for handoff.
@@ -747,7 +882,8 @@ def refresh(ctx, state, tool: str | None = None, *, only: str | None = None,
             # prevents a lost race from being called revocation. This accepts, rather than closes,
             # the remaining window: cx launching on this seat between the session check and the
             # token POST can still double-spend the token. No network I/O runs under the flock.
-            summary[t][email] = store_fetch(state, t, email, u, at=at, blob=blob)
+            summary[t][email] = store_fetch(state, t, email, u, at=at, blob=blob,
+                                            signin=signin, signin_digest=digest)
     state.save()
     return summary
 
@@ -786,6 +922,8 @@ def _detached_blob(ctx, state, tool: str, email: str, *, active: bool) -> str | 
 
 def _fetch_job(job: UsageFetchJob, get: HttpGet) -> UsageFetchResult:
     attempted_at = iso(now())
+    if job.signin is not None and job.signin.signed_out:
+        return UsageFetchResult(job, Usage(error="no_token", fetched_at=attempted_at))
     try:
         fetched = _fetch_for(job.tool, job.blob, get, job.user_agent)
     except Exception:
@@ -822,7 +960,7 @@ def _commit_fetch_result(ctx, result: UsageFetchResult) -> str:
             return "stale"
         if (state.active(job.tool) == job.email) != was_active:
             return "stale"
-        if _credential_digest(current_blob) != job.credential_digest:
+        if (_credential_digest(current_blob) or "") != job.credential_digest:
             return "stale"
         # Two independent processes may poll at once.  A response that started earlier may finish
         # later; never let it replace the newer attempt already stored by the faster request.
@@ -830,7 +968,8 @@ def _commit_fetch_result(ctx, result: UsageFetchResult) -> str:
         latest_at = parse_iso(((seat.get("usage") or {}).get("last_attempted_at")))
         if attempt_at is not None and latest_at is not None and latest_at > attempt_at:
             return "stale"
-        status = store_fetch(state, job.tool, job.email, fetched, blob=job.blob)
+        status = store_fetch(state, job.tool, job.email, fetched, blob=job.blob or None,
+                             signin=job.signin, signin_digest=job.signin_digest)
         state.save()
         return status
 
@@ -950,14 +1089,20 @@ def refresh_live(ctx, tool: str | None = None, *, only: str | None = None,
     prepared: list[UsageFetchJob] = []
     for t, email, added_at, was_active in candidates:
         blob = _detached_blob(ctx, initial, t, email, active=was_active)
-        if not blob:
+        signin, digest = _signin_for(ctx, t, email, blob, at)
+        # Not even ``force`` re-tries a dead credential: the same bytes give the same answer.
+        if _dead_unchanged((initial.get_seat(t, email) or {}).get("usage"), digest, at):
+            summary[t][email] = "cached"
+            continue
+        if not blob and not signin.signed_out:
             summary[t][email] = "no_creds"
             continue
         prepared.append(UsageFetchJob(
-            tool=t, email=email, blob=blob,
+            tool=t, email=email, blob=blob or "",
             credential_digest=_credential_digest(blob) or "",
             added_at=added_at, active=was_active,
             user_agent=ua if t == "claude" else None,
+            signin=signin, signin_digest=digest,
         ))
 
     # Session probes can spawn ps and prune stale heartbeats. Keep that sweep outside the flock;
@@ -993,6 +1138,7 @@ def refresh_live(ctx, tool: str | None = None, *, only: str | None = None,
                 tool=job.tool, email=job.email, blob=job.blob,
                 credential_digest=job.credential_digest, added_at=job.added_at,
                 active=is_active, user_agent=job.user_agent,
+                signin=job.signin, signin_digest=job.signin_digest,
                 recover_codex=(job.tool == "codex" and not is_active and not job.active
                                and _codex_access_token_expired(job.blob)
                                and bool(_codex_refresh_token(job.blob))
@@ -1023,14 +1169,16 @@ def refresh_live(ctx, tool: str | None = None, *, only: str | None = None,
 
 
 def store_fetch(state, tool: str, email: str, u: Usage, at=None, *,
-                trust_reactive_lag: bool = True, blob: str | None = None) -> str:
+                trust_reactive_lag: bool = True, blob: str | None = None,
+                signin: SignIn | None = None, signin_digest: str | None = None) -> str:
     """Persist ONE fetch result onto a seat (windows, limit flags, error backoff) and return its
     summary status ("ok" or the error kind). Shared by refresh() and the launcher's inline probe,
     which must fetch WITHOUT the state lock held and only take it for this quick write. The caller
     saves state. ``trust_reactive_lag`` is threaded to _apply_limit (see there): default True keeps
     in-session/poll behaviour; the launcher's cold-start sweep passes False. A successful caller
     should pass the exact fetched ``blob`` so plan/account identity are refreshed from the same
-    credentials that just authenticated."""
+    credentials that just authenticated. ``signin``/``signin_digest`` (from ``_signin_for``) record
+    the seat's sign-in verdict and which credential bytes a dead-token error was read from."""
     at = at if at is not None else now()
     prev_usage = (state.get_seat(tool, email) or {}).get("usage") or {}
     d = u.to_dict()
@@ -1081,8 +1229,16 @@ def store_fetch(state, tool: str, email: str, u: Usage, at=None, *,
             d["fetched_at"] = prev_usage.get("fetched_at") or None
         d["last_attempted_at"] = u.fetched_at or iso(at)
         d["stale"] = True
-        d["error_streak"] = int(prev_usage.get("error_streak", 0) or 0) + 1
+        if u.error in DEAD_CREDENTIAL_ERRORS:
+            # Not transient: no retry streak. The digest lets the next poll skip identical bytes.
+            d["error_streak"] = 0
+            d["dead_credential_digest"] = signin_digest
+        else:
+            d["error_streak"] = int(prev_usage.get("error_streak", 0) or 0) + 1
         state.set_usage(tool, email, d)
+    seat = state.get_seat(tool, email)
+    if signin is not None and seat is not None:
+        seat["signin"] = signin.to_dict()
     return u.error or "ok"
 
 

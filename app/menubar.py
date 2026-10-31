@@ -557,6 +557,9 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
         def finishUsagePoll_(self, result):
             self._usage_poll_inflight = False
             self.applyResult_(result)
+            # Raised once each by the engine (deduped in persisted state, notify setting applied).
+            for notice in result.get("signin_notices") or []:
+                self._notify(notice["title"], notice["text"])
             handoff = result.get("auto_switch") or {}
             if handoff.get("status") == "switched":
                 notify_on = ((result.get("state") or {}).get("settings") or {}).get("notify", True)

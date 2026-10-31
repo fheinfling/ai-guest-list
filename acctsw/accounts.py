@@ -11,8 +11,8 @@ from .context import Context
 from .errors import CannotIdentify, NoLiveCreds
 from .selection import choose
 from .state import State
-from .usage import MAX_TRUSTED_AGE_S, account_fingerprint, account_workspace
-from .util import email_key, now, parse_iso, jwt_payload
+from .usage import MAX_TRUSTED_AGE_S, SIGNIN_WARN_S, account_fingerprint, account_workspace
+from .util import email_key, now, iso, parse_iso, jwt_payload
 
 # raw plan code -> display label (spec §4: Business|Team|Pro|Max|Free)
 _PLAN_LABELS = {"business": "Business", "team": "Team", "enterprise": "Enterprise",
@@ -89,6 +89,7 @@ def _creds_refreshed(state: State, tool: str, em: str) -> None:
     if seat is None:
         return
     seat.pop("auth_error", None)  # a new login replaces the revoked refresh credential
+    seat.pop("signin", None)      # ...and any signed-out verdict; the next poll classifies it afresh
     u = seat.get("usage")
     if not isinstance(u, dict):  # upsert_seat seeds usage as None until the first poll
         u = {}
@@ -220,6 +221,15 @@ def _usage_pct(seat: dict, win: str):
     return w.get("used_pct")
 
 
+def _signin_view(seat: dict, at: datetime) -> tuple[bool, datetime | None, bool]:
+    """(signed_out, signin_expires_at, signin_expiring) from the verdict the last poll stored."""
+    signin = seat.get("signin") or {}
+    signed_out = bool(signin.get("signed_out"))
+    expires = None if signed_out else parse_iso(signin.get("expires_at"))
+    left = (expires - at).total_seconds() if expires else None
+    return signed_out, expires, left is not None and 0 < left <= SIGNIN_WARN_S
+
+
 def _seat_view(seat: dict, *, active: bool, at: datetime,
                active_session: dict | None = None) -> dict[str, Any]:
     until = parse_iso(seat.get("limited_until"))
@@ -229,6 +239,7 @@ def _seat_view(seat: dict, *, active: bool, at: datetime,
     usage_age_s = max(0.0, (at - fetched_at).total_seconds()) if fetched_at else None
     in_session = bool(active_session and active_session.get("email") == seat["email"])
     error = usage.get("error")
+    signed_out, signin_expires, signin_expiring = _signin_view(seat, at)
     return {
         "email": seat["email"],
         "name": seat.get("name") or seat["email"].split("@")[0],
@@ -237,10 +248,15 @@ def _seat_view(seat: dict, *, active: bool, at: datetime,
         "limited": limited,
         "limited_until": seat.get("limited_until") if limited else None,
         # A 401 is actionable only for the active seat: cached access-token expiry on a parked seat
-        # is routine. A 403 means the entitlement itself is gone and is actionable on every seat.
+        # is routine. A 403 means the entitlement itself is gone and is actionable on every seat, and
+        # so is a seat with no usable login left anywhere (signed out).
         "needs_login": bool(seat.get("auth_error")) or (active and error == "unauthorized")
-                       or error == "forbidden",
+                       or error == "forbidden" or signed_out,
         "entitlement_revoked": error == "forbidden",
+        "signed_out": signed_out,
+        # When the login stops renewing itself (Claude's refresh-token expiry); None when unknown.
+        "signin_expires_at": iso(signin_expires) if signin_expires else None,
+        "signin_expiring": signin_expiring,
         "in_session": in_session,
         "session_started_at": active_session.get("started_at") if in_session else None,
         "usage_fetched_at": usage.get("fetched_at") if fetched_at else None,
@@ -340,6 +356,42 @@ def list_seats(state: State, tool: str, at: datetime | None = None,
     _assign_statuses(seats)
     _mark_shared_accounts(seats)
     return seats
+
+
+def take_signin_notices(state: State,
+                        at: datetime | None = None) -> tuple[list[dict[str, str]], bool]:
+    """Notifications for seats that just became signed out or entered the sign-in-expiring window,
+    each raised once: the marks live on the seat in the persisted state, so neither a restart nor the
+    next poll repeats them. A seat that recovers drops its signed-out mark so a later logout is news
+    again; the expiring mark is keyed on the expiry itself, so a fresh login re-arms it. Returns the
+    notices and whether any mark changed (the caller then saves state)."""
+    at = at or now()
+    notices: list[dict[str, str]] = []
+    changed = False
+    for tool in ("codex", "claude"):
+        for email, seat in state.accounts(tool).items():
+            signed_out, expires, expiring = _signin_view(seat, at)
+            marks = seat.get("signin_notified") or {}
+            before = dict(marks)
+            name = seat.get("name") or email.split("@")[0]
+            if signed_out and not marks.get("signed_out"):
+                marks["signed_out"] = True
+                notices.append({"title": f"{name} needs you to sign in again 🔑",
+                                "text": f"{tool} · {email} is signed out, so it can't take the "
+                                        f"floor — sign in again to bring it back"})
+            elif not signed_out:
+                marks.pop("signed_out", None)
+            stamp = iso(expires) if expires else None
+            if expiring and marks.get("expiring") != stamp:
+                marks["expiring"] = stamp
+                notices.append({"title": f"{name}'s sign-in runs out soon ⏳",
+                                "text": f"{tool} · {email} stays signed in until "
+                                        f"{expires.astimezone():%a %-d %b, %H:%M} — sign in again "
+                                        f"before then to keep it on the guest list"})
+            if marks != before:
+                seat["signin_notified"] = marks
+                changed = True
+    return notices, changed
 
 
 def _shared_account_warnings(tools_seats: dict[str, list[dict[str, Any]]]) -> list[str]:
