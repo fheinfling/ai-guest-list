@@ -86,6 +86,14 @@ def ctx(tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _in_place_switch_off(monkeypatch):
+    """In-place seat switching starts a local proxy in run(). Tests that want it inject a fake
+    swap explicitly; every other launcher test keeps the restart-only behaviour it was written
+    for."""
+    monkeypatch.setenv("ACCTSW_IN_PLACE_SWITCH", "0")
+
+
+@pytest.fixture(autouse=True)
 def _no_network(monkeypatch):
     """HTTP tests inject transports or urllib handlers; no test may open a real connection."""
     def offline(*_args, **_kwargs):
