@@ -193,8 +193,8 @@
   {
     "label": "in-place: maintain()'s handover is ignored",
     "file": "acctsw/launcher.py",
-    "old": "                inplace[\"handover\"] = _swapcall(\"maintain\", ctx) == \"handover\"",
-    "new": "                inplace[\"handover\"] = _swapcall(\"maintain\", ctx) == \"never\"",
+    "old": "                    third_seat=inplace[\"hops\"] < MAX_INPLACE_SWITCHES) == \"handover\"",
+    "new": "                    third_seat=inplace[\"hops\"] < MAX_INPLACE_SWITCHES) == \"never\"",
     "test": [
       "tests/test_launcher_inplace.py::test_handover_restarts_on_the_bound_seats_own_login"
     ]
@@ -221,10 +221,11 @@
   {
     "label": "crossing: open questions outlive the session that asked them",
     "file": "acctsw/launcher.py",
-    "old": "                with ctx.locked():\n                    st = ctx.load_state()\n                    _withdraw_crossings(st)\n                    st.save()\n            except Exception:",
-    "new": "                pass\n            except Exception:",
+    "old": "                    if _withdraw_crossings(st):\n                        st.save()\n",
+    "new": "                    pass\n",
     "test": [
-      "tests/test_launcher_inplace.py::test_open_crossing_questions_are_withdrawn_when_the_session_ends"
+      "tests/test_launcher_inplace.py::test_open_crossing_questions_are_withdrawn_when_the_session_ends",
+      "tests/test_launcher_inplace.py::test_a_question_the_app_raised_for_this_session_is_withdrawn_at_exit"
     ]
   },
   {
@@ -331,8 +332,8 @@
   {
     "label": "review #1: a swap error escapes run() and kills the session",
     "file": "acctsw/launcher.py",
-    "old": "        try:\n            return getattr(swap, method)(*args)\n        except Exception:",
-    "new": "        try:\n            return getattr(swap, method)(*args)\n        except ArithmeticError:",
+    "old": "            return getattr(swap, method)(*args, **kwargs)\n        except Exception:",
+    "new": "            return getattr(swap, method)(*args, **kwargs)\n        except ArithmeticError:",
     "test": [
       "tests/test_launcher_inplace.py::test_no_swap_error_ever_leaves_run_or_stops_the_child"
     ]
@@ -565,8 +566,8 @@
   {
     "label": "round2 N5: a handover asked for once stays armed after maintain() stops asking",
     "file": "acctsw/launcher.py",
-    "old": "                inplace[\"handover\"] = _swapcall(\"maintain\", ctx) == \"handover\"",
-    "new": "                inplace[\"handover\"] = inplace[\"handover\"] or _swapcall(\"maintain\", ctx) == \"handover\"",
+    "old": "                inplace[\"handover\"] = _swapcall(\n",
+    "new": "                inplace[\"handover\"] = inplace[\"handover\"] or _swapcall(\n",
     "test": [
       "tests/test_launcher_inplace.py::test_a_handover_request_lapses_when_maintain_stops_asking"
     ]
@@ -668,6 +669,69 @@
     "new": "                        if False:",
     "test": [
       "tests/test_launcher_inplace.py::test_a_click_across_kinds_asks_this_session_instead_of_moving_it"
+    ]
+  },
+  {
+    "label": "sid: this session's questions are filed under the resume thread, not the supervisor pid",
+    "file": "acctsw/launcher.py",
+    "old": "    crossing = {\"requested\": set(), \"pending\": None, \"sid\": str(os.getpid())}",
+    "new": "    crossing = {\"requested\": set(), \"pending\": None, \"sid\": str(uuid4())}",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_question_the_app_raised_for_this_session_is_withdrawn_at_exit"
+    ]
+  },
+  {
+    "label": "maintain: a third seat is allowed whatever the in-place budget",
+    "file": "acctsw/launcher.py",
+    "old": "                    third_seat=inplace[\"hops\"] < MAX_INPLACE_SWITCHES) == \"handover\"",
+    "new": "                    third_seat=True) == \"handover\"",
+    "test": [
+      "tests/test_launcher_inplace.py::test_maintain_may_pick_a_third_seat_only_while_the_budget_lasts"
+    ]
+  },
+  {
+    "label": "maintain: the swap's own move to a third seat is not counted as a hop",
+    "file": "acctsw/launcher.py",
+    "old": "                if to != launch_email:\n                    inplace[\"hops\"] += 1   # a third seat",
+    "new": "                if False:\n                    inplace[\"hops\"] += 1   # a third seat",
+    "test": [
+      "tests/test_launcher_inplace.py::test_maintain_may_pick_a_third_seat_only_while_the_budget_lasts"
+    ]
+  },
+  {
+    "label": "tls: a rejected certificate is ignored",
+    "file": "acctsw/launcher.py",
+    "old": "                    if swap is not None and (_tls_rejected() or _tick_swap()):",
+    "new": "                    if swap is not None and _tick_swap():",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_rejected_certificate_restarts_once_without_the_proxy"
+    ]
+  },
+  {
+    "label": "tls: the restart after a rejection keeps the proxy env (and can loop)",
+    "file": "acctsw/launcher.py",
+    "old": "                _swapcall(\"stop\")\n                swap = None\n                relaunch_seat = launch_email\n",
+    "new": "                relaunch_seat = launch_email\n",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_rejected_certificate_restarts_once_without_the_proxy"
+    ]
+  },
+  {
+    "label": "tls: a rejection restarts the child even though its traffic went through",
+    "file": "acctsw/launcher.py",
+    "old": "                if (not inplace[\"tls_restart\"] and not _swapcall(\"proxy_used\", default=False)\n",
+    "new": "                if (not inplace[\"tls_restart\"]\n",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_rejected_certificate_after_traffic_only_stops_the_hops"
+    ]
+  },
+  {
+    "label": "tls: hops in place go on after a rejection",
+    "file": "acctsw/launcher.py",
+    "old": "            return (swap is not None and not inplace[\"off\"]\n",
+    "new": "            return (swap is not None\n",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_rejected_certificate_after_traffic_only_stops_the_hops"
     ]
   }
 ]
