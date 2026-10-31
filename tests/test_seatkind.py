@@ -163,28 +163,49 @@ def _claude_seat(ctx, email, plan):
     ctx.claude_cred(email).set_live(make_claude_blob(plan.lower()))
 
 
-def test_a_manual_switch_counts_as_approval(ctx, monkeypatch):
+def test_a_manual_switch_answers_the_question_and_leaves_no_approval(ctx, monkeypatch):
     for email, plan in (("w@x", "Team"), ("p@x", "Max")):
         _claude_seat(ctx, email, plan)
     state = seats(ctx, {"w@x": "Team", "p@x": "Max"}, active="w@x")
+    seatkind.request(state, T, "w@x", "p@x", 7)
+    seatkind.request(state, T, "p@x", "w@x", 8)
+    seatkind.approve(state, T, "w@x", "p@x", "once")   # the user's earlier yes is what it uses
+    seatkind.request(state, T, "w@x", "p@x", 9)
+    state.save()
     monkeypatch.setattr(session, "active_sessions", lambda *_a, **_k: [])
     switch(ctx, state, T, "p@x", sync=False, mirror=False, manual=True)
     state = ctx.load_state()
     assert state.data["tools"][T]["manual_switch"]["email"] == "p@x"
-    assert seatkind.approved(state, T, "w@x", "p@x")
-    assert not seatkind.approved(state, T, "p@x", "w@x")
+    assert [(r["from"], r["to"]) for r in seatkind.pending(state, T)] == [("p@x", "w@x")]
+    # Nothing left over that a later AUTOMATIC crossing could ride on.
+    assert not seatkind.approved(state, T, "w@x", "p@x")
+    rest(state, "w@x")
+    assert not choose(state, T, origin="w@x", exclude={"w@x"}).available
 
 
-def test_a_manual_switch_approves_from_every_seat_a_terminal_bills(ctx, monkeypatch):
+def test_a_manual_switch_keeps_an_always_approval(ctx, monkeypatch):
+    for email, plan in (("w@x", "Team"), ("p@x", "Max")):
+        _claude_seat(ctx, email, plan)
+    state = seats(ctx, {"w@x": "Team", "p@x": "Max"}, active="w@x")
+    seatkind.approve(state, T, "w@x", "p@x", "always")
+    state.save()
+    monkeypatch.setattr(session, "active_sessions", lambda *_a, **_k: [])
+    switch(ctx, state, T, "p@x", sync=False, mirror=False, manual=True)
+    assert seatkind.approved(ctx.load_state(), T, "w@x", "p@x")
+
+
+def test_a_manual_switch_answers_for_every_seat_a_terminal_bills(ctx, monkeypatch):
     for email, plan in (("w@x", "Team"), ("p@x", "Max"), ("u@x", "Pro")):
         _claude_seat(ctx, email, plan)
     state = seats(ctx, {"w@x": "Team", "p@x": "Max", "u@x": "Pro"}, active="u@x")
+    seatkind.request(state, T, "w@x", "p@x", 7)
+    state.save()
     monkeypatch.setattr(session, "active_sessions",
                         lambda *_a, **_k: [{"email": "w@x", "pid": 1, "started_at": iso(now())}])
     switch(ctx, state, T, "p@x", sync=False, mirror=False, manual=True)
     state = ctx.load_state()
-    assert seatkind.approved(state, T, "w@x", "p@x")
-    assert "u@x>p@x" not in state.data["tools"][T]["crossings"]["approvals"]   # not a crossing
+    assert seatkind.pending(state, T) == []
+    assert not seatkind.approved(state, T, "w@x", "p@x")
 
 
 def test_an_automatic_switch_approves_nothing(ctx, monkeypatch):
@@ -250,3 +271,41 @@ def test_mark_session_records_a_home_that_differs(ctx):
     assert session.active_sessions(ctx.data_dir, T, strict=True)[0]["home"] == "a@x"
     session.mark_session(ctx.data_dir, T, "a@x", home="a@x")
     assert "home" not in session.active_session(ctx.data_dir, T)
+
+
+# --- D9: back to the session's own home seat is never a crossing ------------------------------
+
+def test_home_is_exempt_only_as_the_destination(ctx):
+    state = seats(ctx, {"w@x": "Team", "p@x": "Max"})
+    assert not seatkind.crosses(state, T, "p@x", "w@x", home="w@x")
+    assert seatkind.approved(state, T, "p@x", "w@x", home="w@x")
+    assert seatkind.consume(state, T, "p@x", "w@x", home="w@x")
+    assert not seatkind.request(state, T, "p@x", "w@x", 1, home="w@x")
+    assert seatkind.crosses(state, T, "w@x", "p@x", home="w@x"), "leaving home still crosses"
+    assert seatkind.crosses(state, T, "p@x", "w@x")
+
+
+def test_choose_and_candidate_let_a_session_go_home(ctx):
+    state = seats(ctx, {"w@x": "Team", "p@x": "Max"}, active="p@x")
+    rest(state, "p@x")
+    assert not choose(state, T, origin="p@x").available
+    assert choose(state, T, origin="p@x", home="w@x").email == "w@x"
+    assert crossing_candidate(state, T, origin="p@x") == "w@x"
+    assert crossing_candidate(state, T, origin="p@x", home="w@x") is None
+
+
+# --- the app's own auto-switch spends a "once" ---------------------------------------------------
+
+def test_bridge_auto_switch_spends_a_once_approval(ctx, monkeypatch):
+    from tests.test_auto_handoff import probe, seed
+    summary = seed(ctx, spare_count=1)
+    state = ctx.load_state()
+    state.get_seat("codex", "seat0@test.example")["plan"] = "Team"
+    state.get_seat("codex", "seat1@test.example")["plan"] = "Plus"
+    seatkind.approve(state, "codex", "seat0@test.example", "seat1@test.example", "once")
+    state.save()
+    probe(monkeypatch)
+    result = bridge._auto_switch_after_usage(ctx, summary)
+    assert result and result["status"] == "switched" and result["to"] == "seat1@test.example"
+    assert not seatkind.approved(ctx.load_state(), "codex", "seat0@test.example",
+                                 "seat1@test.example")

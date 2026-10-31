@@ -45,12 +45,12 @@
   ]
  },
  {
-  "label": "ACCTSW_IN_PLACE_SWITCH=0 ignored",
+  "label": "falsy ACCTSW_IN_PLACE_SWITCH ignored",
   "file": "acctsw/seatswap.py",
-  "old": "if str(environ.get(SWITCH_ENV, \"\")).strip() == \"0\":",
-  "new": "if False:",
+  "old": "    if switch.lower() in FALSY:\n",
+  "new": "    if switch == \"0\":\n",
   "test": [
-   "tests/test_seatswap.py::test_env_switch_turns_it_off"
+   "tests/test_seatswap.py::test_a_falsy_env_switch_turns_it_off"
   ]
  },
  {
@@ -65,8 +65,8 @@
  {
   "label": "quarantine marker ignored",
   "file": "acctsw/seatswap.py",
-  "old": "    if (ctx.claude_home(email) / \".acctsw-quarantined\").exists():\n        return None\n    blob = claudehome.load(ctx, email)",
-  "new": "    blob = claudehome.get_live(ctx, email) if False else ctx.claude_cred(email).get_live()",
+  "old": "    if (ctx.claude_home(email) / \".acctsw-quarantined\").exists():\n        return None\n    blob = _load(ctx, email)",
+  "new": "    blob = ctx.claude_cred(email).get_live()",
   "test": [
    "tests/test_seatswap.py::test_quarantined_seat_is_not_eligible"
   ]
@@ -74,7 +74,7 @@
  {
   "label": "crossing auto-picked by choose",
   "file": "acctsw/selection.py",
-  "old": "and (allow_crossing or seatkind.approved(state, tool, origin, e, at))",
+  "old": "and (allow_crossing or seatkind.approved(state, tool, origin, e, at, home=home))",
   "new": "and True",
   "test": [
    "tests/test_seatkind.py::test_choose_never_auto_picks_an_unapproved_crossing"
@@ -136,12 +136,12 @@
   ]
  },
  {
-  "label": "manual switch not counting as approval",
+  "label": "manual switch does not answer the question",
   "file": "acctsw/switch.py",
-  "old": "            if seatkind.crosses(state, tool, origin, email):\n",
-  "new": "            if False:\n",
+  "old": "            seatkind.chosen(state, tool, origin, email)\n",
+  "new": "            pass\n",
   "test": [
-   "tests/test_seatkind.py::test_a_manual_switch_counts_as_approval"
+   "tests/test_seatkind.py::test_a_manual_switch_answers_the_question_and_leaves_no_approval"
   ]
  },
  {
@@ -150,7 +150,7 @@
   "old": "origins = {previous, *(s[\"email\"] for s in active_sessions(ctx.data_dir, tool))}",
   "new": "origins = {previous}",
   "test": [
-   "tests/test_seatkind.py::test_a_manual_switch_approves_from_every_seat_a_terminal_bills"
+   "tests/test_seatkind.py::test_a_manual_switch_answers_for_every_seat_a_terminal_bills"
   ]
  },
  {
@@ -246,7 +246,7 @@
  {
   "label": "pick crosses without spending an approval",
   "file": "acctsw/seatswap.py",
-  "old": "                if not seatkind.consume(state, TOOL, leaving, target.email, now()):\n                    return None\n",
+  "old": "                if not seatkind.consume(state, TOOL, leaving, target.email, now(), home=self.home):\n                    return None\n",
   "new": "",
   "test": [
    "tests/test_seatswap.py::test_pick_spends_a_once_approval_and_not_the_reverse"
@@ -295,6 +295,150 @@
   "new": "",
   "test": [
    "tests/test_seatkind.py::test_mark_session_records_a_home_that_differs"
+  ]
+ },
+ {
+  "label": "eligible lets a keychain error escape",
+  "file": "acctsw/seatswap.py",
+  "old": "    except _Unreadable:\n        return None",
+  "new": "    except ZeroDivisionError:\n        return None",
+  "test": [
+   "tests/test_seatswap.py::test_a_keychain_error_is_not_eligible"
+  ]
+ },
+ {
+  "label": "maintain moves the session on an unreadable keychain",
+  "file": "acctsw/seatswap.py",
+  "old": "            fresh = _eligible(ctx, seat.email, home_email=self.home)",
+  "new": "            fresh = eligible(ctx, seat.email, home_email=self.home)",
+  "test": [
+   "tests/test_seatswap.py::test_maintain_keeps_the_binding_when_the_keychain_is_unreadable"
+  ]
+ },
+ {
+  "label": "child --settings ignored",
+  "file": "acctsw/seatswap.py",
+  "old": "    for where, data in _cli_settings(args, cwd):",
+  "new": "    for where, data in []:",
+  "test": [
+   "tests/test_seatswap.py::test_child_settings_flag_gates"
+  ]
+ },
+ {
+  "label": "unreadable --settings treated as harmless",
+  "file": "acctsw/seatswap.py",
+  "old": "            return f\"{where} unreadable\"",
+  "new": "            continue",
+  "test": [
+   "tests/test_seatswap.py::test_an_unreadable_child_settings_flag_gates"
+  ]
+ },
+ {
+  "label": "managed-settings.d ignored",
+  "file": "acctsw/seatswap.py",
+  "old": "        files += sorted(MANAGED_SETTINGS_DIR.glob(\"*.json\"))",
+  "new": "        pass",
+  "test": [
+   "tests/test_seatswap.py::test_managed_settings_drop_ins_gate"
+  ]
+ },
+ {
+  "label": "home exemption dropped from crosses",
+  "file": "acctsw/seatkind.py",
+  "old": "    if not a or not b or a == b or (home and b == home):",
+  "new": "    if not a or not b or a == b:",
+  "test": [
+   "tests/test_seatkind.py::test_home_is_exempt_only_as_the_destination"
+  ]
+ },
+ {
+  "label": "home exemption applies when leaving home too",
+  "file": "acctsw/seatkind.py",
+  "old": "    if not a or not b or a == b or (home and b == home):",
+  "new": "    if not a or not b or a == b or (home and home in (a, b)):",
+  "test": [
+   "tests/test_seatkind.py::test_home_is_exempt_only_as_the_destination"
+  ]
+ },
+ {
+  "label": "choose ignores home",
+  "file": "acctsw/selection.py",
+  "old": "and (allow_crossing or seatkind.approved(state, tool, origin, e, at, home=home))",
+  "new": "and (allow_crossing or seatkind.approved(state, tool, origin, e, at))",
+  "test": [
+   "tests/test_seatkind.py::test_choose_and_candidate_let_a_session_go_home"
+  ]
+ },
+ {
+  "label": "request asks about a non-crossing",
+  "file": "acctsw/seatkind.py",
+  "old": "    if not crosses(state, tool, a, b, home=home):\n        return False\n    store = _store(state, tool)\n    sid",
+  "new": "    store = _store(state, tool)\n    sid",
+  "test": [
+   "tests/test_seatkind.py::test_home_is_exempt_only_as_the_destination"
+  ]
+ },
+ {
+  "label": "seatswap going home ignores home exemption",
+  "file": "acctsw/seatswap.py",
+  "old": "            home = choose(state, TOOL, at, exclude=seats - {self.home}, origin=leaving,\n                          home=self.home)",
+  "new": "            home = choose(state, TOOL, at, exclude=seats - {self.home}, origin=leaving)",
+  "test": [
+   "tests/test_seatswap.py::test_maintain_goes_home_without_approval_even_across_kinds"
+  ]
+ },
+ {
+  "label": "wake written after stop",
+  "file": "acctsw/seatswap.py",
+  "old": "            if self._closed:\n                return None\n            self._asks.append(ask)",
+  "new": "            self._asks.append(ask)",
+  "test": [
+   "tests/test_seatswap.py::test_a_hit_after_stop_never_writes_to_a_reused_descriptor"
+  ]
+ },
+ {
+  "label": "bridge auto-switch does not spend once",
+  "file": "acctsw/bridge.py",
+  "old": "            if not seatkind.consume(state, tool, active, candidate, now()):\n                continue",
+  "new": "            if False:\n                continue",
+  "test": [
+   "tests/test_seatkind.py::test_bridge_auto_switch_spends_a_once_approval"
+  ]
+ },
+ {
+  "label": "manual switch leaves a once approval",
+  "file": "acctsw/switch.py",
+  "old": "            seatkind.chosen(state, tool, origin, email)\n",
+  "new": "            seatkind.approve(state, tool, origin, email, \"once\", via=\"manual\")\n",
+  "test": [
+   "tests/test_seatkind.py::test_a_manual_switch_answers_the_question_and_leaves_no_approval"
+  ]
+ },
+ {
+  "label": "manual switch drops an always approval",
+  "file": "acctsw/seatkind.py",
+  "old": "    if isinstance(record, dict) and record.get(\"scope\") != \"always\":",
+  "new": "    if isinstance(record, dict):",
+  "test": [
+   "tests/test_seatkind.py::test_a_manual_switch_keeps_an_always_approval"
+  ]
+ },
+ {
+  "label": "proxy_used always true",
+  "file": "acctsw/seatswap.py",
+  "old": "        return self.proxy.messages_seen() > 0",
+  "new": "        return True",
+  "test": [
+   "tests/test_seatswap.py::test_preflight_and_proxy_used_delegate"
+  ]
+ },
+ {
+  "label": "preflight never reports",
+  "file": "acctsw/seatswap.py",
+  "old": "        return self.proxy.preflight()",
+  "new": "        return None",
+  "test": [
+   "tests/test_seatswap.py::test_preflight_and_proxy_used_delegate"
   ]
  }
 ]
