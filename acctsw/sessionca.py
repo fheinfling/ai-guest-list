@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import atexit
 import os
+import re
 import shutil
 import ssl
 import subprocess
@@ -23,6 +24,8 @@ from pathlib import Path
 _TIMEOUT_S = 20
 _DAYS = 2
 _FALLBACK_ROOTS = "/etc/ssl/cert.pem"
+_KEYCHAINS = ("/Library/Keychains/System.keychain", "/System/Library/Keychains/SystemRootCertificates.keychain")
+_CERT_RE = re.compile(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", re.S)
 
 
 class SessionCAError(RuntimeError):
@@ -43,8 +46,30 @@ def _join(*pems: str) -> str:
     return "".join(p if p.endswith("\n") else p + "\n" for p in pems)
 
 
+def _certs(text: str | None) -> list[str]:
+    """Certificate blocks only (never keys or other PEM types)."""
+    return _CERT_RE.findall(text or "")
+
+
+def _norm(block: str) -> str:
+    return "".join(block.split())
+
+
+def _keychain_roots(security: str) -> str | None:
+    try:
+        r = subprocess.run([security, "find-certificate", "-a", "-p", *_KEYCHAINS], capture_output=True,
+                           timeout=_TIMEOUT_S, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout.decode("utf-8", "replace")
+
+
 class SessionCA:
-    def __init__(self, hosts=("api.anthropic.com",), *, openssl: str = "/usr/bin/openssl", tmp_root=None):
+    def __init__(self, hosts=("api.anthropic.com",), *, openssl: str = "/usr/bin/openssl",
+                 security: str = "/usr/bin/security", tmp_root=None):
+        self._security = security
         hosts = tuple(hosts)
         if not hosts or any(not h or not all(c.isalnum() or c in "-." for c in h) for h in hosts):
             raise SessionCAError("invalid host list")
@@ -141,15 +166,20 @@ class SessionCA:
         base = (_read_text(environ.get("SSL_CERT_FILE"))
                 or _read_text(ssl.get_default_verify_paths().cafile)
                 or _read_text(_FALLBACK_ROOTS))
-        parts = [base] if base else []
-        for var in ("REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
-            extra = _read_text(environ.get(var))
-            if extra and extra not in parts:
-                parts.append(extra)
+        texts = [base, _keychain_roots(self._security)]
+        texts += [_read_text(environ.get(v)) for v in ("REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")]
+        texts.append(self._ca_pem)
+        seen: set[str] = set()
+        blocks: list[str] = []
+        for block in (b for t in texts for b in _certs(t)):
+            key = _norm(block)
+            if key not in seen:
+                seen.add(key)
+                blocks.append(block)
         node = self._dir / "node.pem"
         full = self._dir / "full.pem"
         self._write(node, _join(*([node_user] if node_user else []), self._ca_pem))
-        self._write(full, _join(*parts, self._ca_pem))
+        self._write(full, _join(*blocks))
         return {"NODE_EXTRA_CA_CERTS": str(node), "SSL_CERT_FILE": str(full),
                 "REQUESTS_CA_BUNDLE": str(full), "CURL_CA_BUNDLE": str(full)}
 
