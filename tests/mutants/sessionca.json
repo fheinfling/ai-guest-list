@@ -142,5 +142,14 @@
   "test": [
    "tests/test_sessionca.py::test_keychain_failure_skipped"
   ]
+ },
+ {
+  "label": "TRUSTED CERTIFICATE blocks dropped",
+  "file": "acctsw/sessionca.py",
+  "old": "(?P<t>TRUSTED )?CERTIFICATE-----.*?",
+  "new": "(?P<t>NEVER )?CERTIFICATE-----.*?",
+  "test": [
+   "tests/test_sessionca.py::test_trusted_certificate_blocks_kept"
+  ]
  }
 ]
