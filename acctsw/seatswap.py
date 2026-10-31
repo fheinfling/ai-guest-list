@@ -18,7 +18,8 @@ decision is made here, on the launcher's thread:
   "handover" restart once the proxy is idle. This app never refreshes a token itself.
 
 Gates (``gate``/``enabled``): the setting ``in_place_switch``, a falsy ``ACCTSW_IN_PLACE_SWITCH``
-(0/false/no/off), no ``/usr/bin/openssl`` (no session CA), and any configuration that already routes or authenticates Claude differently:
+(0/false/no/off), no ``/usr/bin/openssl`` (no session CA), a launcher nested inside another
+supervised session (its inherited HTTPS proxy is ours), and any configuration that already routes or authenticates Claude differently:
 the env, or the ``env``/``apiKeyHelper`` of a Claude settings source (user and project
 settings.json/settings.local.json, managed-settings.json and managed-settings.d/*.json, and the
 child's own ``--settings <file|json>``; one that can't be read gates too) naming a base URL other
@@ -71,6 +72,7 @@ UPSTREAM = "https://api.anthropic.com"
 API_HOST = "api.anthropic.com"
 OPENSSL = "/usr/bin/openssl"   # SessionCA's tool; present on every Mac. Module-level for tests.
 SELFTEST_TIMEOUT_S = 5.0
+PROXY_USER = "acctsw"          # the user name in every SeatProxy URL (http://acctsw:<secret>@…)
 PREFLIGHT_CACHE = "seatproxy-preflight.json"
 PREFLIGHT_TTL = timedelta(minutes=10)
 SWITCH_ENV = "ACCTSW_IN_PLACE_SWITCH"
@@ -177,6 +179,19 @@ def _read_settings(path: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _nested(environ) -> bool:
+    """Whether this launcher runs inside a child another SeatSwap already proxies: its inherited
+    HTTPS proxy is one of ours (user ``acctsw`` on 127.0.0.1)."""
+    for name in ("HTTPS_PROXY", "https_proxy"):
+        try:
+            parts = urlsplit(str(environ.get(name) or "").strip())
+            if parts.username == PROXY_USER and parts.hostname == "127.0.0.1":
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 def gate(ctx, environ=os.environ, *, cwd: Path | str | None = None, args=()) -> str | None:
     """Why in-place switching is off for a run started here, or None when it may run. ``args``
     is the child's argv (its ``--settings`` counts like any settings file)."""
@@ -187,6 +202,10 @@ def gate(ctx, environ=os.environ, *, cwd: Path | str | None = None, args=()) -> 
         return "setting off"
     if not os.access(OPENSSL, os.X_OK):
         return "openssl missing"   # no session CA, so no interception
+    if _nested(environ):
+        # The outer session's proxy already serves this one; a second proxy (and token
+        # injection) inside it would fight over which seat gets billed. Leave the env alone.
+        return "nested in another acctsw session"
     found = _env_gate(environ)
     if found:
         return f"env {found}"
