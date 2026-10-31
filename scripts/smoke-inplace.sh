@@ -182,8 +182,11 @@ def run(name, prompt, *, bind, rules, answer, trust_ca, expect):
     if claude == "-":
         cmd = [sys.executable, "-c", STAND_IN, prompt]
     else:
-        cmd = ["sandbox-exec", "-f", str(out / "net.sb"), claude, "-p", prompt,
-               "--output-format", "stream-json", "--verbose", "--allowedTools", "Bash"]
+        # Already inside a sandbox (e.g. a sandboxed agent shell)? macOS refuses a nested
+        # sandbox_apply, so SMOKE_NO_SANDBOX=1 relies on the enclosing sandbox's network rules.
+        wrap = [] if os.environ.get("SMOKE_NO_SANDBOX") == "1" else ["sandbox-exec", "-f", str(out / "net.sb")]
+        cmd = wrap + [claude, "-p", prompt,
+                      "--output-format", "stream-json", "--verbose", "--allowedTools", "Bash"]
     with (d / "claude.jsonl").open("w") as so, (d / "claude.err").open("w") as se:
         try:
             rc = subprocess.run(cmd, cwd=d / "work", env=env, stdin=subprocess.DEVNULL, stdout=so,
