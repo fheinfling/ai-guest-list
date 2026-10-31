@@ -1938,19 +1938,23 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         "tokens": {},       # seat -> the token last bound for it (an auth Hit re-reads against it)
         "dead": {},         # seat -> a token that got a 401: not served in place until it renews
         "handover": False,  # maintain() asked for a handover restart; waiting for a quiet child
+        "off": False,       # a client rejected the proxy's TLS: no more hops in place this run
+        "tls_restart": False,   # the one restart without the proxy env has been used
     }
     # Crossing business <-> personal needs the user's say-so. One request per move per session;
     # ``pending`` is the (from, to) the heartbeat watches for an approval.
     kinds = seatkind if seatkind is not None else _load_seatkind()
-    crossing = {"requested": set(), "pending": None, "sid": None}
+    # One session id for every question about this session — the supervisor's pid, which is also
+    # what the app uses when a click asks this session — so withdraw() reaches all of them.
+    crossing = {"requested": set(), "pending": None, "sid": str(os.getpid())}
 
-    def _swapcall(method: str, *args, default=None):
+    def _swapcall(method: str, *args, default=None, **kwargs):
         """Every call into the swap goes through here: the proxy is an optimisation, so no error
         of its may ever leave run() or stop the child. Logged; the binding stays as it was."""
         if swap is None:
             return default
         try:
-            return getattr(swap, method)(*args)
+            return getattr(swap, method)(*args, **kwargs)
         except Exception:
             logging.getLogger(__name__).info("seat swap %s failed", method, exc_info=True)
             return default
@@ -1993,7 +1997,6 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         if (frm, target) in crossing["requested"]:
             return False
         crossing["requested"].add((frm, target))
-        crossing["sid"] = crossing["sid"] or resume_thread or str(os.getpid())
         kinds.request(st, tool, frm, target, crossing["sid"], now(), home=_home())
         return True
 
@@ -2023,12 +2026,16 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         pending = crossing["pending"]
         return None, pending is not None and pending[0] == origin
 
-    def _withdraw_crossings(st) -> None:
-        """Caller holds the lock and saves."""
-        if kinds is not None and crossing["requested"]:
-            kinds.withdraw(st, tool, crossing["sid"])
-            crossing["requested"].clear()
-            crossing["pending"] = None
+    def _withdraw_crossings(st) -> bool:
+        """Retract every open question about this session (ours, and the app's for a click).
+        Caller holds the lock and saves; True when anything was retracted."""
+        if kinds is None:
+            return False
+        before = json.dumps(st.data["tools"][tool].get("crossings"), sort_keys=True)
+        kinds.withdraw(st, tool, crossing["sid"])
+        crossing["requested"].clear()
+        crossing["pending"] = None
+        return json.dumps(st.data["tools"][tool].get("crossings"), sort_keys=True) != before
 
     try:
         if tool == "claude" and key is None:
@@ -2220,7 +2227,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             sent /v1/messages through the proxy (a client that ignores the base URL would be
             billed to its own login whatever we bind), and within MAX_INPLACE_SWITCHES — except
             that going back to the child's own login is always allowed."""
-            return (swap is not None
+            return (swap is not None and not inplace["off"]
                     and (target == launch_email or inplace["hops"] < MAX_INPLACE_SWITCHES)
                     and bool(_swapcall("proxy_used", default=False)))
 
@@ -2937,6 +2944,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                         switch(ctx, st, tool, to, sync=False, mirror=False, save=False)
                         st.data["last_switch_at"] = iso(now())
                         st.save()
+                if to != launch_email:
+                    inplace["hops"] += 1   # a third seat, chosen by the swap: still a hop
                 mark_session(ctx.data_dir, tool, to, home=launch_email)
                 notify(f"{frm}'s login here is running out — {to} takes over, same session ✨")
 
@@ -2954,7 +2963,10 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     return False
                 before = running_seat()
                 # A handover is asked for afresh by every maintain(): None clears it.
-                inplace["handover"] = _swapcall("maintain", ctx) == "handover"
+                # A third seat only while the in-place budget lasts (going home is always fine).
+                inplace["handover"] = _swapcall(
+                    "maintain", ctx,
+                    third_seat=inplace["hops"] < MAX_INPLACE_SWITCHES) == "handover"
                 if running_seat() != before:
                     _follow_maintain(before, running_seat())
                 seat = running_seat()
@@ -3000,9 +3012,28 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 except Exception:
                     return False   # e.g. a locked keychain: no restart into "not logged in"
 
+            def _tls_rejected() -> bool:
+                """A client in the child refused the proxy's certificate. Hopping is over for this
+                run. If nothing ever went through the proxy, Claude Code itself is that client and
+                is talking to nobody: restart it once, without the proxy, on the same seat (with
+                resume). Otherwise it works and keeps running; only the hops stop. Never twice."""
+                if inplace["off"] or not _swapcall("tls_rejected", default=False):
+                    return False
+                inplace["off"] = True
+                logging.getLogger(__name__).info("in-place switching off: TLS rejected")
+                if (not inplace["tls_restart"] and not _swapcall("proxy_used", default=False)
+                        and (tool != "claude" or _capture_claude_resume())):
+                    inplace["tls_restart"] = True
+                    hit.update(reason="tls", email=launch_email, active=launch_email,
+                               hard=False, handled=True)
+                    return True
+                notify(f"{tool}: switching seats without a restart is off for this session "
+                       f"(a tool in it doesn't accept the switch's certificate)")
+                return False
+
             def _tick() -> bool:
                 try:
-                    if swap is not None and _tick_swap():
+                    if swap is not None and (_tls_rejected() or _tick_swap()):
                         return True
                 except Exception:
                     # Belt and braces around the swap glue: whatever went wrong, the child lives.
@@ -3211,6 +3242,17 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 resuming = True
                 continue
 
+            if hit["reason"] == "tls":
+                # Claude Code would not accept the proxy's certificate, so nothing it sent ever
+                # arrived. Same seat, same session, now without the proxy — once per run.
+                notify(f"claude: restarting this session once without seat switching (it didn't "
+                       f"accept the switch's certificate), resuming your work ✨")
+                _swapcall("stop")
+                swap = None
+                relaunch_seat = launch_email
+                resuming = True
+                continue
+
             if hit["reason"] == "handover":
                 # The child ran on a borrowed seat whose token only that seat's own login can renew:
                 # same session, now launched on that seat. It counts against the relaunch budget.
@@ -3374,13 +3416,13 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 swap.stop()
             except Exception:
                 pass
-        if crossing["requested"]:
+        if kinds is not None:
             try:
-                # A session that ended no longer needs the move it asked about.
+                # A session that ended no longer needs the move it (or a click for it) asked about.
                 with ctx.locked():
                     st = ctx.load_state()
-                    _withdraw_crossings(st)
-                    st.save()
+                    if _withdraw_crossings(st):
+                        st.save()
             except Exception:
                 pass
         watcher_stop.set()

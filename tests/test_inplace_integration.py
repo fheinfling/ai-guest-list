@@ -4,6 +4,7 @@ scripted child. Only the socket-owning SeatProxy is a fake, injected through sea
 ``_default_proxy``; it plays the proxy thread by calling ``decide`` from a thread of its own, the
 way a 429 on a live request would."""
 import json
+import os
 import select
 import threading
 from datetime import timedelta
@@ -198,7 +199,7 @@ def test_a_crossing_asks_first_and_moves_on_the_tick_after_approval(seats, proxi
 
     proxy = proxies[0]
     assert proxy.answered(calls[0]) is None                     # passed through: not approved
-    assert [(r["from"], r["to"], r["session_id"]) for r in asked] == [(C1, C2, _session(spawn))]
+    assert [(r["from"], r["to"], r["session_id"]) for r in asked] == [(C1, C2, str(os.getpid()))]
     assert any("approve in ai guest list" in n for n in notes)
     assert spawn.stops == 0
     assert proxy.seat == Seat(C2, f"tok-{C2}")

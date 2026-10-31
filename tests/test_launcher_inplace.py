@@ -44,6 +44,7 @@ class FakeSwap:
     """SeatSwap's frozen surface. ``post`` stands in for the proxy thread queueing a Hit."""
 
     wake_fd = 4242
+    PROXY_URL = "http://acctsw:secret@127.0.0.1:9"   # the test process may have its own proxy
 
     def __init__(self):
         self.queue = []
@@ -56,6 +57,7 @@ class FakeSwap:
         self.preflight_says = None    # a reason string: the proxy can't reach the API
         self.used = True              # the child has sent /v1/messages through the proxy
         self.raising = set()          # method names that blow up
+        self.tls_says_no = False      # a client in the child rejected the session CA
         self.in_flight = 0            # the proxy's own view of the child's traffic
         self.idle = 999.0
         self.proxy = types.SimpleNamespace(in_flight=lambda: self.in_flight,
@@ -74,13 +76,18 @@ class FakeSwap:
     def proxy_used(self):
         return self.used
 
+    def tls_rejected(self):
+        return self.tls_says_no
+
     def post(self, kind, seat, **kw):
         hit = Hit(kind, seat, **kw)
         self.queue.append(hit)
         return hit
 
     def env(self, base):
-        return {**base, "ANTHROPIC_BASE_URL": "http://127.0.0.1:9/secret"}
+        # Transport v2: the child keeps talking to api.anthropic.com through an HTTPS proxy.
+        return {**base, "HTTPS_PROXY": self.PROXY_URL,
+                "NODE_EXTRA_CA_CERTS": "/private/session-ca/node.pem"}
 
     def set_home(self, email):
         self.homes.append(email)
@@ -108,7 +115,8 @@ class FakeSwap:
         self.binds.append(seat)
         self._take(seat)
 
-    def maintain(self, ctx):
+    def maintain(self, ctx, *, third_seat=True):
+        self.third_seat = third_seat
         if self.maintain_moves_to:
             self._bound, self.maintain_moves_to = self.maintain_moves_to, None
         return self.maintain_result
@@ -250,6 +258,21 @@ class Clock:
         self.offset += seconds
 
 
+class Wall:
+    """The wall clock the launcher and choose() read, advanced by hand: a rest that "runs out"
+    does so exactly when the test says, however slow the machine is."""
+
+    def __init__(self, monkeypatch):
+        from acctsw import selection
+        self.offset = timedelta(0)
+        shifted = lambda: now() + self.offset   # noqa: E731
+        monkeypatch.setattr(L, "now", shifted)
+        monkeypatch.setattr(selection, "now", shifted)
+
+    def advance(self, delta):
+        self.offset += delta
+
+
 def _drop(ctx, email):
     st = ctx.load_state()
     st.remove_seat("claude", email)
@@ -286,7 +309,8 @@ def test_limit_hit_moves_the_live_child_without_a_restart(seats, tokens, marks):
     assert st.get_seat("claude", C1)["limit_source"] == "usage"
     assert st.get_seat("claude", C2).get("limited_until") is None
     assert (C2, C1) in marks                                   # billed c2, client home c1
-    assert spawn.envs[0]["ANTHROPIC_BASE_URL"].startswith("http://127.0.0.1:")
+    assert spawn.envs[0]["HTTPS_PROXY"].startswith("http://acctsw:")
+    assert "ANTHROPIC_BASE_URL" not in spawn.envs[0]
     assert spawn.wakes == [FakeSwap.wake_fd]
     assert swap.homes == [C1]
     assert swap.stopped
@@ -517,7 +541,7 @@ def test_default_factory_follows_seatswap_enabled(seats, monkeypatch, on):
 
     assert run(seats, "claude", [], spawn=spawn, get=fake_get({})) == 0
 
-    assert ("ANTHROPIC_BASE_URL" in spawn.envs[0]) is on
+    assert (spawn.envs[0].get("HTTPS_PROXY") == FakeSwap.PROXY_URL) is on
     assert spawn.wakes == [FakeSwap.wake_fd if on else None]
     assert len(built) == int(on)
 
@@ -539,7 +563,7 @@ def test_a_failing_factory_falls_back_to_restart_only(seats):
 
     spawn = Spawn(([None], 0))
     assert run(seats, "claude", [], spawn=spawn, get=fake_get({}), swap_factory=factory) == 0
-    assert "ANTHROPIC_BASE_URL" not in spawn.envs[0] and spawn.wakes == [None]
+    assert spawn.envs[0].get("HTTPS_PROXY") != FakeSwap.PROXY_URL and spawn.wakes == [None]
 
 
 def test_pty_spawn_wake_fd_rings_the_heartbeat_at_once(monkeypatch):
@@ -597,7 +621,7 @@ def test_unapproved_crossing_never_switches_and_asks_once(seats, tokens, monkeyp
     assert swap.answers == [(hits[0], None), (hits[1], None)]
     assert spawn.stops == 0
     assert seats.load_state().active("claude") == C1
-    assert kinds.requests == [(C1, C2, _session(spawn))]
+    assert kinds.requests == [(C1, C2, str(os.getpid()))]
     asks = [n for n in notes if "approve in ai guest list" in n]
     assert len(asks) == 1 and C2 in asks[0]
     assert not any("no other claude seat is ready" in n for n in notes)
@@ -684,7 +708,7 @@ def test_open_crossing_questions_are_withdrawn_when_the_session_ends(seats, toke
     swap = FakeSwap()
     spawn = Spawn(([lambda: swap.post("limit", C1), None], 0))
     assert _run(seats, spawn, swap, seatkind=kinds) == 0
-    assert kinds.withdrawn == [_session(spawn)]
+    assert kinds.withdrawn == [str(os.getpid())]
     assert seats.load_state().data["tools"]["claude"]["crossings"]["requests"] == []
 
 
@@ -773,26 +797,22 @@ def test_recovery_looks_for_a_landing_from_the_billed_seat(seats, tokens, monkey
     """Another terminal moved ``active`` to personal c2 (resting) while this one is billed to
     business c1. When business c3's rest runs out on the clock, recovery must ask from c1 (c3 is
     same-kind), not from c2 (c3 would be a crossing, and the session would stay stuck)."""
-    clock = Clock(monkeypatch)
+    clock, wall = Clock(monkeypatch), Wall(monkeypatch)
     _plans(seats, **{C1: "team", C2: "max", C3: "team"})
-    _rest(seats, C2)
+    _rest(seats, C2, until=iso(now() + timedelta(hours=10)))
+    _rest(seats, C3, until=iso(now() + timedelta(hours=1)))
     swap = FakeSwap()
-
-    def c3_resting_briefly_then_c1_hits_its_limit():
-        # Stamped here, not before run(): its startup must not eat the short rest.
-        _rest(seats, C3, until=iso(now() + timedelta(seconds=0.4)))
-        swap.post("limit", C1)
 
     def other_terminal_moves_active():
         st = seats.load_state()
         st.set_active("claude", C2)
         st.save()
 
-    def c3_rest_runs_out():
-        time.sleep(0.5)
+    def c3_rest_runs_out():   # c1's own rest (DEFAULT_COOLDOWN) is still on
+        wall.advance(timedelta(hours=2))
         clock.advance(L.TICK_BLOCK_S + 1)
 
-    spawn = Spawn(([c3_resting_briefly_then_c1_hits_its_limit, None,
+    spawn = Spawn(([lambda: swap.post("limit", C1), None,
                     other_terminal_moves_active, None, c3_rest_runs_out], 0))
     assert _run(seats, spawn, swap) == 0
     assert swap.binds == [Seat(C3, "tok-c3")]
@@ -803,7 +823,7 @@ def test_recovery_looks_for_a_landing_from_the_billed_seat(seats, tokens, monkey
 def test_the_question_is_withdrawn_when_the_sessions_own_seat_comes_back(seats, tokens,
                                                                           monkeypatch):
     from acctsw import seatkind
-    clock = Clock(monkeypatch)
+    clock, wall = Clock(monkeypatch), Wall(monkeypatch)
     _drop(seats, C3)
     _plans(seats, **{C1: "team", C2: "max"})
     swap = FakeSwap()
@@ -811,11 +831,11 @@ def test_the_question_is_withdrawn_when_the_sessions_own_seat_comes_back(seats, 
 
     def c1_resets():
         asked.extend(seatkind.pending(seats.load_state(), "claude"))
-        time.sleep(0.5)
+        wall.advance(timedelta(hours=2))
         clock.advance(L.TICK_BLOCK_S + 1)
 
     spawn = Spawn(([lambda: swap.post("limit", C1,
-                                      reset_at=iso(now() + timedelta(seconds=0.4))), None,
+                                      reset_at=iso(now() + timedelta(hours=1))), None,
                     c1_resets,
                     lambda: still_asked.extend(seatkind.pending(seats.load_state(), "claude"))],
                    0))
@@ -903,12 +923,12 @@ def test_a_failed_preflight_runs_the_session_without_the_proxy(seats):
     swap.preflight_says = "TLS: certificate verify failed"
     spawn = Spawn(([None], 0))
     assert _run(seats, spawn, swap) == 0
-    assert "ANTHROPIC_BASE_URL" not in spawn.envs[0] and spawn.wakes == [None]
+    assert spawn.envs[0].get("HTTPS_PROXY") != FakeSwap.PROXY_URL and spawn.wakes == [None]
     assert swap.stopped and swap.homes == []
 
 
 def test_no_hop_in_place_before_the_child_has_used_the_proxy(seats, tokens):
-    """A client that ignores ANTHROPIC_BASE_URL bills its own login whatever we bind."""
+    """A client that never talks through the proxy bills its own login whatever we bind."""
     swap = FakeSwap()
     swap.used = False
     spawn = Spawn(([lambda: _rest(seats, C1), None], 1), ([None], 0))
@@ -1303,3 +1323,76 @@ def test_a_cold_start_on_a_dead_seat_asks_and_waits_for_the_crossing(seats, toke
     assert any("approve in ai guest list" in n for n in notes)
     assert swap.homes == [C2]
     assert sleeps and max(sleeps) <= L.CROSSING_POLL_S   # N7b: an open question polls fast
+
+
+# --- transport v2: a client that won't trust the session CA --------------------------------------
+
+def test_a_rejected_certificate_restarts_once_without_the_proxy(seats, tokens):
+    """Nothing ever went through: Claude Code itself refused the CA. Restart it once on the same
+    seat without the proxy env (resume) — and never again, however often it is asked."""
+    swap = FakeSwap()
+    swap.used = False
+
+    def rejected():
+        swap.tls_says_no = True
+
+    spawn = Spawn(([rejected, None], 1), ([None, None, None], 0))
+    assert _run(seats, spawn, swap) == 0
+    assert spawn.stops == 1 and len(spawn.calls) == 2
+    assert spawn.calls[1][-2:] == ["--resume", _session(spawn)]
+    assert spawn.envs[0]["HTTPS_PROXY"] == FakeSwap.PROXY_URL
+    assert spawn.envs[1].get("HTTPS_PROXY") != FakeSwap.PROXY_URL
+    assert spawn.wakes == [FakeSwap.wake_fd, None] and swap.stopped
+    assert seats.load_state().active("claude") == C1
+
+
+def test_a_rejected_certificate_after_traffic_only_stops_the_hops(seats, tokens):
+    """Claude Code's own requests went through, so some other tool refused the CA: no restart,
+    the session keeps running, and it no longer hops in place."""
+    swap = FakeSwap()
+    hits = []
+
+    def rejected():
+        swap.tls_says_no = True
+
+    spawn = Spawn(([rejected, None, lambda: hits.append(swap.post("limit", C1)),
+                    lambda: hits.append(spawn.stops)], 1), ([None], 0))
+    notes = []
+    assert _run(seats, spawn, swap, notify=notes.append) == 0
+    assert swap.binds == [] and swap.answers[0] == (hits[0], None)
+    assert any("off for this session" in n for n in notes)
+
+
+@pytest.mark.crossings
+def test_a_question_the_app_raised_for_this_session_is_withdrawn_at_exit(seats, tokens):
+    """A click elsewhere asked about THIS session under the supervisor's pid; when the session
+    ends, that question goes with it."""
+    from acctsw import seatkind
+    _plans(seats, **{C1: "team", C2: "max"})
+    swap = FakeSwap()
+
+    def app_asks_for_this_session():
+        st = seats.load_state()
+        seatkind.request(st, "claude", C1, C2, str(os.getpid()))
+        st.save()
+
+    spawn = Spawn(([app_asks_for_this_session, None], 0))
+    assert _run(seats, spawn, swap) == 0
+    assert seatkind.pending(seats.load_state(), "claude") == []
+
+
+def test_maintain_may_pick_a_third_seat_only_while_the_budget_lasts(seats, tokens, monkeypatch):
+    """The swap's own move to a third seat counts as a hop, and once the budget is spent it is
+    told so: third_seat=False."""
+    monkeypatch.setattr(L, "MAX_INPLACE_SWITCHES", 2)
+    swap = FakeSwap()
+    seen = []
+
+    def swap_moves_to_c3():
+        swap.maintain_moves_to = C3
+
+    spawn = Spawn(([lambda: swap.post("limit", C1), None, swap_moves_to_c3, None,
+                    lambda: seen.append(swap.third_seat), None,
+                    lambda: seen.append(swap.third_seat)], 0))
+    assert _run(seats, spawn, swap) == 0
+    assert seen == [False, False] and seats.load_state().active("claude") == C3
