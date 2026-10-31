@@ -1359,11 +1359,11 @@ def _load_seatkind():
     return seatkind
 
 
-def _crossing_candidate(state, tool: str, exclude) -> str | None:
+def _crossing_candidate(state, tool: str, exclude, origin: str) -> str | None:
     """The best landing seat that choose() left out only because it crosses business/personal."""
     from . import selection
     pick = getattr(selection, "crossing_candidate", None)
-    return pick(state, tool, exclude=exclude) if pick is not None else None
+    return pick(state, tool, exclude=exclude, origin=origin) if pick is not None else None
 
 
 def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
@@ -1889,21 +1889,34 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         "hit": None,        # the proxy Hit the decision tail is deciding right now, if any
         "hopped": False,    # the last decision moved the child in place (it is not blocked)
     }
-    # Crossing business <-> personal needs the user's say-so. One request per target per session;
+    # Crossing business <-> personal needs the user's say-so. One request per move per session;
     # ``pending`` is the (from, to) the heartbeat watches for an approval.
     kinds = seatkind if seatkind is not None else _load_seatkind()
-    crossing = {"requested": set(), "pending": None}
+    crossing = {"requested": set(), "pending": None, "sid": None}
 
     def running_seat() -> str | None:
         """The seat this child is billed to now: the proxy's bound seat after an in-place hop,
         else the seat it was launched on (whose own login the client holds)."""
         return (swap.bound() if swap is not None else None) or launch_email
 
-    def _consume_crossing(st, frm, to) -> None:
-        """A switch that crosses business/personal spends a one-time approval. Caller holds the
-        lock and saves."""
-        if kinds is not None and frm and to and kinds.crosses(st, tool, frm, to):
-            kinds.consume(st, tool, frm, to)
+    def _spend_crossing(st, frm, to) -> bool:
+        """In the locked write that commits a switch: spend the approval a business/personal
+        crossing uses ("once" goes, "always" stays) and retract this session's open questions,
+        which the move answers. False: the approval lapsed since the decision, so no switch.
+        Caller saves."""
+        if kinds is None:
+            return True
+        if not kinds.consume(st, tool, frm, to, now()):
+            return False
+        _withdraw_crossings(st)
+        return True
+
+    def _withdraw_crossings(st) -> None:
+        """Caller holds the lock and saves."""
+        if kinds is not None and crossing["requested"]:
+            kinds.withdraw(st, tool, crossing["sid"])
+            crossing["requested"].clear()
+            crossing["pending"] = None
 
     try:
         if tool == "claude" and key is None:
@@ -2075,11 +2088,13 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 return None   # e.g. a locked keychain: a restart can still serve it
             return _inplace_seat(email, token) if token else None
 
-        def _hop_in_place(target: str, *, frm: str | None) -> bool:
+        def _hop_in_place(target: str, *, frm: str | None, spend: bool = True) -> bool:
             """Carry the LIVE child to ``target`` without a restart: point the proxy at that seat
             and commit the hop in state exactly as a restart would. False when it can't be served
             in place (feature off, MAX_INPLACE_SWITCHES spent, no eligible token, seat gone); the
-            caller then restarts instead. Answers the proxy Hit under decision, if there is one."""
+            caller then restarts instead. Answers the proxy Hit under decision, if there is one.
+            ``spend=False`` is for the user's own click: switch(manual=True) already approved any
+            crossing, and a second session on the same seat must not find it spent."""
             if swap is None or inplace["hops"] >= MAX_INPLACE_SWITCHES:
                 return False
             seat = _proxy_seat(target)
@@ -2089,8 +2104,11 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 st = ctx.load_state()
                 if st.get_seat(tool, target) is None:
                     return False
+                if spend and not _spend_crossing(st, frm, target):
+                    return False
+                if not spend:
+                    _withdraw_crossings(st)
                 switch(ctx, st, tool, target, sync=False, mirror=False, save=False)
-                _consume_crossing(st, frm, target)
                 st.data["last_switch_at"] = iso(now())
                 st.save()
             pending, inplace["hit"] = inplace["hit"], None
@@ -2120,15 +2138,16 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 target = dec.email
             elif dec.action == "give_up":
                 # choose() never auto-picks a crossing seat; ask whether one was all there was.
-                target = _crossing_candidate(state, tool, set(auth_failed) | {frm})
+                target = _crossing_candidate(state, tool, set(auth_failed) | {frm}, frm)
                 if not target:
                     return None, False
             else:
                 return None, False
-            fresh = target not in crossing["requested"]
+            fresh = (frm, target) not in crossing["requested"]
             if fresh:
-                crossing["requested"].add(target)
-                kinds.request(state, tool, frm, target, resume_thread or str(os.getpid()), now())
+                crossing["requested"].add((frm, target))
+                crossing["sid"] = crossing["sid"] or resume_thread or str(os.getpid())
+                kinds.request(state, tool, frm, target, crossing["sid"], now())
                 state.save()
             crossing["pending"] = (frm, target)
             return target, fresh
@@ -2555,7 +2574,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 """The user chose ``target`` (a click, or approving a crossing): in place when the
                 proxy can serve it, else stop for a restart there. An explicit choice is not vetoed
                 by auto-switch or the automatic hop budget."""
-                if _hop_in_place(target, frm=frm):
+                if _hop_in_place(target, frm=frm, spend=(reason != "manual")):
                     return False
                 exec_why = _exec_blocker()
                 if exec_why:
@@ -2609,7 +2628,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 if switches >= max_switches and not (
                         swap is not None and inplace["hops"] < MAX_INPLACE_SWITCHES):
                     return False
-                sel = choose(snap, tool,
+                sel = choose(snap, tool, origin=billed,
                              exclude=set(auth_failed) | ({billed} if billed else set()))
                 if not (sel.email and sel.available):
                     return False   # still nowhere to go; try again after the next TICK_BLOCK_S
@@ -2647,6 +2666,18 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     inplace["hit"] = None
                 return stop
 
+            def _follow_maintain(frm: str | None, to: str) -> None:
+                """maintain() moved the proxy on its own (a borrowed token lapsing with no fresher
+                one): record the seat now billed exactly as any hop would."""
+                with ctx.locked():
+                    st = ctx.load_state()
+                    if st.get_seat(tool, to) is not None and st.active(tool) != to:
+                        switch(ctx, st, tool, to, sync=False, mirror=False, save=False)
+                        st.data["last_switch_at"] = iso(now())
+                        st.save()
+                mark_session(ctx.data_dir, tool, to, home=launch_email)
+                notify(f"{frm}'s login here is running out — {to} takes over, same session ✨")
+
             def _tick_swap() -> bool:
                 hits = list(swap.pending())
                 while hits:
@@ -2657,7 +2688,11 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                         for rest in hits:
                             swap.answer(rest, None)   # the child is stopping for a restart
                         return True
-                if key_request is None and swap.maintain(ctx) == "handover":
+                before = running_seat()
+                verdict = swap.maintain(ctx) if key_request is None else None
+                if running_seat() != before:
+                    _follow_maintain(before, running_seat())
+                if verdict == "handover":
                     # The borrowed seat's token is running out and only its own login can renew
                     # it: restart the child on that seat (with resume) once the proxy sees it idle.
                     seat = running_seat()
@@ -2992,9 +3027,12 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 elif state.active(tool) != hit["active"]:
                     handoff_blocked = "another switch changed the active seat before the handoff completed"
                 else:
-                    _consume_crossing(state, hit["active"], hit["email"])
-                    _commit_switch(state, hit["email"])
-                    committed = True
+                    if _spend_crossing(state, hit["active"], hit["email"]):
+                        _commit_switch(state, hit["email"])
+                        committed = True
+                    else:
+                        handoff_blocked = (f"approval to continue on {hit['email']} lapsed "
+                                           f"before the handoff completed")
             if not committed:
                 notify(f"{tool} {handoff_blocked}")
                 return status
@@ -3012,6 +3050,15 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         if swap is not None:
             try:
                 swap.stop()
+            except Exception:
+                pass
+        if crossing["requested"]:
+            try:
+                # A session that ended no longer needs the move it asked about.
+                with ctx.locked():
+                    st = ctx.load_state()
+                    _withdraw_crossings(st)
+                    st.save()
             except Exception:
                 pass
         watcher_stop.set()

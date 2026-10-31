@@ -51,6 +51,7 @@ class FakeSwap:
         self.binds = []
         self.homes = []
         self.maintain_result = None
+        self.maintain_moves_to = None
         self.stopped = False
         self._bound = None
 
@@ -86,6 +87,8 @@ class FakeSwap:
         self._take(seat)
 
     def maintain(self, ctx):
+        if self.maintain_moves_to:
+            self._bound, self.maintain_moves_to = self.maintain_moves_to, None
         return self.maintain_result
 
     def stop(self):
@@ -99,6 +102,8 @@ class FakeKinds:
         self.kinds = kinds
         self.requests = []
         self.consumed = []
+        self.withdrawn = []
+        self.lapse = False   # approved() says yes, but it is gone by the commit
 
     def kind(self, seat):
         return "personal"
@@ -117,11 +122,22 @@ class FakeKinds:
         state.data["tools"][tool].setdefault("crossings", {}).setdefault("requests", []).append(
             {"from": a, "to": b, "session_id": session_id, "at": iso(at)})
 
-    def consume(self, state, tool, a, b):
+    def consume(self, state, tool, a, b, at=None):
+        if not self.crosses(state, tool, a, b):
+            return True
+        if self.lapse or not self.approved(state, tool, a, b, at):
+            return False
         self.consumed.append((a, b))
         approvals = self._approvals(state, tool)
-        if (approvals.get(f"{a}>{b}") or {}).get("scope") == "once":
+        if approvals[f"{a}>{b}"].get("scope") == "once":
             del approvals[f"{a}>{b}"]
+        return True
+
+    def withdraw(self, state, tool, session_id):
+        self.withdrawn.append(session_id)
+        crossings = state.data["tools"][tool].setdefault("crossings", {})
+        crossings["requests"] = [r for r in crossings.get("requests", [])
+                                 if r["session_id"] != session_id]
 
 
 class Spawn:
@@ -394,6 +410,19 @@ def test_handover_restarts_on_the_bound_seats_own_login(seats, tokens):
     assert seats.load_state().active("claude") == C2
 
 
+def test_maintain_moving_the_proxy_on_its_own_is_recorded_as_a_hop(seats, tokens, marks):
+    swap = FakeSwap()
+
+    def token_lapses_and_swap_moves():
+        swap.maintain_moves_to = C3
+
+    spawn = Spawn(([lambda: swap.post("limit", C1), None, token_lapses_and_swap_moves], 0))
+    assert _run(seats, spawn, swap) == 0
+    assert spawn.stops == 0
+    assert seats.load_state().active("claude") == C3
+    assert (C3, C1) in marks
+
+
 # --- feature gate and teardown --------------------------------------------------------------------
 
 @pytest.mark.parametrize("on", [False, True])
@@ -515,6 +544,34 @@ def test_approved_crossing_is_taken_in_place_on_the_next_tick(seats, tokens):
     st = seats.load_state()
     assert st.active("claude") == C2
     assert "c1@x.com>c2@x.com" not in st.data["tools"]["claude"]["crossings"]["approvals"]
+    assert st.data["tools"]["claude"]["crossings"]["requests"] == []   # answered: retracted
+
+
+def test_an_approval_that_lapsed_before_the_commit_switches_nothing(seats, tokens):
+    _drop(seats, C3)
+    kinds = FakeKinds({C1: "business", C2: "personal"})
+    swap = FakeSwap()
+
+    def approve_then_lapse():
+        _approve(seats, C1, C2)
+        kinds.lapse = True
+
+    spawn = Spawn(([lambda: swap.post("limit", C1), None, approve_then_lapse, None], 1))
+    notes = []
+    assert _run(seats, spawn, swap, seatkind=kinds, notify=notes.append) == 1
+    assert swap.binds == [] and kinds.consumed == []
+    assert seats.load_state().active("claude") == C1
+    assert any("lapsed" in n for n in notes)
+
+
+def test_open_crossing_questions_are_withdrawn_when_the_session_ends(seats, tokens):
+    _drop(seats, C3)
+    kinds = FakeKinds({C1: "business", C2: "personal"})
+    swap = FakeSwap()
+    spawn = Spawn(([lambda: swap.post("limit", C1), None], 0))
+    assert _run(seats, spawn, swap, seatkind=kinds) == 0
+    assert kinds.withdrawn == [_session(spawn)]
+    assert seats.load_state().data["tools"]["claude"]["crossings"]["requests"] == []
 
 
 def test_approved_crossing_restarts_when_the_swap_is_off(seats):
@@ -531,35 +588,78 @@ def test_approved_crossing_restarts_when_the_swap_is_off(seats):
     assert seats.load_state().active("claude") == C2
 
 
-def test_crossing_candidate_asked_when_choose_already_left_it_out(seats, tokens, monkeypatch):
-    """With choose() filtering crossings itself, the limit gives up; the launcher still asks."""
-    from acctsw import selection
-    _drop(seats, C3)
-    kinds = FakeKinds({C1: "business", C2: "personal"})
-    real_choose = L.choose
-    monkeypatch.setattr(L, "choose", lambda state, tool, **kw: real_choose(
-        state, tool, **{**kw, "exclude": set(kw.get("exclude", ())) | {C2}}))
-    monkeypatch.setattr(selection, "crossing_candidate",
-                        lambda state, tool, exclude=(): None if C2 in exclude else C2,
-                        raising=False)
-    swap = FakeSwap()
-    spawn = Spawn(([lambda: swap.post("limit", C1), None], 0))
+def _plans(ctx, **plans):
+    st = ctx.load_state()
+    for email, plan in plans.items():
+        st.get_seat("claude", email)["plan"] = plan
+    st.save()
 
-    assert _run(seats, spawn, swap, seatkind=kinds) == 0
-    assert kinds.requests == [(C1, C2, _session(spawn))]
-    assert swap.answers[0][1] is None
+
+@pytest.mark.crossings
+def test_real_rules_ask_then_carry_the_session_over_once_approved(seats, tokens):
+    """The real seatkind and choose(): business c1 -> personal c2 is held back, the launcher asks
+    about the candidate choose() left out, and an app approval moves the live child in place."""
+    from acctsw import seatkind
+    _drop(seats, C3)
+    _plans(seats, **{C1: "team", C2: "max"})
+    swap = FakeSwap()
+    asked = []
+
+    def app_sees_and_approves():
+        st = seats.load_state()
+        asked.extend(seatkind.pending(st, "claude"))
+        seatkind.approve(st, "claude", C1, C2, "once")
+        st.save()
+
+    hits = []
+    still_asked = []
+    spawn = Spawn(([lambda: hits.append(swap.post("limit", C1)), None, app_sees_and_approves,
+                    lambda: still_asked.extend(seatkind.pending(seats.load_state(), "claude"))],
+                   0))
+    notes = []
+    assert _run(seats, spawn, swap, notify=notes.append) == 0
+
+    assert swap.answers == [(hits[0], None)] and swap.binds == [Seat(C2, "tok-c2")]
+    assert [(r["from"], r["to"]) for r in asked] == [(C1, C2)]
+    assert any("approve in ai guest list" in n and "(personal)" in n for n in notes)
+    st = seats.load_state()
+    assert st.active("claude") == C2
+    assert not seatkind.approved(st, "claude", C1, C2)   # "once" was spent by this move
+    assert still_asked == []   # the move answered it, before the session ended
+
+
+@pytest.mark.crossings
+def test_a_question_is_withdrawn_once_the_session_moves_elsewhere(seats, tokens, monkeypatch):
+    """c1 (business) is out, c3 (business) is resting, so the launcher asks about c2 (personal).
+    When c3 frees first, the session moves there and the question about c2 is moot."""
+    from acctsw import seatkind
+    monkeypatch.setattr(L, "TICK_BLOCK_S", 0.0)
+    _plans(seats, **{C1: "team", C2: "max", C3: "team"})
+    _rest(seats, C3)
+    swap = FakeSwap()
+    asked, still_asked = [], []
+
+    def c3_frees():
+        asked.extend(seatkind.pending(seats.load_state(), "claude"))
+        st = seats.load_state()
+        st.get_seat("claude", C3).pop("limited_until")
+        st.save()
+
+    spawn = Spawn(([lambda: swap.post("limit", C1), None, c3_frees, None,
+                    lambda: still_asked.extend(seatkind.pending(seats.load_state(), "claude"))],
+                   0))
+    assert _run(seats, spawn, swap) == 0
+    assert [(r["from"], r["to"]) for r in asked] == [(C1, C2)]
+    assert swap.binds == [Seat(C3, "tok-c3")]
+    assert still_asked == []
 
 
 # --- a seat the user picked -----------------------------------------------------------------------
 
 def _click(ctx, email):
-    """The app's click: active moves, and (B's switch.py) records a manual_switch for claude."""
+    """The app's click: active moves and a manual_switch request is recorded."""
     with ctx.locked():
-        st = ctx.load_state()
-        switch(ctx, st, "claude", email, sync=False, mirror=False, save=False)
-        st.data["tools"]["claude"]["manual_switch"] = {"id": int(st.data.get("rev", 0)) + 1,
-                                                       "email": email}
-        st.save()
+        switch(ctx, ctx.load_state(), "claude", email, sync=False, mirror=False, manual=True)
 
 
 def test_manual_switch_moves_claude_in_place(seats, tokens):
@@ -575,3 +675,16 @@ def test_manual_switch_restarts_claude_without_the_swap(seats):
                swap_factory=lambda _ctx: None) == 0
     assert spawn.stops == 1 and spawn.calls[1][-2:] == ["--resume", _session(spawn)]
     assert seats.load_state().active("claude") == C2
+
+
+@pytest.mark.crossings
+def test_a_click_across_kinds_moves_in_place_without_spending_the_approval(seats, tokens):
+    """switch(manual=True) approves the crossing once for every session billed to the old seat;
+    this session must not spend it, or a second terminal on c1 would find it gone."""
+    from acctsw import seatkind
+    _plans(seats, **{C1: "team", C2: "max", C3: "max"})
+    swap = FakeSwap()
+    spawn = Spawn(([lambda: _click(seats, C2), None], 0))
+    assert _run(seats, spawn, swap) == 0
+    assert swap.binds == [Seat(C2, "tok-c2")]
+    assert seatkind.approved(seats.load_state(), "claude", C1, C2)
