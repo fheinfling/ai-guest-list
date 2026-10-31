@@ -1,0 +1,7 @@
+[
+  {"label": "usage: 401 is classified as unauthorized",
+   "file": "acctsw/usage.py",
+   "old": "    if status == 401:\n        return \"unauthorized\"",
+   "new": "    if status == 402:\n        return \"unauthorized\"",
+   "test": ["tests/test_usage.py"]}
+]
