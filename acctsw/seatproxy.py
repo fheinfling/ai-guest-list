@@ -7,8 +7,8 @@ keeps talking to api.anthropic.com itself and stays a first-party client. The li
 
 - ``CONNECT api.anthropic.com:443`` (the upstream's own host and port) with a per-run ``ca``: the
   client's TLS is terminated with ``ca.server_context()`` and its requests are served below. A
-  client that rejects the certificate (a certificate alert, nothing else) reports through
-  ``on_tls_reject(reason)``, once. A ``Connection: upgrade`` request (voice mode's WebSocket) goes
+  client that rejects the certificate (a certificate alert, or ``EOF_REJECT_COUNT`` hang-ups
+  mid-handshake before any handshake succeeded) reports through ``on_tls_reject(reason)``, once. A ``Connection: upgrade`` request (voice mode's WebSocket) goes
   out verbatim on a fresh upstream connection and, after a 101, is spliced both ways.
 - any other host, or no ``ca``: a blind byte tunnel. Never decrypted, never cut for being quiet.
 
@@ -72,6 +72,10 @@ TUNNEL_SEND_TIMEOUT = 300.0    # a tunnel peer that takes no bytes for this long
 # "TLSV1_ALERT_" or "SSLV3_ALERT_"). Any other handshake failure says nothing about our CA.
 CERT_ALERTS = frozenset({"UNKNOWN_CA", "BAD_CERTIFICATE", "CERTIFICATE_UNKNOWN",
                          "UNSUPPORTED_CERTIFICATE", "ACCESS_DENIED"})
+# Some clients (Claude Code's Bun) reject the certificate by hanging up without an alert. Before any
+# intercepted handshake has succeeded, this many such hang-ups within the window count as a reject.
+EOF_REJECT_COUNT = 3
+EOF_REJECT_WINDOW = 60.0
 CHUNK = 65536
 PROXY_USER = "acctsw"
 
@@ -399,6 +403,7 @@ class SeatProxy:
         self._on_tls_reject = on_tls_reject
         self._tls_rejected = False
         self._intercepts_ok = 0
+        self._eofs: list[float] = []      # when recent handshakes ended in a hang-up (no alert)
         self._upstream_failures = 0
         self._secret = secrets.token_urlsafe(24)
         self._lock = threading.Lock()
@@ -459,10 +464,18 @@ class SeatProxy:
     def _intercepts(self, host: str, port: int) -> bool:
         return self._ca is not None and f"{host}:{port}" == self._authority
 
-    def _handshake_failed(self, reason: str) -> None:
+    def _handshake_failed(self, reason: str, eof: bool) -> None:
         if reason.rpartition("ALERT_")[2] in CERT_ALERTS:
             return self._tls_reject(reason)
-        # A dropped connection, plain HTTP or a protocol mismatch: not a verdict on the CA.
+        # Plain HTTP or a protocol mismatch says nothing about the CA; neither does one hang-up, or
+        # any hang-up once a client has completed a handshake (the CA is trusted).
+        now = time.monotonic()
+        with self._lock:
+            if eof and self._intercepts_ok == 0:
+                self._eofs = [t for t in self._eofs if now - t <= EOF_REJECT_WINDOW] + [now]
+            streak = len(self._eofs)
+        if streak >= EOF_REJECT_COUNT:
+            self._tls_reject(f"eof x{EOF_REJECT_COUNT}")
         self._log("tls_handshake_failed", reason=reason)
 
     def _tls_reject(self, reason: str) -> None:
@@ -931,7 +944,9 @@ def _make_handler(proxy: SeatProxy, authority: str | None = None):
             try:
                 tls = proxy._ca.server_context().wrap_socket(self.connection, server_side=True)
             except ssl.SSLError as e:
-                return proxy._handshake_failed(f"{getattr(e, 'reason', None) or e}"[:200])
+                reason = f"{getattr(e, 'reason', None) or e}"[:200]
+                eof = isinstance(e, ssl.SSLEOFError) or reason == "UNEXPECTED_EOF_WHILE_READING"
+                return proxy._handshake_failed(reason, eof)
             except OSError:
                 return
             with proxy._lock:

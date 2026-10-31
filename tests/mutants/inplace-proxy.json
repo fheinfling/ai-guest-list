@@ -428,8 +428,8 @@
  {
   "label": "proxy r3: a certificate alert is only logged, never reported",
   "file": "acctsw/seatproxy.py",
-  "old": "return self._tls_reject(reason)\n        # A dropped",
-  "new": "pass\n        # A dropped",
+  "old": "return self._tls_reject(reason)\n        # Plain HTTP",
+  "new": "pass\n        # Plain HTTP",
   "test": [
    "tests/test_seatproxy.py::test_certificate_alerts_are_a_tls_reject"
   ]
@@ -621,6 +621,52 @@
   "new": "",
   "test": [
    "tests/test_seatproxy.py::test_a_tls_splice_ends_both_ways_when_either_side_ends"
+  ]
+ },
+ {
+  "label": "proxy r3: two hang-ups mid-handshake already count as a reject",
+  "file": "acctsw/seatproxy.py",
+  "old": "if streak >= EOF_REJECT_COUNT:",
+  "new": "if streak >= EOF_REJECT_COUNT - 1:",
+  "test": [
+   "tests/test_seatproxy.py::test_hang_ups_mid_handshake_count_as_a_reject"
+  ]
+ },
+ {
+  "label": "proxy r3: a hang-up mid-handshake (Bun's reject) is never counted",
+  "file": "acctsw/seatproxy.py",
+  "old": "eof = isinstance(e, ssl.SSLEOFError) or reason == \"UNEXPECTED_EOF_WHILE_READING\"",
+  "new": "eof = False",
+  "test": [
+   "tests/test_seatproxy.py::test_hang_ups_mid_handshake_count_as_a_reject"
+  ]
+ },
+ {
+  "label": "proxy r3: plain HTTP / version mismatches count as hang-ups",
+  "file": "acctsw/seatproxy.py",
+  "old": "eof = isinstance(e, ssl.SSLEOFError) or reason == \"UNEXPECTED_EOF_WHILE_READING\"",
+  "new": "eof = True",
+  "test": [
+   "tests/test_seatproxy.py::test_repeated_plain_http_is_never_a_reject"
+  ]
+ },
+ {
+  "label": "proxy r3: hang-ups count even after a completed handshake (no reset, no trust)",
+  "file": "acctsw/seatproxy.py",
+  "old": "if eof and self._intercepts_ok == 0:",
+  "new": "if eof:",
+  "test": [
+   "tests/test_seatproxy.py::test_a_completed_handshake_breaks_the_hang_up_streak",
+   "tests/test_seatproxy.py::test_after_a_completed_handshake_hang_ups_never_count"
+  ]
+ },
+ {
+  "label": "proxy r3: hang-ups count however far apart",
+  "file": "acctsw/seatproxy.py",
+  "old": "[t for t in self._eofs if now - t <= EOF_REJECT_WINDOW]",
+  "new": "list(self._eofs)",
+  "test": [
+   "tests/test_seatproxy.py::test_hang_ups_spread_beyond_the_window_do_not_count"
   ]
  }
 ]
