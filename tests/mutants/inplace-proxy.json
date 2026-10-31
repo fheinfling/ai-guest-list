@@ -604,5 +604,23 @@
   "test": [
    "tests/test_seatproxy.py::test_the_listener_queues_a_burst_of_connections"
   ]
+ },
+ {
+  "label": "proxy r3: an unbuffered body read asks for the whole remaining body each time",
+  "file": "acctsw/seatproxy.py",
+  "old": "data = self.rfile.read(min(n, CHUNK))",
+  "new": "data = self.rfile.read(n)",
+  "test": [
+   "tests/test_gaps_proxy.py::test_an_unbuffered_body_read_never_asks_for_more_than_a_chunk"
+  ]
+ },
+ {
+  "label": "proxy r3: a TLS splice half-closes instead of ending both ways",
+  "file": "acctsw/seatproxy.py",
+  "old": "            if isinstance(a, ssl.SSLSocket) or isinstance(b, ssl.SSLSocket):\n                return\n",
+  "new": "",
+  "test": [
+   "tests/test_seatproxy.py::test_a_tls_splice_ends_both_ways_when_either_side_ends"
+  ]
  }
 ]
