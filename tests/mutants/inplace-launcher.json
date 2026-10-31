@@ -579,16 +579,18 @@
     "old": "                    return proxy.in_flight() == 0 and proxy.idle_for() >= HANDOVER_QUIET_S",
     "new": "                    return True",
     "test": [
-      "tests/test_launcher_inplace.py::test_a_handover_waits_for_the_proxy_to_be_quiet"
+      "tests/test_launcher_inplace.py::test_a_handover_waits_for_the_proxy_to_be_quiet",
+      "tests/test_launcher_inplace.py::test_model_restart_obeys_handover_safety_checks[recent_request]"
     ]
   },
   {
     "label": "round2 N5: a print run is handed over",
     "file": "acctsw/launcher.py",
-    "old": "                if (claude_print or switches >= max_switches or not _quiet()",
-    "new": "                if (switches >= max_switches or not _quiet()",
+    "old": "return not (claude_print or switches >= max_switches or not _quiet()",
+    "new": "return not (switches >= max_switches or not _quiet()",
     "test": [
-      "tests/test_launcher_inplace.py::test_no_handover_restart_for_a_print_run"
+      "tests/test_launcher_inplace.py::test_no_handover_restart_for_a_print_run",
+      "tests/test_launcher_inplace.py::test_model_restart_obeys_handover_safety_checks[print]"
     ]
   },
   {
@@ -597,7 +599,8 @@
     "old": "                        or _exec_blocker() is not None or not _login_loadable(seat)",
     "new": "                        or _exec_blocker() is not None",
     "test": [
-      "tests/test_launcher_inplace.py::test_no_handover_onto_a_seat_without_a_loadable_login"
+      "tests/test_launcher_inplace.py::test_no_handover_onto_a_seat_without_a_loadable_login",
+      "tests/test_launcher_inplace.py::test_model_restart_obeys_handover_safety_checks[login]"
     ]
   },
   {
@@ -897,6 +900,267 @@
     "new": "                        and not _swapcall(\"proxy_used\", default=False)):",
     "test": [
       "tests/test_launcher_inplace.py::test_an_unreachable_api_restarts_once_even_after_messages_went_through"
+    ]
+  },
+  {
+    "label": "cross-tier: a hop restarted only for the tier asks nothing",
+    "file": "acctsw/launcher.py",
+    "old": "                        _ask_tier(landing)   # in place would have taken it but for the tier?\n",
+    "new": "                        pass\n",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_hop_that_restarts_only_for_the_tier_asks_about_that_pair_once"
+    ]
+  },
+  {
+    "label": "cross-tier: the same tier pair is asked again within a run",
+    "file": "acctsw/launcher.py",
+    "old": "if pair is None or frozenset(pair) in inplace[\"tier_asked\"]:",
+    "new": "if pair is None:",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_hop_that_restarts_only_for_the_tier_asks_about_that_pair_once"
+    ]
+  },
+  {
+    "label": "cross-tier: the tier request is never saved",
+    "file": "acctsw/launcher.py",
+    "old": "if tiers.request(st, tool, *pair, now()):\n                        st.save()",
+    "new": "if tiers.request(st, tool, *pair, now()):\n                        pass",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_hop_that_restarts_only_for_the_tier_asks_about_that_pair_once"
+    ]
+  },
+  {
+    "label": "cross-tier: a tier question even when something besides the tier blocks in place",
+    "file": "acctsw/launcher.py",
+    "old": "    if seatswap.eligible_reason(ctx, email, home_email=home_email) != \"tier\":\n        return None\n",
+    "new": "",
+    "test": [
+      "tests/test_launcher_inplace.py::test_tier_pair_names_the_tiers_only_when_the_tier_alone_blocks"
+    ]
+  },
+  {
+    "label": "cross-tier: a failing tier request escapes and kills the decision",
+    "file": "acctsw/launcher.py",
+    "old": "            except Exception:\n                logging.getLogger(__name__).info(\"tier request failed\", exc_info=True)",
+    "new": "            except ImportError:\n                logging.getLogger(__name__).info(\"tier request failed\", exc_info=True)",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_tier_request_that_blows_up_never_stops_the_restart"
+    ]
+  },
+  {
+    "label": "model: a refused model never goes back home in place",
+    "file": "acctsw/launcher.py",
+    "old": "                    home_ok = away and _seat_usable(launch_email, frm=billed)\n",
+    "new": "                    home_ok = False\n",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_model_the_borrowed_seat_lacks_goes_back_home_in_place"
+    ]
+  },
+  {
+    "label": "model: the user hears about a refused model every time",
+    "file": "acctsw/launcher.py",
+    "old": "                        inplace[\"model_said\"] = True\n                        return\n",
+    "new": "                        return\n",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_model_the_borrowed_seat_lacks_goes_back_home_in_place"
+    ]
+  },
+  {
+    "label": "model: no restart on the seat whose plan lacks the model",
+    "file": "acctsw/launcher.py",
+    "old": "                    inplace[\"model\"] = billed\n",
+    "new": "",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_model_refused_with_home_resting_restarts_on_that_seat_once_quiet"
+    ]
+  },
+  {
+    "label": "model: the model restart doesn't wait for a quiet child",
+    "file": "acctsw/launcher.py",
+    "old": "                    elif _restart_ready(seat):\n                        inplace[\"model\"] = None\n",
+    "new": "                    else:\n                        inplace[\"model\"] = None\n",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_model_refused_with_home_resting_restarts_on_that_seat_once_quiet"
+    ]
+  },
+  {
+    "label": "model: a seat may be restarted on for its models more than once per run",
+    "file": "acctsw/launcher.py",
+    "old": "if away and billed not in inplace[\"model_done\"]:",
+    "new": "if away:",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_model_restart_happens_once_per_seat"
+    ]
+  },
+  {
+    "label": "cross-tier: an approved crossing restarts without asking about the tier",
+    "file": "acctsw/launcher.py",
+    "old": "                    _ask_tier(target)\n",
+    "new": "",
+    "test": [
+      "tests/test_launcher_inplace.py::test_tier_request_waits_for_the_independent_crossing_approval"
+    ]
+  },
+  {
+    "label": "cross-tier: asks even when the proxy cannot serve the child",
+    "file": "acctsw/launcher.py",
+    "old": "                    or not _inplace_on(target)):\n",
+    "new": "                    or False):\n",
+    "test": [
+      "tests/test_launcher_inplace.py::test_no_tier_question_when_the_proxy_cannot_carry_the_hop"
+    ]
+  },
+  {
+    "label": "cross-tier: asks even when in-place switching is disabled",
+    "file": "acctsw/launcher.py",
+    "old": "                    if not st.settings().get(\"in_place_switch\", True):\n                        return\n",
+    "new": "",
+    "test": [
+      "tests/test_launcher_inplace.py::test_no_tier_question_when_the_proxy_cannot_carry_the_hop[setting]"
+    ]
+  },
+  {
+    "label": "cross-tier: an auth restart also asks about the tier",
+    "file": "acctsw/launcher.py",
+    "old": "if served == NOT_SERVABLE and reason == \"limit\":\n                        _ask_tier(landing)",
+    "new": "if served == NOT_SERVABLE:\n                        _ask_tier(landing)",
+    "test": [
+      "tests/test_launcher_inplace.py::test_no_tier_question_when_the_proxy_cannot_carry_the_hop[auth]"
+    ]
+  },
+  {
+    "label": "cross-tier: asks despite no restart budget",
+    "file": "acctsw/launcher.py",
+    "old": "                # In place could not take it and the restart budget is spent: a no-hop after all.\n",
+    "new": "                _ask_tier(landing)\n",
+    "test": [
+      "tests/test_launcher_inplace.py::test_no_tier_question_when_restart_budget_is_spent"
+    ]
+  },
+  {
+    "label": "cross-tier: asks before business-personal crossing approval",
+    "file": "acctsw/launcher.py",
+    "old": "            if crossed_fresh:\n                _crossing_notice(active, crossed)",
+    "new": "            if crossed_fresh:\n                _ask_tier(crossed)\n                _crossing_notice(active, crossed)",
+    "test": [
+      "tests/test_launcher_inplace.py::test_tier_request_waits_for_the_independent_crossing_approval"
+    ]
+  },
+  {
+    "label": "model: replay goes to home even when it is unavailable",
+    "file": "acctsw/launcher.py",
+    "old": "                    home_ok = away and _seat_usable(launch_email, frm=billed)\n",
+    "new": "                    home_ok = away\n",
+    "test": [
+      "tests/test_launcher_inplace.py::test_model_replay_requires_a_usable_home"
+    ]
+  },
+  {
+    "label": "model: a model rejection is treated as a quota limit",
+    "file": "acctsw/launcher.py",
+    "old": "                if h.kind == \"model\":\n",
+    "new": "                if False:  # ignore model classification\n",
+    "test": [
+      "tests/test_launcher_inplace.py::test_model_replay_requires_a_usable_home"
+    ]
+  },
+  {
+    "label": "model: restart ignores requests in flight",
+    "file": "acctsw/launcher.py",
+    "old": "return proxy.in_flight() == 0 and proxy.idle_for() >= HANDOVER_QUIET_S",
+    "new": "return proxy.idle_for() >= HANDOVER_QUIET_S",
+    "test": [
+      "tests/test_launcher_inplace.py::test_model_restart_obeys_handover_safety_checks[in_flight]"
+    ]
+  },
+  {
+    "label": "model: restart ignores PTY output",
+    "file": "acctsw/launcher.py",
+    "old": "if time.monotonic() - tick[\"last_output\"] < HANDOVER_QUIET_S:",
+    "new": "if False:",
+    "test": [
+      "tests/test_launcher_inplace.py::test_model_restart_obeys_handover_safety_checks[output]"
+    ]
+  },
+  {
+    "label": "model: restart ignores the restart budget",
+    "file": "acctsw/launcher.py",
+    "old": "return not (claude_print or switches >= max_switches or not _quiet()",
+    "new": "return not (claude_print or not _quiet()",
+    "test": [
+      "tests/test_launcher_inplace.py::test_model_restart_obeys_handover_safety_checks[budget]"
+    ]
+  },
+  {
+    "label": "model: restart cannot identify the session to resume",
+    "file": "acctsw/launcher.py",
+    "old": "                            or (tool == \"claude\" and not _capture_claude_resume()))",
+    "new": "                            or False)",
+    "test": [
+      "tests/test_launcher_inplace.py::test_model_restart_obeys_handover_safety_checks[resume]"
+    ]
+  },
+  {
+    "label": "model: a pending restart follows the child onto a different seat",
+    "file": "acctsw/launcher.py",
+    "old": "if inplace[\"model\"] != seat:",
+    "new": "if False:",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_pending_model_restart_is_cancelled_when_the_bound_seat_changes"
+    ]
+  },
+  {
+    "label": "model: a pending restart survives a replacement child",
+    "file": "acctsw/launcher.py",
+    "old": "                    inplace[\"model\"] = None   # a new child has already left the rejected model\n",
+    "new": "",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_pending_model_restart_does_not_survive_another_child_restart"
+    ]
+  },
+  {
+    "label": "model: a model error enters exit-time quota recovery",
+    "file": "acctsw/launcher.py",
+    "old": "                hit[\"handled\"] = True   # a model error is not an exit-time quota signal\n",
+    "new": "",
+    "test": [
+      "tests/test_launcher_inplace.py::test_model_rejection_does_not_trigger_exit_time_limit_recovery"
+    ]
+  },
+  {
+    "label": "model: a failing home decision leaves the proxy without an answer",
+    "file": "acctsw/launcher.py",
+    "old": "                finally:\n                    if inplace[\"hit\"] is not None:\n",
+    "new": "                finally:\n                    if False:\n",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_failing_model_decision_answers_and_keeps_the_child_alive"
+    ]
+  },
+  {
+    "label": "model: model errors are notified again after a restart",
+    "file": "acctsw/launcher.py",
+    "old": "                        inplace[\"model_said\"] = True\n                        notify(f\"{billed}'s plan",
+    "new": "                        inplace[\"model_said\"] = False\n                        notify(f\"{billed}'s plan",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_model_restart_happens_once_per_seat"
+    ]
+  },
+  {
+    "label": "model: a restart returns to the launch seat instead of the bound seat",
+    "file": "acctsw/launcher.py",
+    "old": "                        hit.update(reason=\"model\", email=seat, active=seat, hard=False,",
+    "new": "                        hit.update(reason=\"model\", email=launch_email, active=seat, hard=False,",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_model_refused_with_home_resting_restarts_on_that_seat_once_quiet"
+    ]
+  },
+  {
+    "label": "model: the restart starts a new conversation instead of resuming",
+    "file": "acctsw/launcher.py",
+    "old": "                resuming = True\n                continue\n\n            if hit[\"reason\"] == \"manual\":",
+    "new": "                resuming = hit[\"reason\"] != \"model\"\n                continue\n\n            if hit[\"reason\"] == \"manual\":",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_model_refused_with_home_resting_restarts_on_that_seat_once_quiet"
     ]
   }
 ]
