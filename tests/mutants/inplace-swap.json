@@ -796,8 +796,8 @@
  {
   "label": "verdict never expires",
   "file": "acctsw/seatswap.py",
-  "old": "and timedelta(0) <= now() - at < VERDICT_TTL",
-  "new": "and timedelta(0) <= now() - at",
+  "old": "    return at is not None and timedelta(0) <= now() - at < VERDICT_TTL\n\n\ndef _remember",
+  "new": "    return at is not None and timedelta(0) <= now() - at\n\n\ndef _remember",
   "test": [
    "tests/test_gaps_glue.py::test_a_tls_reject_is_remembered_for_that_claude_for_a_week"
   ]
@@ -869,8 +869,8 @@
  {
   "label": "preflight key upstream only",
   "file": "acctsw/seatswap.py",
-  "old": "        key = json.dumps([self.upstream,",
-  "new": "        key = json.dumps([self.upstream] + [None] * 4 if 1 else [",
+  "old": "        return json.dumps([self.upstream, self.upstream_proxy,",
+  "new": "        return json.dumps([self.upstream, None,",
   "test": [
    "tests/test_gaps_glue.py::test_the_preflight_cache_key_covers_proxy_no_proxy_and_ca_files"
   ]
@@ -887,8 +887,8 @@
  {
   "label": "upstream_failing ignores threshold",
   "file": "acctsw/seatswap.py",
-  "old": "return failures >= n and not self._upstream_worked",
-  "new": "return failures >= 1 and not self._upstream_worked",
+  "old": "failing = self.proxy.upstream_failures() >= n and not self._upstream_worked",
+  "new": "failing = self.proxy.upstream_failures() >= 1 and not self._upstream_worked",
   "test": [
    "tests/test_gaps_glue.py::test_upstream_failing_needs_a_streak_and_no_prior_success"
   ]
@@ -896,8 +896,8 @@
  {
   "label": "upstream_failing ignores success latch",
   "file": "acctsw/seatswap.py",
-  "old": "return failures >= n and not self._upstream_worked",
-  "new": "return failures >= n",
+  "old": "failing = self.proxy.upstream_failures() >= n and not self._upstream_worked",
+  "new": "failing = self.proxy.upstream_failures() >= n",
   "test": [
    "tests/test_gaps_glue.py::test_upstream_failing_needs_a_streak_and_no_prior_success"
   ]
@@ -927,6 +927,78 @@
   "new": "if p and not _routes_api(p):",
   "test": [
    "tests/test_gaps_glue.py::test_no_proxy_is_merged_deduplicated_and_written_to_both"
+  ]
+ },
+ {
+  "label": "latch on messages_seen",
+  "file": "acctsw/seatswap.py",
+  "old": "if self.proxy.upstream_successes() > 0:",
+  "new": "if self.proxy.messages_seen() > 0:",
+  "test": [
+   "tests/test_gaps_glue.py::test_messages_seen_alone_is_not_an_upstream_success"
+  ]
+ },
+ {
+  "label": "latch never set",
+  "file": "acctsw/seatswap.py",
+  "old": "            self._upstream_worked = True\n",
+  "new": "            pass\n",
+  "test": [
+   "tests/test_gaps_glue.py::test_upstream_failing_needs_a_streak_and_no_prior_success"
+  ]
+ },
+ {
+  "label": "preflight not marked failed",
+  "file": "acctsw/seatswap.py",
+  "old": "            self._cache_preflight(\"upstream failing: no request succeeded\")",
+  "new": "            pass",
+  "test": [
+   "tests/test_gaps_glue.py::test_upstream_failing_marks_the_preflight_cache_failed_once"
+  ]
+ },
+ {
+  "label": "preflight marked repeatedly",
+  "file": "acctsw/seatswap.py",
+  "old": "            self._preflight_marked = True\n",
+  "new": "",
+  "test": [
+   "tests/test_gaps_glue.py::test_upstream_failing_marks_the_preflight_cache_failed_once"
+  ]
+ },
+ {
+  "label": "late reject remembered",
+  "file": "acctsw/seatswap.py",
+  "old": "        if self.proxy.intercepts_ok() == 0:\n            _remember",
+  "new": "        if True:\n            _remember",
+  "test": [
+   "tests/test_gaps_glue.py::test_a_reject_after_a_good_handshake_is_another_tool_and_not_remembered"
+  ]
+ },
+ {
+  "label": "claude_bin ignored",
+  "file": "acctsw/seatswap.py",
+  "old": "    found = getattr(ctx, \"claude_bin\", None) or shutil.which(",
+  "new": "    found = shutil.which(",
+  "test": [
+   "tests/test_gaps_glue.py::test_the_verdict_is_keyed_on_the_launchers_claude_not_path"
+  ]
+ },
+ {
+  "label": "version spawned without live verdict",
+  "file": "acctsw/seatswap.py",
+  "old": "    if not any(_live(v) for v in entries.values()):",
+  "new": "    if not entries:",
+  "test": [
+   "tests/test_gaps_glue.py::test_gate_does_not_run_claude_without_a_live_verdict"
+  ]
+ },
+ {
+  "label": "process NO_PROXY star ignored",
+  "file": "acctsw/seatswap.py",
+  "old": "        if \"*\" in [e.strip() for e in str(environ.get(name) or \"\").split(\",\")]:",
+  "new": "        if False:",
+  "test": [
+   "tests/test_gaps_glue.py::test_a_process_no_proxy_star_gates_off"
   ]
  }
 ]
