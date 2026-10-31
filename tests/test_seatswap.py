@@ -479,12 +479,102 @@ def test_maintain_goes_home_without_approval_even_across_kinds(ctx):
     assert proxy.bound() == Seat("home@x", None)
 
 
-def test_preflight_and_proxy_used_delegate(ctx):
+def test_proxy_used_delegates(ctx):
     swap, proxy, _ = make(ctx)
-    assert swap.preflight() is None and not swap.proxy_used()
-    proxy.preflight_reason, proxy.seen = "tls: certificate verify failed", 1
-    assert swap.preflight() == "tls: certificate verify failed" and swap.proxy_used()
+    assert not swap.proxy_used()
+    proxy.seen = 1
+    assert swap.proxy_used()
     swap.stop()
+
+
+def _age_cache(ctx, minutes):
+    path = ctx.data_dir / seatswap.PREFLIGHT_CACHE
+    cache = json.loads(path.read_text())
+    for entry in cache.values():
+        entry["at"] = iso(now() - timedelta(minutes=minutes))
+    path.write_text(json.dumps(cache))
+
+
+def test_preflight_verdict_is_cached_per_upstream_for_ten_minutes(ctx):
+    ctx.ensure_dirs()
+    swap, proxy, _ = make(ctx)
+    calls = []
+    proxy.preflight = lambda: calls.append(1) or proxy.preflight_reason
+    assert swap.preflight() is None and len(calls) == 1
+    proxy.preflight_reason = "tls: certificate verify failed"
+    assert swap.preflight() is None and len(calls) == 1          # cached ok
+    _age_cache(ctx, 9)
+    assert swap.preflight() is None and len(calls) == 1
+    _age_cache(ctx, 11)
+    assert swap.preflight() == "tls: certificate verify failed" and len(calls) == 2
+    proxy.preflight_reason = None
+    assert swap.preflight() == "tls: certificate verify failed"   # a failure is cached too
+    other = seatswap.SeatSwap(ctx, "home@x", proxy_factory=FakeProxy, upstream="https://gw.example")
+    assert other.preflight() is None                             # its own upstream, its own verdict
+    cache = json.loads((ctx.data_dir / seatswap.PREFLIGHT_CACHE).read_text())
+    assert set(cache) == {seatswap.UPSTREAM, "https://gw.example"}
+    assert cache[seatswap.UPSTREAM] == {"ok": False, "reason": "tls: certificate verify failed",
+                                        "at": cache[seatswap.UPSTREAM]["at"]}
+
+
+def test_an_unreadable_preflight_cache_just_preflights(ctx):
+    ctx.ensure_dirs()
+    (ctx.data_dir / seatswap.PREFLIGHT_CACHE).write_text("{broken")
+    swap, proxy, _ = make(ctx)
+    proxy.preflight_reason = "unreachable: ConnectionRefusedError"
+    assert swap.preflight() == "unreachable: ConnectionRefusedError"
+
+
+# --- N9: a third seat only with auto_switch, in_place_switch and the hop budget ------------------
+
+def _lapsing_on_b(ctx):
+    put_seat(ctx, "home@x")
+    put_seat(ctx, "b@x", token="b", minutes=10)
+    put_seat(ctx, "c@x", token="c")
+    rest(ctx, "home@x")
+    swap, proxy, _ = make(ctx)
+    proxy.bind(Seat("b@x", "b"))
+    return swap, proxy
+
+
+@pytest.mark.parametrize("setting", ["auto_switch", "in_place_switch"])
+def test_maintain_never_moves_to_a_third_seat_with_a_setting_off(ctx, setting):
+    swap, proxy = _lapsing_on_b(ctx)
+    state = ctx.load_state()
+    state.set_setting(setting, False)
+    state.save()
+    assert swap.maintain() == "handover"
+    assert proxy.bound().email == "b@x" and swap.third_seat_moves == 0
+
+
+def test_maintain_never_moves_to_a_third_seat_past_the_hop_budget(ctx):
+    swap, proxy = _lapsing_on_b(ctx)
+    assert swap.maintain(third_seat=False) == "handover"
+    assert proxy.bound().email == "b@x"
+
+
+def test_a_third_seat_move_is_counted(ctx):
+    swap, proxy = _lapsing_on_b(ctx)
+    swap.maintain()
+    assert proxy.bound() == Seat("c@x", "c") and swap.third_seat_moves == 1
+
+
+@pytest.mark.parametrize("setting", ["auto_switch", "in_place_switch"])
+def test_going_home_and_rebinding_ignore_the_settings_and_budget(ctx, setting):
+    put_seat(ctx, "home@x")
+    put_seat(ctx, "b@x", token="old", minutes=10)
+    state = ctx.load_state()
+    state.set_setting(setting, False)
+    state.save()
+    swap, proxy, clock = make(ctx)
+    proxy.bind(Seat("b@x", "old"))
+    ctx.claude_cred("b@x").set_live(blob("new"))
+    swap.maintain(third_seat=False)
+    assert proxy.bound() == Seat("b@x", "new")
+    ctx.claude_cred("b@x").set_live(blob("new", minutes=10))
+    clock.t += seatswap.MAINTAIN_EVERY_S
+    swap.maintain(third_seat=False)
+    assert proxy.bound() == Seat("home@x", None) and swap.third_seat_moves == 0
 
 
 def test_a_hit_after_stop_never_writes_to_a_reused_descriptor(ctx):

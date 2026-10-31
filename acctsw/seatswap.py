@@ -51,14 +51,17 @@ from typing import Any, Callable
 
 from . import seatkind
 from .keychain import KeychainError
-from .seatproxy import Hit, Seat
+from .seatproxy import Seat
 from .selection import choose
-from .util import now
+from .util import iso, now, parse_iso, write_json
 
 TOOL = "claude"
 MIN_TTL = timedelta(minutes=15)
 MAINTAIN_EVERY_S = 60.0     # at most one Keychain read of the bound seat per minute
 HANDOVER_IDLE_S = 5.0       # a handover restart waits for this much proxy silence
+UPSTREAM = "https://api.anthropic.com"
+PREFLIGHT_CACHE = "seatproxy-preflight.json"
+PREFLIGHT_TTL = timedelta(minutes=10)
 SWITCH_ENV = "ACCTSW_IN_PLACE_SWITCH"
 GATE_ENV = ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
             "CLAUDE_CODE_OAUTH_TOKEN")
@@ -249,15 +252,15 @@ class _Ask:
     done: bool = False
 
 
-def _default_proxy(decide, *, decide_timeout: float, log):
+def _default_proxy(decide, *, decide_timeout: float, log, upstream: str = UPSTREAM):
     from .seatproxy import SeatProxy
-    return SeatProxy(decide, decide_timeout=decide_timeout, log=log)
+    return SeatProxy(decide, upstream=upstream, decide_timeout=decide_timeout, log=log)
 
 
 class SeatSwap:
     def __init__(self, ctx, home_email: str | None = None, *, proxy=None, proxy_factory=None,
                  decide_timeout: float = 10.0, clock: Callable[[], float] = time.monotonic,
-                 log: Callable[..., None] = _noop):
+                 log: Callable[..., None] = _noop, upstream: str = UPSTREAM):
         self._ctx = ctx
         self.home = home_email
         self._timeout = decide_timeout
@@ -268,6 +271,8 @@ class SeatSwap:
         self._closed = False
         self._next_read = 0.0
         self._handover = False
+        self.third_seat_moves = 0
+        self.upstream = upstream
         self.base_url: str | None = None
         r, w = os.pipe()
         os.set_blocking(r, False)
@@ -275,8 +280,14 @@ class SeatSwap:
         self.wake_fd, self._wake_w = r, w
         self._stopped = False
         try:
-            self.proxy = proxy if proxy is not None else (proxy_factory or _default_proxy)(
-                self._decide, decide_timeout=decide_timeout, log=log)
+            if proxy is not None:
+                self.proxy = proxy
+            elif proxy_factory is not None:
+                self.proxy = proxy_factory(self._decide, decide_timeout=decide_timeout, log=log)
+            else:
+                extra = {} if upstream == UPSTREAM else {"upstream": upstream}
+                self.proxy = _default_proxy(self._decide, decide_timeout=decide_timeout, log=log,
+                                            **extra)
             self.start()
         except BaseException:
             self._close_fds()
@@ -337,8 +348,26 @@ class SeatSwap:
         return self.proxy.bound().email or None
 
     def preflight(self) -> str | None:
-        """Can the proxy reach the API (TLS included)? None when it can, else a short reason."""
-        return self.proxy.preflight()
+        """Can the proxy reach the API (TLS included)? None when it can, else a short reason.
+        The verdict is cached per upstream for ``PREFLIGHT_TTL`` in the data dir, so starting a
+        terminal doesn't cost a TLS handshake each time."""
+        path = Path(self._ctx.data_dir) / PREFLIGHT_CACHE
+        try:
+            cache = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            cache = {}
+        cache = cache if isinstance(cache, dict) else {}
+        entry = cache.get(self.upstream)
+        at = parse_iso(entry.get("at")) if isinstance(entry, dict) else None
+        if at is not None and timedelta(0) <= now() - at < PREFLIGHT_TTL:
+            return None if entry.get("ok") is True else str(entry.get("reason") or "preflight failed")
+        reason = self.proxy.preflight()
+        cache[self.upstream] = {"ok": reason is None, "reason": reason, "at": iso(now())}
+        try:
+            write_json(path, cache, mode=0o600)
+        except OSError:
+            pass   # an uncached verdict is still a verdict
+        return reason
 
     def proxy_used(self) -> bool:
         """Has the child sent a /v1/messages request through the proxy yet?"""
@@ -390,11 +419,13 @@ class SeatSwap:
             return True
 
     # decisions -----------------------------------------------------------------------------------
-    def pick(self, ctx, leaving: str, *, exclude=(), consume: bool = True):
-        """Where a session billed to ``leaving`` goes next in place: home when it is usable and
-        the move needs no unapproved crossing, else the next seat ``choose`` offers that is also
-        ``eligible``. None when nothing qualifies. With ``consume`` a "once" approval is spent in
-        the same locked write that confirms it is still there."""
+    def pick(self, ctx, leaving: str, *, exclude=(), consume: bool = True,
+             third_seat: bool = True):
+        """Where a session billed to ``leaving`` goes next in place: home when it is usable, else
+        the next seat ``choose`` offers that is also ``eligible`` and needs no unapproved
+        crossing. A third seat only with ``third_seat`` and both ``auto_switch`` and
+        ``in_place_switch`` on, read now. None when nothing qualifies. With ``consume`` a "once"
+        approval is spent in the same locked write that confirms it is still there."""
         at = now()
         state = ctx.load_state()
         seats = set(state.accounts(TOOL))
@@ -404,8 +435,12 @@ class SeatSwap:
             home = choose(state, TOOL, at, exclude=seats - {self.home}, origin=leaving,
                           home=self.home)
             if home.available and home.email == self.home:
-                target = _seat(self.home, None)
+                return _seat(self.home, None)   # the session's own login: never a crossing
             skip.add(self.home)
+        settings = state.settings()
+        if not (third_seat and settings.get("auto_switch", True)
+                and settings.get("in_place_switch", True)):
+            return None
         while target is None:
             sel = choose(state, TOOL, at, exclude=skip, origin=leaving, home=self.home)
             if not (sel.available and sel.email):
@@ -426,8 +461,11 @@ class SeatSwap:
                 return None
         return target
 
-    def maintain(self, ctx=None) -> str | None:
-        """Keep a borrowed seat's token current. ``"handover"`` asks for one restart, now."""
+    def maintain(self, ctx=None, *, third_seat: bool = True) -> str | None:
+        """Keep a borrowed seat's token current. ``"handover"`` asks for one restart, now.
+        Rebinding a renewed token and going home are always allowed; moving to a third seat
+        also needs ``third_seat`` (the caller's hop budget) and both settings on. Such a move
+        counts in ``third_seat_moves``."""
         ctx = ctx or self._ctx
         seat = self.proxy.bound()
         if seat.token is None or seat.email == self.home:
@@ -452,8 +490,10 @@ class SeatSwap:
                 self.proxy.bind(_seat(seat.email, fresh))
                 self._log("seatswap: newer token rebound", seat=seat.email)
             return None
-        target = self.pick(ctx, seat.email)
+        target = self.pick(ctx, seat.email, third_seat=third_seat)
         if target is not None:
+            if target.email != self.home:
+                self.third_seat_moves += 1
             self.proxy.bind(target)
             self._log("seatswap: token lapsing, moved", seat=seat.email, to=target.email)
             return None

@@ -163,49 +163,42 @@ def _claude_seat(ctx, email, plan):
     ctx.claude_cred(email).set_live(make_claude_blob(plan.lower()))
 
 
-def test_a_manual_switch_answers_the_question_and_leaves_no_approval(ctx, monkeypatch):
-    for email, plan in (("w@x", "Team"), ("p@x", "Max")):
+def test_a_manual_switch_moves_whom_it_does_not_cross_and_asks_the_rest(ctx, monkeypatch):
+    plans = {"w@x": "Team", "w2@x": "Team", "p@x": "Max", "p2@x": "Max", "u@x": "Pro"}
+    for email, plan in plans.items():
         _claude_seat(ctx, email, plan)
-    state = seats(ctx, {"w@x": "Team", "p@x": "Max"}, active="w@x")
-    seatkind.request(state, T, "w@x", "p@x", 7)
-    seatkind.request(state, T, "p@x", "w@x", 8)
-    seatkind.approve(state, T, "w@x", "p@x", "once")   # the user's earlier yes is what it uses
-    seatkind.request(state, T, "w@x", "p@x", 9)
+    state = seats(ctx, plans, active="u@x")
+    seatkind.request(state, T, "w2@x", "w@x", 9)           # an earlier same-kind question
+    seatkind.approve(state, T, "p2@x", "w@x", "once")      # the user's earlier yes for p2
+    seatkind.approve(state, T, "u@x", "w@x", "once")       # the app's seat runs no terminal
     state.save()
-    monkeypatch.setattr(session, "active_sessions", lambda *_a, **_k: [])
-    switch(ctx, state, T, "p@x", sync=False, mirror=False, manual=True)
+    t = iso(now())
+    monkeypatch.setattr(session, "active_sessions", lambda *_a, **_k: [
+        {"email": "w2@x", "pid": 1, "started_at": t},                  # same kind: moves
+        {"email": "p@x", "pid": 2, "started_at": t},                   # would cross: asked
+        {"email": "p2@x", "pid": 3, "started_at": t, "home": "w@x"},   # back home: moves
+    ])
+    switch(ctx, state, T, "w@x", sync=False, mirror=False, manual=True)
     state = ctx.load_state()
-    assert state.data["tools"][T]["manual_switch"]["email"] == "p@x"
+    store = state.data["tools"][T]["crossings"]
+    assert [(r["from"], r["to"], r["session_id"]) for r in store["requests"]] == [
+        ("p@x", "w@x", "2")]
     assert [(r["from"], r["to"]) for r in seatkind.pending(state, T)] == [("p@x", "w@x")]
-    # Nothing left over that a later AUTOMATIC crossing could ride on.
-    assert not seatkind.approved(state, T, "w@x", "p@x")
-    rest(state, "w@x")
-    assert not choose(state, T, origin="w@x", exclude={"w@x"}).available
+    assert not seatkind.approved(state, T, "p@x", "w@x")
+    assert not seatkind.approved(state, T, "p2@x", "w@x"), "the move home spent no new grant"
+    assert seatkind.approved(state, T, "u@x", "w@x"), "no terminal left u@x, so nothing spent"
 
 
-def test_a_manual_switch_keeps_an_always_approval(ctx, monkeypatch):
+def test_a_manual_move_home_keeps_an_always_approval(ctx, monkeypatch):
     for email, plan in (("w@x", "Team"), ("p@x", "Max")):
         _claude_seat(ctx, email, plan)
-    state = seats(ctx, {"w@x": "Team", "p@x": "Max"}, active="w@x")
-    seatkind.approve(state, T, "w@x", "p@x", "always")
+    state = seats(ctx, {"w@x": "Team", "p@x": "Max"}, active="p@x")
+    seatkind.approve(state, T, "p@x", "w@x", "always")
     state.save()
-    monkeypatch.setattr(session, "active_sessions", lambda *_a, **_k: [])
-    switch(ctx, state, T, "p@x", sync=False, mirror=False, manual=True)
-    assert seatkind.approved(ctx.load_state(), T, "w@x", "p@x")
-
-
-def test_a_manual_switch_answers_for_every_seat_a_terminal_bills(ctx, monkeypatch):
-    for email, plan in (("w@x", "Team"), ("p@x", "Max"), ("u@x", "Pro")):
-        _claude_seat(ctx, email, plan)
-    state = seats(ctx, {"w@x": "Team", "p@x": "Max", "u@x": "Pro"}, active="u@x")
-    seatkind.request(state, T, "w@x", "p@x", 7)
-    state.save()
-    monkeypatch.setattr(session, "active_sessions",
-                        lambda *_a, **_k: [{"email": "w@x", "pid": 1, "started_at": iso(now())}])
-    switch(ctx, state, T, "p@x", sync=False, mirror=False, manual=True)
-    state = ctx.load_state()
-    assert seatkind.pending(state, T) == []
-    assert not seatkind.approved(state, T, "w@x", "p@x")
+    monkeypatch.setattr(session, "active_sessions", lambda *_a, **_k: [
+        {"email": "p@x", "pid": 4, "started_at": iso(now()), "home": "w@x"}])
+    switch(ctx, state, T, "w@x", sync=False, mirror=False, manual=True)
+    assert seatkind.approved(ctx.load_state(), T, "p@x", "w@x")
 
 
 def test_an_automatic_switch_approves_nothing(ctx, monkeypatch):

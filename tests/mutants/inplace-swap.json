@@ -138,19 +138,19 @@
  {
   "label": "manual switch does not answer the question",
   "file": "acctsw/switch.py",
-  "old": "            seatkind.chosen(state, tool, origin, email)\n",
-  "new": "            pass\n",
+  "old": "            else:\n                seatkind.chosen(state, tool, origin, email)\n",
+  "new": "            else:\n                pass\n",
   "test": [
-   "tests/test_seatkind.py::test_a_manual_switch_answers_the_question_and_leaves_no_approval"
+   "tests/test_seatkind.py::test_a_manual_switch_moves_whom_it_does_not_cross_and_asks_the_rest"
   ]
  },
  {
   "label": "manual switch ignores terminal seats",
   "file": "acctsw/switch.py",
-  "old": "origins = {previous, *(s[\"email\"] for s in active_sessions(ctx.data_dir, tool))}",
-  "new": "origins = {previous}",
+  "old": "        sessions = sorted(active_sessions(ctx.data_dir, tool), key=lambda s: s[\"pid\"])",
+  "new": "        sessions = []",
   "test": [
-   "tests/test_seatkind.py::test_a_manual_switch_answers_for_every_seat_a_terminal_bills"
+   "tests/test_seatkind.py::test_a_manual_switch_moves_whom_it_does_not_cross_and_asks_the_rest"
   ]
  },
  {
@@ -408,10 +408,10 @@
  {
   "label": "manual switch leaves a once approval",
   "file": "acctsw/switch.py",
-  "old": "            seatkind.chosen(state, tool, origin, email)\n",
-  "new": "            seatkind.approve(state, tool, origin, email, \"once\", via=\"manual\")\n",
+  "old": "            else:\n                seatkind.chosen(state, tool, origin, email)\n",
+  "new": "            else:\n                seatkind.approve(state, tool, origin, email, \"once\", via=\"manual\")\n",
   "test": [
-   "tests/test_seatkind.py::test_a_manual_switch_answers_the_question_and_leaves_no_approval"
+   "tests/test_seatkind.py::test_a_manual_switch_moves_whom_it_does_not_cross_and_asks_the_rest"
   ]
  },
  {
@@ -420,7 +420,7 @@
   "old": "    if isinstance(record, dict) and record.get(\"scope\") != \"always\":",
   "new": "    if isinstance(record, dict):",
   "test": [
-   "tests/test_seatkind.py::test_a_manual_switch_keeps_an_always_approval"
+   "tests/test_seatkind.py::test_a_manual_move_home_keeps_an_always_approval"
   ]
  },
  {
@@ -429,16 +429,124 @@
   "old": "        return self.proxy.messages_seen() > 0",
   "new": "        return True",
   "test": [
-   "tests/test_seatswap.py::test_preflight_and_proxy_used_delegate"
+   "tests/test_seatswap.py::test_proxy_used_delegates"
   ]
  },
  {
   "label": "preflight never reports",
   "file": "acctsw/seatswap.py",
-  "old": "        return self.proxy.preflight()",
-  "new": "        return None",
+  "old": "        reason = self.proxy.preflight()\n",
+  "new": "        reason = None\n",
   "test": [
-   "tests/test_seatswap.py::test_preflight_and_proxy_used_delegate"
+   "tests/test_seatswap.py::test_preflight_verdict_is_cached_per_upstream_for_ten_minutes"
+  ]
+ },
+ {
+  "label": "N8 manual click answers a crossing session instead of asking",
+  "file": "acctsw/switch.py",
+  "old": "            if seatkind.crosses(state, tool, origin, email, home=home):\n                asks.append",
+  "new": "            if False:\n                asks.append",
+  "test": [
+   "tests/test_seatkind.py::test_a_manual_switch_moves_whom_it_does_not_cross_and_asks_the_rest"
+  ]
+ },
+ {
+  "label": "N8 crossing session not asked",
+  "file": "acctsw/switch.py",
+  "old": "        for origin, sid, home in asks:   # after chosen(), which closes a direction's requests\n            seatkind.request(state, tool, origin, email, sid, home=home)\n",
+  "new": "",
+  "test": [
+   "tests/test_seatkind.py::test_a_manual_switch_moves_whom_it_does_not_cross_and_asks_the_rest"
+  ]
+ },
+ {
+  "label": "N8 session home ignored",
+  "file": "acctsw/switch.py",
+  "old": "origin, home = record[\"email\"], record.get(\"home\") or record[\"email\"]",
+  "new": "origin, home = record[\"email\"], record[\"email\"]",
+  "test": [
+   "tests/test_seatkind.py::test_a_manual_switch_moves_whom_it_does_not_cross_and_asks_the_rest"
+  ]
+ },
+ {
+  "label": "N9 third seat with auto_switch off",
+  "file": "acctsw/seatswap.py",
+  "old": "        if not (third_seat and settings.get(\"auto_switch\", True)\n",
+  "new": "        if not (third_seat\n",
+  "test": [
+   "tests/test_seatswap.py::test_maintain_never_moves_to_a_third_seat_with_a_setting_off"
+  ]
+ },
+ {
+  "label": "N9 third seat with in_place_switch off",
+  "file": "acctsw/seatswap.py",
+  "old": "                and settings.get(\"in_place_switch\", True)):\n            return None",
+  "new": "                and True):\n            return None",
+  "test": [
+   "tests/test_seatswap.py::test_maintain_never_moves_to_a_third_seat_with_a_setting_off"
+  ]
+ },
+ {
+  "label": "N9 hop budget ignored",
+  "file": "acctsw/seatswap.py",
+  "old": "        target = self.pick(ctx, seat.email, third_seat=third_seat)",
+  "new": "        target = self.pick(ctx, seat.email)",
+  "test": [
+   "tests/test_seatswap.py::test_maintain_never_moves_to_a_third_seat_past_the_hop_budget"
+  ]
+ },
+ {
+  "label": "N9 third-seat move not counted",
+  "file": "acctsw/seatswap.py",
+  "old": "                self.third_seat_moves += 1",
+  "new": "                pass",
+  "test": [
+   "tests/test_seatswap.py::test_a_third_seat_move_is_counted"
+  ]
+ },
+ {
+  "label": "N9 going home gated by the settings",
+  "file": "acctsw/seatswap.py",
+  "old": "                return _seat(self.home, None)   # the session's own login: never a crossing\n            skip.add(self.home)\n        settings = state.settings()\n        if not (third_seat",
+  "new": "                if third_seat and state.settings().get(\"auto_switch\", True) and state.settings().get(\"in_place_switch\", True):\n                    return _seat(self.home, None)\n            skip.add(self.home)\n        settings = state.settings()\n        if not (third_seat",
+  "test": [
+   "tests/test_seatswap.py::test_going_home_and_rebinding_ignore_the_settings_and_budget"
+  ]
+ },
+ {
+  "label": "N11 preflight cache ignored",
+  "file": "acctsw/seatswap.py",
+  "old": "        if at is not None and timedelta(0) <= now() - at < PREFLIGHT_TTL:",
+  "new": "        if False:",
+  "test": [
+   "tests/test_seatswap.py::test_preflight_verdict_is_cached_per_upstream_for_ten_minutes"
+  ]
+ },
+ {
+  "label": "N11 preflight cache never expires",
+  "file": "acctsw/seatswap.py",
+  "old": "        if at is not None and timedelta(0) <= now() - at < PREFLIGHT_TTL:",
+  "new": "        if at is not None:",
+  "test": [
+   "tests/test_seatswap.py::test_preflight_verdict_is_cached_per_upstream_for_ten_minutes"
+  ]
+ },
+ {
+  "label": "N11 preflight failure not cached",
+  "file": "acctsw/seatswap.py",
+  "old": "            return None if entry.get(\"ok\") is True else str(entry.get(\"reason\") or \"preflight failed\")",
+  "new": "            return None if entry.get(\"ok\") is True else self.proxy.preflight()",
+  "test": [
+   "tests/test_seatswap.py::test_preflight_verdict_is_cached_per_upstream_for_ten_minutes"
+  ]
+ },
+ {
+  "label": "N11 cache shared across upstreams",
+  "file": "acctsw/seatswap.py",
+  "old": "        entry = cache.get(self.upstream)",
+  "new": "        entry = next(iter(cache.values()), None)",
+  "test": [
+   "tests/test_seatswap.py::test_preflight_verdict_is_cached_per_upstream_for_ten_minutes"
   ]
  }
 ]
