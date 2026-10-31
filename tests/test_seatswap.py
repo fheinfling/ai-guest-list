@@ -1,5 +1,6 @@
 """In-place switching glue: gates, eligibility, the hit hand-off and token maintenance."""
 import json
+import os
 import threading
 import time
 from datetime import timedelta
@@ -162,8 +163,42 @@ def test_missing_item_or_token_is_not_eligible(ctx):
 
 # --- SeatSwap with a fake proxy --------------------------------------------------------------------
 
+_REAL_CA = []
+
+
+def real_ca():
+    """One genuine SessionCA per test run (an openssl call costs ~100ms)."""
+    if not _REAL_CA:
+        from acctsw.sessionca import SessionCA
+        _REAL_CA.append(SessionCA())
+    return _REAL_CA[0]
+
+
+class FakeCA:
+    """The SessionCA surface: real TLS material, fake bundle files, counted close()."""
+
+    def __init__(self, pem=None):
+        self.closes = 0
+        self.pem = pem
+
+    def ca_pem(self):
+        return self.pem if self.pem is not None else real_ca().ca_pem()
+
+    def server_context(self):
+        return real_ca().server_context()
+
+    def bundle_paths(self, environ):
+        self.bundle_base = dict(environ)
+        return {"NODE_EXTRA_CA_CERTS": "/ca/node.pem", "SSL_CERT_FILE": "/ca/full.pem",
+                "REQUESTS_CA_BUNDLE": "/ca/full.pem", "CURL_CA_BUNDLE": "/ca/full.pem"}
+
+    def close(self):
+        self.closes += 1
+
+
 class FakeProxy:
-    def __init__(self, decide=None, **_kw):
+    def __init__(self, decide=None, **kw):
+        self.kw = kw
         self.decide = decide
         self.seat = Seat("", None)
         self.stops = 0
@@ -212,6 +247,8 @@ class Clock:
 
 def make(ctx, home="home@x", **kw):
     clock = Clock()
+    kw.setdefault("ca", FakeCA())
+    kw.setdefault("environ", {})
     swap = seatswap.SeatSwap(ctx, home, proxy_factory=FakeProxy, clock=clock, **kw)
     return swap, swap.proxy, clock
 
@@ -222,7 +259,8 @@ def test_start_binds_home_passthrough_and_env_points_at_the_proxy(ctx):
     assert swap.bound() == "home@x"
     assert swap.start() == "http://127.0.0.1:40404/s3cret" and len(proxy.binds) == 1
     env = swap.env({"PATH": "/bin", "NO_PROXY": "corp.example"})
-    assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:40404/s3cret"
+    assert env["HTTPS_PROXY"] == env["https_proxy"] == "http://127.0.0.1:40404/s3cret"
+    assert "ANTHROPIC_BASE_URL" not in env
     assert env["NO_PROXY"].split(",") == ["corp.example", "127.0.0.1", "localhost"]
     assert env["no_proxy"] == "127.0.0.1,localhost"
     assert env["PATH"] == "/bin"
@@ -378,7 +416,7 @@ def test_stop_releases_a_waiting_proxy_thread(ctx):
 
 
 def test_constructed_without_a_home_until_set_home(ctx):
-    swap = seatswap.SeatSwap(ctx, proxy_factory=FakeProxy)
+    swap = seatswap.SeatSwap(ctx, proxy_factory=FakeProxy, ca=FakeCA())
     assert swap.proxy.running and swap.bound() is None and swap.proxy.binds == []
     assert swap.maintain() is None
     swap.set_home("a@x")
@@ -398,7 +436,7 @@ def test_a_proxy_that_cannot_bind_raises_and_leaks_nothing(ctx):
             raise OSError("bind refused")
     before = len(os.listdir("/dev/fd"))
     with pytest.raises(OSError):
-        seatswap.SeatSwap(ctx, "a@x", proxy_factory=Broken)
+        seatswap.SeatSwap(ctx, "a@x", proxy_factory=Broken, ca=FakeCA())
     assert len(os.listdir("/dev/fd")) == before
 
 
@@ -509,7 +547,8 @@ def test_preflight_verdict_is_cached_per_upstream_for_ten_minutes(ctx):
     assert swap.preflight() == "tls: certificate verify failed" and len(calls) == 2
     proxy.preflight_reason = None
     assert swap.preflight() == "tls: certificate verify failed"   # a failure is cached too
-    other = seatswap.SeatSwap(ctx, "home@x", proxy_factory=FakeProxy, upstream="https://gw.example")
+    other = seatswap.SeatSwap(ctx, "home@x", proxy_factory=FakeProxy, upstream="https://gw.example",
+                              ca=FakeCA())
     assert other.preflight() is None                             # its own upstream, its own verdict
     cache = json.loads((ctx.data_dir / seatswap.PREFLIGHT_CACHE).read_text())
     assert set(cache) == {seatswap.UPSTREAM, "https://gw.example"}
@@ -599,3 +638,134 @@ def test_a_hit_after_stop_never_writes_to_a_reused_descriptor(ctx):
     finally:
         for fd in fds:
             os.close(fd)
+
+
+# --- transport v2: HTTPS_PROXY interception with a session CA -----------------------------------
+
+def test_env_routes_https_through_the_proxy_and_trusts_the_session_ca(ctx):
+    ca = FakeCA()
+    swap, _, _ = make(ctx, ca=ca)
+    base = {"HTTPS_PROXY": "http://corp:3128", "https_proxy": "http://corp:3128",
+            "ANTHROPIC_BASE_URL": "https://api.anthropic.com", "HTTP_PROXY": "http://corp:3128",
+            "NODE_EXTRA_CA_CERTS": "/user/extra.pem", "TERM": "xterm"}
+    env = swap.env(base)
+    assert env["HTTPS_PROXY"] == env["https_proxy"] == swap.proxy_url
+    assert env["ANTHROPIC_BASE_URL"] == "https://api.anthropic.com"   # the user's, untouched
+    assert env["HTTP_PROXY"] == "http://corp:3128" and env["TERM"] == "xterm"
+    assert env["NODE_EXTRA_CA_CERTS"] == "/ca/node.pem" and env["SSL_CERT_FILE"] == "/ca/full.pem"
+    assert env["REQUESTS_CA_BUNDLE"] == env["CURL_CA_BUNDLE"] == "/ca/full.pem"
+    assert ca.bundle_base["NODE_EXTRA_CA_CERTS"] == "/user/extra.pem"   # merged from the user's
+    assert "ANTHROPIC_BASE_URL" not in swap.env({"PATH": "/bin"})
+
+
+def test_env_takes_anthropic_out_of_no_proxy_and_keeps_the_rest(ctx):
+    swap, _, _ = make(ctx)
+    entries = ["corp.example", "api.anthropic.com", ".anthropic.com", "*.anthropic.com",
+               "anthropic.com", "API.Anthropic.COM:443", " 10.0.0.0/8", "notanthropic.com",
+               "anthropic.com.evil.example", "pi.anthropic.com", "[::1]", "localhost"]
+    env = swap.env({"NO_PROXY": ",".join(entries), "no_proxy": "anthropic.com"})
+    assert env["NO_PROXY"].split(",") == ["corp.example", "10.0.0.0/8", "notanthropic.com",
+                                          "anthropic.com.evil.example", "pi.anthropic.com",
+                                          "[::1]", "localhost",
+                                          "127.0.0.1"]
+    assert env["no_proxy"] == "127.0.0.1,localhost"
+
+
+@pytest.mark.parametrize("environ, expected", [
+    ({"HTTPS_PROXY": "http://corp:3128", "ALL_PROXY": "socks5://x:1"}, "http://corp:3128"),
+    ({"https_proxy": "http://lower:8080"}, "http://lower:8080"),
+    ({"ALL_PROXY": "http://all:1"}, "http://all:1"),
+    ({"all_proxy": "http://all-lower:1"}, "http://all-lower:1"),
+    ({"HTTPS_PROXY": "  ", "HTTP_PROXY": "http://plain:1"}, None),
+    ({}, None),
+])
+def test_the_users_own_proxy_becomes_the_upstream_proxy(ctx, environ, expected):
+    ca = FakeCA()
+    swap, proxy, _ = make(ctx, ca=ca, environ=environ)
+    assert swap.upstream_proxy == expected
+    assert proxy.kw["upstream_proxy"] == expected and proxy.kw["ca"] is ca
+    assert proxy.kw["on_tls_reject"] == swap._on_tls_reject
+
+
+def test_a_client_rejecting_the_ca_flags_and_wakes_once(ctx):
+    import select
+    swap, proxy, _ = make(ctx)
+    assert not swap.tls_rejected()
+    proxy.kw["on_tls_reject"]("alert unknown ca")
+    proxy.kw["on_tls_reject"]("alert unknown ca")
+    assert swap.tls_rejected()
+    assert select.select([swap.wake_fd], [], [], 1)[0]
+    assert os.read(swap.wake_fd, 64) == b"!"
+    swap.stop()
+
+
+def test_stop_closes_the_session_ca_once(ctx):
+    ca = FakeCA()
+    swap, _, _ = make(ctx, ca=ca)
+    swap.stop()
+    swap.stop()
+    assert ca.closes == 1
+
+
+def test_a_failing_session_ca_raises_and_leaks_nothing(ctx):
+    from acctsw.sessionca import SessionCAError
+
+    def broken():
+        raise SessionCAError("openssl unavailable: FileNotFoundError")
+    before = len(os.listdir("/dev/fd"))
+    with pytest.raises(SessionCAError):
+        seatswap.SeatSwap(ctx, "a@x", proxy_factory=FakeProxy, ca_factory=broken, environ={})
+    assert len(os.listdir("/dev/fd")) == before
+
+
+def test_a_proxy_that_cannot_start_closes_the_ca_it_was_given_by_the_factory(ctx):
+    built = []
+
+    class Broken(FakeProxy):
+        def start(self):
+            raise OSError("bind refused")
+
+    def factory():
+        built.append(FakeCA())
+        return built[-1]
+    with pytest.raises(OSError):
+        seatswap.SeatSwap(ctx, "a@x", proxy_factory=Broken, ca_factory=factory, environ={})
+    assert built[0].closes == 1
+
+
+def test_missing_openssl_turns_it_off(ctx, tmp_path, monkeypatch):
+    monkeypatch.setattr(seatswap, "OPENSSL", str(tmp_path / "no-openssl"))
+    assert seatswap.gate(ctx, {}, cwd=tmp_path) == "openssl missing"
+
+
+@pytest.mark.parametrize("url, gated", [
+    ("https://api.anthropic.com", False), ("https://api.anthropic.com/", False),
+    ("https://API.anthropic.com:443", False), ("http://api.anthropic.com", True),
+    ("https://api.anthropic.com.evil.example", True), ("https://gateway.example", True),
+    ("https://api.anthropic.com:8443", True), ("not a url", True),
+])
+def test_a_first_party_base_url_does_not_gate(ctx, tmp_path, url, gated):
+    assert (seatswap.gate(ctx, {"ANTHROPIC_BASE_URL": url}, cwd=tmp_path) is not None) is gated
+    path = ctx._claude_real / "settings.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": url}}))
+    assert (seatswap.gate(ctx, {}, cwd=tmp_path) is not None) is gated
+
+
+def test_preflight_self_test_passes_with_the_session_ca(ctx):
+    swap, _, _ = make(ctx)
+    assert swap._ca_selftest() is None
+    assert swap.preflight() is None
+
+
+def test_preflight_self_test_fails_when_the_ca_is_not_the_servers(ctx, tmp_path):
+    from acctsw.sessionca import SessionCA
+    other = SessionCA()
+    try:
+        swap, proxy, _ = make(ctx, ca=FakeCA(pem=other.ca_pem()))
+        calls = []
+        proxy.preflight = lambda: calls.append(1)
+        reason = swap.preflight()
+        assert reason and reason.startswith("local ca:") and calls == []
+    finally:
+        other.close()

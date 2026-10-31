@@ -109,8 +109,9 @@ def proxies(monkeypatch, tmp_path):
     """The feature ON through its real gate, with the fake proxy in place of the socket."""
     made = []
 
-    def factory(decide, *, decide_timeout, log):
+    def factory(decide, *, decide_timeout, log, **transport):   # ca, upstream_proxy, on_tls_reject
         made.append(FakeProxy(decide, decide_timeout=decide_timeout, log=log))
+        made[-1].transport = transport
         return made[-1]
 
     monkeypatch.setattr(seatswap, "_default_proxy", factory)
@@ -164,7 +165,8 @@ def test_limit_moves_the_live_child_to_a_same_kind_seat(seats, proxies):
     proxy = proxies[0]
     assert proxy.answered(calls[0]) == Seat(C2, f"tok-{C2}")    # replayed on c2
     assert spawn.stops == 0 and len(spawn.calls) == 1
-    assert spawn.envs[0]["ANTHROPIC_BASE_URL"] == BASE_URL
+    assert spawn.envs[0]["HTTPS_PROXY"] == BASE_URL and "ANTHROPIC_BASE_URL" not in spawn.envs[0]
+    assert spawn.envs[0]["NODE_EXTRA_CA_CERTS"]          # the child trusts the session CA
     assert "127.0.0.1" in spawn.envs[0]["NO_PROXY"].split(",")
     assert spawn.wakes[0] is not None
     st = ctx.load_state()

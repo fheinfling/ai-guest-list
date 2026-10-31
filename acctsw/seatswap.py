@@ -1,8 +1,12 @@
 """Main-thread glue for in-place seat switching: Claude keeps running while its requests move seats.
 
 The launcher owns one ``SeatSwap`` per supervised Claude run. Its ``SeatProxy`` (``seatproxy``,
-I/O only) sits between the child and the API on 127.0.0.1; the child keeps its own home-seat
-login, and the proxy swaps in another seat's access token only while that seat is bound. Every
+I/O only) is the child's HTTPS proxy on 127.0.0.1 (transport v2: ``HTTPS_PROXY``, never
+``ANTHROPIC_BASE_URL``, so Claude Code stays first-party). It terminates TLS for api.anthropic.com
+only, with a per-run ``SessionCA`` the child trusts through its CA bundle variables, and tunnels
+every other host untouched (chained to the user's own proxy, if any). The child keeps its own
+home-seat login, and the proxy swaps in another seat's access token only while that seat is bound.
+A child that rejects the session CA flips ``tls_rejected()`` and wakes the launcher. Every
 decision is made here, on the launcher's thread:
 
 - the proxy thread posts a ``Hit`` (a limit or a 401) and blocks up to ``decide_timeout`` seconds;
@@ -14,11 +18,11 @@ decision is made here, on the launcher's thread:
   "handover" restart once the proxy is idle. This app never refreshes a token itself.
 
 Gates (``gate``/``enabled``): the setting ``in_place_switch``, a falsy ``ACCTSW_IN_PLACE_SWITCH``
-(0/false/no/off), and any configuration that already routes or authenticates Claude differently:
+(0/false/no/off), no ``/usr/bin/openssl`` (no session CA), and any configuration that already routes or authenticates Claude differently:
 the env, or the ``env``/``apiKeyHelper`` of a Claude settings source (user and project
 settings.json/settings.local.json, managed-settings.json and managed-settings.d/*.json, and the
-child's own ``--settings <file|json>``; one that can't be read gates too) naming a base URL, an API
-key or token, Bedrock/Vertex/Foundry, or a key helper. Everything this module can't serve falls
+child's own ``--settings <file|json>``; one that can't be read gates too) naming a base URL other
+than https://api.anthropic.com, an API key or token, Bedrock/Vertex/Foundry, or a key helper. Everything this module can't serve falls
 back to the restart path.
 
 Eligibility (``eligible``): the seat's Keychain item (quarantined homes have none), its access
@@ -36,18 +40,22 @@ Additions to the frozen interface (nothing in it changed): ``gate()`` names why 
 idempotent; ``bind(seat)`` rebinds without a hit; ``bound()`` is the billed seat's email (None
 before any bind); ``answer()`` returns whether the reply was accepted; ``pick()`` chooses (and by
 default spends the approval for) the next seat, by the same rules ``maintain`` uses;
-``preflight()`` and ``proxy_used()`` delegate to the proxy's ``preflight()``/``messages_seen()``.
+``preflight()`` adds a local session-CA handshake self-test to the proxy's (cached) reachability
+check; ``proxy_used()`` is the proxy's ``messages_seen() > 0``; ``tls_rejected()``.
 """
 from __future__ import annotations
 
 import json
 import os
+import socket
+import ssl
 import threading
 import time
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 from . import seatkind
 from .keychain import KeychainError
@@ -60,6 +68,9 @@ MIN_TTL = timedelta(minutes=15)
 MAINTAIN_EVERY_S = 60.0     # at most one Keychain read of the bound seat per minute
 HANDOVER_IDLE_S = 5.0       # a handover restart waits for this much proxy silence
 UPSTREAM = "https://api.anthropic.com"
+API_HOST = "api.anthropic.com"
+OPENSSL = "/usr/bin/openssl"   # SessionCA's tool; present on every Mac. Module-level for tests.
+SELFTEST_TIMEOUT_S = 5.0
 PREFLIGHT_CACHE = "seatproxy-preflight.json"
 PREFLIGHT_TTL = timedelta(minutes=10)
 SWITCH_ENV = "ACCTSW_IN_PLACE_SWITCH"
@@ -93,9 +104,17 @@ def _flag(value: Any) -> bool:
     return value is not None and str(value).strip().lower() not in ("", *FALSY)
 
 
+def _first_party(url: str) -> bool:
+    try:
+        parts = urlsplit(url.strip())
+        return parts.scheme == "https" and parts.hostname == API_HOST and parts.port in (None, 443)
+    except ValueError:
+        return False
+
+
 def _env_gate(env: dict) -> str | None:
     for name in GATE_ENV:
-        if _set(env.get(name)):
+        if _set(env.get(name)) and not (name == "ANTHROPIC_BASE_URL" and _first_party(env[name])):
             return name
     for name in GATE_FLAGS:
         if _flag(env.get(name)):
@@ -166,6 +185,8 @@ def gate(ctx, environ=os.environ, *, cwd: Path | str | None = None, args=()) -> 
         return f"{SWITCH_ENV}={switch}"
     if not ctx.load_state().settings().get("in_place_switch", True):
         return "setting off"
+    if not os.access(OPENSSL, os.X_OK):
+        return "openssl missing"   # no session CA, so no interception
     found = _env_gate(environ)
     if found:
         return f"env {found}"
@@ -252,13 +273,37 @@ class _Ask:
     done: bool = False
 
 
-def _default_proxy(decide, *, decide_timeout: float, log, upstream: str = UPSTREAM):
+def _default_proxy(decide, *, decide_timeout: float, log, upstream: str = UPSTREAM, **transport):
     from .seatproxy import SeatProxy
-    return SeatProxy(decide, upstream=upstream, decide_timeout=decide_timeout, log=log)
+    return SeatProxy(decide, upstream=upstream, decide_timeout=decide_timeout, log=log, **transport)
+
+
+def _default_ca():
+    from .sessionca import SessionCA
+    return SessionCA((API_HOST,), openssl=OPENSSL)
+
+
+def _upstream_proxy(environ) -> str | None:
+    """The proxy the user's own traffic to api.anthropic.com went through, if any: ours chains
+    to it, since HTTPS_PROXY now points the child at us."""
+    for name in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+        if _set(environ.get(name)):
+            return environ[name].strip()
+    return None
+
+
+def _routes_api(entry: str) -> bool:
+    """Whether a NO_PROXY entry would send api.anthropic.com around the proxy."""
+    host = entry.strip().lower()
+    if host.startswith("[") or host.count(":") > 1:
+        return False   # an IPv6 literal, never a DNS name
+    host = host.split(":", 1)[0].lstrip("*").lstrip(".")
+    return bool(host) and (API_HOST == host or API_HOST.endswith("." + host))
 
 
 class SeatSwap:
     def __init__(self, ctx, home_email: str | None = None, *, proxy=None, proxy_factory=None,
+                 ca=None, ca_factory=None, environ=None,
                  decide_timeout: float = 10.0, clock: Callable[[], float] = time.monotonic,
                  log: Callable[..., None] = _noop, upstream: str = UPSTREAM):
         self._ctx = ctx
@@ -273,34 +318,47 @@ class SeatSwap:
         self._handover = False
         self.third_seat_moves = 0
         self.upstream = upstream
-        self.base_url: str | None = None
+        self.proxy_url: str | None = None
+        self._tls_rejected = False
+        self.upstream_proxy = _upstream_proxy(os.environ if environ is None else environ)
         r, w = os.pipe()
         os.set_blocking(r, False)
         os.set_blocking(w, False)
         self.wake_fd, self._wake_w = r, w
         self._stopped = False
+        self.ca = ca
+        self.proxy = None
         try:
             if proxy is not None:
                 self.proxy = proxy
-            elif proxy_factory is not None:
-                self.proxy = proxy_factory(self._decide, decide_timeout=decide_timeout, log=log)
             else:
-                extra = {} if upstream == UPSTREAM else {"upstream": upstream}
-                self.proxy = _default_proxy(self._decide, decide_timeout=decide_timeout, log=log,
-                                            **extra)
+                if self.ca is None:   # SessionCAError (no openssl, a failing one) propagates
+                    self.ca = (ca_factory or _default_ca)()
+                transport = {"ca": self.ca, "upstream_proxy": self.upstream_proxy,
+                             "on_tls_reject": self._on_tls_reject}
+                if proxy_factory is not None:
+                    self.proxy = proxy_factory(self._decide, decide_timeout=decide_timeout,
+                                               log=log, **transport)
+                else:
+                    if upstream != UPSTREAM:
+                        transport["upstream"] = upstream
+                    self.proxy = _default_proxy(self._decide, decide_timeout=decide_timeout,
+                                                log=log, **transport)
             self.start()
         except BaseException:
             self._close_fds()
+            if self.ca is not None and ca is None:
+                self.ca.close()
             raise
 
     # lifecycle ---------------------------------------------------------------------------------
     def start(self) -> str:
         """Start the proxy (the constructor already did; repeat calls return its URL)."""
-        if not self.base_url:
-            self.base_url = self.proxy.start()
+        if not self.proxy_url:
+            self.proxy_url = self.proxy.start()
             if self.home:
                 self.proxy.bind(_seat(self.home, None))
-        return self.base_url
+        return self.proxy_url
 
     def _close_fds(self) -> None:
         for fd in (self.wake_fd, self._wake_w):
@@ -318,19 +376,44 @@ class SeatSwap:
         try:
             self.proxy.stop()
         finally:
-            self._close_fds()
+            try:
+                if self.ca is not None:
+                    self.ca.close()
+            finally:
+                self._close_fds()
 
     def env(self, base: dict) -> dict:
-        """The child's environment: requests go through the proxy, which no HTTP proxy may eat."""
-        if not self.base_url:
+        """The child's environment. HTTPS goes through the proxy (HTTPS_PROXY), which intercepts
+        only api.anthropic.com and tunnels every other host untouched; the child trusts the
+        session CA through its CA bundle variables. No ANTHROPIC_BASE_URL: Claude Code keeps
+        talking to api.anthropic.com as itself. Nothing else the user set is removed."""
+        if not self.proxy_url:
             raise RuntimeError("SeatSwap.env() before start()")
         out = dict(base)
-        out["ANTHROPIC_BASE_URL"] = self.base_url
+        out["HTTPS_PROXY"] = out["https_proxy"] = self.proxy_url
+        if self.ca is not None:
+            out.update(self.ca.bundle_paths(base))
         for name in ("NO_PROXY", "no_proxy"):
             parts = [p.strip() for p in str(out.get(name) or "").split(",") if p.strip()]
+            parts = [p for p in parts if not _routes_api(p)]
             parts += [h for h in ("127.0.0.1", "localhost") if h not in parts]
             out[name] = ",".join(parts)
         return out
+
+    def _on_tls_reject(self, reason: str) -> None:
+        """Proxy thread: the child refused the session CA. The launcher stops using the swap."""
+        with self._cv:
+            if self._tls_rejected or self._closed:
+                return
+            self._tls_rejected = True
+            self._log("seatswap: client rejected the session CA", reason=str(reason)[:200])
+            try:
+                os.write(self._wake_w, b"!")
+            except OSError:
+                pass
+
+    def tls_rejected(self) -> bool:
+        return self._tls_rejected
 
     def set_home(self, email: str) -> None:
         """After a restart onto ``email``'s own login: that seat is home and passthrough again."""
@@ -359,6 +442,9 @@ class SeatSwap:
         cache = cache if isinstance(cache, dict) else {}
         entry = cache.get(self.upstream)
         at = parse_iso(entry.get("at")) if isinstance(entry, dict) else None
+        local = self._ca_selftest()
+        if local:
+            return local
         if at is not None and timedelta(0) <= now() - at < PREFLIGHT_TTL:
             return None if entry.get("ok") is True else str(entry.get("reason") or "preflight failed")
         reason = self.proxy.preflight()
@@ -368,6 +454,41 @@ class SeatSwap:
         except OSError:
             pass   # an uncached verdict is still a verdict
         return reason
+
+    def _ca_selftest(self) -> str | None:
+        """One TLS handshake, in process over a socketpair (no port), between the proxy's server
+        context and a client that trusts only the session CA, for api.anthropic.com."""
+        if self.ca is None:
+            return None
+        server_sock, client_sock = socket.socketpair()
+        failure: list[str] = []
+        try:
+            server_sock.settimeout(SELFTEST_TIMEOUT_S)
+            client_sock.settimeout(SELFTEST_TIMEOUT_S)
+            client_ctx = ssl.create_default_context(cadata=self.ca.ca_pem())   # nothing else
+            server_ctx = self.ca.server_context()
+
+            def serve():
+                try:
+                    server_ctx.wrap_socket(server_sock, server_side=True).close()
+                except (OSError, ssl.SSLError) as exc:
+                    failure.append(f"server: {exc.__class__.__name__}")
+            worker = threading.Thread(target=serve, daemon=True)
+            worker.start()
+            try:
+                client_ctx.wrap_socket(client_sock, server_hostname=API_HOST).close()
+            except ssl.SSLCertVerificationError as exc:
+                return f"local ca: {getattr(exc, 'verify_message', None) or exc}"[:200]
+            except (OSError, ssl.SSLError) as exc:
+                return f"local ca: {exc.__class__.__name__}: {exc}"[:200]
+            finally:
+                worker.join(SELFTEST_TIMEOUT_S)
+        except (OSError, ssl.SSLError, ValueError) as exc:   # ValueError: unparseable CA PEM
+            return f"local ca: {exc.__class__.__name__}: {exc}"[:200]
+        finally:
+            server_sock.close()
+            client_sock.close()
+        return f"local ca: {failure[0]}" if failure else None
 
     def proxy_used(self) -> bool:
         """Has the child sent a /v1/messages request through the proxy yet?"""
