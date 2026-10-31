@@ -1,5 +1,7 @@
 """Gaps found by the diff-scoped mutation sweep of acctsw/launcher.py: in-place hops, crossings,
 manual choices, auth hits and handover. Reuses the fakes of test_launcher_inplace."""
+import os
+
 import pytest
 
 from acctsw import launcher as L
@@ -279,3 +281,104 @@ def test_a_second_limit_inside_the_block_window_is_passed_straight_through(seats
     assert _run(seats, spawn, swap, notify=notes.append) == 0
     assert swap.answers == [(hits[0], None), (hits[1], None)]
     assert sum("no other claude seat is ready" in n for n in notes) == 1
+
+
+# --- round 3: a click across business/personal spends the approval it rode on ---------------------
+
+@pytest.mark.crossings
+def test_a_click_across_kinds_on_a_once_approval_spends_it(seats, tokens):
+    """The session asked to cross earlier and the user said "once"; then they clicked that seat.
+    The click moves the session in place and the "once" is gone: a later automatic move from the
+    same seat across the line asks again."""
+    from acctsw import seatkind
+    _plans(seats, **{C1: "team", C2: "max", C3: "max"})
+    _approve(seats, C1, C2, "once")
+    swap = FakeSwap()
+    spawn = Spawn(([lambda: _click(seats, C2), None], 0))
+    assert _run(seats, spawn, swap) == 0
+    assert swap.binds == [Seat(C2, "tok-c2")]
+    assert not seatkind.approved(seats.load_state(), "claude", C1, C2)
+
+
+def _codex_kinds(ctx, approve=True):
+    from acctsw import seatkind
+    from tests.test_launcher import _two_codex
+    st = _two_codex(ctx)
+    st.get_seat("codex", "a@x.com")["plan"] = "team"
+    st.get_seat("codex", "b@x.com")["plan"] = "plus"
+    if approve:
+        seatkind.approve(st, "codex", "a@x.com", "b@x.com", "once")
+    st.save()
+
+
+def _codex_click_spawn(ctx, calls, between=lambda: None):
+    from acctsw.switch import switch
+
+    def spawn(argv, on_output, on_tick=None, *, env=None):
+        calls.append(list(argv))
+        if len(calls) == 1:
+            with ctx.locked():
+                switch(ctx, ctx.load_state(), "codex", "b@x.com", manual=True)
+            assert on_tick()
+            between()
+            return -15
+        return 0
+    return spawn
+
+
+@pytest.mark.crossings
+def test_a_codex_click_across_kinds_spends_the_once_approval_at_the_commit(ctx):
+    from acctsw import seatkind
+    _codex_kinds(ctx)
+    calls = []
+    assert run(ctx, "codex", [], spawn=_codex_click_spawn(ctx, calls)) == 0
+    st = ctx.load_state()
+    assert len(calls) == 2 and st.active("codex") == "b@x.com"
+    assert not seatkind.approved(st, "codex", "a@x.com", "b@x.com")
+
+
+@pytest.mark.crossings
+def test_a_codex_click_whose_approval_lapses_while_stopping_resumes_where_it_was(ctx):
+    _codex_kinds(ctx)
+    homes = []
+
+    def lapse():
+        st = ctx.load_state()
+        st.data["tools"]["codex"]["crossings"]["approvals"].clear()
+        st.save()
+
+    calls = []
+    inner = _codex_click_spawn(ctx, calls, between=lapse)
+
+    def spawn(argv, on_output, on_tick=None, *, env=None):
+        homes.append(os.environ.get("CODEX_HOME"))
+        return inner(argv, on_output, on_tick, env=env)
+
+    notes = []
+    assert run(ctx, "codex", [], spawn=spawn, notify=notes.append) == 0
+    assert len(calls) == 2 and homes[1] == str(ctx.codex_home("a@x.com"))
+    assert "resume" in calls[1]   # the session carries on, not afresh
+    assert any("continue this session on b@x.com" in n for n in notes)   # asked again
+
+
+@pytest.mark.crossings
+def test_a_codex_click_across_kinds_without_approval_asks_and_never_restarts(ctx):
+    """N8 where in place can't serve the click: the child is not stopped for a move that would
+    only be refused at the commit. The session asks instead."""
+    from acctsw.switch import switch
+    _codex_kinds(ctx, approve=False)
+    calls, stopped = [], []
+
+    def spawn(argv, on_output, on_tick=None, *, env=None):
+        calls.append(list(argv))
+        if len(calls) > 1:
+            return 0   # restarted: the guard below fails, and nothing clicks again
+        with ctx.locked():
+            switch(ctx, ctx.load_state(), "codex", "b@x.com", manual=True)
+        stopped.append(on_tick())
+        return 0
+
+    notes = []
+    assert run(ctx, "codex", [], spawn=spawn, notify=notes.append) == 0
+    assert stopped == [False] and len(calls) == 1
+    assert any("continue this session on b@x.com" in n for n in notes)
