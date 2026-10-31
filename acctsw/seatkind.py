@@ -27,6 +27,7 @@ crossing hours later. "always" stays until ``deny`` revokes it.
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta
 
 from .util import iso, now, parse_iso
@@ -44,10 +45,12 @@ def kind(seat) -> str:
     plan = seat.get("plan") if isinstance(seat, dict) else seat
     if not isinstance(plan, str):
         return "unknown"
-    plan = plan.strip().lower()
-    if plan in BUSINESS:
+    # Providers spell plans freely ("Team", "self_serve_business_prolite", "max_5x"), so judge by the
+    # words in the name. A business word wins: a business plan that is also "pro" is still business.
+    words = set(re.split(r"[^a-z0-9]+", plan.strip().lower()))
+    if words & BUSINESS:
         return "business"
-    if plan in PERSONAL:
+    if words & PERSONAL:
         return "personal"
     return "unknown"
 

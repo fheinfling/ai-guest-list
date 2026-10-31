@@ -32,7 +32,7 @@ def rest(state, email, hours=2):
     ("Free", "personal"), ("Pro", "personal"), ("Max", "personal"), ("max", "personal"),
     ("Plus", "personal"), ("Edu", "business"), ("TEAM", "business"),
     (None, "unknown"), ("", "unknown"), ("Unlimited", "unknown"),
-    ("Claude_max_20x", "unknown"),
+    ("Claude_max_20x", "personal"),
 ])
 def test_kind_comes_from_the_plan_label(plan, expected):
     assert seatkind.kind({"plan": plan}) == expected
@@ -302,3 +302,16 @@ def test_bridge_auto_switch_spends_a_once_approval(ctx, monkeypatch):
     assert result and result["status"] == "switched" and result["to"] == "seat1@test.example"
     assert not seatkind.approved(ctx.load_state(), "codex", "seat0@test.example",
                                  "seat1@test.example")
+
+
+@pytest.mark.parametrize("plan,expected", [
+    ("Team", "business"), ("self_serve_business_prolite", "business"), ("Self_Serve_Business_Prolite", "business"),
+    ("enterprise", "business"), ("team-premium", "business"), ("business pro", "business"),
+    ("Max", "personal"), ("max_5x", "personal"), ("Plus", "personal"), ("pro_lite", "personal"),
+    ("free", "personal"),
+    ("prolite", "unknown"), ("teammate", "unknown"), ("", "unknown"), (None, "unknown"),
+])
+def test_kind_reads_the_words_in_free_form_plan_names(plan, expected):
+    """Providers spell plans freely; a ChatGPT "self_serve_business_prolite" seat is business, not unknown
+    (unknown would make every automatic hop between a user's own business seats ask for approval)."""
+    assert seatkind.kind({"plan": plan}) == expected

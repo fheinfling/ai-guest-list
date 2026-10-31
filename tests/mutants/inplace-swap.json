@@ -1000,5 +1000,23 @@
   "test": [
    "tests/test_gaps_glue.py::test_a_process_no_proxy_star_gates_off"
   ]
+ },
+ {
+  "label": "kind: exact plan names only (no word split)",
+  "file": "acctsw/seatkind.py",
+  "old": "    words = set(re.split(r\"[^a-z0-9]+\", plan.strip().lower()))",
+  "new": "    words = {plan.strip().lower()}",
+  "test": [
+   "tests/test_seatkind.py::test_kind_reads_the_words_in_free_form_plan_names"
+  ]
+ },
+ {
+  "label": "kind: personal word wins over business word",
+  "file": "acctsw/seatkind.py",
+  "old": "    if words & BUSINESS:\n        return \"business\"\n    if words & PERSONAL:\n        return \"personal\"",
+  "new": "    if words & PERSONAL:\n        return \"personal\"\n    if words & BUSINESS:\n        return \"business\"",
+  "test": [
+   "tests/test_seatkind.py::test_kind_reads_the_words_in_free_form_plan_names"
+  ]
  }
 ]
