@@ -1,0 +1,164 @@
+[
+ {
+  "label": "proxy: a broken stream is resent after the first byte reached the client",
+  "file": "acctsw/seatproxy.py",
+  "old": "                if reply.started:\n                    # The client holds",
+  "new": "                if False:\n                    # The client holds",
+  "test": [
+   "tests/test_seatproxy.py::test_no_replay_once_the_response_started"
+  ]
+ },
+ {
+  "label": "proxy: any 429 counts as a seat limit (transient 429s replayed)",
+  "file": "acctsw/seatproxy.py",
+  "old": "return \"limit\" if verdict == \"rejected\" else None",
+  "new": "return \"limit\"",
+  "test": [
+   "tests/test_seatproxy.py::test_transient_429_and_529_pass_through"
+  ]
+ },
+ {
+  "label": "proxy: the path allowlist is dropped (every request carries the seat token)",
+  "file": "acctsw/seatproxy.py",
+  "old": "inject = method == \"POST\" and urlsplit(path).path in INJECT_PATHS",
+  "new": "inject = True",
+  "test": [
+   "tests/test_seatproxy.py::test_only_message_posts_carry_the_seat_token"
+  ]
+ },
+ {
+  "label": "proxy: the per-run secret is not checked",
+  "file": "acctsw/seatproxy.py",
+  "old": "secrets.compare_digest(head.encode(), self._secret.encode())",
+  "new": "True",
+  "test": [
+   "tests/test_seatproxy.py::test_requests_without_the_secret_are_forbidden"
+  ]
+ },
+ {
+  "label": "proxy: a 401 on the home seat (client's own login) calls decide",
+  "file": "acctsw/seatproxy.py",
+  "old": "                if kind == \"auth\" and seat.token is None:\n                    kind = None",
+  "new": "                if False:\n                    kind = None",
+  "test": [
+   "tests/test_seatproxy.py::test_home_401_passes_through_without_decide"
+  ]
+ },
+ {
+  "label": "proxy: one try per credential is not enforced",
+  "file": "acctsw/seatproxy.py",
+  "old": "if answer is not None and _key(answer) not in done:",
+  "new": "if answer is not None:",
+  "test": [
+   "tests/test_seatproxy.py::test_each_credential_is_tried_once"
+  ]
+ },
+ {
+  "label": "proxy: the hard cap on upstream sends per request is removed",
+  "file": "acctsw/seatproxy.py",
+  "old": "if kind and not reply.started and len(tried) < MAX_TRIES:",
+  "new": "if kind and not reply.started:",
+  "test": [
+   "tests/test_seatproxy.py::test_upstream_sends_are_capped"
+  ]
+ },
+ {
+  "label": "proxy: a token reaches the logs as text (replay event)",
+  "file": "acctsw/seatproxy.py",
+  "old": "self._log(\"replay\", kind=kind, seat=_label(seat), token=tok(token),",
+  "new": "self._log(\"replay\", kind=kind, seat=_label(seat), token=token,",
+  "test": [
+   "tests/test_seatproxy.py::test_logs_never_carry_token_text"
+  ]
+ },
+ {
+  "label": "proxy: exception texts quoting a token are logged unredacted",
+  "file": "acctsw/seatproxy.py",
+  "old": "text = text.replace(s, f\"<{tok(s)}>\")",
+  "new": "text = text",
+  "test": [
+   "tests/test_seatproxy.py::test_logs_never_carry_token_text"
+  ]
+ },
+ {
+  "label": "proxy: decide is waited on without a timeout (limit never passes through)",
+  "file": "acctsw/seatproxy.py",
+  "old": "if not done.wait(self._decide_timeout):",
+  "new": "if not done.wait():",
+  "test": [
+   "tests/test_seatproxy.py::test_decide_timeout_passes_the_limit_through"
+  ]
+ },
+ {
+  "label": "proxy: an injected 401 without an answer is passed through instead of failing open",
+  "file": "acctsw/seatproxy.py",
+  "old": "return Seat(\"\", None)    # fail open",
+  "new": "return None    # fail open",
+  "test": [
+   "tests/test_seatproxy.py::test_injected_401_without_answer_fails_open"
+  ]
+ },
+ {
+  "label": "proxy: decide's answer is not bound for later requests",
+  "file": "acctsw/seatproxy.py",
+  "old": "                self.bind(answer)\n",
+  "new": "                pass\n",
+  "test": [
+   "tests/test_seatproxy.py::test_limit_replays_on_the_decided_seat_and_binds_it"
+  ]
+ },
+ {
+  "label": "proxy: the client's own Authorization goes out next to the injected seat token",
+  "file": "acctsw/seatproxy.py",
+  "old": "(token is not None and low in CLIENT_AUTH)",
+  "new": "False",
+  "test": [
+   "tests/test_seatproxy.py::test_message_posts_carry_the_bound_seat_token"
+  ]
+ },
+ {
+  "label": "proxy: SSE chunks are not flushed one by one",
+  "file": "acctsw/seatproxy.py",
+  "old": "self.wfile.write(f\"{len(data):x}\\r\\n\".encode() + data + b\"\\r\\n\" if self.chunked else data)\n        self.wfile.flush()",
+  "new": "self.wfile.write(f\"{len(data):x}\\r\\n\".encode() + data + b\"\\r\\n\" if self.chunked else data)",
+  "test": [
+   "tests/test_seatproxy.py::test_stream_is_flushed_per_chunk"
+  ]
+ },
+ {
+  "label": "proxy: a handler exception leaves the client without a 502",
+  "file": "acctsw/seatproxy.py",
+  "old": "reply.error(502, \"api_error\", \"seat proxy: internal error\")",
+  "new": "pass",
+  "test": [
+   "tests/test_seatproxy.py::test_handler_exception_answers_502_and_the_proxy_keeps_serving"
+  ]
+ },
+ {
+  "label": "proxy: a fresh connection that fails is retried (only a stale pooled one may be)",
+  "file": "acctsw/seatproxy.py",
+  "old": "if reused and not fresh:",
+  "new": "if not fresh:",
+  "test": [
+   "tests/test_seatproxy.py::test_connect_failure_answers_502_without_retry"
+  ]
+ },
+ {
+  "label": "proxy: a concurrent rebind is not followed (every request in a burst asks decide)",
+  "file": "acctsw/seatproxy.py",
+  "old": "if _key(current) != _key(seat) and _key(current) not in done:",
+  "new": "if False:",
+  "test": [
+   "tests/test_seatproxy.py::test_concurrent_rebind_is_followed_without_asking"
+  ]
+ },
+ {
+  "label": "proxy: after a decide timeout every request of the burst waits for its own timeout",
+  "file": "acctsw/seatproxy.py",
+  "old": "answer = self._ask(hit) if time.monotonic() >= self._stalled_until else None",
+  "new": "answer = self._ask(hit)",
+  "test": [
+   "tests/test_seatproxy.py::test_a_burst_waits_for_one_decide_timeout_only"
+  ]
+ }
+]
