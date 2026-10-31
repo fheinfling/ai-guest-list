@@ -48,8 +48,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import ssl
+import subprocess
 import threading
 import time
 from dataclasses import dataclass
@@ -84,6 +86,14 @@ GATE_FLAGS = ("CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_
 MANAGED_SETTINGS = Path("/Library/Application Support/ClaudeCode/managed-settings.json")
 MANAGED_SETTINGS_DIR = Path("/Library/Application Support/ClaudeCode/managed-settings.d")
 FALSY = ("0", "false", "no", "off")
+# Variables that, in a settings ``env`` block, override the ones we set inside Claude Code and so
+# defeat the interception (in the process env, HTTPS_PROXY and NODE_EXTRA_CA_CERTS are chained
+# and merged instead).
+SETTINGS_TLS_ENV = ("NODE_EXTRA_CA_CERTS", "CLAUDE_CODE_CERT_STORE", "HTTPS_PROXY", "https_proxy",
+                    "NODE_TLS_REJECT_UNAUTHORIZED")
+VERDICT_FILE = "seatswap-ca-verdict.json"
+VERDICT_TTL = timedelta(days=7)
+VERSION_TIMEOUT_S = 3.0
 
 
 def _noop(*_a, **_k) -> None:
@@ -167,8 +177,62 @@ def _settings_gate(where: str, data: dict) -> str | None:
     if _set(data.get("apiKeyHelper")):
         return f"{where} apiKeyHelper"
     env = data.get("env")
-    found = _env_gate(env) if isinstance(env, dict) else None
+    found = (_env_gate(env) or _settings_tls_gate(env)) if isinstance(env, dict) else None
     return f"{where} env {found}" if found else None
+
+
+def _settings_tls_gate(env: dict) -> str | None:
+    """A settings ``env`` entry that overrides our proxy or CA variables inside Claude Code."""
+    for name in SETTINGS_TLS_ENV:
+        if env.get(name) is not None and str(env[name]).strip():
+            return name
+    for name in ("NO_PROXY", "no_proxy"):
+        entries = [e.strip() for e in str(env.get(name) or "").split(",")]
+        if any(e == "*" or _routes_api(e) for e in entries):
+            return name
+    return None
+
+
+def _claude_key(environ) -> str | None:
+    """Identifies the claude binary a verdict is about: its realpath plus ``claude --version``
+    (path alone if the version can't be had in time). None when claude isn't on PATH."""
+    found = shutil.which("claude", path=environ.get("PATH") or os.defpath)
+    if not found:
+        return None
+    real = os.path.realpath(found)
+    try:
+        out = subprocess.run([real, "--version"], capture_output=True, text=True,
+                             timeout=VERSION_TIMEOUT_S, stdin=subprocess.DEVNULL).stdout.strip()
+    except (OSError, subprocess.SubprocessError, ValueError):
+        out = ""
+    return f"{real}\n{out}" if out else real
+
+
+def _verdicts(ctx) -> dict:
+    return _read_settings(Path(ctx.data_dir) / VERDICT_FILE)
+
+
+def _rejected_before(ctx, environ) -> bool:
+    """Whether this claude binary refused the session CA within ``VERDICT_TTL``."""
+    entries = _verdicts(ctx)
+    if not entries:
+        return False
+    key = _claude_key(environ)
+    at = parse_iso(entries.get(key)) if key and isinstance(entries.get(key), str) else None
+    return at is not None and timedelta(0) <= now() - at < VERDICT_TTL
+
+
+def _remember_rejection(ctx, environ) -> None:
+    key = _claude_key(environ)
+    if key is None:
+        return
+    entries = {k: v for k, v in _verdicts(ctx).items()
+               if isinstance(v, str) and (parse_iso(v) or now()) > now() - VERDICT_TTL}
+    entries[key] = iso(now())
+    try:
+        write_json(Path(ctx.data_dir) / VERDICT_FILE, entries, mode=0o600)
+    except OSError:
+        pass   # an unremembered verdict only costs one more try
 
 
 def _read_settings(path: Path) -> dict:
@@ -209,6 +273,8 @@ def gate(ctx, environ=os.environ, *, cwd: Path | str | None = None, args=()) -> 
     found = _env_gate(environ)
     if found:
         return f"env {found}"
+    if _rejected_before(ctx, environ):
+        return "client rejected the session certificate"
     cwd = Path(cwd) if cwd is not None else Path.cwd()
     for where, data in _cli_settings(args, cwd):
         if data is None:
@@ -339,7 +405,9 @@ class SeatSwap:
         self.upstream = upstream
         self.proxy_url: str | None = None
         self._tls_rejected = False
-        self.upstream_proxy = _upstream_proxy(os.environ if environ is None else environ)
+        self._upstream_worked = False
+        self._environ = os.environ if environ is None else environ
+        self.upstream_proxy = _upstream_proxy(self._environ)
         r, w = os.pipe()
         os.set_blocking(r, False)
         os.set_blocking(w, False)
@@ -412,11 +480,14 @@ class SeatSwap:
         out["HTTPS_PROXY"] = out["https_proxy"] = self.proxy_url
         if self.ca is not None:
             out.update(self.ca.bundle_paths(base))
+        parts: list[str] = []
         for name in ("NO_PROXY", "no_proxy"):
-            parts = [p.strip() for p in str(out.get(name) or "").split(",") if p.strip()]
-            parts = [p for p in parts if not _routes_api(p)]
-            parts += [h for h in ("127.0.0.1", "localhost") if h not in parts]
-            out[name] = ",".join(parts)
+            for p in str(out.get(name) or "").split(","):
+                p = p.strip()
+                if p and p not in parts and not _routes_api(p):
+                    parts.append(p)
+        parts += [h for h in ("127.0.0.1", "localhost") if h not in parts]
+        out["NO_PROXY"] = out["no_proxy"] = ",".join(parts)
         return out
 
     def _on_tls_reject(self, reason: str) -> None:
@@ -430,9 +501,26 @@ class SeatSwap:
                 os.write(self._wake_w, b"!")
             except OSError:
                 pass
+        # Outside the lock: asking claude for its version can take a moment.
+        _remember_rejection(self._ctx, self._environ)
 
     def tls_rejected(self) -> bool:
         return self._tls_rejected
+
+    def intercepts_ok(self) -> int:
+        """Successful intercepted TLS handshakes (the proxy's count)."""
+        return self.proxy.intercepts_ok()
+
+    def upstream_failing(self, n: int = 3) -> bool:
+        """The upstream has failed ``n`` times running and nothing has ever got through it.
+        The proxy only knows the streak since its last success, and ``messages_seen()`` counts
+        requests received, not answered, so "ever succeeded" is a latch kept here: set whenever
+        a poll (this one, or ``maintain``) sees a clean streak with messages seen. Callers poll
+        from the launcher loop, so a working session is latched long before it could fail."""
+        failures = self.proxy.upstream_failures()
+        if failures == 0 and self.proxy.messages_seen() > 0:
+            self._upstream_worked = True
+        return failures >= n and not self._upstream_worked
 
     def set_home(self, email: str) -> None:
         """After a restart onto ``email``'s own login: that seat is home and passthrough again."""
@@ -453,13 +541,18 @@ class SeatSwap:
         """Can the proxy reach the API (TLS included)? None when it can, else a short reason.
         The verdict is cached per upstream for ``PREFLIGHT_TTL`` in the data dir, so starting a
         terminal doesn't cost a TLS handshake each time."""
+        env = self._environ
+        key = json.dumps([self.upstream, self.upstream_proxy,
+                          str(env.get("NO_PROXY") or "") + "|" + str(env.get("no_proxy") or ""),
+                          str(env.get("SSL_CERT_FILE") or ""),
+                          str(env.get("NODE_EXTRA_CA_CERTS") or "")])
         path = Path(self._ctx.data_dir) / PREFLIGHT_CACHE
         try:
             cache = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             cache = {}
         cache = cache if isinstance(cache, dict) else {}
-        entry = cache.get(self.upstream)
+        entry = cache.get(key)
         at = parse_iso(entry.get("at")) if isinstance(entry, dict) else None
         local = self._ca_selftest()
         if local:
@@ -467,7 +560,7 @@ class SeatSwap:
         if at is not None and timedelta(0) <= now() - at < PREFLIGHT_TTL:
             return None if entry.get("ok") is True else str(entry.get("reason") or "preflight failed")
         reason = self.proxy.preflight()
-        cache[self.upstream] = {"ok": reason is None, "reason": reason, "at": iso(now())}
+        cache[key] = {"ok": reason is None, "reason": reason, "at": iso(now())}
         try:
             write_json(path, cache, mode=0o600)
         except OSError:
@@ -607,6 +700,7 @@ class SeatSwap:
         also needs ``third_seat`` (the caller's hop budget) and both settings on. Such a move
         counts in ``third_seat_moves``."""
         ctx = ctx or self._ctx
+        self.upstream_failing()   # keeps the "upstream has worked" latch current
         seat = self.proxy.bound()
         if seat.token is None or seat.email == self.home:
             self._handover = False

@@ -359,3 +359,144 @@ def test_pick_third_seat_settings_default_to_on(ctx):
     state.save()
     swap, _, _ = make(ctx)
     assert swap.pick(ctx, "home@x") == Seat("b@x", "b")
+
+
+# --- round 3: verdicts, settings TLS overrides, preflight key, upstream_failing, NO_PROXY -----------
+
+def _fake_claude(tmp_path, version="1.0.0"):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    exe = bin_dir / "claude"
+    exe.write_text(f"#!/bin/sh\necho {version}\n")
+    exe.chmod(0o755)
+    return {"PATH": str(bin_dir)}
+
+
+def test_a_tls_reject_is_remembered_for_that_claude_for_a_week(ctx, tmp_path):
+    env = _fake_claude(tmp_path)
+    assert seatswap.gate(ctx, env, cwd=tmp_path) is None
+    swap, _, _ = make(ctx, environ=env)
+    swap._on_tls_reject("alert unknown ca")
+    assert seatswap.gate(ctx, env, cwd=tmp_path) == "client rejected the session certificate"
+    _fake_claude(tmp_path, "2.0.0")                       # an upgraded claude gets a fresh try
+    assert seatswap.gate(ctx, env, cwd=tmp_path) is None
+    _fake_claude(tmp_path, "1.0.0")
+    assert seatswap.gate(ctx, env, cwd=tmp_path) is not None
+    path = ctx.data_dir / seatswap.VERDICT_FILE
+    [key] = json.loads(path.read_text())
+    path.write_text(json.dumps({key: iso(now() - timedelta(days=7, minutes=1))}))
+    assert seatswap.gate(ctx, env, cwd=tmp_path) is None  # expired
+    path.write_text(json.dumps({key: iso(now() - timedelta(days=6, hours=23))}))
+    assert seatswap.gate(ctx, env, cwd=tmp_path) is not None
+    swap.stop()
+
+
+def test_a_version_timeout_falls_back_to_the_path_alone(ctx, tmp_path, monkeypatch):
+    env = _fake_claude(tmp_path)
+    monkeypatch.setattr(seatswap, "VERSION_TIMEOUT_S", 0.0001)
+    (tmp_path / "bin" / "claude").write_text("#!/bin/sh\nsleep 2\n")
+    key = seatswap._claude_key(env)
+    assert key == str((tmp_path / "bin" / "claude").resolve())
+
+
+def test_no_claude_on_path_means_no_verdict_file(ctx, tmp_path):
+    swap, _, _ = make(ctx, environ={"PATH": str(tmp_path / "empty")})
+    swap._on_tls_reject("x")
+    assert not (ctx.data_dir / seatswap.VERDICT_FILE).exists()
+    swap.stop()
+
+
+@pytest.mark.parametrize("name,value", [
+    ("NODE_EXTRA_CA_CERTS", "/x.pem"), ("CLAUDE_CODE_CERT_STORE", "bundled"),
+    ("HTTPS_PROXY", "http://p:1"), ("https_proxy", "http://p:1"),
+    ("NODE_TLS_REJECT_UNAUTHORIZED", "0"), ("NO_PROXY", "a.com,anthropic.com"),
+    ("no_proxy", ".anthropic.com"), ("NO_PROXY", "*")])
+def test_settings_env_that_overrides_our_proxy_or_ca_turns_it_off(ctx, tmp_path, name, value):
+    ctx._claude_real.mkdir(parents=True, exist_ok=True)
+    for how in ("user", "project", "cli"):
+        proj = tmp_path / how
+        (proj / ".claude").mkdir(parents=True, exist_ok=True)
+        body = json.dumps({"env": {name: value}})
+        args = ()
+        if how == "user":
+            (ctx._claude_real / "settings.json").write_text(body)
+        elif how == "project":
+            (proj / ".claude" / "settings.local.json").write_text(body)
+        else:
+            args = ("--settings", body)
+        assert (seatswap.gate(ctx, {}, cwd=proj, args=args) or "").endswith(name), how
+        if how == "user":
+            (ctx._claude_real / "settings.json").unlink()
+
+
+def test_managed_settings_env_override_turns_it_off(ctx, tmp_path, monkeypatch):
+    d = tmp_path / "_managed" / "managed-settings.d"
+    d.mkdir(parents=True)
+    (d / "10.json").write_text(json.dumps({"env": {"NODE_EXTRA_CA_CERTS": "/corp.pem"}}))
+    assert seatswap.gate(ctx, {}, cwd=tmp_path).endswith("NODE_EXTRA_CA_CERTS")
+
+
+def test_process_env_proxy_and_ca_and_unrelated_settings_do_not_gate(ctx, tmp_path):
+    env = {"HTTPS_PROXY": "http://corp:3128", "NODE_EXTRA_CA_CERTS": "/corp.pem",
+           "NO_PROXY": "corp.example"}
+    ctx._claude_real.mkdir(parents=True, exist_ok=True)
+    (ctx._claude_real / "settings.json").write_text(
+        json.dumps({"env": {"FOO": "1", "NO_PROXY": "corp.example"}}))
+    assert seatswap.gate(ctx, env, cwd=tmp_path) is None
+
+
+def test_the_preflight_cache_key_covers_proxy_no_proxy_and_ca_files(ctx):
+    calls = []
+    base = {"HTTPS_PROXY": "http://p:1", "NO_PROXY": "a", "SSL_CERT_FILE": "/s", "NODE_EXTRA_CA_CERTS": "/n"}
+    variants = [dict(base), {**base, "HTTPS_PROXY": "http://q:2"}, {**base, "NO_PROXY": "b"},
+                {**base, "no_proxy": "b"}, {**base, "SSL_CERT_FILE": "/t"},
+                {**base, "NODE_EXTRA_CA_CERTS": "/m"}]
+    for env in variants:
+        swap, proxy, _ = make(ctx, environ=env)
+        proxy.preflight = lambda: calls.append(1)
+        swap.preflight()
+        swap.stop()
+    assert len(calls) == len(variants)
+    swap, proxy, _ = make(ctx, environ=dict(base))
+    proxy.preflight = lambda: calls.append(1)
+    swap.preflight()
+    assert len(calls) == len(variants)   # an identical environment hits the cache
+    swap.stop()
+
+
+def test_intercepts_ok_delegates(ctx):
+    swap, proxy, _ = make(ctx)
+    proxy.ok = 4
+    assert swap.intercepts_ok() == 4
+    swap.stop()
+
+
+def test_upstream_failing_needs_a_streak_and_no_prior_success(ctx):
+    swap, proxy, _ = make(ctx)
+    proxy.failures = 2
+    assert not swap.upstream_failing()
+    proxy.failures = 3
+    assert swap.upstream_failing() and not swap.upstream_failing(4) and swap.upstream_failing(1)
+    proxy.failures, proxy.seen = 0, 5
+    assert not swap.upstream_failing()      # a working session is latched...
+    proxy.failures = 9
+    assert not swap.upstream_failing()      # ...so a later streak is not "never worked"
+    swap.stop()
+
+
+def test_maintain_latches_that_the_upstream_worked(ctx):
+    swap, proxy, _ = make(ctx)
+    proxy.failures, proxy.seen = 0, 1
+    swap.maintain()
+    proxy.failures = 5
+    assert not swap.upstream_failing()
+    swap.stop()
+
+
+def test_no_proxy_is_merged_deduplicated_and_written_to_both(ctx):
+    swap, _, _ = make(ctx)
+    env = swap.env({"NO_PROXY": "a.com, api.anthropic.com,b.com", "no_proxy": "b.com,c.com,.anthropic.com"})
+    assert env["NO_PROXY"] == env["no_proxy"] == "a.com,b.com,c.com,127.0.0.1,localhost"
+    env = swap.env({"no_proxy": "localhost"})
+    assert env["NO_PROXY"] == env["no_proxy"] == "localhost,127.0.0.1"
+    swap.stop()

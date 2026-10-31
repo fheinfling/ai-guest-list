@@ -29,8 +29,8 @@
  {
   "label": "settings.json env gate skipped",
   "file": "acctsw/seatswap.py",
-  "old": "found = _env_gate(env) if isinstance(env, dict) else None",
-  "new": "found = None",
+  "old": "found = (_env_gate(env) or _settings_tls_gate(env)) if isinstance(env, dict) else None",
+  "new": "found = _settings_tls_gate(env) if isinstance(env, dict) else None",
   "test": [
    "tests/test_seatswap.py::test_claude_settings_routing_turns_it_off"
   ]
@@ -544,8 +544,8 @@
  {
   "label": "N11 cache shared across upstreams",
   "file": "acctsw/seatswap.py",
-  "old": "        entry = cache.get(self.upstream)",
-  "new": "        entry = next(iter(cache.values()), None)",
+  "old": "entry = cache.get(key)",
+  "new": "entry = next(iter(cache.values()), None)",
   "test": [
    "tests/test_seatswap.py::test_preflight_verdict_is_cached_per_upstream_for_ten_minutes"
   ]
@@ -580,8 +580,8 @@
  {
   "label": "v2 NO_PROXY keeps anthropic entries",
   "file": "acctsw/seatswap.py",
-  "old": "            parts = [p for p in parts if not _routes_api(p)]\n",
-  "new": "",
+  "old": "if p and p not in parts and not _routes_api(p):",
+  "new": "if p and p not in parts:",
   "test": [
    "tests/test_seatswap.py::test_env_takes_anthropic_out_of_no_proxy_and_keeps_the_rest"
   ]
@@ -607,7 +607,7 @@
  {
   "label": "v2 user's proxy not chained",
   "file": "acctsw/seatswap.py",
-  "old": "        self.upstream_proxy = _upstream_proxy(os.environ if environ is None else environ)",
+  "old": "        self.upstream_proxy = _upstream_proxy(self._environ)",
   "new": "        self.upstream_proxy = None",
   "test": [
    "tests/test_seatswap.py::test_the_users_own_proxy_becomes_the_upstream_proxy"
@@ -764,6 +764,169 @@
   "new": "            if parts.username == PROXY_USER:",
   "test": [
    "tests/test_seatswap.py::test_other_proxies_are_not_mistaken_for_ours"
+  ]
+ },
+ {
+  "label": "verdict never consulted",
+  "file": "acctsw/seatswap.py",
+  "old": "    if _rejected_before(ctx, environ):\n",
+  "new": "    if False:\n",
+  "test": [
+   "tests/test_gaps_glue.py::test_a_tls_reject_is_remembered_for_that_claude_for_a_week"
+  ]
+ },
+ {
+  "label": "verdict never written",
+  "file": "acctsw/seatswap.py",
+  "old": "    entries[key] = iso(now())\n",
+  "new": "    pass\n",
+  "test": [
+   "tests/test_gaps_glue.py::test_a_tls_reject_is_remembered_for_that_claude_for_a_week"
+  ]
+ },
+ {
+  "label": "verdict ignores version",
+  "file": "acctsw/seatswap.py",
+  "old": "    return f\"{real}\\n{out}\" if out else real",
+  "new": "    return real",
+  "test": [
+   "tests/test_gaps_glue.py::test_a_tls_reject_is_remembered_for_that_claude_for_a_week"
+  ]
+ },
+ {
+  "label": "verdict never expires",
+  "file": "acctsw/seatswap.py",
+  "old": "and timedelta(0) <= now() - at < VERDICT_TTL",
+  "new": "and timedelta(0) <= now() - at",
+  "test": [
+   "tests/test_gaps_glue.py::test_a_tls_reject_is_remembered_for_that_claude_for_a_week"
+  ]
+ },
+ {
+  "label": "verdict ttl too short",
+  "file": "acctsw/seatswap.py",
+  "old": "VERDICT_TTL = timedelta(days=7)",
+  "new": "VERDICT_TTL = timedelta(days=1)",
+  "test": [
+   "tests/test_gaps_glue.py::test_a_tls_reject_is_remembered_for_that_claude_for_a_week"
+  ]
+ },
+ {
+  "label": "version timeout ignored",
+  "file": "acctsw/seatswap.py",
+  "old": "except (OSError, subprocess.SubprocessError, ValueError):",
+  "new": "except (OSError, ValueError):",
+  "test": [
+   "tests/test_gaps_glue.py::test_a_version_timeout_falls_back_to_the_path_alone"
+  ]
+ },
+ {
+  "label": "settings tls env ignored",
+  "file": "acctsw/seatswap.py",
+  "old": "(_env_gate(env) or _settings_tls_gate(env))",
+  "new": "_env_gate(env)",
+  "test": [
+   "tests/test_gaps_glue.py::test_settings_env_that_overrides_our_proxy_or_ca_turns_it_off",
+   "tests/test_gaps_glue.py::test_managed_settings_env_override_turns_it_off"
+  ]
+ },
+ {
+  "label": "settings no_proxy ignored",
+  "file": "acctsw/seatswap.py",
+  "old": "        if any(e == \"*\" or _routes_api(e) for e in entries):",
+  "new": "        if False:",
+  "test": [
+   "tests/test_gaps_glue.py::test_settings_env_that_overrides_our_proxy_or_ca_turns_it_off"
+  ]
+ },
+ {
+  "label": "settings no_proxy star ignored",
+  "file": "acctsw/seatswap.py",
+  "old": "e == \"*\" or _routes_api(e)",
+  "new": "_routes_api(e)",
+  "test": [
+   "tests/test_gaps_glue.py::test_settings_env_that_overrides_our_proxy_or_ca_turns_it_off"
+  ]
+ },
+ {
+  "label": "settings NODE_TLS dropped",
+  "file": "acctsw/seatswap.py",
+  "old": "\"NODE_TLS_REJECT_UNAUTHORIZED\")\nVERDICT",
+  "new": "\"X_UNUSED\")\nVERDICT",
+  "test": [
+   "tests/test_gaps_glue.py::test_settings_env_that_overrides_our_proxy_or_ca_turns_it_off"
+  ]
+ },
+ {
+  "label": "process env proxy/ca gates",
+  "file": "acctsw/seatswap.py",
+  "old": "    found = _env_gate(environ)\n    if found:",
+  "new": "    found = _env_gate(environ) or _settings_tls_gate(environ)\n    if found:",
+  "test": [
+   "tests/test_gaps_glue.py::test_process_env_proxy_and_ca_and_unrelated_settings_do_not_gate"
+  ]
+ },
+ {
+  "label": "preflight key upstream only",
+  "file": "acctsw/seatswap.py",
+  "old": "        key = json.dumps([self.upstream,",
+  "new": "        key = json.dumps([self.upstream] + [None] * 4 if 1 else [",
+  "test": [
+   "tests/test_gaps_glue.py::test_the_preflight_cache_key_covers_proxy_no_proxy_and_ca_files"
+  ]
+ },
+ {
+  "label": "intercepts_ok undelegated",
+  "file": "acctsw/seatswap.py",
+  "old": "        return self.proxy.intercepts_ok()",
+  "new": "        return 0",
+  "test": [
+   "tests/test_gaps_glue.py::test_intercepts_ok_delegates"
+  ]
+ },
+ {
+  "label": "upstream_failing ignores threshold",
+  "file": "acctsw/seatswap.py",
+  "old": "return failures >= n and not self._upstream_worked",
+  "new": "return failures >= 1 and not self._upstream_worked",
+  "test": [
+   "tests/test_gaps_glue.py::test_upstream_failing_needs_a_streak_and_no_prior_success"
+  ]
+ },
+ {
+  "label": "upstream_failing ignores success latch",
+  "file": "acctsw/seatswap.py",
+  "old": "return failures >= n and not self._upstream_worked",
+  "new": "return failures >= n",
+  "test": [
+   "tests/test_gaps_glue.py::test_upstream_failing_needs_a_streak_and_no_prior_success"
+  ]
+ },
+ {
+  "label": "maintain skips latch",
+  "file": "acctsw/seatswap.py",
+  "old": "        self.upstream_failing()   # keeps",
+  "new": "        # keeps",
+  "test": [
+   "tests/test_gaps_glue.py::test_maintain_latches_that_the_upstream_worked"
+  ]
+ },
+ {
+  "label": "no_proxy not merged",
+  "file": "acctsw/seatswap.py",
+  "old": "    for name in (\"NO_PROXY\", \"no_proxy\"):\n            for p in",
+  "new": "    for name in (\"NO_PROXY\",):\n            for p in",
+  "test": [
+   "tests/test_gaps_glue.py::test_no_proxy_is_merged_deduplicated_and_written_to_both"
+  ]
+ },
+ {
+  "label": "no_proxy not deduped",
+  "file": "acctsw/seatswap.py",
+  "old": "if p and p not in parts and not _routes_api(p):",
+  "new": "if p and not _routes_api(p):",
+  "test": [
+   "tests/test_gaps_glue.py::test_no_proxy_is_merged_deduplicated_and_written_to_both"
   ]
  }
 ]
