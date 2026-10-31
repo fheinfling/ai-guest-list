@@ -6,7 +6,8 @@ for any other path gets a 403. Every request is forwarded to ``upstream`` with t
 headers, except ``POST /v1/messages`` and ``POST /v1/messages/count_tokens``: those carry the token
 of the BOUND seat when it has one. A seat without a token is the client's own login (the home seat),
 so a proxy bound to home is a pure passthrough. Only a request that authenticates the way Claude
-Code's own login does (``Authorization: Bearer``, no ``x-api-key``) is ever given a seat token: an
+Code's own login does (``Authorization: Bearer``, no ``x-api-key``, ``oauth-`` in ``anthropic-beta``)
+is ever given a seat token: an
 SDK script or MCP server in the child inherits the base URL too and must reach upstream unchanged.
 
 Before the first response byte reaches the client, two upstream answers are replayed instead of
@@ -265,9 +266,13 @@ class _Reply:
 
 
 def _oauth_client(headers) -> bool:
-    """Whether the client authenticates like Claude Code's own login: a bearer token, no API key."""
+    """Whether the request comes from Claude Code's own OAuth login: a bearer token, no API key, and
+    an ``anthropic-beta`` that opts into OAuth (a bearer alone could be any gateway client)."""
     auth = _header(headers, "authorization") or ""
-    return auth[:7].lower() == "bearer " and _header(headers, "x-api-key") is None
+    items = headers.items() if hasattr(headers, "items") else headers
+    beta = ",".join(v for k, v in items if k.lower() == "anthropic-beta").lower()
+    return (auth[:7].lower() == "bearer " and _header(headers, "x-api-key") is None
+            and "oauth-" in beta)
 
 
 def _forward_headers(headers, token: str | None, netloc: str, length: int | None) -> dict:

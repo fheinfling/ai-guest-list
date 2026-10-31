@@ -174,11 +174,11 @@ class Harness:
         return f"/{self.proxy._secret}{path}"
 
     def send(self, path="/v1/messages?beta=true", *, method="POST", body=MSG, headers=None,
-             raw_target=None, auth=f"Bearer {CLIENT_TOKEN}"):
+             raw_target=None, auth=f"Bearer {CLIENT_TOKEN}", beta="oauth-2025-04-20"):
         wire = Wire()
         self.t.wire = wire
-        hdrs = [("Content-Type", "application/json"), ("anthropic-beta", "oauth-2025-04-20"),
-                ("Content-Length", str(len(body)))]
+        hdrs = [("Content-Type", "application/json"), ("Content-Length", str(len(body)))]
+        hdrs += [("anthropic-beta", beta)] if beta is not None else []
         hdrs += [("Authorization", auth)] if auth is not None else []
         hdrs += list(headers or [])
         target = self.url(path) if raw_target is None else raw_target
@@ -329,6 +329,34 @@ def test_only_oauth_bearer_clients_get_a_seat_token(auth, extra):
     assert h.hits == [] and len(h.t.sent) == 1
 
 
+@pytest.mark.parametrize("beta", [None, "", "claude-code-20250219", "interleaved-thinking-2025-05-14",
+                                  "oauth", "prompt-caching-2024-07-31,oauthy"])
+def test_bearer_without_the_oauth_beta_is_not_claude_code(beta):
+    """A bearer token alone could be any gateway client; Claude Code's login opts into oauth-*."""
+    h = Harness()
+    h.proxy.bind(B)
+    h.fake.update({"next": [429]})
+    h.answers = [C]
+    resp, _ = h.send(beta=beta)
+    assert resp.status == 429
+    assert h.t.sent[0]["headers"]["Authorization"] == f"Bearer {CLIENT_TOKEN}"
+    assert h.hits == [] and len(h.t.sent) == 1
+    assert h.proxy.messages_seen() == 0
+
+
+@pytest.mark.parametrize("beta,extra", [
+    ("claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14", []),
+    ("OAuth-2025-04-20", []),
+    ("claude-code-20250219", [("anthropic-beta", "oauth-2025-04-20")]),   # split over two headers
+])
+def test_oauth_beta_anywhere_in_anthropic_beta_counts(beta, extra):
+    h = Harness()
+    h.proxy.bind(B)
+    h.send(beta=beta, headers=extra)
+    assert h.t.sent[0]["headers"]["Authorization"] == f"Bearer {B.token}"
+    assert h.proxy.messages_seen() == 1
+
+
 def test_bearer_scheme_is_case_insensitive():
     h = Harness()
     h.proxy.bind(B)
@@ -428,6 +456,26 @@ def test_limit_replays_on_the_decided_seat_and_binds_it():
     assert "rate limit" in hit.detail
     h.send()    # the next request goes straight to B
     assert bearers(h)[-1] == tok(B.token) and len(h.hits) == 1
+
+
+@pytest.mark.parametrize("claim", ["five_hour", "seven_day", "seven_day_opus", None])
+def test_limit_hit_carries_the_representative_claim(claim):
+    h = Harness()
+    h.proxy.bind(A)
+    respond = h.fake.respond
+
+    def with_claim(*args):
+        ans = respond(*args)
+        ans.headers = [(k, v) for k, v in ans.headers
+                       if k != "anthropic-ratelimit-unified-representative-claim"]
+        if claim is not None and ans.status == 429:
+            ans.headers.append(("anthropic-ratelimit-unified-representative-claim", claim))
+        return ans
+    h.fake.respond = with_claim
+    rules(h, a=429)
+    h.answers = [B]
+    h.send()
+    assert [x.claim for x in h.hits] == [claim]
 
 
 def test_limit_on_home_replays_on_a_seat():
@@ -1035,7 +1083,7 @@ class Live:
         from urllib.parse import urlsplit
         conn = self.client()
         conn.request(method, urlsplit(self.base).path + path, body=body,
-                     headers={"content-type": "application/json",
+                     headers={"content-type": "application/json", "anthropic-beta": "oauth-2025-04-20",
                               "authorization": f"Bearer {CLIENT_TOKEN}", **(headers or {})})
         return conn, conn.getresponse()
 
