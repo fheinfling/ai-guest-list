@@ -3034,8 +3034,10 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 certificate, or the proxy never got through to the API. Hops away from home are
                 over for this run (each cause is handled once). If nothing of Claude Code's ever
                 went through, it is talking to nobody: restart it once, without the proxy, on the
-                same seat. A rejection after a handshake that did succeed is some other tool in
-                the session: never a restart. Otherwise the child keeps running."""
+                same seat. An upstream that never once worked broke every request the child
+                sent, so it restarts the same way even after messages went through. A rejection
+                after a handshake that did succeed is some other tool in the session: never a
+                restart. Otherwise the child keeps running."""
                 if not inplace["tls"] and _swapcall("tls_rejected", default=False):
                     inplace["tls"] = True
                     why = "tls"
@@ -3048,7 +3050,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 inplace["off"] = True
                 logging.getLogger(__name__).info("in-place switching off: %s", why)
                 if (not other_tool and not inplace["tls_restart"]
-                        and not _swapcall("proxy_used", default=False)):
+                        and (why == "upstream" or not _swapcall("proxy_used", default=False))):
                     inplace["tls_restart"] = True
                     hit.update(reason=why, email=launch_email, active=launch_email,
                                hard=False, handled=True)

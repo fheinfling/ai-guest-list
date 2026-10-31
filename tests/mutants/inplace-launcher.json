@@ -721,8 +721,8 @@
   {
     "label": "tls: a rejection restarts the child even though its traffic went through",
     "file": "acctsw/launcher.py",
-    "old": "                if (not other_tool and not inplace[\"tls_restart\"]\n                        and not _swapcall(\"proxy_used\", default=False)):",
-    "new": "                if (not other_tool and not inplace[\"tls_restart\"]):",
+    "old": "                        and (why == \"upstream\" or not _swapcall(\"proxy_used\", default=False))):",
+    "new": "                        and True):",
     "test": [
       "tests/test_launcher_inplace.py::test_a_rejected_certificate_after_traffic_only_stops_the_hops"
     ]
@@ -845,21 +845,12 @@
     ]
   },
   {
-    "label": "W3: an unreachable API is reported on every tick",
-    "file": "acctsw/launcher.py",
-    "old": "                elif not inplace[\"upstream\"] and _swapcall(\"upstream_failing\", default=False):\n",
-    "new": "                elif _swapcall(\"upstream_failing\", default=False):\n",
-    "test": [
-      "tests/test_launcher_inplace.py::test_an_unreachable_api_after_traffic_stops_the_hops_and_says_so_once"
-    ]
-  },
-  {
-    "label": "W3: an unreachable API leaves hops in place on",
+    "label": "proxy trouble: hops away from home go on after it",
     "file": "acctsw/launcher.py",
     "old": "                inplace[\"off\"] = True\n                logging.getLogger(__name__).info(\"in-place switching off: %s\", why)",
     "new": "                logging.getLogger(__name__).info(\"in-place switching off: %s\", why)",
     "test": [
-      "tests/test_launcher_inplace.py::test_an_unreachable_api_after_traffic_stops_the_hops_and_says_so_once"
+      "tests/test_launcher_inplace.py::test_a_rejected_certificate_after_traffic_only_stops_the_hops"
     ]
   },
   {
@@ -897,6 +888,15 @@
     "new": "                if False:\n",
     "test": [
       "tests/test_gaps_launcher.py::test_a_codex_click_whose_approval_lapses_while_stopping_resumes_where_it_was"
+    ]
+  },
+  {
+    "label": "W3: an unreachable API after messages went through only stops the hops",
+    "file": "acctsw/launcher.py",
+    "old": "                        and (why == \"upstream\" or not _swapcall(\"proxy_used\", default=False))):",
+    "new": "                        and not _swapcall(\"proxy_used\", default=False)):",
+    "test": [
+      "tests/test_launcher_inplace.py::test_an_unreachable_api_restarts_once_even_after_messages_went_through"
     ]
   }
 ]

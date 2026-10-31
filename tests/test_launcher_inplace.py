@@ -1421,23 +1421,22 @@ def test_an_unreachable_api_restarts_once_without_the_proxy(seats, tokens):
     assert any("couldn't reach Anthropic's API" in n for n in notes)
 
 
-def test_an_unreachable_api_after_traffic_stops_the_hops_and_says_so_once(seats, tokens):
-    """W3: Claude Code's messages already went through the proxy: no restart for that. Hops stop
-    (a limit is passed on and restarts as it did before in place existed), and the user hears
-    about it once."""
+def test_an_unreachable_api_restarts_once_even_after_messages_went_through(seats, tokens):
+    """W3: no request ever got through upstream, so every message the child sent failed: the
+    session is broken through the proxy. Restart once without it, resuming the conversation."""
     swap = FakeSwap()
-    hits = []
 
     def down():
+        _transcript(seats, _session(spawn))
         swap.upstream_down = True
 
-    spawn = Spawn(([down, None, None, lambda: hits.append(len(spawn.calls)),
-                    lambda: hits.append(swap.post("limit", C1)), None], 1), ([None], 0))
+    spawn = Spawn(([down, None], 1), ([None, None, None], 0))
     notes = []
     assert _run(seats, spawn, swap, notify=notes.append) == 0
-    assert hits[0] == 1   # still the first child after the trouble was seen
-    assert swap.binds == [] and swap.answers[0] == (hits[1], None)
-    assert sum("can't reach Anthropic's API" in n for n in notes) == 1
+    assert spawn.stops == 1 and len(spawn.calls) == 2
+    assert spawn.calls[1][-2:] == ["--resume", _session(spawn)]
+    assert spawn.envs[1].get("HTTPS_PROXY") != FakeSwap.PROXY_URL and swap.stopped
+    assert any("couldn't reach Anthropic's API, resuming" in n for n in notes)
 
 
 def test_in_place_off_still_goes_home_and_asks_maintain_for_no_third_seat(seats, tokens):
