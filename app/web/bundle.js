@@ -533,6 +533,7 @@ function buildSettings(state) {
       ${toggleRow("same_tool_only", "stay on the same tool", "Codex to Codex; Claude to Claude", s.same_tool_only)}
       ${toggleRow("notify", "notify when switched", "show which seat is ready", s.notify)}
       ${toggleRow("restart_app", "restart the Codex app", "refresh its account after a switch", s.restart_app)}
+      ${toggleRow("in_place_switch", "switch seats without restarting claude", "the conversation keeps running", s.in_place_switch !== false)}
       <p class="support">with supervision off, only cx/cl auto-switch. terminals switch without restarting the desktop app.</p>
     </section><section class="set-sec paid-settings"><h2 class="set-label">paid keys</h2>
       ${toggleRow("key_fallback", "allow paid use", "off stops sessions and new requests", s.key_fallback === true)}
@@ -733,7 +734,7 @@ function buildHTML(state) {
   return `<div class="app ambient-app${glance ? " roster-app" : ""}${compact ? " compact-roster-app" : ""} theme-${theme} mood-${mood}">${art}
     <header class="top"><span class="brand">ai guest list</span><div class="top-actions"><details class="header-menu"><summary class="ibtn" aria-label="add a subscription seat or API key" title="add a seat or key">＋</summary><nav class="menu-panel"><button data-action="add">a subscription seat</button><button data-action="key-start">an API key</button></nav></details>
     <details class="header-menu"><summary class="ibtn" aria-label="app menu" title="app menu">⋯</summary><nav class="menu-panel"><button data-action="settings">settings</button><button data-action="quit">quit ai guest list</button></nav></details></div></header>
-    <div class="ambient-stage">${prompts}${paid ? paidUseControl(state) : `<div class="availability">${glance ? roster : ambientVerdict(state)}</div>`}${compact ? `<section class="roster-compact" aria-label="seat availability" tabindex="0">${rosterTable(state, true)}</section>` : ""}</div>
+    <div class="ambient-stage">${prompts}${crossingRequests(state)}${paid ? paidUseControl(state) : `<div class="availability">${glance ? roster : ambientVerdict(state)}</div>`}${compact ? `<section class="roster-compact" aria-label="seat availability" tabindex="0">${rosterTable(state, true)}</section>` : ""}</div>
     <details class="guest-drawer"><summary class="drawer-handle"><span>${glance ? "seat options" : "guest list"}</span>${glance ? "" : `<span class="drawer-count">${seats.length + (state?.keys?.length || 0)} seats</span>`}<span class="chevron" aria-hidden="true">⌃</span></summary>
       <div class="drawer-content"><div class="main-body">${engineBanner(state)}${supervisionBanner(state)}${toolGroup("codex", state?.tools?.codex, (state?.keys || []).filter((k) => k.harness === "codex"))}${toolGroup("claude", state?.tools?.claude, (state?.keys || []).filter((k) => k.harness === "claude"))}
       ${!seats.length && !state?.keys?.length ? `<p class="empty">use ＋ above to add a subscription or API key.</p>` : ""}${moved}
@@ -841,6 +842,22 @@ function keySeatCard(seat) {
     ${checked ? `<p class="key-check-status" role="status">${checked.operation_permitted ? "key check passed; account access confirmed" : "key check was not permitted; check access with your provider"}</p>` : ""}
     ${unproven ? `<div class="proof-gate"><input class="local-check" type="checkbox" id="proof-${esc(seat.id)}"><label class="proof-open" for="proof-${esc(seat.id)}">check this endpoint</label><div class="proof-choice"><p>this sends a paid request. price unavailable here; check provider pricing. this app does not cap spend.</p><div class="equal-choices"><label class="choice" for="proof-${esc(seat.id)}">not now</label><button class="choice" data-action="key-prove" data-id="${esc(seat.id)}">send paid check</button></div></div></div>` : ""}
     <div class="seat-actions"><button data-action="key-validate" data-id="${esc(seat.id)}">check key</button><button class="logout" data-action="key-remove" data-id="${esc(seat.id)}">remove key</button></div></div></details></article>`;
+}
+
+// A session waits on a move between a business and a personal seat (or one whose kind is
+// unknown): never taken automatically, so the user answers here. "no" closes the question.
+const KIND_WORD = { business: "business", personal: "personal", unknown: "plan unknown" };
+function crossingRequests(state) {
+  const requests = state?.pending_crossings || [];
+  if (!requests.length) return "";
+  return `<div class="crossing-prompts">${requests.map((r) => {
+    const data = `data-tool="${esc(r.tool)}" data-from="${esc(r.from)}" data-to="${esc(r.to)}"`;
+    return `<section class="crossing-confirm" aria-label="needs you"><p class="crossing-tag">needs you</p>
+      <h2>${esc(r.from_name || r.from)} is out. continue on ${esc(r.to_name || r.to)} (${esc(KIND_WORD[r.to_kind] || KIND_WORD.unknown)})?</h2>
+      <p class="crossing-why">${esc(r.from_name || r.from)} is ${esc(KIND_WORD[r.from_kind] || KIND_WORD.unknown)}; moving between work and personal seats needs your yes.</p>
+      <div class="crossing-acts"><button class="choice" data-action="crossing-answer" data-scope="once" ${data}>approve once</button><button class="choice" data-action="crossing-answer" data-scope="always" ${data}>always allow</button><button class="choice" data-action="crossing-answer" data-scope="deny" ${data}>no</button></div>
+    </section>`;
+  }).join("")}</div>`;
 }
 
 function keyConfirmations(state, answering = new Set(), now = Date.now()) {
@@ -1259,6 +1276,11 @@ document.addEventListener("click", (e) => {
       if (answering.has(el.dataset.id)) break;
       answering.add(el.dataset.id); refreshKeyPrompts();
       send("answer_key_switch", { id: el.dataset.id, approved: el.dataset.approved === "true" }); break;
+    case "crossing-answer": {
+      const { tool, from, to, scope } = el.dataset;
+      send(scope === "deny" ? "deny_crossing" : "approve_crossing", { tool, from, to, scope });
+      break;
+    }
     case "key-stop": send("toggle", { key: "key_fallback", value: false }); break;
     case "key-terminal":
       if (paidTerminal?.pending) break;

@@ -11,7 +11,8 @@ Holds only metadata — NEVER credentials (those live in the Keychain). Shape::
       "keys": {"<id>": <key-seat metadata>},
       "settings": {"auto_switch": true, "same_tool_only": true, "notify": true,
                    "restart_app": false, "celebrations": true, "supervise_shell": true,
-                   "theme": "light", "confirm_key_switch": true, "key_fallback": false},
+                   "theme": "light", "confirm_key_switch": true, "key_fallback": false,
+                   "in_place_switch": true},
       "engine": {"last_writer": "<version>", "newest_writer": "<version>",
                  "min_writer": "<version>"}
     }
@@ -111,6 +112,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "theme": "light",         # the design default
     "confirm_key_switch": True,  # consent for each hop onto metered API usage
     "key_fallback": False,    # metered seats must be explicitly opted into
+    "in_place_switch": True,  # move a running claude between seats without restarting it
 }
 
 

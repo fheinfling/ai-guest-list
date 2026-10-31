@@ -22,6 +22,7 @@ from . import keyprove as keyprove_mod
 from . import paths as P
 from . import pricing as pricing_mod
 from . import providers as providers_mod
+from . import seatkind
 from . import session as session_mod
 from . import usage as usage_mod
 from .context import Context
@@ -36,7 +37,7 @@ from .web_dot import dot_for, door_for
 # Settings the UI may toggle (boolean only) — a whitelist so a stray key can't clobber e.g. theme.
 TOGGLE_KEYS = {
     "auto_switch", "notify", "restart_app", "celebrations", "same_tool_only", "supervise_shell",
-    "confirm_key_switch", "key_fallback",
+    "confirm_key_switch", "key_fallback", "in_place_switch",
 }
 
 KEY_ACTIONS = {"key_add", "key_remove", "key_validate", "key_prove", "models_list", "answer_key_switch",
@@ -112,8 +113,21 @@ def snapshot_state(ctx: Context) -> dict[str, Any]:
          and (parse_iso(record.get("expires_at")) or at) > at),
         key=lambda record: (record["created_at"], record["id"]),
     )
+    data["pending_crossings"] = _pending_crossings(state, at)
     data["rev"] = int(state.data.get("rev", 0))  # monotonic; the UI drops a snapshot older than one it applied
     return data
+
+
+def _pending_crossings(state, at) -> list[dict[str, Any]]:
+    """Sessions waiting for a yes to move between a business and a personal seat (seatkind)."""
+    out = []
+    for tool in TOOLS:
+        for r in seatkind.pending(state, tool, at):
+            a, b = state.get_seat(tool, r["from"]) or {}, state.get_seat(tool, r["to"]) or {}
+            out.append({**r, "tool": tool,
+                        "from_name": a.get("name") or r["from"], "to_name": b.get("name") or r["to"],
+                        "from_kind": seatkind.kind(a), "to_kind": seatkind.kind(b)})
+    return out
 
 
 class _KeyRequestError(AcctswError):
@@ -581,6 +595,25 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
             with ctx.locked():
                 state = ctx.load_state()
                 state.set_setting("strategy", val)
+                state.save()
+            return {"ok": True, "state": snapshot_state(ctx)}
+
+        if action in ("approve_crossing", "deny_crossing"):
+            tool, a, b = message["tool"], message["from"], message["to"]
+            if tool not in TOOLS or not isinstance(a, str) or not isinstance(b, str) or a == b:
+                return {"ok": False, "error": "bad crossing request"}
+            scope = message.get("scope", "once")
+            if action == "approve_crossing" and scope not in seatkind.SCOPES:
+                return {"ok": False, "error": f"bad crossing scope: {scope}"}
+            with ctx.locked():
+                state = ctx.load_state()
+                if a not in state.accounts(tool) or b not in state.accounts(tool):
+                    return {"ok": False, "error": "that seat is no longer on the list",
+                            "state": snapshot_state(ctx)}
+                if action == "approve_crossing":
+                    seatkind.approve(state, tool, a, b, scope)
+                else:
+                    seatkind.deny(state, tool, a, b)
                 state.save()
             return {"ok": True, "state": snapshot_state(ctx)}
 

@@ -29,3 +29,4 @@ include = ["acctsw*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-rs"  # Always explain skips, especially when live containment was not exercised.
+markers = ["crossings: sees seatkind's real rule for seats stored without a plan"]

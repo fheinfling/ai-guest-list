@@ -1,0 +1,300 @@
+[
+ {
+  "label": "MIN_TTL margin dropped",
+  "file": "acctsw/seatswap.py",
+  "old": "MIN_TTL = timedelta(minutes=15)",
+  "new": "MIN_TTL = timedelta(minutes=0)",
+  "test": [
+   "tests/test_seatswap.py::test_eligible_needs_more_than_the_minimum_ttl"
+  ]
+ },
+ {
+  "label": "unknown expiry counted as live",
+  "file": "acctsw/seatswap.py",
+  "old": "expiry = _oauth(blob).get(\"expiresAt\")",
+  "new": "expiry = _oauth(blob).get(\"expiresAt\") or 1e15",
+  "test": [
+   "tests/test_seatswap.py::test_unknown_expiry_is_not_eligible"
+  ]
+ },
+ {
+  "label": "env gate skipped",
+  "file": "acctsw/seatswap.py",
+  "old": "    found = _env_gate(environ)\n",
+  "new": "    found = None\n",
+  "test": [
+   "tests/test_seatswap.py::test_env_routing_or_auth_turns_it_off"
+  ]
+ },
+ {
+  "label": "settings.json env gate skipped",
+  "file": "acctsw/seatswap.py",
+  "old": "found = _env_gate(env) if isinstance(env, dict) else None",
+  "new": "found = None",
+  "test": [
+   "tests/test_seatswap.py::test_claude_settings_routing_turns_it_off"
+  ]
+ },
+ {
+  "label": "settings.json apiKeyHelper ignored",
+  "file": "acctsw/seatswap.py",
+  "old": "if _set(data.get(\"apiKeyHelper\")):",
+  "new": "if False:",
+  "test": [
+   "tests/test_seatswap.py::test_claude_settings_routing_turns_it_off"
+  ]
+ },
+ {
+  "label": "ACCTSW_IN_PLACE_SWITCH=0 ignored",
+  "file": "acctsw/seatswap.py",
+  "old": "if str(environ.get(SWITCH_ENV, \"\")).strip() == \"0\":",
+  "new": "if False:",
+  "test": [
+   "tests/test_seatswap.py::test_env_switch_turns_it_off"
+  ]
+ },
+ {
+  "label": "tier check dropped",
+  "file": "acctsw/seatswap.py",
+  "old": "if tier and home_tier and tier != home_tier:",
+  "new": "if False:",
+  "test": [
+   "tests/test_seatswap.py::test_a_different_tier_than_home_is_not_eligible"
+  ]
+ },
+ {
+  "label": "quarantine marker ignored",
+  "file": "acctsw/seatswap.py",
+  "old": "    if (ctx.claude_home(email) / \".acctsw-quarantined\").exists():\n        return None\n    blob = claudehome.load(ctx, email)",
+  "new": "    blob = claudehome.get_live(ctx, email) if False else ctx.claude_cred(email).get_live()",
+  "test": [
+   "tests/test_seatswap.py::test_quarantined_seat_is_not_eligible"
+  ]
+ },
+ {
+  "label": "crossing auto-picked by choose",
+  "file": "acctsw/selection.py",
+  "old": "and (allow_crossing or seatkind.approved(state, tool, origin, e, at))",
+  "new": "and True",
+  "test": [
+   "tests/test_seatkind.py::test_choose_never_auto_picks_an_unapproved_crossing"
+  ]
+ },
+ {
+  "label": "approval not directional",
+  "file": "acctsw/seatkind.py",
+  "old": "    return f\"{a}>{b}\"",
+  "new": "    return \">\".join(sorted((a, b)))",
+  "test": [
+   "tests/test_seatkind.py::test_approval_is_directional"
+  ]
+ },
+ {
+  "label": "once approval not consumed",
+  "file": "acctsw/seatkind.py",
+  "old": "    if record[\"scope\"] == \"once\":\n        del store[\"approvals\"][_key(a, b)]",
+  "new": "    if record[\"scope\"] == \"once\":\n        pass",
+  "test": [
+   "tests/test_seatkind.py::test_once_is_consumed_by_the_switch_that_uses_it"
+  ]
+ },
+ {
+  "label": "once approval never lapses",
+  "file": "acctsw/seatkind.py",
+  "old": "return granted is not None and at - granted < ONCE_TTL",
+  "new": "return granted is not None",
+  "test": [
+   "tests/test_seatkind.py::test_once_lapses_when_no_switch_uses_it"
+  ]
+ },
+ {
+  "label": "once downgrades always",
+  "file": "acctsw/seatkind.py",
+  "old": "    if not (scope == \"once\" and isinstance(current, dict) and current.get(\"scope\") == \"always\"):\n",
+  "new": "    if True:\n",
+  "test": [
+   "tests/test_seatkind.py::test_always_survives_use_until_denied"
+  ]
+ },
+ {
+  "label": "unknown kind treated as same-kind",
+  "file": "acctsw/seatkind.py",
+  "old": "return ka == \"unknown\" or kb == \"unknown\" or ka != kb",
+  "new": "return ka != kb",
+  "test": [
+   "tests/test_seatkind.py::test_crosses_on_kind_change_or_any_unknown",
+   "tests/test_seatkind.py::test_unknown_plans_are_crossings_for_choose"
+  ]
+ },
+ {
+  "label": "Team not business",
+  "file": "acctsw/seatkind.py",
+  "old": "BUSINESS = frozenset({\"team\", \"enterprise\", \"business\", \"edu\", \"education\"})",
+  "new": "BUSINESS = frozenset({\"enterprise\", \"business\", \"edu\", \"education\"})",
+  "test": [
+   "tests/test_seatkind.py::test_kind_comes_from_the_plan_label"
+  ]
+ },
+ {
+  "label": "manual switch not counting as approval",
+  "file": "acctsw/switch.py",
+  "old": "            if seatkind.crosses(state, tool, origin, email):\n",
+  "new": "            if False:\n",
+  "test": [
+   "tests/test_seatkind.py::test_a_manual_switch_counts_as_approval"
+  ]
+ },
+ {
+  "label": "manual switch ignores terminal seats",
+  "file": "acctsw/switch.py",
+  "old": "origins = {previous, *(s[\"email\"] for s in active_sessions(ctx.data_dir, tool))}",
+  "new": "origins = {previous}",
+  "test": [
+   "tests/test_seatkind.py::test_a_manual_switch_approves_from_every_seat_a_terminal_bills"
+  ]
+ },
+ {
+  "label": "in_place_switch setting ignored by the gate",
+  "file": "acctsw/seatswap.py",
+  "old": "if not ctx.load_state().settings().get(\"in_place_switch\", True):",
+  "new": "if False:",
+  "test": [
+   "tests/test_seatswap.py::test_the_setting_turns_it_off"
+  ]
+ },
+ {
+  "label": "in_place_switch not a UI toggle",
+  "file": "acctsw/bridge.py",
+  "old": "\"confirm_key_switch\", \"key_fallback\", \"in_place_switch\",",
+  "new": "\"confirm_key_switch\", \"key_fallback\",",
+  "test": [
+   "tests/test_seatkind.py::test_in_place_switch_is_a_default_on_toggle"
+  ]
+ },
+ {
+  "label": "in_place_switch default off",
+  "file": "acctsw/state.py",
+  "old": "\"in_place_switch\": True,",
+  "new": "\"in_place_switch\": False,",
+  "test": [
+   "tests/test_seatkind.py::test_in_place_switch_is_a_default_on_toggle",
+   "tests/test_seatswap.py::test_enabled_by_default"
+  ]
+ },
+ {
+  "label": "bridge approve action missing",
+  "file": "acctsw/bridge.py",
+  "old": "if action in (\"approve_crossing\", \"deny_crossing\"):",
+  "new": "if action in (\"deny_crossing\",):",
+  "test": [
+   "tests/test_seatkind.py::test_bridge_approve_crossing"
+  ]
+ },
+ {
+  "label": "bridge never shows pending crossings",
+  "file": "acctsw/bridge.py",
+  "old": "data[\"pending_crossings\"] = _pending_crossings(state, at)",
+  "new": "data[\"pending_crossings\"] = []",
+  "test": [
+   "tests/test_seatkind.py::test_bridge_approve_crossing"
+  ]
+ },
+ {
+  "label": "UI approve button sends deny",
+  "file": "app/web/bundle.js",
+  "old": "send(scope === \"deny\" ? \"deny_crossing\" : \"approve_crossing\", { tool, from, to, scope });",
+  "new": "send(\"deny_crossing\", { tool, from, to, scope });",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "UI approve-once button missing",
+  "file": "app/web/render.mjs",
+  "old": "<button class=\"choice\" data-action=\"crossing-answer\" data-scope=\"once\" ${data}>approve once</button>",
+  "new": "",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "UI needs-you item not rendered",
+  "file": "app/web/render.mjs",
+  "old": "${prompts}${crossingRequests(state)}${paid",
+  "new": "${prompts}${paid",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "UI toggle missing",
+  "file": "app/web/render.mjs",
+  "old": "      ${toggleRow(\"in_place_switch\", \"switch seats without restarting claude\", \"the conversation keeps running\", s.in_place_switch !== false)}\n",
+  "new": "",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "pick crosses without spending an approval",
+  "file": "acctsw/seatswap.py",
+  "old": "                if not seatkind.consume(state, TOOL, leaving, target.email, now()):\n                    return None\n",
+  "new": "",
+  "test": [
+   "tests/test_seatswap.py::test_pick_spends_a_once_approval_and_not_the_reverse"
+  ]
+ },
+ {
+  "label": "maintain reads the keychain every tick",
+  "file": "acctsw/seatswap.py",
+  "old": "self._next_read = t + MAINTAIN_EVERY_S",
+  "new": "self._next_read = t",
+  "test": [
+   "tests/test_seatswap.py::test_maintain_rebinds_a_newer_token_at_most_once_a_minute"
+  ]
+ },
+ {
+  "label": "handover while requests are in flight",
+  "file": "acctsw/seatswap.py",
+  "old": "if self.proxy.in_flight() == 0 and self.proxy.idle_for() >= HANDOVER_IDLE_S:",
+  "new": "if True:",
+  "test": [
+   "tests/test_seatswap.py::test_maintain_asks_for_a_handover_only_once_idle"
+  ]
+ },
+ {
+  "label": "late answer accepted after timeout",
+  "file": "acctsw/seatswap.py",
+  "old": "            if ask in self._asks:\n                self._asks.remove(ask)\n            if not ask.done or self._closed:\n                ask.done = True",
+  "new": "            if not ask.done or self._closed:\n                pass",
+  "test": [
+   "tests/test_seatswap.py::test_an_unanswered_hit_times_out_and_a_late_answer_is_refused"
+  ]
+ },
+ {
+  "label": "NO_PROXY not extended",
+  "file": "acctsw/seatswap.py",
+  "old": "parts += [h for h in (\"127.0.0.1\", \"localhost\") if h not in parts]",
+  "new": "parts += []",
+  "test": [
+   "tests/test_seatswap.py::test_start_binds_home_passthrough_and_env_points_at_the_proxy"
+  ]
+ },
+ {
+  "label": "session home not recorded",
+  "file": "acctsw/session.py",
+  "old": "    if home is not None and home != email:\n        data[\"home\"] = home\n",
+  "new": "",
+  "test": [
+   "tests/test_seatkind.py::test_mark_session_records_a_home_that_differs"
+  ]
+ }
+]
