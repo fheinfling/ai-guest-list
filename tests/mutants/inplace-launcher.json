@@ -305,7 +305,7 @@
   {
     "label": "integration: SeatSwap.env does not point the child at the proxy",
     "file": "acctsw/seatswap.py",
-    "old": "        out[\"ANTHROPIC_BASE_URL\"] = self.base_url\n",
+    "old": "        out[\"HTTPS_PROXY\"] = out[\"https_proxy\"] = self.proxy_url\n",
     "new": "",
     "test": [
       "tests/test_inplace_integration.py::test_limit_moves_the_live_child_to_a_same_kind_seat"
