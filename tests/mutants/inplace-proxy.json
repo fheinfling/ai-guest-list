@@ -300,8 +300,8 @@
  {
   "label": "proxy N10: the limit Hit drops the representative claim",
   "file": "acctsw/seatproxy.py",
-  "old": "_error_detail(data), _header(headers, \"anthropic-ratelimit-unified-representative-claim\"))",
-  "new": "_error_detail(data), None)",
+  "old": "_header(headers, \"anthropic-ratelimit-unified-representative-claim\"))",
+  "new": "None)",
   "test": [
    "tests/test_seatproxy.py::test_limit_hit_carries_the_representative_claim"
   ]
@@ -695,6 +695,160 @@
   "new": "                return",
   "test": [
    "tests/test_seatproxy.py::test_resets_mid_handshake_count_like_hang_ups"
+  ]
+ },
+ {
+  "label": "proxy model: a model error on the home seat (the client's own login) posts a hit",
+  "file": "acctsw/seatproxy.py",
+  "old": "if kind is None and seat is not None and seat.token is not None \\",
+  "new": "if kind is None and seat is not None \\",
+  "test": [
+   "tests/test_seatproxy.py::test_a_model_error_on_the_home_seat_is_the_clients"
+  ]
+ },
+ {
+  "label": "proxy model: any 4xx/5xx status can be a model rejection",
+  "file": "acctsw/seatproxy.py",
+  "old": "and resp.status in MODEL_STATUSES:",
+  "new": "and resp.status >= 400:",
+  "test": [
+   "tests/test_seatproxy.py::test_other_errors_are_not_a_model_rejection"
+  ]
+ },
+ {
+  "label": "proxy model: only 404 counts (400/403 model errors missed)",
+  "file": "acctsw/seatproxy.py",
+  "old": "MODEL_STATUSES = frozenset({400, 403, 404})",
+  "new": "MODEL_STATUSES = frozenset({404})",
+  "test": [
+   "tests/test_seatproxy.py::test_model_rejection_on_a_seat_replays_on_the_answer"
+  ]
+ },
+ {
+  "label": "proxy model: any error type counts",
+  "file": "acctsw/seatproxy.py",
+  "old": "err.get(\"type\") in MODEL_ERRORS",
+  "new": "True",
+  "test": [
+   "tests/test_seatproxy.py::test_other_errors_are_not_a_model_rejection"
+  ]
+ },
+ {
+  "label": "proxy model: only not_found_error counts",
+  "file": "acctsw/seatproxy.py",
+  "old": "MODEL_ERRORS = frozenset({\"not_found_error\", \"permission_error\", \"invalid_request_error\"})",
+  "new": "MODEL_ERRORS = frozenset({\"not_found_error\"})",
+  "test": [
+   "tests/test_seatproxy.py::test_model_rejection_on_a_seat_replays_on_the_answer"
+  ]
+ },
+ {
+  "label": "proxy model: an error that never mentions the model counts",
+  "file": "acctsw/seatproxy.py",
+  "old": "            and \"model\" in str(err.get(\"message\") or \"\").lower())",
+  "new": "            )",
+  "test": [
+   "tests/test_seatproxy.py::test_other_errors_are_not_a_model_rejection"
+  ]
+ },
+ {
+  "label": "proxy model: the model match is case-sensitive",
+  "file": "acctsw/seatproxy.py",
+  "old": "\"model\" in str(err.get(\"message\") or \"\").lower()",
+  "new": "\"model\" in str(err.get(\"message\") or \"\")",
+  "test": [
+   "tests/test_seatproxy.py::test_model_rejection_matches_any_case_and_truncates_the_detail"
+  ]
+ },
+ {
+  "label": "proxy model: the body is not checked (any candidate status posts)",
+  "file": "acctsw/seatproxy.py",
+  "old": "if kind == \"model\" and not _model_rejection(_decoded(resp.headers, data)):",
+  "new": "if False:",
+  "test": [
+   "tests/test_seatproxy.py::test_other_errors_are_not_a_model_rejection"
+  ]
+ },
+ {
+  "label": "proxy model: model rejections are never detected",
+  "file": "acctsw/seatproxy.py",
+  "old": "kind = \"model\"    # a candidate",
+  "new": "kind = None    # a candidate",
+  "test": [
+   "tests/test_seatproxy.py::test_model_rejection_on_a_seat_replays_on_the_answer",
+   "tests/test_seatproxy.py::test_model_rejection_without_an_answer_passes_through_verbatim"
+  ]
+ },
+ {
+  "label": "proxy model: a gzipped error body is read compressed",
+  "file": "acctsw/seatproxy.py",
+  "old": "return zlib.decompressobj(47).decompress(data, 1 << 20)",
+  "new": "return data",
+  "test": [
+   "tests/test_seatproxy.py::test_a_gzipped_model_rejection_is_recognised_and_passed_on_compressed"
+  ]
+ },
+ {
+  "label": "proxy model: the hit detail is taken from the still-encoded body",
+  "file": "acctsw/seatproxy.py",
+  "old": "_error_detail(_decoded(headers, data)),",
+  "new": "_error_detail(data),",
+  "test": [
+   "tests/test_seatproxy.py::test_a_gzipped_model_rejection_is_recognised_and_passed_on_compressed"
+  ]
+ },
+ {
+  "label": "proxy model: an unanswered model rejection fails open onto the client's login like a 401",
+  "file": "acctsw/seatproxy.py",
+  "old": "if kind == \"auth\" and (\"client\",) not in done:",
+  "new": "if (\"client\",) not in done:",
+  "test": [
+   "tests/test_seatproxy.py::test_model_rejection_without_an_answer_passes_through_verbatim"
+  ]
+ },
+ {
+  "label": "proxy model: a rejection after response bytes have been sent is replayed",
+  "file": "acctsw/seatproxy.py",
+  "old": "if kind and not reply.started and len(tried) < MAX_TRIES:",
+  "new": "if kind and len(tried) < MAX_TRIES:",
+  "test": [
+   "tests/test_seatproxy.py::test_a_model_rejection_after_the_response_started_is_not_replayed"
+  ]
+ },
+ {
+  "label": "proxy model: the detail is not truncated",
+  "file": "acctsw/seatproxy.py",
+  "old": "return str(message)[:200] if message else None",
+  "new": "return str(message) if message else None",
+  "test": [
+   "tests/test_seatproxy.py::test_model_rejection_matches_any_case_and_truncates_the_detail"
+  ]
+ },
+ {
+  "label": "proxy model: model hits are reported as limits",
+  "file": "acctsw/seatproxy.py",
+  "old": "hit = Hit(kind, seat.email,",
+  "new": "hit = Hit(\"limit\" if kind == \"model\" else kind, seat.email,",
+  "test": [
+   "tests/test_seatproxy.py::test_a_model_rejection_is_not_a_limit"
+  ]
+ },
+ {
+  "label": "proxy model: a 429 mentioning a model is reported as a model rejection",
+  "file": "acctsw/seatproxy.py",
+  "old": "hit = Hit(kind, seat.email,",
+  "new": "hit = Hit(\"model\" if kind == \"limit\" else kind, seat.email,",
+  "test": [
+   "tests/test_seatproxy.py::test_a_429_with_a_model_message_is_still_a_limit"
+  ]
+ },
+ {
+  "label": "proxy model: replay ignores the returned seat and uses the client login",
+  "file": "acctsw/seatproxy.py",
+  "old": "                        seat = nxt\n",
+  "new": "                        seat = Seat(\"\", None)\n",
+  "test": [
+   "tests/test_seatproxy.py::test_model_rejection_on_a_seat_replays_on_the_answer"
   ]
  }
 ]

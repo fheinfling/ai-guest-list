@@ -23,15 +23,17 @@ bound to home is a pure passthrough. Only a request that authenticates the way C
 login does (``Authorization: Bearer``, no ``x-api-key``, ``oauth-`` in ``anthropic-beta``) is ever
 given a seat token: SDK scripts and MCP servers in the child inherit the proxy too.
 
-Before the first response byte reaches the client, two upstream answers are replayed instead of
+Before the first response byte reaches the client, three upstream answers are replayed instead of
 passed on, at most once per seat credential:
 
 - a usage limit (429 with ``anthropic-ratelimit-unified-status: rejected``), on any seat;
-- a 401 on a seat whose token the proxy injected (a 401 on home is the client's to handle).
+- a 401 on a seat whose token the proxy injected (a 401 on home is the client's to handle);
+- a model rejection on an injected seat (400/403/404, a ``MODEL_ERRORS`` type, "model" in the
+  message): that seat's plan may not offer the session's model. ``Hit(kind="model")``.
 
 The proxy asks ``decide(hit)`` for the next seat, on a helper thread, for at most
 ``decide_timeout`` seconds; the seat it answers is bound for later requests too. No answer, or a
-late one, passes a limit through unchanged (the launcher's restart path takes over) and replays an
+late one, passes a limit or a model rejection through unchanged (the launcher's restart path takes over) and replays an
 injected 401 with the client's own login instead. Transient 429s and 529s always pass through.
 
 This module does I/O only: it never reads state.json or the Keychain. Tokens live in memory and are
@@ -52,6 +54,7 @@ import ssl
 import threading
 import time
 import urllib.request
+import zlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -64,6 +67,10 @@ HOP_BY_HOP = frozenset({"connection", "keep-alive", "proxy-authenticate", "proxy
                         "upgrade", "host", "content-length", "expect"})
 CLIENT_AUTH = frozenset({"authorization", "x-api-key"})
 MAX_BODY = 64 * 1024 * 1024
+# A seat's plan may not offer the model the session uses: the API answers one of these statuses with
+# one of these error types, naming the model in the message.
+MODEL_STATUSES = frozenset({400, 403, 404})
+MODEL_ERRORS = frozenset({"not_found_error", "permission_error", "invalid_request_error"})
 MAX_TRIES = 8                  # upstream sends per request, whatever ``decide`` answers
 UPSTREAM_TIMEOUT = 660.0       # long thinking pauses between SSE events
 CLIENT_IDLE_TIMEOUT = 900.0    # an idle keep-alive client connection frees its thread after this
@@ -88,7 +95,7 @@ class Seat:
 
 @dataclass(frozen=True)
 class Hit:
-    kind: str                  # "limit" | "auth"
+    kind: str                  # "limit" | "auth" | "model" (the seat cannot use the requested model)
     seat: str                  # email of the seat the request went out on
     reset_at: str | None       # ISO 8601, from anthropic-ratelimit-unified-reset
     detail: str | None         # upstream error message, if any
@@ -132,6 +139,30 @@ def _reset_iso(headers) -> str | None:
         return datetime.fromtimestamp(float(raw), timezone.utc).isoformat() if raw else None
     except (ValueError, OverflowError, OSError):
         return None
+
+
+def _decoded(headers, data: bytes) -> bytes:
+    """An error body without its gzip/deflate content-encoding, for reading only (b"" when it
+    cannot be decoded). The client still gets the bytes as they came."""
+    encoding = (_header(headers, "content-encoding") or "").strip().lower()
+    if encoding in ("", "identity"):
+        return data
+    if encoding in ("gzip", "x-gzip", "deflate"):
+        try:
+            return zlib.decompressobj(47).decompress(data, 1 << 20)    # gzip or zlib header, <= 1 MiB
+        except zlib.error:
+            return b""
+    return b""
+
+
+def _model_rejection(data: bytes) -> bool:
+    """Whether an error body says the requested model is not available (to this seat)."""
+    try:
+        err = json.loads(data).get("error")
+    except (ValueError, AttributeError):
+        return False
+    return (isinstance(err, dict) and err.get("type") in MODEL_ERRORS
+            and "model" in str(err.get("message") or "").lower())
 
 
 def _error_detail(data: bytes) -> str | None:
@@ -653,10 +684,16 @@ class SeatProxy:
                 kind = classify(resp.status, resp.headers) if seat is not None else None
                 if kind == "auth" and seat.token is None:
                     kind = None    # the client's own login: it re-reads its own credentials
+                if kind is None and seat is not None and seat.token is not None \
+                        and resp.status in MODEL_STATUSES:
+                    kind = "model"    # a candidate: the body decides (never on the client's own login)
                 if kind and not reply.started and len(tried) < MAX_TRIES:
                     data = resp.read()
                     self._done(conn, resp)
-                    nxt = self._next_seat(kind, seat, resp.headers, data, tried)
+                    if kind == "model" and not _model_rejection(_decoded(resp.headers, data)):
+                        nxt = None
+                    else:
+                        nxt = self._next_seat(kind, seat, resp.headers, data, tried)
                     if nxt is not None:
                         self._log("replay", kind=kind, seat=_label(seat), token=tok(token),
                                   next=_label(nxt), next_token=tok(nxt.token), path=path)
@@ -752,7 +789,8 @@ class SeatProxy:
     def _next_seat(self, kind: str, seat: Seat, headers, data: bytes, tried: list[Seat]) -> Seat | None:
         """The seat to replay on after ``kind`` hit ``seat``, or None to pass the answer through."""
         hit = Hit(kind, seat.email, _reset_iso(headers) if kind == "limit" else None,
-                  _error_detail(data), _header(headers, "anthropic-ratelimit-unified-representative-claim"))
+                  _error_detail(_decoded(headers, data)),
+                  _header(headers, "anthropic-ratelimit-unified-representative-claim"))
         done = {_key(s) for s in tried}
         with self._decide_lock:
             current = self.bound()
