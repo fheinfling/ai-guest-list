@@ -729,5 +729,41 @@
   "test": [
    "tests/test_seatswap.py::test_preflight_self_test_passes_with_the_session_ca"
   ]
+ },
+ {
+  "label": "nested session not gated",
+  "file": "acctsw/seatswap.py",
+  "old": "    if _nested(environ):\n",
+  "new": "    if False:\n",
+  "test": [
+   "tests/test_seatswap.py::test_a_launcher_nested_in_a_proxied_session_stays_off"
+  ]
+ },
+ {
+  "label": "nested check misses lowercase https_proxy",
+  "file": "acctsw/seatswap.py",
+  "old": "    for name in (\"HTTPS_PROXY\", \"https_proxy\"):\n        try:",
+  "new": "    for name in (\"HTTPS_PROXY\",):\n        try:",
+  "test": [
+   "tests/test_seatswap.py::test_a_launcher_nested_in_a_proxied_session_stays_off"
+  ]
+ },
+ {
+  "label": "nested check ignores the user name",
+  "file": "acctsw/seatswap.py",
+  "old": "            if parts.username == PROXY_USER and parts.hostname == \"127.0.0.1\":",
+  "new": "            if parts.hostname == \"127.0.0.1\":",
+  "test": [
+   "tests/test_seatswap.py::test_other_proxies_are_not_mistaken_for_ours"
+  ]
+ },
+ {
+  "label": "nested check ignores the host",
+  "file": "acctsw/seatswap.py",
+  "old": "            if parts.username == PROXY_USER and parts.hostname == \"127.0.0.1\":",
+  "new": "            if parts.username == PROXY_USER:",
+  "test": [
+   "tests/test_seatswap.py::test_other_proxies_are_not_mistaken_for_ours"
+  ]
  }
 ]

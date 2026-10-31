@@ -769,3 +769,16 @@ def test_preflight_self_test_fails_when_the_ca_is_not_the_servers(ctx, tmp_path)
         assert reason and reason.startswith("local ca:") and calls == []
     finally:
         other.close()
+
+
+@pytest.mark.parametrize("name", ["HTTPS_PROXY", "https_proxy"])
+def test_a_launcher_nested_in_a_proxied_session_stays_off(ctx, tmp_path, name):
+    outer = {name: "http://acctsw:s3cret@127.0.0.1:50123"}
+    assert seatswap.gate(ctx, outer, cwd=tmp_path) == "nested in another acctsw session"
+
+
+@pytest.mark.parametrize("value", [
+    "http://corp:3128", "http://acctsw:x@corp.example:3128", "http://user:x@127.0.0.1:3128",
+    "http://127.0.0.1:3128", "http://acctsw@[::1", ""])
+def test_other_proxies_are_not_mistaken_for_ours(ctx, tmp_path, value):
+    assert seatswap.gate(ctx, {"HTTPS_PROXY": value}, cwd=tmp_path) is None
