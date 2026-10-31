@@ -5,7 +5,9 @@ child gets ``ANTHROPIC_BASE_URL=<start()>``, a URL whose path is a random per-ru
 for any other path gets a 403. Every request is forwarded to ``upstream`` with the client's own
 headers, except ``POST /v1/messages`` and ``POST /v1/messages/count_tokens``: those carry the token
 of the BOUND seat when it has one. A seat without a token is the client's own login (the home seat),
-so a proxy bound to home is a pure passthrough.
+so a proxy bound to home is a pure passthrough. Only a request that authenticates the way Claude
+Code's own login does (``Authorization: Bearer``, no ``x-api-key``) is ever given a seat token: an
+SDK script or MCP server in the child inherits the base URL too and must reach upstream unchanged.
 
 Before the first response byte reaches the client, two upstream answers are replayed instead of
 passed on, at most once per seat credential:
@@ -29,6 +31,7 @@ import http.client
 import json
 import os
 import secrets
+import select
 import ssl
 import threading
 import time
@@ -126,6 +129,21 @@ def _label(seat: Seat) -> str:
 
 # --- upstream ----------------------------------------------------------------------------------
 
+def _tls_context() -> ssl.SSLContext:
+    """The default trust store plus the CA files the user points Python, OpenSSL or Node at (a
+    corporate TLS-inspecting proxy is usually trusted only through one of those)."""
+    ctx = ssl.create_default_context()
+    for var, kind in (("SSL_CERT_FILE", "cafile"), ("SSL_CERT_DIR", "capath"),
+                      ("NODE_EXTRA_CA_CERTS", "cafile")):
+        value = os.environ.get(var)
+        if value:
+            try:
+                ctx.load_verify_locations(**{kind: value})
+            except (OSError, ssl.SSLError):
+                pass    # an unreadable file is left to preflight() to surface
+    return ctx
+
+
 def _tunnel_proxy(scheme: str, host: str) -> str | None:
     """The ``HTTPS_PROXY``/``HTTP_PROXY`` to tunnel through, unless ``NO_PROXY`` exempts ``host``.
 
@@ -134,6 +152,17 @@ def _tunnel_proxy(scheme: str, host: str) -> str | None:
     if urllib.request.proxy_bypass_environment(host, env):
         return None
     return env.get(scheme) or env.get("all") or None
+
+
+def _dropped(conn) -> bool:
+    """Whether an idle keep-alive connection was closed by the far end (it reads as ready: EOF)."""
+    sock = getattr(conn, "sock", None)
+    if sock is None:
+        return False
+    try:
+        return bool(select.select([sock], [], [], 0)[0])
+    except (OSError, ValueError):
+        return True
 
 
 class _Upstream:
@@ -149,7 +178,7 @@ class _Upstream:
         self.netloc = u.netloc.rpartition("@")[2]
         self.base = u.path.rstrip("/")
         self.timeout = timeout
-        self.ssl = ssl.create_default_context() if self.https else None
+        self.ssl = _tls_context() if self.https else None
         self.tunnel: tuple[str, int, dict] | None = None
         proxy = _tunnel_proxy(u.scheme, self.host)
         if proxy:
@@ -173,11 +202,16 @@ class _Upstream:
         return conn
 
     def acquire(self, fresh: bool = False) -> tuple[http.client.HTTPConnection, bool]:
-        """A connection and whether it was reused from the pool."""
-        if not fresh:
+        """A connection and whether it was reused from the pool. Pooled connections the upstream has
+        already closed are discarded here, before anything is sent on them."""
+        while not fresh:
             with self._lock:
-                if self._idle:
-                    return self._idle.pop(), True
+                conn = self._idle.pop() if self._idle else None
+            if conn is None:
+                break
+            if not _dropped(conn):
+                return conn, True
+            conn.close()
         return self._new(), False
 
     def release(self, conn) -> None:
@@ -230,6 +264,12 @@ class _Reply:
         self.whole(status, "", [("content-type", "application/json")], data)
 
 
+def _oauth_client(headers) -> bool:
+    """Whether the client authenticates like Claude Code's own login: a bearer token, no API key."""
+    auth = _header(headers, "authorization") or ""
+    return auth[:7].lower() == "bearer " and _header(headers, "x-api-key") is None
+
+
 def _forward_headers(headers, token: str | None, netloc: str, length: int | None) -> dict:
     items = list(headers.items() if hasattr(headers, "items") else headers)
     named = {n.strip().lower() for k, v in items if k.lower() == "connection" for n in v.split(",")}
@@ -267,6 +307,7 @@ class SeatProxy:
         self._seat = Seat("", None)
         self._known: set[str] = set()     # every token ever bound, for redacting exception texts
         self._active = 0
+        self._messages = 0
         self._last = time.monotonic()
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -314,6 +355,31 @@ class SeatProxy:
     def bound(self) -> Seat:
         with self._lock:
             return self._seat
+
+    def messages_seen(self) -> int:
+        """Client ``POST /v1/messages`` requests with Claude Code's own kind of login (bearer, no
+        API key) received so far, any status, injected or not: proof that Claude Code itself
+        talks to the API through this proxy. An API-key script in the child does not count."""
+        with self._lock:
+            return self._messages
+
+    def preflight(self, timeout: float = 5.0) -> str | None:
+        """Connect to the upstream the way real requests do (tunnel, TLS trust) and send a tokenless
+        ``HEAD /``. None when that works, else a short reason. Any HTTP status counts as working."""
+        conn, _ = self._transport.acquire(fresh=True)
+        conn.timeout = timeout
+        try:
+            conn.request("HEAD", self._transport.base + "/", headers={"Host": self._transport.netloc})
+            conn.getresponse().read()
+            return None
+        except ssl.SSLCertVerificationError as e:
+            return f"tls: {getattr(e, 'verify_message', None) or e}"[:200]
+        except ssl.SSLError as e:
+            return f"tls: {getattr(e, 'reason', None) or e}"[:200]
+        except (OSError, http.client.HTTPException) as e:
+            return f"unreachable: {e.__class__.__name__}: {e}"[:200]
+        finally:
+            conn.close()
 
     def in_flight(self) -> int:
         with self._lock:
@@ -382,7 +448,12 @@ class SeatProxy:
             self._log("forbidden", method=method)
             reply.error(403, "permission_error", "seat proxy: unknown path")
             return True
-        inject = method == "POST" and urlsplit(path).path in INJECT_PATHS
+        endpoint = path.split("?")[0]
+        oauth = _oauth_client(headers)
+        if method == "POST" and endpoint == "/v1/messages" and oauth:
+            with self._lock:
+                self._messages += 1
+        inject = method == "POST" and endpoint in INJECT_PATHS and oauth
         seat = self.bound() if inject else None    # None: the client's headers go out untouched
         tried = [seat] if seat is not None else []
         length = len(body) if body or method in ("POST", "PUT", "PATCH") else None
@@ -391,9 +462,11 @@ class SeatProxy:
         while True:
             token = seat.token if seat is not None else None
             conn, reused = self._transport.acquire(fresh)
+            sent = False
             try:
                 conn.request(method, self._transport.base + path, body=body or None,
                              headers=_forward_headers(headers, token, self._transport.netloc, length))
+                sent = True
                 resp = conn.getresponse()
                 kind = classify(resp.status, resp.headers) if seat is not None else None
                 if kind == "auth" and seat.token is None:
@@ -423,8 +496,10 @@ class SeatProxy:
                     # it. Drop the connection; the client retries the request on its own.
                     self._log("upstream_broken", path=path, error=error)
                     return False
-                if reused and not fresh:
-                    fresh = True    # a pooled keep-alive socket the upstream had already closed
+                if reused and not sent and not fresh:
+                    # A pooled socket that broke while the request was going out: upstream cannot
+                    # have acted on it. Once it is sent, a resend could run it twice.
+                    fresh = True
                     continue
                 self._log("upstream_error", path=path, error=error)
                 reply.error(502, "api_error", "seat proxy: upstream unreachable")
