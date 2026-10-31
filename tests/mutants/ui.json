@@ -2,8 +2,8 @@
  {
   "label": "signedOut ignores the signed_out flag",
   "file": "app/web/render.mjs",
-  "old": "seat?.signed_out === true || seat?.needs_login",
-  "new": "false || seat?.needs_login",
+  "old": "if (typeof seat?.signed_out === \"boolean\") return seat.signed_out;",
+  "new": "if (false) return seat.signed_out;",
   "cmd": [
    "node",
    "--test",
@@ -13,8 +13,8 @@
  {
   "label": "signedOut ignores needs_login (old engine field)",
   "file": "app/web/render.mjs",
-  "old": "|| seat?.needs_login === true ||",
-  "new": "|| false ||",
+  "old": "return seat?.needs_login === true ||",
+  "new": "return false ||",
   "cmd": [
    "node",
    "--test",
@@ -167,8 +167,8 @@
  {
   "label": "expiring seat offers no sign in again",
   "file": "app/web/render.mjs",
-  "old": "if (signinExpiring(seat)) return add(\"sign in again\");",
-  "new": "if (false) return add(\"sign in again\");",
+  "old": "const again = signinExpiring(seat) ? add(\"sign in again\") : \"\";",
+  "new": "const again = \"\";",
   "cmd": [
    "node",
    "--test",
@@ -211,8 +211,8 @@
  {
   "label": "old engine: absent fields turn on signed-out",
   "file": "app/web/render.mjs",
-  "old": "seat?.signed_out === true ||",
-  "new": "seat?.signed_out !== false ||",
+  "old": "if (typeof seat?.signed_out === \"boolean\") return seat.signed_out;",
+  "new": "if (seat?.signed_out !== false) return true;",
   "cmd": [
    "node",
    "--test",

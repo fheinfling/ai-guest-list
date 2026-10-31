@@ -2272,3 +2272,9 @@ test("expiring seat keeps its switch action beside sign in again", () => {
   assert.doesNotMatch(a, />switch</);
   assert.match(a, />sign in again</);
 });
+
+test("headline counts a signed_out seat as not ready even when its status says ready", () => {
+  const html = buildHTML(claudeState(seat({ status: "ready", signed_out: true, usage: { error: "no_token" } })));
+  assert.doesNotMatch(html, /you can keep working/);
+  assert.match(html, /<span class="reading-value">0<\/span>/);
+});
