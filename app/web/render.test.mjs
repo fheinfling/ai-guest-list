@@ -2237,3 +2237,49 @@ test("old engine without the new fields renders as before", () => {
   assert.match(html, /80%/);
   assert.doesNotMatch(html, /signed out|sign-in expires|resetting/);
 });
+
+// --- in-place switching and business/personal crossings ---------------------------------------
+import { crossingRequests } from "./render.mjs";
+
+test("settings offers the in-place switch toggle, on unless turned off", () => {
+  const on = buildSettings({ settings: { theme: "light", strategy: "soonest_back" } });
+  assert.match(on, /switch seats without restarting claude/);
+  assert.match(on, /data-action="toggle" data-key="in_place_switch" checked/);
+  const off = buildSettings({ settings: { theme: "light", strategy: "soonest_back", in_place_switch: false } });
+  assert.match(off, /data-key="in_place_switch" >/);
+});
+
+const crossing = (over = {}) => ({ tool: "claude", from: "w@x", to: "p@x", at: "2026-10-31T10:00:00Z",
+  from_name: "Work", to_name: "Home", from_kind: "business", to_kind: "personal", ...over });
+
+test("a pending crossing is a needs-you item with approve once, always allow and no", () => {
+  const html = buildHTML(state({ pending_crossings: [crossing()] }));
+  assert.match(html, /needs you/);
+  assert.match(html, /Work is out\. continue on Home \(personal\)\?/);
+  for (const scope of ["once", "always", "deny"]) {
+    assert.match(html, new RegExp(`data-action="crossing-answer" data-scope="${scope}" data-tool="claude" data-from="w@x" data-to="p@x"`));
+  }
+  assert.match(html, />approve once</);
+  assert.match(html, />always allow</);
+  assert.match(html, />no</);
+  assert.equal(crossingRequests(state({})), "");
+  assert.doesNotMatch(buildHTML(state({})), /crossing-answer/);
+});
+
+test("an unknown kind is said plainly and names are escaped", () => {
+  const html = crossingRequests({ pending_crossings: [crossing({ to_name: "<b>x</b>", to_kind: "unknown" })] });
+  assert.match(html, /continue on &lt;b&gt;x&lt;\/b&gt; \(plan unknown\)/);
+});
+
+test("crossing answers reach the bridge as approve_crossing / deny_crossing", () => {
+  const html = crossingRequests({ pending_crossings: [crossing()] });
+  const buttons = [...html.matchAll(/data-action="crossing-answer" data-scope="(\w+)" data-tool="([^"]+)" data-from="([^"]+)" data-to="([^"]+)"/g)];
+  assert.equal(buttons.length, 3);
+  const app = keyApp();
+  for (const [, scope, tool, from, to] of buttons) app.click({ action: "crossing-answer", scope, tool, from, to });
+  assert.deepEqual(JSON.parse(JSON.stringify(app.sent.slice(-3))), [
+    { action: "approve_crossing", tool: "claude", from: "w@x", to: "p@x", scope: "once" },
+    { action: "approve_crossing", tool: "claude", from: "w@x", to: "p@x", scope: "always" },
+    { action: "deny_crossing", tool: "claude", from: "w@x", to: "p@x", scope: "deny" },
+  ]);
+});

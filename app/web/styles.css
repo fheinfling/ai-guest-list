@@ -459,3 +459,11 @@ input:focus-visible ~ .sw, .free-control:focus-within, .proof-gate:focus-within 
 .theme-dark .roster-signedout .roster-status { color:#e8877d; }
 .roster-signedout .roster-identity { font-weight:650; }
 .signin-expiry { display:block; margin-top:2px; font-size:.75rem; line-height:1.3; }
+
+/* business <-> personal crossing questions ("needs you") */
+.crossing-prompts { display:flex; flex-direction:column; gap:10px; padding:0 28px 12px; }
+.crossing-confirm { display:flex; flex-direction:column; gap:8px; padding:14px 16px; border:1px solid var(--edge); border-radius:14px; background:var(--surface); }
+.crossing-confirm h2 { font-size:1rem; margin:0; }
+.crossing-tag { font-size:.72rem; letter-spacing:.08em; text-transform:uppercase; opacity:.7; margin:0; }
+.crossing-why { font-size:.8rem; opacity:.75; margin:0; }
+.crossing-acts { display:grid; grid-template-columns:repeat(3, minmax(0,1fr)); gap:8px; }

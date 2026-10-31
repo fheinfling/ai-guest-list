@@ -67,7 +67,8 @@ def switch(ctx: Context, state: State, tool: str, email: str, *, sync: bool = Tr
 
     ``sync=False`` skips sync-back from the stock mirror. Both supervised tools maintain their
     own homes; ``mirror=False`` also leaves stock credentials alone (supervised Claude hops).
-    ``manual=True`` records a request for supervised Codex sessions to resume on the selected seat.
+    ``manual=True`` records a request for supervised sessions to resume on the selected seat, and
+    approves (once) a business/personal crossing onto it: the user chose it.
     ``save=False`` lets a lock-owning caller persist additional hop metadata in the same write.
     """
     if email not in state.accounts(tool):
@@ -101,9 +102,10 @@ def switch(ctx: Context, state: State, tool: str, email: str, *, sync: bool = Tr
             state.data["tools"][tool]["captured_stock_digest"] = _claude_digest(blob)
 
     # 3. record active
+    previous = state.active(tool)
     state.set_active(tool, email)
     state.set_last_on_floor(tool, email, iso(now()))
-    if manual and tool == "codex":
+    if manual:
         # An explicit click/CLI request authorizes a live handoff. Ordinary active-pointer
         # changes (login reconciliation, usage polling) must never interrupt a healthy child.
         # The caller holds the state lock and save() increments this revision. It already
@@ -111,5 +113,13 @@ def switch(ctx: Context, state: State, tool: str, email: str, *, sync: bool = Tr
         state.data["tools"][tool]["manual_switch"] = {
             "id": int(state.data.get("rev", 0)) + 1, "email": email,
         }
+        # The user picked this seat, so moving onto it is no unasked business/personal crossing:
+        # approve it once from the seat the app was on and from every seat a terminal bills.
+        from . import seatkind
+        from .session import active_sessions
+        origins = {previous, *(s["email"] for s in active_sessions(ctx.data_dir, tool))}
+        for origin in sorted(o for o in origins if o and o != email):
+            if seatkind.crosses(state, tool, origin, email):
+                seatkind.approve(state, tool, origin, email, "once", via="manual")
     if save:
         state.save()

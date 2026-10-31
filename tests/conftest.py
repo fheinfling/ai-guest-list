@@ -59,6 +59,24 @@ def _isolate_tool_config_dirs(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _planless_fixture_seats_share_a_kind(request, monkeypatch):
+    """Most fixture seats are stored without a plan, and the tests built on them model ordinary
+    same-kind hops. seatkind rightly treats a missing plan as unknown, and every move involving an
+    unknown kind as a business/personal crossing that needs approval. Give a MISSING plan one shared
+    kind here so those tests keep exercising what they were written for. A named plan (even an
+    unrecognized one) keeps its real kind, and tests marked ``crossings`` see the real rule."""
+    if request.node.get_closest_marker("crossings"):
+        return
+    from acctsw import seatkind
+    real = seatkind.kind
+
+    def kind(seat):
+        plan = seat.get("plan") if isinstance(seat, dict) else seat
+        return "personal" if plan is None or plan == "" else real(seat)
+    monkeypatch.setattr(seatkind, "kind", kind)
+
+
+@pytest.fixture(autouse=True)
 def _clear_process_start_caches():
     """Drop the pid → ``ps`` start-time caches around every test.
 
