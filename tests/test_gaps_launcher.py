@@ -39,9 +39,6 @@ def test_a_click_settles_the_sessions_open_crossing_questions(seats, tokens, mon
     assert (C1, C2) not in seen[1]   # retracted (see the BUG test below for what else follows)
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: after a click hops the session in place, _tick_state "
-                   "keeps judging the pre-hop snapshot/billed seat; the old seat's rest is "
-                   "re-decided and the clicked seat is stamped limited")
 def test_a_click_to_a_healthy_seat_never_rests_that_seat(seats, tokens):
     _rest(seats, C3)
     swap = FakeSwap()

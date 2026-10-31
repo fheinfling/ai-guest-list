@@ -656,8 +656,8 @@
   {
     "label": "round2 N12: a click claude can't take swallows the rest of the tick",
     "file": "acctsw/launcher.py",
-    "old": "                        elif _take_choice(target, frm=billed, reason=\"manual\"):\n                            return True\n",
-    "new": "                        else:\n                            return _take_choice(target, frm=billed, reason=\"manual\")\n",
+    "old": "                            if inplace[\"hopped\"]:\n                                # Moved in place",
+    "new": "                            if True:\n                                # Moved in place",
     "test": [
       "tests/test_launcher_inplace.py::test_a_click_still_lets_the_heartbeat_see_a_rest_in_the_same_write"
     ]
@@ -732,6 +732,60 @@
     "new": "            return (swap is not None\n",
     "test": [
       "tests/test_launcher_inplace.py::test_a_rejected_certificate_after_traffic_only_stops_the_hops"
+    ]
+  },
+  {
+    "label": "click: a click taken in place goes on judging the seat it just left",
+    "file": "acctsw/launcher.py",
+    "old": "                            if inplace[\"hopped\"]:\n                                # Moved in place",
+    "new": "                            if False:\n                                # Moved in place",
+    "test": [
+      "tests/test_gaps_launcher.py::test_a_click_to_a_healthy_seat_never_rests_that_seat"
+    ]
+  },
+  {
+    "label": "consent: maintain() runs while a paid-seat invitation is in flight",
+    "file": "acctsw/launcher.py",
+    "old": "                if key_request is not None:\n                    return False\n                before = running_seat()",
+    "new": "                before = running_seat()",
+    "test": [
+      "tests/test_launcher_inplace.py::test_paid_key_consent_owns_the_child_while_it_is_in_flight"
+    ]
+  },
+  {
+    "label": "crossing: an approval asked from another seat is taken for the current one",
+    "file": "acctsw/launcher.py",
+    "old": "                    if pending[0] == billed:\n                        return _take_choice(pending[1]",
+    "new": "                    if True:\n                        return _take_choice(pending[1]",
+    "test": [
+      "tests/test_launcher_inplace.py::test_an_approval_for_a_question_asked_from_another_seat_is_not_taken"
+    ]
+  },
+  {
+    "label": "crossing: an approved restart kills a session that can't be resumed",
+    "file": "acctsw/launcher.py",
+    "old": "                if tool == \"claude\" and not _capture_claude_resume():\n                    notify(\"claude: couldn't identify this session for resume — staying on this seat\")\n                    tick[\"gui_switch_notified\"] = True",
+    "new": "                if False:\n                    notify(\"claude: couldn't identify this session for resume — staying on this seat\")\n                    tick[\"gui_switch_notified\"] = True",
+    "test": [
+      "tests/test_launcher_inplace.py::test_an_approved_crossing_that_cannot_be_resumed_leaves_the_child_alone"
+    ]
+  },
+  {
+    "label": "banner: an auth hit mutes the next limit banner",
+    "file": "acctsw/launcher.py",
+    "old": "                if h.kind == \"limit\":\n                    tick[\"proxy_limit_at\"] = time.monotonic()",
+    "new": "                if True:\n                    tick[\"proxy_limit_at\"] = time.monotonic()",
+    "test": [
+      "tests/test_launcher_inplace.py::test_an_auth_hit_does_not_mute_the_next_limit_banner"
+    ]
+  },
+  {
+    "label": "pty: a wake fd at EOF stays watched and spins the heartbeat",
+    "file": "acctsw/launcher.py",
+    "old": "                    if not os.read(wake_fd, 4096):   # a doorbell only: the bytes carry nothing\n                        watch.remove(wake_fd)        # writer gone: stop watching, never spin",
+    "new": "                    if not os.read(wake_fd, 4096):   # a doorbell only: the bytes carry nothing\n                        pass",
+    "test": [
+      "tests/test_launcher_inplace.py::test_pty_spawn_stops_watching_a_wake_fd_whose_writer_is_gone"
     ]
   }
 ]

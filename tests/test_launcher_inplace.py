@@ -116,6 +116,7 @@ class FakeSwap:
         self._take(seat)
 
     def maintain(self, ctx, *, third_seat=True):
+        self.maintained = getattr(self, "maintained", 0) + 1
         self.third_seat = third_seat
         if self.maintain_moves_to:
             self._bound, self.maintain_moves_to = self.maintain_moves_to, None
@@ -1396,3 +1397,107 @@ def test_maintain_may_pick_a_third_seat_only_while_the_budget_lasts(seats, token
                     lambda: seen.append(swap.third_seat)], 0))
     assert _run(seats, spawn, swap) == 0
     assert seen == [False, False] and seats.load_state().active("claude") == C3
+
+
+
+# --- mutation triage gaps -------------------------------------------------------------------------
+
+def test_paid_key_consent_owns_the_child_while_it_is_in_flight(ctx, monkeypatch):
+    """While the paid-seat invitation waits for an answer, the swap decides nothing: its Hits
+    pass through and maintain() (which could move or hand over the child) is not consulted."""
+    import json as _json
+    from acctsw import handoff
+    from tests import test_launcher_keyseats as K
+    monkeypatch.setattr(handoff.session, "_proc_start", lambda *_: "test process")
+    _, reset = K.setup(ctx, tool="claude")
+    swap = FakeSwap()
+    seen = {}
+
+    def spawn(argv, on_output, on_tick=None, *, env=None, wake_fd=None):
+        path = ctx._claude_real / "projects" / "test-project" / f"{K.THREAD}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_json.dumps({"sessionId": K.THREAD, "cwd": os.getcwd()}) + "\n")
+        assert not on_output(b"You've hit your usage limit\n")
+        assert handoff.pending(ctx)                     # the invitation is out
+        before = getattr(swap, "maintained", 0)
+        hit = swap.post("limit", "c1@x.com")
+        assert not on_tick()
+        seen.update(answers=list(swap.answers), hit=hit,
+                    maintained=getattr(swap, "maintained", 0) - before)
+        record, = handoff.pending(ctx)
+        handoff.answer(ctx, record["id"], False)
+        return 1
+
+    assert L.run(ctx, "claude", [], spawn=spawn, get=K.usage_get(reset, tool="claude"),
+                 price_get=K.price_get, swap_factory=lambda _ctx: swap) == 1
+    assert seen["answers"] == [(seen["hit"], None)] and seen["maintained"] == 0
+
+
+def test_an_approval_for_a_question_asked_from_another_seat_is_not_taken(seats, tokens):
+    """The session asked c1 -> c2, then the swap itself moved it to c3. An approval of c1 -> c2
+    no longer describes this session's move: nothing happens, nothing is asked again."""
+    kinds = FakeKinds({C1: "business", C2: "personal", C3: "business"})
+    _rest(seats, C3)
+    swap = FakeSwap()
+
+    def swap_moves_to_c3():
+        swap.maintain_moves_to = C3
+
+    spawn = Spawn(([lambda: swap.post("limit", C1), None, swap_moves_to_c3, None,
+                    lambda: _approve(seats, C1, C2), None], 0))
+    assert _run(seats, spawn, swap, seatkind=kinds) == 0
+    assert Seat(C2, "tok-c2") not in swap.binds
+    assert [r[:2] for r in kinds.requests] == [(C1, C2)]
+
+
+def test_an_approved_crossing_that_cannot_be_resumed_leaves_the_child_alone(seats):
+    """A forked session can't be resumed by id: the approved restart is refused, not a kill."""
+    _drop(seats, C3)
+    kinds = FakeKinds({C1: "business", C2: "personal"})
+    spawn = Spawn(([lambda: _rest(seats, C1), None, lambda: _approve(seats, C1, C2), None], 0))
+    notes = []
+    assert run(seats, "claude", ["--resume", "abc", "--fork-session"], spawn=spawn,
+               get=fake_get({}), notify=notes.append, swap_factory=lambda _ctx: None,
+               seatkind=kinds) == 0
+    assert spawn.stops == 0 and len(spawn.calls) == 1
+    assert any("couldn't identify this session for resume" in n for n in notes)
+
+
+def test_an_auth_hit_does_not_mute_the_next_limit_banner(seats, tokens):
+    """Only a proxy LIMIT makes the child's limit banner an echo; after a 401 the banner is news."""
+    from tests.test_usage import claude_ok_body
+    from acctsw import paths as P
+    fetches = []
+
+    def get(url, headers, timeout):
+        fetches.append(url)
+        return 200, claude_ok_body(five=10.0, week=10.0)
+
+    swap = FakeSwap()
+    spawn = Spawn(([lambda: swap.post("auth", C1), None,
+                    b"You've hit your usage limit \xc2\xb7 resets 8pm\n"], 0))
+    assert run(seats, "claude", [], spawn=spawn, get=get, notify=lambda m: None,
+               swap_factory=lambda _ctx: swap) == 0
+    assert fetches   # the banner was checked against the usage endpoint
+
+
+def test_pty_spawn_stops_watching_a_wake_fd_whose_writer_is_gone(monkeypatch):
+    """EOF on the doorbell must not turn the loop into a busy spin of heartbeats."""
+    procs = []
+
+    def fork():
+        r, w = os.pipe()
+        procs.append(subprocess.Popen(["/bin/sleep", "0.5"], stdout=w, start_new_session=True))
+        os.close(w)
+        return procs[0].pid, r
+
+    monkeypatch.setattr(L.pty, "fork", fork)
+    wake_r, wake_w = os.pipe()
+    os.close(wake_w)   # the writer is gone from the start
+    ticks = []
+    try:
+        L.pty_spawn(["unused"], lambda chunk: False, on_tick=lambda: ticks.append(1) and False,
+                    tick_interval=60.0, wake_fd=wake_r)
+    finally:
+        os.close(wake_r)
+    assert len(ticks) <= 2

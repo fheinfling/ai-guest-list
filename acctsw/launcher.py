@@ -2744,8 +2744,14 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                             # The click would carry THIS session across business/personal: ask
                             # for it, like any other crossing, instead of moving.
                             _ask_again(billed, target)
-                        elif _take_choice(target, frm=billed, reason="manual"):
-                            return True
+                        else:
+                            inplace["hopped"] = False
+                            if _take_choice(target, frm=billed, reason="manual"):
+                                return True
+                            if inplace["hopped"]:
+                                # Moved in place: this snapshot (and ``billed``) describe the seat
+                                # just left. Its rest must not be re-decided against the new seat.
+                                return False
                         # Not moved by the click: the checks below still apply to this tick.
                 pending = crossing["pending"]
                 if pending is not None and kinds.approved(snap, tool, *pending, now(),
