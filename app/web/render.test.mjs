@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   buildHTML, dotState, dotKey, doorKey, doorMark, creditLeft, pct, fmtCountdown, needsHello,
-  signedOut, signinExpiring, usable, resetIsPast,
+  signedOut, isActive, signinExpiring, usable, resetIsPast,
   buildSettings, buildAddSeat, reduceReply, supervisionBanner, engineBanner, fmtUsageAge, fmtSessionAge, updateClockText,
 } from "./render.mjs";
 
@@ -2124,7 +2124,7 @@ const rowOf = (html, email) => {
 };
 
 test("signed-out active seat is never shown as active with numbers", () => {
-  const s = seat({ status: "active", signed_out: true, needs_login: true, usage: { error: "no_token", windows: { "5h": win(inHours(1)), weekly: win(inHours(30)) } } });
+  const s = seat({ status: "needs-login", active: true, signed_out: true, needs_login: true, usage: { error: "no_token", windows: { "5h": win(inHours(1)), weekly: win(inHours(30)) } } });
   const html = buildHTML(claudeState(s));
   const row = rosterOf(html);
   assert.match(row, /on now · signed out/);
@@ -2149,7 +2149,7 @@ test("signed-out parked seat reads signed out with a sign in action and no numbe
 });
 
 test("signed-out seat card in the drawer hides bars and offers sign in", () => {
-  const html = buildHTML(claudeState(seat({ status: "active", signed_out: true, usage: { error: "no_token" } })));
+  const html = buildHTML(claudeState(seat({ status: "needs-login", active: true, signed_out: true, usage: { error: "no_token" } })));
   const card = html.slice(html.indexOf("<article"), html.indexOf("</article>"));
   assert.match(card, /on now · signed out/);
   assert.doesNotMatch(card, /% left|usage unknown|class="window"/);
@@ -2219,7 +2219,7 @@ test("headline does not claim all is fine when a seat is signed out", () => {
 });
 
 test("headline with only a signed-out active seat does not say you can keep working", () => {
-  const html = buildHTML(claudeState(seat({ status: "active", signed_out: true, usage: { error: "no_token" } })));
+  const html = buildHTML(claudeState(seat({ status: "needs-login", active: true, signed_out: true, usage: { error: "no_token" } })));
   assert.doesNotMatch(html, /you can keep working/);
   assert.match(html, /your seats need attention\./);
   assert.match(html, /<span class="reading-value">0<\/span>/);
@@ -2236,4 +2236,45 @@ test("old engine without the new fields renders as before", () => {
   assert.match(html, />active</);
   assert.match(html, /80%/);
   assert.doesNotMatch(html, /signed out|sign-in expires|resetting/);
+});
+
+test("revoked subscription is not signed out: keeps check your subscription, no sign in", () => {
+  const s = seat({ status: "ready", signed_out: false, needs_login: true, usage: { error: "forbidden" } });
+  assert.equal(signedOut(s), false);
+  const html = buildHTML(claudeState(s));
+  const card = html.slice(html.indexOf("<article"), html.indexOf("</article>"));
+  assert.match(card, /check your subscription to refresh usage/);
+  assert.doesNotMatch(card, />sign in<\/button>/);
+  assert.doesNotMatch(card, /signed out/);
+});
+
+test("active signed-out seat is keyed on seat.active, not status", () => {
+  const s = seat({ status: "needs-login", active: true, signed_out: true });
+  assert.equal(isActive(s), true);
+  assert.equal(isActive(seat({ status: "needs-login", active: false })), false);
+  const other = seat({ email: "b@x.com", name: "B", status: "ready" });
+  const html = buildHTML(claudeState(other, s));
+  const table = rosterOf(html);
+  assert.ok(table.indexOf("work@x.com") < table.indexOf("b@x.com") || table.indexOf("Work") < table.indexOf(">B<"), "active seat leads");
+  assert.match(table, /on now · signed out/);
+});
+
+test("expiring seat keeps its switch action beside sign in again", () => {
+  const s = seat({ status: "ready", signin_expiring: true, signin_expires_at: inHours(50) });
+  const html = buildHTML(claudeState(s, seat({ email: "b@x.com", name: "B" })));
+  const mine = rowOf(rosterOf(html), "work@x.com");
+  assert.match(mine, /data-action="switch"[^>]*>switch<\/button>/);
+  assert.match(mine, />sign in again<\/button>/);
+  const row = rosterOf(html).split("<tr").find((r) => r.includes("work@x.com") && r.includes("roster-identity"));
+  assert.match(row, /^[^>]*data-action="switch"/, "row itself is a switch target");
+  const active = seat({ status: "active", active: true, signin_expiring: true, signin_expires_at: inHours(50) });
+  const a = rowOf(rosterOf(buildHTML(claudeState(active))), "work@x.com");
+  assert.doesNotMatch(a, />switch</);
+  assert.match(a, />sign in again</);
+});
+
+test("headline counts a signed_out seat as not ready even when its status says ready", () => {
+  const html = buildHTML(claudeState(seat({ status: "ready", signed_out: true, usage: { error: "no_token" } })));
+  assert.doesNotMatch(html, /you can keep working/);
+  assert.match(html, /<span class="reading-value">0<\/span>/);
 });
