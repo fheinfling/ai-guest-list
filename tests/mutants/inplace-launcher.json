@@ -38,7 +38,7 @@
   {
     "label": "in-place: the flag off still starts the proxy and sets ANTHROPIC_BASE_URL",
     "file": "acctsw/launcher.py",
-    "old": "    if not seatswap.enabled(ctx):\n        return None\n",
+    "old": "    if not seatswap.enabled(ctx, args=args):\n        return None\n",
     "new": "",
     "test": [
       "tests/test_launcher_inplace.py::test_default_factory_follows_seatswap_enabled"
@@ -47,8 +47,8 @@
   {
     "label": "in-place: swap.stop missing from run()'s finally",
     "file": "acctsw/launcher.py",
-    "old": "                swap.stop()\n",
-    "new": "                pass\n",
+    "old": "            try:\n                swap.stop()\n",
+    "new": "            try:\n                pass\n",
     "test": [
       "tests/test_launcher_inplace.py::test_swap_is_stopped_even_when_the_child_blows_up",
       "tests/test_launcher_inplace.py::test_limit_hit_moves_the_live_child_without_a_restart"
@@ -64,10 +64,10 @@
     ]
   },
   {
-    "label": "crossing: the request is written on every decision, not once per target",
+    "label": "crossing: the request is written on every decision, not once per move",
     "file": "acctsw/launcher.py",
-    "old": "            fresh = (frm, target) not in crossing[\"requested\"]\n",
-    "new": "            fresh = True\n",
+    "old": "        if (frm, target) in crossing[\"requested\"]:\n            return False\n",
+    "new": "",
     "test": [
       "tests/test_launcher_inplace.py::test_unapproved_crossing_never_switches_and_asks_once"
     ]
@@ -75,8 +75,8 @@
   {
     "label": "crossing: an approval in state is never acted on",
     "file": "acctsw/launcher.py",
-    "old": "                pending = crossing[\"pending\"]\n",
-    "new": "                pending = None\n",
+    "old": "                pending = crossing[\"pending\"]\n                if pending is not None and kinds.approved(snap",
+    "new": "                pending = None\n                if pending is not None and kinds.approved(snap",
     "test": [
       "tests/test_launcher_inplace.py::test_approved_crossing_is_taken_in_place_on_the_next_tick",
       "tests/test_launcher_inplace.py::test_approved_crossing_restarts_when_the_swap_is_off"
@@ -85,8 +85,8 @@
   {
     "label": "crossing: a once-approval is not consumed by the restart that used it",
     "file": "acctsw/launcher.py",
-    "old": "                    if _spend_crossing(state, hit[\"active\"], hit[\"email\"]):\n",
-    "new": "                    if True:\n",
+    "old": "                elif _spend_crossing(state, hit[\"frm\"] or hit[\"active\"], hit[\"email\"]):",
+    "new": "                elif True:",
     "test": [
       "tests/test_launcher_inplace.py::test_approved_crossing_restarts_when_the_swap_is_off"
     ]
@@ -94,7 +94,7 @@
   {
     "label": "crossing: give_up never asks for the candidate choose() left out",
     "file": "acctsw/launcher.py",
-    "old": "    return pick(state, tool, exclude=exclude, origin=origin) if pick is not None else None",
+    "old": "    return selection.crossing_candidate(state, tool, exclude=exclude, origin=origin, home=home)",
     "new": "    return None",
     "test": [
       "tests/test_launcher_inplace.py::test_real_rules_ask_then_carry_the_session_over_once_approved"
@@ -103,8 +103,8 @@
   {
     "label": "in-place: MAX_INPLACE_SWITCHES is not enforced",
     "file": "acctsw/launcher.py",
-    "old": "            if swap is None or inplace[\"hops\"] >= MAX_INPLACE_SWITCHES:\n                return False\n            seat = _proxy_seat(target)",
-    "new": "            if swap is None:\n                return False\n            seat = _proxy_seat(target)",
+    "old": "            return (swap is not None and inplace[\"hops\"] < MAX_INPLACE_SWITCHES\n",
+    "new": "            return (swap is not None\n",
     "test": [
       "tests/test_launcher_inplace.py::test_in_place_budget_is_enforced"
     ]
@@ -112,17 +112,17 @@
   {
     "label": "in-place: an ineligible landing is bound tokenless instead of restarting",
     "file": "acctsw/launcher.py",
-    "old": "            return _inplace_seat(email, token) if token else None",
-    "new": "            return _inplace_seat(email, token)",
+    "old": "            if not token or token == inplace[\"dead\"].get(email):\n                return None\n",
+    "new": "",
     "test": [
       "tests/test_launcher_inplace.py::test_ineligible_landing_falls_back_to_restart"
     ]
   },
   {
-    "label": "in-place: a failed in-place hop is reported as done (no restart fallback)",
+    "label": "in-place: a landing that can't be served in place is reported as done (no restart fallback)",
     "file": "acctsw/launcher.py",
-    "old": "                if _hop_in_place(landing, frm=active):\n                    clear()\n                    return False\n",
-    "new": "                if swap is not None:\n                    _hop_in_place(landing, frm=active)\n                    clear()\n                    return False\n",
+    "old": "                if served == HOPPED:\n                    clear()\n                    return False\n                if served == REFUSED or",
+    "new": "                if served != REFUSED:\n                    clear()\n                    return False\n                if served == REFUSED or",
     "test": [
       "tests/test_launcher_inplace.py::test_ineligible_landing_falls_back_to_restart"
     ]
@@ -148,8 +148,8 @@
   {
     "label": "in-place: the claude spawn is not handed the wake fd",
     "file": "acctsw/launcher.py",
-    "old": "                    wake = {\"wake_fd\": swap.wake_fd}\n",
-    "new": "",
+    "old": "                        wake = {\"wake_fd\": swap.wake_fd}\n",
+    "new": "                        pass\n",
     "test": [
       "tests/test_launcher_inplace.py::test_limit_hit_moves_the_live_child_without_a_restart"
     ]
@@ -157,8 +157,8 @@
   {
     "label": "in-place: a Hit that did not hop is never answered (the proxy waits out its timeout)",
     "file": "acctsw/launcher.py",
-    "old": "                if inplace[\"hit\"] is not None:\n                    swap.answer(inplace[\"hit\"], None)\n",
-    "new": "                if False:\n                    swap.answer(inplace[\"hit\"], None)\n",
+    "old": "                if inplace[\"hit\"] is not None:\n                    _swapcall(\"answer\", inplace[\"hit\"], None)\n                    inplace[\"hit\"] = None\n                return stop\n",
+    "new": "                return stop\n",
     "test": [
       "tests/test_launcher_inplace.py::test_ineligible_landing_falls_back_to_restart"
     ]
@@ -166,8 +166,8 @@
   {
     "label": "in-place: a Hit queued before a hop is passed through instead of replayed",
     "file": "acctsw/launcher.py",
-    "old": "                    swap.answer(h, _proxy_seat(billed) if billed else None)",
-    "new": "                    swap.answer(h, None)",
+    "old": "                    _swapcall(\"answer\", h, _proxy_seat(billed) if billed else None)",
+    "new": "                    _swapcall(\"answer\", h, None)",
     "test": [
       "tests/test_launcher_inplace.py::test_hits_queued_before_a_hop_replay_on_the_new_seat"
     ]
@@ -184,17 +184,17 @@
   {
     "label": "in-place: a dead borrowed token does not fall back to the client's own login",
     "file": "acctsw/launcher.py",
-    "old": "                    _hop_in_place(launch_email, frm=billed)\n",
-    "new": "                    pass\n",
+    "old": "                landings.append(launch_email)   # the client's own login: always ours to go back to\n",
+    "new": "",
     "test": [
-      "tests/test_launcher_inplace.py::test_auth_hit_on_a_borrowed_seat_falls_back_to_the_clients_own_login"
+      "tests/test_launcher_inplace.py::test_a_dead_borrowed_token_falls_back_to_the_clients_own_login"
     ]
   },
   {
     "label": "in-place: maintain()'s handover is ignored",
     "file": "acctsw/launcher.py",
-    "old": "                if verdict == \"handover\":",
-    "new": "                if verdict == \"never\":",
+    "old": "                if _swapcall(\"maintain\", ctx) == \"handover\":",
+    "new": "                if _swapcall(\"maintain\", ctx) == \"never\":",
     "test": [
       "tests/test_launcher_inplace.py::test_handover_restarts_on_the_bound_seats_own_login"
     ]
@@ -205,8 +205,7 @@
     "old": "                if request != seen_manual_switch:\n",
     "new": "                if tool == \"codex\" and request != seen_manual_switch:\n",
     "test": [
-      "tests/test_launcher_inplace.py::test_manual_switch_moves_claude_in_place",
-      "tests/test_launcher_inplace.py::test_manual_switch_restarts_claude_without_the_swap"
+      "tests/test_launcher_inplace.py::test_manual_switch_moves_claude_in_place"
     ]
   },
   {
@@ -216,11 +215,11 @@
     "new": "                if False:\n",
     "test": [
       "tests/test_launcher_inplace.py::test_real_rules_ask_then_carry_the_session_over_once_approved",
-      "tests/test_launcher_inplace.py::test_an_approval_that_lapsed_before_the_commit_switches_nothing"
+      "tests/test_launcher_inplace.py::test_an_approval_refused_at_the_commit_never_kills_and_asks_again"
     ]
   },
   {
-    "label": "crossing: the user's own click spends the approval switch(manual=True) granted",
+    "label": "crossing: the user's own click spends an approval",
     "file": "acctsw/launcher.py",
     "old": "spend=(reason != \"manual\")",
     "new": "spend=True",
@@ -231,8 +230,8 @@
   {
     "label": "crossing: open questions outlive the session that asked them",
     "file": "acctsw/launcher.py",
-    "old": "                with ctx.locked():\n                    st = ctx.load_state()\n                    _withdraw_crossings(st)\n                    st.save()\n",
-    "new": "                pass\n",
+    "old": "                with ctx.locked():\n                    st = ctx.load_state()\n                    _withdraw_crossings(st)\n                    st.save()\n            except Exception:",
+    "new": "                pass\n            except Exception:",
     "test": [
       "tests/test_launcher_inplace.py::test_open_crossing_questions_are_withdrawn_when_the_session_ends"
     ]
@@ -240,8 +239,8 @@
   {
     "label": "crossing: a session that moved elsewhere leaves its question open",
     "file": "acctsw/launcher.py",
-    "old": "        if not kinds.consume(st, tool, frm, to, now()):\n            return False\n        _withdraw_crossings(st)\n",
-    "new": "        if not kinds.consume(st, tool, frm, to, now()):\n            return False\n",
+    "old": "        if not kinds.consume(st, tool, frm, to, now(), home=_home()):\n            return False\n        _withdraw_crossings(st)\n",
+    "new": "        if not kinds.consume(st, tool, frm, to, now(), home=_home()):\n            return False\n",
     "test": [
       "tests/test_launcher_inplace.py::test_a_question_is_withdrawn_once_the_session_moves_elsewhere"
     ]
@@ -256,16 +255,16 @@
     ]
   },
   {
-    "label": "origin (a): the recovery pre-check looks for a landing from the active seat, not the billed one",
+    "label": "origin: the recovery pre-check looks for a landing from the active seat, not the billed one",
     "file": "acctsw/launcher.py",
-    "old": "                sel = choose(snap, tool, origin=billed,\n",
-    "new": "                sel = choose(snap, tool,\n",
+    "old": "                sel = choose(snap, tool, origin=billed, home=launch_email,\n",
+    "new": "                sel = choose(snap, tool, home=launch_email,\n",
     "test": [
       "tests/test_launcher_inplace.py::test_recovery_looks_for_a_landing_from_the_billed_seat"
     ]
   },
   {
-    "label": "manual (b): a click is gated on an approval being on record",
+    "label": "manual: a click is gated on an approval being on record",
     "file": "acctsw/launcher.py",
     "old": "                        return _take_choice(target, frm=billed, reason=\"manual\")\n",
     "new": "                        if kinds is None or kinds.approved(snap, tool, billed, target, now()):\n                            return _take_choice(target, frm=billed, reason=\"manual\")\n",
@@ -274,28 +273,28 @@
     ]
   },
   {
-    "label": "withdraw (c): the question stays open after the session's own seat came back",
+    "label": "withdraw: the question stays open after the session's own seat came back",
     "file": "acctsw/launcher.py",
-    "old": "                    if crossing[\"requested\"]:\n                        # Its own seat came back: the move this session asked about is moot.\n",
-    "new": "                    if False:\n                        # Its own seat came back: the move this session asked about is moot.\n",
+    "old": "                    if crossing[\"requested\"]:\n                        # Its own seat came back",
+    "new": "                    if False:\n                        # Its own seat came back",
     "test": [
       "tests/test_launcher_inplace.py::test_the_question_is_withdrawn_when_the_sessions_own_seat_comes_back"
     ]
   },
   {
-    "label": "approval (d): an approval waits out the blocked window instead of the next tick",
+    "label": "approval: an approval waits out the blocked window instead of the next tick",
     "file": "acctsw/launcher.py",
-    "old": "if pending is not None and kinds.approved(snap, tool, *pending, now()):",
-    "new": "if pending is not None and time.monotonic() >= tick[\"blocked_until\"] and kinds.approved(snap, tool, *pending, now()):",
+    "old": "                if pending is not None and kinds.approved(snap, tool, *pending, now(),",
+    "new": "                if pending is not None and time.monotonic() >= tick[\"blocked_until\"] and kinds.approved(snap, tool, *pending, now(),",
     "test": [
       "tests/test_launcher_inplace.py::test_approved_crossing_is_taken_in_place_on_the_next_tick",
       "tests/test_inplace_integration.py::test_a_crossing_asks_first_and_moves_on_the_tick_after_approval"
     ]
   },
   {
-    "label": "handover (e): the restarted child's seat is never made the proxy's home",
+    "label": "handover: the restarted child's seat is never made the proxy's home",
     "file": "acctsw/launcher.py",
-    "old": "                    swap.set_home(launch_email)\n",
+    "old": "                    _swapcall(\"set_home\", launch_email)\n",
     "new": "",
     "test": [
       "tests/test_launcher_inplace.py::test_handover_restarts_on_the_bound_seats_own_login",
@@ -305,8 +304,8 @@
   {
     "label": "answer: a refused (late) answer leaves the proxy on the old seat",
     "file": "acctsw/launcher.py",
-    "old": "            if pending is None or not swap.answer(pending, seat):",
-    "new": "            if pending is None or not swap.answer(pending, seat) and False:",
+    "old": "            if pending is None or not _swapcall(\"answer\", pending, seat, default=False):",
+    "new": "            if pending is None or not _swapcall(\"answer\", pending, seat, default=False) and False:",
     "test": [
       "tests/test_launcher_inplace.py::test_a_late_answer_still_moves_the_proxy_for_the_requests_to_come"
     ]
@@ -314,8 +313,8 @@
   {
     "label": "integration: the real stack hops in place on a limit Hit",
     "file": "acctsw/launcher.py",
-    "old": "                if _hop_in_place(landing, frm=active):\n",
-    "new": "                if False:\n",
+    "old": "                if served == HOPPED:\n                    clear()\n",
+    "new": "                if False:\n                    clear()\n",
     "test": [
       "tests/test_inplace_integration.py::test_limit_moves_the_live_child_to_a_same_kind_seat"
     ]
@@ -341,10 +340,181 @@
   {
     "label": "integration: the launcher gives a restarted child the old billed seat as home",
     "file": "acctsw/launcher.py",
-    "old": "                    swap.set_home(launch_email)\n",
-    "new": "                    swap.set_home(running_seat())\n",
+    "old": "                    _swapcall(\"set_home\", launch_email)\n",
+    "new": "                    _swapcall(\"set_home\", running_seat())\n",
     "test": [
       "tests/test_inplace_integration.py::test_a_target_whose_token_is_about_to_expire_is_reached_by_restart"
+    ]
+  },
+  {
+    "label": "review #1: a swap error escapes run() and kills the session",
+    "file": "acctsw/launcher.py",
+    "old": "        try:\n            return getattr(swap, method)(*args)\n        except Exception:",
+    "new": "        try:\n            return getattr(swap, method)(*args)\n        except ArithmeticError:",
+    "test": [
+      "tests/test_launcher_inplace.py::test_no_swap_error_ever_leaves_run_or_stops_the_child"
+    ]
+  },
+  {
+    "label": "review #2: a refused approval at the in-place commit falls through to a restart",
+    "file": "acctsw/launcher.py",
+    "old": "                if served == REFUSED or (restart_ok and not _approval_holds(active, landing)):",
+    "new": "                if (restart_ok and not _approval_holds(active, landing)):",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_limit_whose_approval_is_refused_at_the_commit_stays_and_asks_again"
+    ]
+  },
+  {
+    "label": "review #2: no approval re-check before a stop for a crossing restart",
+    "file": "acctsw/launcher.py",
+    "old": "                if served == REFUSED or (restart_ok and not _approval_holds(active, landing)):",
+    "new": "                if served == REFUSED:",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_limit_never_restarts_for_an_approval_that_is_gone"
+    ]
+  },
+  {
+    "label": "review #2: a heartbeat-taken crossing does not ask again when refused",
+    "file": "acctsw/launcher.py",
+    "old": "                if served == REFUSED:\n                    _refused(frm, target)\n                    return False\n                if reason == \"manual\"",
+    "new": "                if served == REFUSED:\n                    return False\n                if reason == \"manual\"",
+    "test": [
+      "tests/test_launcher_inplace.py::test_an_approval_refused_at_the_commit_never_kills_and_asks_again"
+    ]
+  },
+  {
+    "label": "review #2: an approval lapsing during the stop ends the session instead of resuming it",
+    "file": "acctsw/launcher.py",
+    "old": "                    if stay and state.get_seat(tool, stay) is not None:",
+    "new": "                    if False:",
+    "test": [
+      "tests/test_launcher_inplace.py::test_an_approval_lapsing_while_the_child_stops_resumes_on_the_same_seat"
+    ]
+  },
+  {
+    "label": "review #4: a restart relaunches on whatever active is, not the seat it committed",
+    "file": "acctsw/launcher.py",
+    "old": "            relaunch_seat = hit[\"email\"]   # launch on the seat committed, whatever moves next\n",
+    "new": "",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_restart_launches_on_the_seat_it_committed"
+    ]
+  },
+  {
+    "label": "review #4: the exit-time net judges the active seat, not the billed one",
+    "file": "acctsw/launcher.py",
+    "old": "                            seat=active, home=launch_email\n",
+    "new": "                            home=launch_email\n",
+    "test": [
+      "tests/test_launcher_inplace.py::test_the_exit_time_net_judges_the_billed_seat"
+    ]
+  },
+  {
+    "label": "review #4: the wait commits without spending the approval it used",
+    "file": "acctsw/launcher.py",
+    "old": "            if not _spend_crossing(state, origin, email):\n                return False   # the approval lapsed while we waited",
+    "new": "            if False:\n                return False   # the approval lapsed while we waited",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_cold_start_whose_only_free_seat_crosses_asks_and_starts_there_once_approved"
+    ]
+  },
+  {
+    "label": "review #6: a 401 never re-reads the seat's token before giving it up",
+    "file": "acctsw/launcher.py",
+    "old": "                if fresh is not None and fresh.token != inplace[\"tokens\"].get(billed):",
+    "new": "                if False:",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_401_on_a_renewed_token_replays_on_the_new_one"
+    ]
+  },
+  {
+    "label": "review #6: a 401 goes down the limit path and can restart the child",
+    "file": "acctsw/launcher.py",
+    "old": "                if h.kind == \"auth\":\n                    _on_auth_hit(h, billed)\n",
+    "new": "                if False:\n                    _on_auth_hit(h, billed)\n",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_401_never_restarts_the_child"
+    ]
+  },
+  {
+    "label": "review #6: a 401 writes the seat off for the whole run",
+    "file": "acctsw/launcher.py",
+    "old": "                if billed and billed != launch_email:\n                    # Not this token again",
+    "new": "                auth_failed.add(billed)\n                if billed and billed != launch_email:\n                    # Not this token again",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_401_does_not_write_the_seat_off_for_the_run"
+    ]
+  },
+  {
+    "label": "review #6: a token that got a 401 is bound again on the next limit",
+    "file": "acctsw/launcher.py",
+    "old": "                    inplace[\"dead\"][billed] = inplace[\"tokens\"].get(billed)\n",
+    "new": "                    pass\n",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_dead_borrowed_token_is_not_bound_again"
+    ]
+  },
+  {
+    "label": "review #7: hops in place before the child ever used the proxy",
+    "file": "acctsw/launcher.py",
+    "old": "                    and bool(_swapcall(\"proxy_used\", default=False)))",
+    "new": "                    and True)",
+    "test": [
+      "tests/test_launcher_inplace.py::test_no_hop_in_place_before_the_child_has_used_the_proxy"
+    ]
+  },
+  {
+    "label": "review #7: the in_place_switch setting is not read at decision time",
+    "file": "acctsw/launcher.py",
+    "old": "                if (st.get_seat(tool, target) is None\n                        or not st.settings().get(\"in_place_switch\", True)):",
+    "new": "                if (st.get_seat(tool, target) is None):",
+    "test": [
+      "tests/test_launcher_inplace.py::test_switching_the_setting_off_mid_run_stops_hops_in_place_at_once"
+    ]
+  },
+  {
+    "label": "review #3: a failed preflight still points the child at the proxy",
+    "file": "acctsw/launcher.py",
+    "old": "            if why:\n                logging.getLogger(__name__).info(\"in-place seat switching off: %s\", why)",
+    "new": "            if False:\n                logging.getLogger(__name__).info(\"in-place seat switching off: %s\", why)",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_failed_preflight_runs_the_session_without_the_proxy"
+    ]
+  },
+  {
+    "label": "review D8: a click restarts a running claude terminal it can't move in place",
+    "file": "acctsw/launcher.py",
+    "old": "                if reason == \"manual\" and tool == \"claude\":\n",
+    "new": "                if False:\n",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_click_never_restarts_claude_when_it_cannot_move_in_place"
+    ]
+  },
+  {
+    "label": "review D9: the limit path forgets the session's home, so going home needs approval",
+    "file": "acctsw/launcher.py",
+    "old": "    return _hop_or_give_up(state, tool, exclude=exclude, active=active, home=home)\n\n\ndef handle_auth_dead",
+    "new": "    return _hop_or_give_up(state, tool, exclude=exclude, active=active)\n\n\ndef handle_auth_dead",
+    "test": [
+      "tests/test_launcher_inplace.py::test_going_back_home_is_never_a_crossing"
+    ]
+  },
+  {
+    "label": "review D10: the waits never ask about a seat held back only by the crossing rule",
+    "file": "acctsw/launcher.py",
+    "old": "                                 on_crossing=lambda: _crossing_wait(origin))",
+    "new": "                                 on_crossing=None)",
+    "test": [
+      "tests/test_launcher_inplace.py::test_a_cold_start_whose_only_free_seat_crosses_asks_and_starts_there_once_approved"
+    ]
+  },
+  {
+    "label": "review LOW: a handover restarts under a busy child",
+    "file": "acctsw/launcher.py",
+    "old": "                if (time.monotonic() - tick[\"last_output\"] < HANDOVER_QUIET_S\n                        or _exec_blocker()",
+    "new": "                if (False\n                        or _exec_blocker()",
+    "test": [
+      "tests/test_launcher_inplace.py::test_handover_waits_while_the_child_is_busy"
     ]
   }
 ]

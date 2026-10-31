@@ -56,6 +56,12 @@ class FakeProxy:
     def in_flight(self):
         return 0
 
+    def preflight(self, timeout=5.0):
+        return None   # TLS to the upstream would be fine
+
+    def messages_seen(self):
+        return 1      # the child talks to the API through the proxy
+
     def idle_for(self):
         return 999.0
 

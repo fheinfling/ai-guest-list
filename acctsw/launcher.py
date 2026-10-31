@@ -78,6 +78,10 @@ Notifier = Callable[[str], None]
 DEFAULT_COOLDOWN = usage_mod.DEFAULT_COOLDOWN
 MAX_SWITCHES = 6      # safety bound on auto-relaunches within one `run`
 MAX_INPLACE_SWITCHES = 12   # separate bound on in-place seat hops (no restart) within one `run`
+HANDOVER_QUIET_S = 10.0     # a handover restart waits for this much silence on the child's PTY:
+                            # a running tool redraws its spinner, an idle prompt prints nothing
+# What an in-place hop came to (see run()._hop_in_place).
+HOPPED, NOT_SERVABLE, REFUSED = "hopped", "not_servable", "refused"
 TICK_INTERVAL_S = 2.0   # heartbeat for the structured signals (rollout JSONL + state file). Cheap
                         # by construction: one incremental read of an already-open path and one
                         # os.stat, so a silent child is still supervised without polling the network.
@@ -285,7 +289,8 @@ POLL_MIN_FETCH_S = 240   # unforced in-wait polls: per-seat floor between usage 
 
 def _verify_capacity(ctx: Context, tool: str, get, *, at, force: bool,
                      exclude: set | frozenset = frozenset(), ua: str | None = None,
-                     trust_reactive_lag: bool = True) -> Selection:
+                     trust_reactive_lag: bool = True, origin: str | None = None,
+                     home: str | None = None) -> Selection:
     """Fresh ground truth before blocking or giving up: fetch usage for the tool's seats, persist
     the results (store_fetch → _apply_limit, which clears flags a confirmed-healthy fetch disproves
     and re-stamps ones it confirms), drop rest markers that have expired by ``at``, and return a
@@ -295,7 +300,9 @@ def _verify_capacity(ctx: Context, tool: str, get, *, at, force: bool,
     Lock discipline (same as _probe / store_fetch's contract): the state flock is held only for the
     quick reads/writes on either side — NEVER across the network fetches. ``force=False`` polls are
     gated per-seat by usage._due with a POLL_MIN_FETCH_S floor, which includes the endpoint's
-    exponential error backoff — sustained 429s stretch a seat's polls instead of hammering it."""
+    exponential error backoff — sustained 429s stretch a seat's polls instead of hammering it.
+    ``origin``/``home``: the seat a running session is billed to and the one it was launched on, so
+    the business/personal rule judges the move this session would make (default: the active seat)."""
     with ctx.locked():
         state = ctx.load_state()
         due = []
@@ -357,7 +364,7 @@ def _verify_capacity(ctx: Context, tool: str, get, *, at, force: bool,
                 changed = True
         if changed:
             state.save()   # skip the fsync'd rewrite on idle polls (nothing fetched, nothing expired)
-        return choose(state, tool, at=at, exclude=exclude)
+        return choose(state, tool, at=at, exclude=exclude, origin=origin, home=home)
 
 
 def _same_signin(ctx: Context, state, tool: str, email: str, blob: str | None,
@@ -378,7 +385,9 @@ def _same_signin(ctx: Context, state, tool: str, email: str, blob: str | None,
 def _wait_for_unlock(ctx: Context, tool: str, notify: Notifier,
                      sleep: Callable[[float], None], get=usage_mod._default_get,
                      exclude: set | frozenset = frozenset(), cold_start: bool = False,
-                     on_all_resting: Callable[[], bool] | None = None) -> str | None:
+                     on_all_resting: Callable[[], bool] | None = None,
+                     origin: str | None = None, home: str | None = None,
+                     on_crossing: Callable[[], str | None] | None = None) -> str | None:
     """Verify-then-poll until a seat is actually usable. Returns the seat's email, or None to give up.
 
     Never sleeps on stored flags alone: a FORCED verify sweep runs first, so a launch against stale
@@ -399,7 +408,10 @@ def _wait_for_unlock(ctx: Context, tool: str, notify: Notifier,
     give-up (a limit caught during the run, then this wait) must NOT clear its own just-stamped
     reactive rest on an endpoint that merely lags below 100% — that would resume the maxed seat at
     once and busy-loop. Mid-session entries keep the conservative lag guard (trust_reactive_lag=True);
-    only the cold start, where the flag is old and untrusted, relaxes it."""
+    only the cold start, where the flag is old and untrusted, relaxes it.
+
+    ``on_crossing`` runs whenever no seat is free: it asks the user about a seat held back only by
+    the business/personal rule (once), and returns that seat once the move is approved."""
     start = now()
     virtual = start
 
@@ -415,8 +427,17 @@ def _wait_for_unlock(ctx: Context, tool: str, notify: Notifier,
     # trust_reactive_lag=False also lets a fresh "still has credit" reading clear a stale near-max
     # reactive guess (see usage._apply_limit); mid-session keeps the conservative lag guard so a
     # just-stamped reactive rest isn't cleared into a same-seat resume busy-loop.
-    sel = _verify_capacity(ctx, tool, get, at=vnow(), force=True, exclude=exclude, ua=ua,
-                           trust_reactive_lag=not cold_start)
+    def sweep(force: bool, **kw) -> Selection:
+        sel = _verify_capacity(ctx, tool, get, at=vnow(), force=force, exclude=exclude, ua=ua,
+                               origin=origin, home=home, **kw)
+        if not sel.available and on_crossing is not None:
+            approved = on_crossing()
+            if approved:
+                return Selection(email=approved, available=True, unlocks_at=None,
+                                 all_limited=False)
+        return sel
+
+    sel = sweep(True, trust_reactive_lag=not cold_start)
     # This is the existing verified all-resting boundary, including wait-disabled launches.
     # The callback can finish a metered confirmation; False retains the subscription wait verbatim.
     if sel.all_limited and on_all_resting is not None and on_all_resting():
@@ -438,7 +459,7 @@ def _wait_for_unlock(ctx: Context, tool: str, notify: Notifier,
             # An advertised unlock slipped past while a sweep's network fetches were in flight
             # (its ``at`` is captured before the calls): re-verify with a FRESH clock instead of
             # giving up — the expired sweep then frees the seat or stamps a new future target.
-            sel = _verify_capacity(ctx, tool, get, at=vnow(), force=True, exclude=exclude, ua=ua)
+            sel = sweep(True)
             continue
         if announced != target:
             notify(f"all {tool} seats are resting; waiting until {target.isoformat()} to resume "
@@ -452,7 +473,7 @@ def _wait_for_unlock(ctx: Context, tool: str, notify: Notifier,
         sleep(chunk)
         virtual = base + timedelta(seconds=chunk)   # anchor to the base ``remaining`` was cut from
         reached = vnow() >= target
-        sel = _verify_capacity(ctx, tool, get, at=vnow(), force=reached, exclude=exclude, ua=ua)
+        sel = sweep(reached)
 
 
 # --- commands ---------------------------------------------------------------------------------
@@ -526,11 +547,13 @@ def _seat_confirmed_healthy(state, tool: str, email: str, summary: dict) -> bool
     return bool(pcts) and max(pcts) < FALSE_ALARM_MAX_PCT
 
 
-def _hop_or_give_up(state, tool: str, *, exclude, active) -> Decision:
+def _hop_or_give_up(state, tool: str, *, exclude, active, home: str | None = None) -> Decision:
     """Shared decision tail for the limit/auth/exhausted handlers: hop to a free OTHER seat, else
     give_up carrying the soonest unlock time. (``exclude`` may already contain ``active``; the
-    ``!= active`` guard is a belt-and-braces so we never 'switch' to the seat we're leaving.)"""
-    sel = choose(state, tool, exclude=exclude)
+    ``!= active`` guard is a belt-and-braces so we never 'switch' to the seat we're leaving.)
+    ``active`` is the seat being left and ``home`` the session's launch seat: a move back home is
+    never a business/personal crossing."""
+    sel = choose(state, tool, exclude=exclude, origin=active, home=home)
     if sel.email and sel.available and sel.email != active:
         return Decision("switch", sel.email)
     return Decision("give_up", sel.email,
@@ -540,7 +563,7 @@ def _hop_or_give_up(state, tool: str, *, exclude, active) -> Decision:
 def handle_limit(ctx: Context, state, tool: str, *, get=usage_mod._default_get,
                  exclude: set | frozenset = frozenset(), corroborated: bool = False,
                  hard: bool = False, reset_at: str | None = None, source: str | None = None,
-                 detail: str | None = None) -> Decision:
+                 detail: str | None = None, home: str | None = None) -> Decision:
     """A limit was caught for the active seat. Flag it, then choose the next seat. ``exclude`` carries
     seats that already failed auth this run, so a limit never re-selects a known-dead-token seat.
     ``corroborated``: the verify-before-kill probe force-refreshed usage moments ago and it confirmed
@@ -607,10 +630,11 @@ def handle_limit(ctx: Context, state, tool: str, *, get=usage_mod._default_get,
             if detail:
                 seat["limit_detail"] = detail   # the server's own phrase, for the UI/notifications
     state.save()
-    return _hop_or_give_up(state, tool, exclude=exclude, active=active)
+    return _hop_or_give_up(state, tool, exclude=exclude, active=active, home=home)
 
 
-def handle_auth_dead(ctx: Context, state, tool: str, *, exclude: set | frozenset = frozenset()) -> Decision:
+def handle_auth_dead(ctx: Context, state, tool: str, *, exclude: set | frozenset = frozenset(),
+                     home: str | None = None) -> Decision:
     """The active seat's credentials are dead (revoked/signed out) for THIS run. Choose a DIFFERENT
     seat, skipping the active one plus any that already failed auth this session (``exclude``).
 
@@ -621,7 +645,7 @@ def handle_auth_dead(ctx: Context, state, tool: str, *, exclude: set | frozenset
     """
     active = state.active(tool)
     skip = set(exclude) | ({active} if active else set())
-    return _hop_or_give_up(state, tool, exclude=skip, active=active)
+    return _hop_or_give_up(state, tool, exclude=skip, active=active, home=home)
 
 
 def plan_claude_login(ctx: Context, state, email: str) -> tuple[str, str, str | None] | None:
@@ -692,14 +716,16 @@ def _verify_claude_login(blob: str, get, ua: str | None) -> str:
 
 def handle_exhausted(ctx: Context, state, tool: str, *, get=usage_mod._default_get,
                      exclude: set | frozenset = frozenset(),
-                     user_agent: str | None = None) -> Decision:
+                     user_agent: str | None = None, seat: str | None = None,
+                     home: str | None = None) -> Decision:
     """Post-exit safety net: the child exited on its own WITHOUT a stdout limit banner we could catch
     mid-session (codex often just errors/exits on a real limit, and this repo's own limit-prose can
     have turned scanning off earlier in the run). FORCE-refresh the active seat; only if the endpoint
     now POSITIVELY confirms it is out AND another seat is free do we hop. No confirmation → give_up,
     so an ordinary non-zero exit (build failure, crash) is surfaced untouched, never a spurious
-    switch."""
-    active = state.active(tool)
+    switch. ``seat`` is the seat the child was billed to (default: the active seat), ``home`` the
+    one it was launched on."""
+    active = seat or state.active(tool)
     if not active or state.get_seat(tool, active) is None:
         return Decision("give_up", active)
     summary = usage_mod.refresh(
@@ -709,7 +735,8 @@ def handle_exhausted(ctx: Context, state, tool: str, *, get=usage_mod._default_g
     # A 403 is positive evidence that this seat is no longer entitled, not an inconclusive fetch
     # and not a quota rest. Leave it through the dead-token path without inventing a reset time.
     if status == "forbidden":
-        return handle_auth_dead(ctx, state, tool, exclude=exclude)
+        return _hop_or_give_up(state, tool, exclude=set(exclude) | {active}, active=active,
+                               home=home)
     until = parse_iso((state.get_seat(tool, active) or {}).get("limited_until"))
     out = until is not None and until > now()
     # A seat can be authoritatively out (limit_reached / a window at 100%) yet carry NO reset
@@ -723,7 +750,7 @@ def handle_exhausted(ctx: Context, state, tool: str, *, get=usage_mod._default_g
         out = True
     if not out:
         return Decision("give_up", active)
-    return _hop_or_give_up(state, tool, exclude=exclude, active=active)
+    return _hop_or_give_up(state, tool, exclude=exclude, active=active, home=home)
 
 
 # --- real PTY supervisor ----------------------------------------------------------------------
@@ -1328,12 +1355,12 @@ def _claude_env(ctx: Context, email: str) -> dict:
 # The real modules are imported lazily, only when the feature is on, so a launcher without them
 # (or with the feature off) behaves exactly as before. Tests inject fakes through run().
 
-def _default_swap_factory(ctx: Context):
+def _default_swap_factory(ctx: Context, args=()):
     """The live SeatSwap for one run, or None when the feature is off or can't be served (the
     setting, ACCTSW_IN_PLACE_SWITCH=0, a custom API endpoint or key in the environment). Raises
     when the proxy can't start; run() then falls back to restarting the child."""
     from . import seatswap
-    if not seatswap.enabled(ctx):
+    if not seatswap.enabled(ctx, args=args):
         return None
     return seatswap.SeatSwap(ctx)
 
@@ -1359,11 +1386,10 @@ def _load_seatkind():
     return seatkind
 
 
-def _crossing_candidate(state, tool: str, exclude, origin: str) -> str | None:
+def _crossing_candidate(state, tool: str, exclude, origin: str, home: str | None) -> str | None:
     """The best landing seat that choose() left out only because it crosses business/personal."""
     from . import selection
-    pick = getattr(selection, "crossing_candidate", None)
-    return pick(state, tool, exclude=exclude, origin=origin) if pick is not None else None
+    return selection.crossing_candidate(state, tool, exclude=exclude, origin=origin, home=home)
 
 
 def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
@@ -1819,8 +1845,13 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 return False
             return _wait_key() != "declined"
 
+        nonlocal relaunch_seat
+        # The seat being left: the one this session is billed to, or at cold start the active one.
+        origin = ctx.load_state().active(tool) if cold_start else running_seat()
         email = _wait_for_unlock(ctx, tool, notify, sleep, get, exclude=auth_failed,
-                                 cold_start=cold_start, on_all_resting=all_resting)
+                                 cold_start=cold_start, on_all_resting=all_resting,
+                                 origin=origin, home=_home(),
+                                 on_crossing=lambda: _crossing_wait(origin))
         if key_answer == "approved":
             return _activate_key(cold_start=cold_start)
         if email is None or (not cold_start and not _auto_switch_is_on()):
@@ -1830,9 +1861,14 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             state = ctx.load_state()
             if not cold_start and not state.settings().get("auto_switch", True):
                 return False
+            if not _spend_crossing(state, origin, email):
+                return False   # the approval lapsed while we waited: nothing moves
             if email != state.active(tool):
                 _commit_switch(state, email)
                 hopped = True
+            else:
+                state.save()
+        relaunch_seat = email   # launch on the seat committed here, whatever moves active next
         if hopped:
             mark_session(ctx.data_dir, tool, email)
         return True
@@ -1868,7 +1904,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                         return
                 try:
                     sel = _verify_capacity(ctx, tool, get, at=now(), force=False,
-                                           exclude=excluded, ua=ua)
+                                           exclude=excluded, ua=ua, origin=blocked_email,
+                                           home=_home())
                 except Exception:
                     continue
                 if sel.email and sel.available:
@@ -1888,16 +1925,34 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         "hops": 0,          # in-place hops this run (MAX_INPLACE_SWITCHES; not ``switches``)
         "hit": None,        # the proxy Hit the decision tail is deciding right now, if any
         "hopped": False,    # the last decision moved the child in place (it is not blocked)
+        "tokens": {},       # seat -> the token last bound for it (an auth Hit re-reads against it)
+        "dead": {},         # seat -> a token that got a 401: not served in place until it renews
+        "handover": False,  # maintain() asked for a handover restart; waiting for a quiet child
     }
     # Crossing business <-> personal needs the user's say-so. One request per move per session;
     # ``pending`` is the (from, to) the heartbeat watches for an approval.
     kinds = seatkind if seatkind is not None else _load_seatkind()
     crossing = {"requested": set(), "pending": None, "sid": None}
 
+    def _swapcall(method: str, *args, default=None):
+        """Every call into the swap goes through here: the proxy is an optimisation, so no error
+        of its may ever leave run() or stop the child. Logged; the binding stays as it was."""
+        if swap is None:
+            return default
+        try:
+            return getattr(swap, method)(*args)
+        except Exception:
+            logging.getLogger(__name__).info("seat swap %s failed", method, exc_info=True)
+            return default
+
     def running_seat() -> str | None:
         """The seat this child is billed to now: the proxy's bound seat after an in-place hop,
         else the seat it was launched on (whose own login the client holds)."""
-        return (swap.bound() if swap is not None else None) or launch_email
+        return _swapcall("bound") or launch_email
+
+    def _home() -> str | None:
+        """The seat this child was launched on (its own login), once there is a child."""
+        return launch_email if child_started else None
 
     def _spend_crossing(st, frm, to) -> bool:
         """In the locked write that commits a switch: spend the approval a business/personal
@@ -1906,10 +1961,45 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         Caller saves."""
         if kinds is None:
             return True
-        if not kinds.consume(st, tool, frm, to, now()):
+        if not kinds.consume(st, tool, frm, to, now(), home=_home()):
             return False
         _withdraw_crossings(st)
         return True
+
+    def _ask_crossing(st, frm: str, target: str) -> bool:
+        """Record the question ``frm`` -> ``target`` for this session (once per move) and what the
+        heartbeat must watch for. Caller holds the lock and saves; notifies when True."""
+        crossing["pending"] = (frm, target)
+        if (frm, target) in crossing["requested"]:
+            return False
+        crossing["requested"].add((frm, target))
+        crossing["sid"] = crossing["sid"] or resume_thread or str(os.getpid())
+        kinds.request(st, tool, frm, target, crossing["sid"], now(), home=_home())
+        return True
+
+    def _crossing_notice(frm: str, target: str) -> None:
+        kind = kinds.kind(ctx.load_state().get_seat(tool, target) or {})
+        notify(f"{frm} is out. continue this session on {target} ({kind})? "
+               f"approve in ai guest list")
+
+    def _crossing_wait(origin: str | None) -> str | None:
+        """For the waits (cold start, all resting, exit-time): ask about a seat held back only by
+        the business/personal rule, once; return it as soon as the user approved the move."""
+        if kinds is None or not origin:
+            return None
+        with ctx.locked():
+            st = ctx.load_state()
+            pending = crossing["pending"]
+            if (pending is not None and pending[0] == origin
+                    and kinds.approved(st, tool, *pending, now(), home=_home())):
+                return pending[1]
+            target = _crossing_candidate(st, tool, set(auth_failed) | {origin}, origin, _home())
+            fresh = target is not None and _ask_crossing(st, origin, target)
+            if fresh:
+                st.save()
+        if fresh:
+            _crossing_notice(origin, target)
+        return None
 
     def _withdraw_crossings(st) -> None:
         """Caller holds the lock and saves."""
@@ -1921,12 +2011,19 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
     try:
         if tool == "claude" and key is None:
             try:
-                swap = (swap_factory or _default_swap_factory)(ctx)
+                swap = (swap_factory or (lambda c: _default_swap_factory(c, args)))(ctx)
             except Exception:
                 # A proxy that can't start costs nothing but the feature: limits restart as before.
                 # Logged below WARNING: nothing may print into the child's terminal.
                 logging.getLogger(__name__).info("in-place seat switching unavailable",
                                                  exc_info=True)
+                swap = None
+            # Before any child is pointed at it: can the proxy reach the API at all (TLS through
+            # a corporate proxy or a custom CA included)? If not, this run goes without it.
+            why = _swapcall("preflight", default="preflight raised") if swap is not None else None
+            if why:
+                logging.getLogger(__name__).info("in-place seat switching off: %s", why)
+                _swapcall("stop")
                 swap = None
         initial_resting: Decision | None = None
         if pin:
@@ -1946,7 +2043,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 if not sel.email and all(s.get("auth_error") for s in state.accounts(tool).values()):
                     notify(f"all {tool} seats need you to sign in again — re-add them via the app")
                     return EXIT_GAVE_UP
-                if sel.available and sel.email and sel.email != state.active(tool):
+                if (sel.available and sel.email and sel.email != state.active(tool)
+                        and _spend_crossing(state, state.active(tool), sel.email)):
                     switch(ctx, state, tool, sel.email, sync=False, mirror=(tool != "claude"))
                 _activate_home(state.active(tool))
             if sel.all_limited:
@@ -2086,26 +2184,39 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 token = _inplace_eligible(ctx, email, home_email=launch_email)
             except Exception:
                 return None   # e.g. a locked keychain: a restart can still serve it
-            return _inplace_seat(email, token) if token else None
+            if not token or token == inplace["dead"].get(email):
+                return None
+            return _inplace_seat(email, token)
 
-        def _hop_in_place(target: str, *, frm: str | None, spend: bool = True) -> bool:
+        def _inplace_on() -> bool:
+            """Can a hop be served in place at all right now? Only once the child has actually
+            sent /v1/messages through the proxy (a client that ignores the base URL would be
+            billed to its own login whatever we bind), and within MAX_INPLACE_SWITCHES."""
+            return (swap is not None and inplace["hops"] < MAX_INPLACE_SWITCHES
+                    and bool(_swapcall("proxy_used", default=False)))
+
+        def _hop_in_place(target: str, *, frm: str | None, spend: bool = True) -> str:
             """Carry the LIVE child to ``target`` without a restart: point the proxy at that seat
-            and commit the hop in state exactly as a restart would. False when it can't be served
-            in place (feature off, MAX_INPLACE_SWITCHES spent, no eligible token, seat gone); the
-            caller then restarts instead. Answers the proxy Hit under decision, if there is one.
-            ``spend=False`` is for the user's own click: switch(manual=True) already approved any
-            crossing, and a second session on the same seat must not find it spent."""
-            if swap is None or inplace["hops"] >= MAX_INPLACE_SWITCHES:
-                return False
+            and commit the hop in state exactly as a restart would. HOPPED when done (answering
+            the proxy Hit under decision, if any); NOT_SERVABLE when in place can't serve it
+            (feature off or switched off now, proxy unused, budget spent, no eligible token, seat
+            gone), so the caller may restart; REFUSED when the business/personal approval the move
+            needs is gone, so nothing may move — and nothing may be killed either.
+            ``spend=False`` is for the user's own click, which switch(manual=True) already
+            settled with seatkind."""
+            if not _inplace_on():
+                return NOT_SERVABLE
             seat = _proxy_seat(target)
             if seat is None:
-                return False
+                return NOT_SERVABLE
             with ctx.locked():
                 st = ctx.load_state()
-                if st.get_seat(tool, target) is None:
-                    return False
+                # The setting is read at the moment of decision: off means off, mid-run too.
+                if (st.get_seat(tool, target) is None
+                        or not st.settings().get("in_place_switch", True)):
+                    return NOT_SERVABLE
                 if spend and not _spend_crossing(st, frm, target):
-                    return False
+                    return REFUSED
                 if not spend:
                     _withdraw_crossings(st)
                 switch(ctx, st, tool, target, sync=False, mirror=False, save=False)
@@ -2114,8 +2225,9 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             pending, inplace["hit"] = inplace["hit"], None
             # The proxy replays the pending request on the new seat. An answer that came too late
             # (the 429 already went through) is refused, so bind for the requests still to come.
-            if pending is None or not swap.answer(pending, seat):
-                swap.bind(seat)
+            if pending is None or not _swapcall("answer", pending, seat, default=False):
+                _swapcall("bind", seat)
+            inplace["tokens"][target] = seat.token
             inplace["hops"] += 1
             inplace["hopped"] = True
             tick["blocked"] = False
@@ -2123,33 +2235,50 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             mark_session(ctx.data_dir, tool, target, home=launch_email)
             notify(f"{frm} needs a rest 💤 — {target} takes over, same session, no restart ✨"
                    if frm else f"{tool}: now on {target}, same session, no restart ✨")
-            return True
+            return HOPPED
+
+        def _approval_holds(frm: str | None, to: str) -> bool:
+            """Checked right before a stop for a restart: is the business/personal approval the
+            move needs still there? A child is never killed for a move that can't be committed."""
+            if kinds is None:
+                return True
+            with ctx.locked():
+                return kinds.approved(ctx.load_state(), tool, frm, to, now(), home=launch_email)
+
+        def _refused(frm: str, target: str) -> None:
+            """The approval for ``frm`` -> ``target`` was spent or lapsed: stay, and ask again."""
+            if kinds is None:
+                return
+            crossing["requested"].discard((frm, target))
+            with ctx.locked():
+                st = ctx.load_state()
+                fresh = _ask_crossing(st, frm, target)
+                st.save()
+            if fresh:
+                _crossing_notice(frm, target)
 
         def _crossing_gate(state, frm: str | None, dec: Decision) -> tuple[str | None, bool]:
             """Under the lock: the landing seat this decision may NOT take because it crosses
             business <-> personal without the user's approval, and whether that request is new.
-            Records the request (once per target per session) and what the heartbeat must watch."""
+            Records the request (once per move per session) and what the heartbeat must watch.
+            A move back to this session's own launch seat is never a crossing."""
             if kinds is None or not frm:
                 return None, False
             if dec.action == "switch":
-                if (not kinds.crosses(state, tool, frm, dec.email)
-                        or kinds.approved(state, tool, frm, dec.email, now())):
+                if kinds.approved(state, tool, frm, dec.email, now(), home=launch_email):
                     return None, False
                 target = dec.email
             elif dec.action == "give_up":
                 # choose() never auto-picks a crossing seat; ask whether one was all there was.
-                target = _crossing_candidate(state, tool, set(auth_failed) | {frm}, frm)
+                target = _crossing_candidate(state, tool, set(auth_failed) | {frm}, frm,
+                                             launch_email)
                 if not target:
                     return None, False
             else:
                 return None, False
-            fresh = (frm, target) not in crossing["requested"]
+            fresh = _ask_crossing(state, frm, target)
             if fresh:
-                crossing["requested"].add((frm, target))
-                crossing["sid"] = crossing["sid"] or resume_thread or str(os.getpid())
-                kinds.request(state, tool, frm, target, crossing["sid"], now())
                 state.save()
-            crossing["pending"] = (frm, target)
             return target, fresh
 
         def _decide_and_maybe_stop(*, reason: str, hard: bool = False,
@@ -2195,11 +2324,12 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                         if refresh_revoked and seat is not None:
                             seat["auth_error"] = "refresh_token_revoked"
                             state.save()
-                    dec = handle_auth_dead(ctx, state, tool, exclude=auth_failed)
+                    dec = handle_auth_dead(ctx, state, tool, exclude=auth_failed,
+                                           home=launch_email)
                 else:
                     dec = handle_limit(ctx, state, tool, get=get, exclude=auth_failed,
                                        corroborated=True, hard=hard, reset_at=reset_at,
-                                       source=source, detail=detail)
+                                       source=source, detail=detail, home=launch_email)
                 # The app can continue to supervise a session and record a confirmed rest while
                 # automatic hopping is disabled.  In that mode the running child keeps ownership
                 # of its terminal and exit code; a later cold start can still safely select a
@@ -2213,7 +2343,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     if crossed is not None:
                         dec = Decision("give_up", None, dec.unlocks_at)
                 restart_ok = switches < max_switches
-                inplace_ok = swap is not None and inplace["hops"] < MAX_INPLACE_SWITCHES
+                inplace_ok = (_inplace_on()
+                              and bool(state.settings().get("in_place_switch", True)))
                 approved = auto_switch and dec.action == "switch" and (restart_ok or inplace_ok)
                 if realigned and not approved:
                     # Not hopping after all: put the pointer back so a seat the user picked in the
@@ -2221,9 +2352,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     state.set_active(tool, prev_active)
                     state.save()
             if crossed_fresh:
-                kind = kinds.kind(ctx.load_state().get_seat(tool, crossed) or {})
-                notify(f"{active} is out. continue this session on {crossed} ({kind})? "
-                       f"approve in ai guest list")
+                _crossing_notice(active, crossed)
 
             def _undo_realign() -> None:
                 """Same promise as above for the paths that give up AFTER the lock was released:
@@ -2250,7 +2379,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     # workspace and the sibling member was still usable.
                     skip = set(auth_failed) | ({billed} if billed else set())
                     sel = _verify_capacity(ctx, tool, get, at=now(), force=True, exclude=skip,
-                                           ua=None)
+                                           ua=None, origin=billed, home=launch_email)
                     if sel.email and sel.available and sel.email != billed:
                         landing = sel.email   # the fresh sweep may name a different seat than choose
                     else:
@@ -2278,8 +2407,16 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                         scan["auto_switch_off_notified"] = True
                     return False
                 # In place first: the session keeps going on the landing seat with no restart.
-                if _hop_in_place(landing, frm=active):
+                served = _hop_in_place(landing, frm=active)
+                if served == HOPPED:
                     clear()
+                    return False
+                if served == REFUSED or (restart_ok and not _approval_holds(active, landing)):
+                    # The approval this crossing needed is gone: stay put and ask again.
+                    _undo_realign()
+                    _refused(active, landing)
+                    clear()
+                    scan["next_probe"] = time.monotonic() + PROBE_COOLDOWN_S
                     return False
                 if restart_ok:
                     if tool == "claude" and not _capture_claude_resume():
@@ -2486,6 +2623,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 "active": None,       # seat the still-live child was using
                 "hard": False,
                 "handled": False,
+                "frm": None,          # the billed seat a crossing restart leaves (spends from)
             }
             buf.clear()
 
@@ -2511,6 +2649,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 "healthy_at": None,           # monotonic of the last structured "still has headroom"
                 "last_structured": None,      # last structured limit signal (post-exit evidence)
                 "proxy_limit_at": None,       # monotonic of the proxy's last structured limit Hit
+                "last_output": time.monotonic(),   # the child's last PTY output (handover waits)
             }
 
             def _tick_state() -> bool:
@@ -2543,7 +2682,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                             and ctx.snapshot_get(tool, target)):
                         return _take_choice(target, frm=billed, reason="manual")
                 pending = crossing["pending"]
-                if pending is not None and kinds.approved(snap, tool, *pending, now()):
+                if pending is not None and kinds.approved(snap, tool, *pending, now(),
+                                                          home=launch_email):
                     # The user approved the crossing this session asked for: same path as a click.
                     crossing["pending"] = None
                     if pending[0] == billed:
@@ -2572,9 +2712,20 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
 
             def _take_choice(target: str, *, frm: str | None, reason: str) -> bool:
                 """The user chose ``target`` (a click, or approving a crossing): in place when the
-                proxy can serve it, else stop for a restart there. An explicit choice is not vetoed
-                by auto-switch or the automatic hop budget."""
-                if _hop_in_place(target, frm=frm, spend=(reason != "manual")):
+                proxy can serve it, else stop for a restart there — except that a click never
+                restarts a running claude terminal: it applies to the next session, as it always
+                did. An explicit choice is not vetoed by auto-switch or the automatic hop budget."""
+                served = _hop_in_place(target, frm=frm, spend=(reason != "manual"))
+                if served == HOPPED:
+                    return False
+                if served == REFUSED:
+                    _refused(frm, target)
+                    return False
+                if reason == "manual" and tool == "claude":
+                    if not tick["gui_switch_notified"]:
+                        tick["gui_switch_notified"] = True
+                        notify(f"{tool} is still running on {frm}; your new seat applies to "
+                               f"the next session")
                     return False
                 exec_why = _exec_blocker()
                 if exec_why:
@@ -2586,7 +2737,16 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     notify("claude: couldn't identify this session for resume — staying on this seat")
                     tick["gui_switch_notified"] = True
                     return False
-                hit.update(reason=reason, email=target, active=frm, hard=False, handled=True)
+                active = frm
+                if reason == "crossing":
+                    # Never kill for a move that can't be committed: the approval must still be
+                    # there, and the commit after the exit compares against what active is NOW.
+                    if not _approval_holds(frm, target):
+                        _refused(frm, target)
+                        return False
+                    active = ctx.load_state().active(tool)
+                hit.update(reason=reason, email=target, active=active, frm=frm, hard=False,
+                           handled=True)
                 return True
 
             def _tick_decide(**kw) -> bool:
@@ -2635,7 +2795,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 if switches >= max_switches and not (
                         swap is not None and inplace["hops"] < MAX_INPLACE_SWITCHES):
                     return False
-                sel = choose(snap, tool, origin=billed,
+                sel = choose(snap, tool, origin=billed, home=launch_email,
                              exclude=set(auth_failed) | ({billed} if billed else set()))
                 if not (sel.email and sel.available):
                     return False   # still nowhere to go; try again after the next TICK_BLOCK_S
@@ -2654,24 +2814,53 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 billed = running_seat()
                 if h.seat != billed:
                     # Sent before an earlier decision moved the proxy on: replay where it is now.
-                    swap.answer(h, _proxy_seat(billed) if billed else None)
+                    _swapcall("answer", h, _proxy_seat(billed) if billed else None)
                     return False
+                if h.kind == "auth":
+                    _on_auth_hit(h, billed)
+                    return False   # a 401 on a borrowed token never costs the child a restart
                 if time.monotonic() < tick["blocked_until"]:
-                    swap.answer(h, None)   # decided already, nowhere to land: pass it through
+                    _swapcall("answer", h, None)   # decided already, nowhere to land: pass it on
                     return False
                 inplace["hit"] = h
-                stop = _tick_decide(reason="auth" if h.kind == "auth" else "limit",
-                                    reset_at=h.reset_at, detail=h.detail,
-                                    source="usage" if h.kind == "limit" else None)
-                if (not stop and inplace["hit"] is not None and h.kind == "auth"
-                        and billed != launch_email):
-                    # A borrowed seat's token died and no other seat can take over: fall back to
-                    # the client's own login rather than fail the request.
-                    _hop_in_place(launch_email, frm=billed)
+                stop = _tick_decide(reason="limit", reset_at=h.reset_at, detail=h.detail,
+                                    source="usage")
                 if inplace["hit"] is not None:
-                    swap.answer(inplace["hit"], None)
+                    _swapcall("answer", inplace["hit"], None)
                     inplace["hit"] = None
                 return stop
+
+            def _on_auth_hit(h, billed: str | None) -> None:
+                """A borrowed seat's token got a 401. One 401 is no proof the seat is dead (its
+                login may simply have been renewed), so: replay on a fresher token if the seat has
+                one; else move in place to another seat; else back to the child's own login. The
+                seat is not written off for the run, and nothing here ever restarts the child."""
+                inplace["hit"] = h
+                fresh = _proxy_seat(billed) if billed and billed != launch_email else None
+                if fresh is not None and fresh.token != inplace["tokens"].get(billed):
+                    inplace["hit"] = None
+                    if not _swapcall("answer", h, fresh, default=False):
+                        _swapcall("bind", fresh)
+                    inplace["tokens"][billed] = fresh.token
+                    return
+                if billed and billed != launch_email:
+                    # Not this token again (a renewed one is welcome): no in-place ping-pong.
+                    inplace["dead"][billed] = inplace["tokens"].get(billed)
+                landings = []
+                if _auto_switch_is_on():
+                    with ctx.locked():
+                        sel = choose(ctx.load_state(), tool, origin=billed, home=launch_email,
+                                     exclude=set(auth_failed) | ({billed} if billed else set()))
+                    if sel.available and sel.email:
+                        landings.append(sel.email)
+                landings.append(launch_email)   # the client's own login: always ours to go back to
+                for landing in landings:
+                    if (landing and landing != billed
+                            and _hop_in_place(landing, frm=billed) == HOPPED):
+                        return
+                if inplace["hit"] is not None:
+                    _swapcall("answer", inplace["hit"], None)
+                    inplace["hit"] = None
 
             def _follow_maintain(frm: str | None, to: str) -> None:
                 """maintain() moved the proxy on its own (a borrowed token lapsing with no fresher
@@ -2686,33 +2875,44 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 notify(f"{frm}'s login here is running out — {to} takes over, same session ✨")
 
             def _tick_swap() -> bool:
-                hits = list(swap.pending())
+                hits = list(_swapcall("pending", default=()) or ())
                 while hits:
                     h = hits.pop(0)
                     if key_request is not None:
-                        swap.answer(h, None)   # paid consent owns this child: decide nothing
+                        _swapcall("answer", h, None)   # paid consent owns this child: decide nothing
                     elif _on_hit(h):
                         for rest in hits:
-                            swap.answer(rest, None)   # the child is stopping for a restart
+                            _swapcall("answer", rest, None)   # the child is stopping for a restart
                         return True
+                if key_request is not None:
+                    return False
                 before = running_seat()
-                verdict = swap.maintain(ctx) if key_request is None else None
+                if _swapcall("maintain", ctx) == "handover":
+                    inplace["handover"] = True
                 if running_seat() != before:
                     _follow_maintain(before, running_seat())
-                if verdict == "handover":
-                    # The borrowed seat's token is running out and only its own login can renew
-                    # it: restart the child on that seat (with resume) once the proxy sees it idle.
-                    seat = running_seat()
-                    if (seat and seat != launch_email and switches < max_switches
-                            and (tool != "claude" or _capture_claude_resume())):
-                        hit.update(reason="handover", email=seat, active=seat, hard=False,
-                                   handled=True)
-                        return True
-                return False
+                seat = running_seat()
+                if not inplace["handover"] or seat == launch_email:
+                    inplace["handover"] = False
+                    return False
+                # The borrowed seat's token is running out and only its own login can renew it:
+                # restart the child on that seat (with resume) — but only once it is quiet. A tool
+                # running inside the child redraws its spinner; an idle prompt prints nothing.
+                if (time.monotonic() - tick["last_output"] < HANDOVER_QUIET_S
+                        or _exec_blocker() is not None or switches >= max_switches
+                        or (tool == "claude" and not _capture_claude_resume())):
+                    return False
+                inplace["handover"] = False
+                hit.update(reason="handover", email=seat, active=seat, hard=False, handled=True)
+                return True
 
             def _tick() -> bool:
-                if swap is not None and _tick_swap():
-                    return True
+                try:
+                    if swap is not None and _tick_swap():
+                        return True
+                except Exception:
+                    # Belt and braces around the swap glue: whatever went wrong, the child lives.
+                    logging.getLogger(__name__).info("in-place tick failed", exc_info=True)
                 if key_request is not None:
                     answer = _poll_key()
                     if answer == "approved":
@@ -2757,6 +2957,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 return _tick_state() or _tick_recover()
 
             def on_output(chunk: bytes) -> bool:
+                tick["last_output"] = time.monotonic()
                 if key_request is not None:
                     return False  # consent is polled by the heartbeat, not by redrawn banners
                 buf.extend(chunk)
@@ -2854,9 +3055,11 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 wake = {}
                 if swap is not None:
                     # A new child holds this seat's own login: the proxy starts as passthrough.
-                    swap.set_home(launch_email)
-                    env = swap.env(env)
-                    wake = {"wake_fd": swap.wake_fd}
+                    _swapcall("set_home", launch_email)
+                    routed = _swapcall("env", env)
+                    if routed is not None:   # else this child talks to the API directly
+                        env = routed
+                        wake = {"wake_fd": swap.wake_fd}
                 status = spawn(argv, on_output, on_tick=_tick, env=env, **wake)
                 _sync_claude_home(launch_email)
                 _capture_claude_resume()
@@ -2933,6 +3136,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                         return status
                     _commit_switch(state, target)
                     seen_manual_switch = state.data["tools"][tool].get("manual_switch")
+                relaunch_seat = target
                 mark_session(ctx.data_dir, tool, target)
                 notify(f"{tool}: switching to {target}, resuming your work")
                 resuming = True
@@ -2975,11 +3179,12 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                         and _exec_blocker() is None):
                     ua = (usage_mod.claude_user_agent(getattr(ctx, "claude_bin", None))
                           if tool == "claude" else None)  # subprocess — before the state flock
+                    active = running_seat()   # the seat the child was billed to when it exited
                     with ctx.locked():
                         state = ctx.load_state()
-                        active = state.active(tool)
                         dec = handle_exhausted(
-                            ctx, state, tool, get=get, exclude=auth_failed, user_agent=ua
+                            ctx, state, tool, get=get, exclude=auth_failed, user_agent=ua,
+                            seat=active, home=launch_email
                         )
                         # handle_exhausted can now hop for TWO different reasons: a real usage limit,
                         # or a 403 (entitlement gone). Decision carries no reason, so read the status
@@ -2991,13 +3196,16 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     if dec.action == "switch":
                         with ctx.locked():
                             state = ctx.load_state()
-                            landing = choose(state, tool, exclude=auth_failed)
+                            landing = choose(state, tool, exclude=auth_failed, origin=active,
+                                             home=launch_email)
                             if (state.settings().get("auto_switch", True)
                                     and state.active(tool) == active and landing.available
-                                    and landing.email == dec.email):
+                                    and landing.email == dec.email
+                                    and _spend_crossing(state, active, dec.email)):
                                 _commit_switch(state, dec.email)
                                 switched = True
                     if switched:
+                        relaunch_seat = dec.email
                         mark_session(ctx.data_dir, tool, dec.email)
                         why = ("is no longer entitled" if exit_revoked else "hit its usage limit")
                         notify(f"{active} {why} — hopping to {dec.email}, "
@@ -3033,16 +3241,26 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     handoff_blocked = "auto-switch was turned off before the handoff completed"
                 elif state.active(tool) != hit["active"]:
                     handoff_blocked = "another switch changed the active seat before the handoff completed"
+                elif _spend_crossing(state, hit["frm"] or hit["active"], hit["email"]):
+                    _commit_switch(state, hit["email"])
+                    committed = True
                 else:
-                    if _spend_crossing(state, hit["active"], hit["email"]):
-                        _commit_switch(state, hit["email"])
-                        committed = True
-                    else:
-                        handoff_blocked = (f"approval to continue on {hit['email']} lapsed "
-                                           f"before the handoff completed")
+                    # The approval lapsed while the child was stopping. Its session is saved:
+                    # carry on where it was rather than end it, and ask again on the next limit.
+                    stay = hit["frm"] or hit["active"]
+                    if stay and state.get_seat(tool, stay) is not None:
+                        notify(f"{tool}: the approval to continue on {hit['email']} lapsed — "
+                               f"resuming your work on {stay}")
+                        relaunch_seat = stay
+                        switches += 1
+                        resuming = True
+                        continue
+                    handoff_blocked = (f"approval to continue on {hit['email']} lapsed "
+                                       f"before the handoff completed")
             if not committed:
                 notify(f"{tool} {handoff_blocked}")
                 return status
+            relaunch_seat = hit["email"]   # launch on the seat committed, whatever moves next
             mark_session(ctx.data_dir, tool, hit["email"])
             reason_msg = (
                 "needs you to sign in again 🔑" if hit["reason"] == "auth"

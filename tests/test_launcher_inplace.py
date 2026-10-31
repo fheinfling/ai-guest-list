@@ -53,8 +53,22 @@ class FakeSwap:
         self.maintain_result = None
         self.maintain_moves_to = None
         self.refuse_answers = False   # every Hit timed out before the launcher answered
+        self.preflight_says = None    # a reason string: the proxy can't reach the API
+        self.used = True              # the child has sent /v1/messages through the proxy
+        self.raising = set()          # method names that blow up
         self.stopped = False
         self._bound = None
+
+    def __getattribute__(self, name):
+        if name in object.__getattribute__(self, "raising"):
+            raise RuntimeError(f"swap.{name} exploded")
+        return object.__getattribute__(self, name)
+
+    def preflight(self):
+        return self.preflight_says
+
+    def proxy_used(self):
+        return self.used
 
     def post(self, kind, seat, **kw):
         hit = Hit(kind, seat, **kw)
@@ -108,28 +122,36 @@ class FakeKinds:
         self.consumed = []
         self.withdrawn = []
         self.lapse = False   # approved() says yes, but it is gone by the commit
+        self.yes_left = None  # approved() says yes this many more times, then no
 
     def kind(self, seat):
         return "personal"
 
-    def crosses(self, state, tool, a, b):
+    def crosses(self, state, tool, a, b, *, home=None):
+        if a == b or (home and b == home):
+            return False
         return self.kinds.get(a, "unknown") != self.kinds.get(b, "unknown")
 
     def _approvals(self, state, tool):
         return state.data["tools"][tool].setdefault("crossings", {}).setdefault("approvals", {})
 
-    def approved(self, state, tool, a, b, at):
+    def approved(self, state, tool, a, b, at=None, *, home=None):
+        if not self.crosses(state, tool, a, b, home=home):
+            return True
+        if self.yes_left is not None:
+            self.yes_left -= 1
+            return self.yes_left >= 0
         return f"{a}>{b}" in self._approvals(state, tool)
 
-    def request(self, state, tool, a, b, session_id, at):
+    def request(self, state, tool, a, b, session_id, at=None, *, home=None):
         self.requests.append((a, b, session_id))
         state.data["tools"][tool].setdefault("crossings", {}).setdefault("requests", []).append(
             {"from": a, "to": b, "session_id": session_id, "at": iso(at)})
 
-    def consume(self, state, tool, a, b, at=None):
-        if not self.crosses(state, tool, a, b):
+    def consume(self, state, tool, a, b, at=None, *, home=None):
+        if not self.crosses(state, tool, a, b, home=home):
             return True
-        if self.lapse or not self.approved(state, tool, a, b, at):
+        if self.lapse or f"{a}>{b}" not in self._approvals(state, tool):
             return False
         self.consumed.append((a, b))
         approvals = self._approvals(state, tool)
@@ -415,26 +437,47 @@ def test_auth_hit_on_a_borrowed_seat_falls_back_to_the_clients_own_login(seats, 
     _drop(seats, C3)
     swap = FakeSwap()
     hits = []
-    spawn = Spawn(([lambda: swap.post("limit", C1), None,
+    spawn = Spawn(([lambda: _click(seats, C2), None,
                     lambda: hits.append(swap.post("auth", C2)), None], 0))
 
     assert _run(seats, spawn, swap) == 0
 
     assert swap.answers[-1] == (hits[0], Seat(C1, None))
     assert swap.bound() is None and seats.load_state().active("claude") == C1
+    assert spawn.stops == 0
 
 
-def test_handover_restarts_on_the_bound_seats_own_login(seats, tokens):
+def test_handover_restarts_on_the_bound_seats_own_login(seats, tokens, monkeypatch):
+    clock = Clock(monkeypatch)
     swap = FakeSwap()
 
     def token_running_out():
         swap.maintain_result = "handover"
+        clock.advance(L.HANDOVER_QUIET_S + 1)
 
     spawn = Spawn(([lambda: swap.post("limit", C1), None, token_running_out], 1), ([None], 0))
     assert _run(seats, spawn, swap) == 0
     assert spawn.stops == 1 and spawn.calls[1][-2:] == ["--resume", _session(spawn)]
     assert swap.homes == [C1, C2]
     assert seats.load_state().active("claude") == C2
+
+
+def test_handover_waits_while_the_child_is_busy(seats, tokens, monkeypatch):
+    """A tool running inside the child redraws its spinner: never restart under it."""
+    clock = Clock(monkeypatch)
+    swap = FakeSwap()
+    seen = []
+
+    def token_running_out():
+        swap.maintain_result = "handover"
+
+    spawn = Spawn(([lambda: swap.post("limit", C1), None,
+                    lambda: clock.advance(L.HANDOVER_QUIET_S + 1),
+                    b"\xe2\xa0\x8b Running tests\xe2\x80\xa6", token_running_out,
+                    lambda: seen.append(spawn.stops),
+                    lambda: clock.advance(L.HANDOVER_QUIET_S + 1)], 1), ([None], 0))
+    assert _run(seats, spawn, swap) == 0
+    assert seen == [0] and spawn.stops == 1
 
 
 def test_maintain_moving_the_proxy_on_its_own_is_recorded_as_a_hop(seats, tokens, marks):
@@ -462,7 +505,7 @@ def test_default_factory_follows_seatswap_enabled(seats, monkeypatch, on):
             built.append(ctx)
 
     fake = types.ModuleType("acctsw.seatswap")
-    fake.enabled = lambda ctx, environ=os.environ: on
+    fake.enabled = lambda ctx, environ=os.environ, **kw: on
     fake.SeatSwap = RealishSwap
     monkeypatch.setitem(sys.modules, "acctsw.seatswap", fake)
     monkeypatch.setattr(acctsw, "seatswap", fake, raising=False)
@@ -574,21 +617,61 @@ def test_approved_crossing_is_taken_in_place_on_the_next_tick(seats, tokens):
     assert st.data["tools"]["claude"]["crossings"]["requests"] == []   # answered: retracted
 
 
-def test_an_approval_that_lapsed_before_the_commit_switches_nothing(seats, tokens):
+def test_an_approval_refused_at_the_commit_never_kills_and_asks_again(seats, tokens):
     _drop(seats, C3)
     kinds = FakeKinds({C1: "business", C2: "personal"})
     swap = FakeSwap()
 
     def approve_then_lapse():
         _approve(seats, C1, C2)
+        kinds.yes_left = 1   # seen once by the heartbeat, gone by the commit
         kinds.lapse = True
 
-    spawn = Spawn(([lambda: swap.post("limit", C1), None, approve_then_lapse, None], 1))
-    notes = []
-    assert _run(seats, spawn, swap, seatkind=kinds, notify=notes.append) == 1
-    assert swap.binds == [] and kinds.consumed == []
+    spawn = Spawn(([lambda: swap.post("limit", C1), None, approve_then_lapse, None, None], 0))
+    assert _run(seats, spawn, swap, seatkind=kinds) == 0
+    assert spawn.stops == 0 and swap.binds == [] and kinds.consumed == []
     assert seats.load_state().active("claude") == C1
-    assert any("lapsed" in n for n in notes)
+    assert [r[:2] for r in kinds.requests] == [(C1, C2), (C1, C2)]   # asked again
+
+
+def test_a_limit_never_restarts_for_an_approval_that_is_gone(seats, tokens):
+    """The decision saw the approval; by the stop check it is gone. No kill for that move."""
+    _drop(seats, C3)
+    tokens.clear()   # not servable in place: the only way would be a restart
+    kinds = FakeKinds({C1: "business", C2: "personal"})
+    kinds.yes_left = 1   # the decision's check says yes, the pre-kill check says no
+    swap = FakeSwap()
+    hits = []
+    spawn = Spawn(([lambda: hits.append(swap.post("limit", C1)), None], 0))
+    assert _run(seats, spawn, swap, seatkind=kinds) == 0
+    assert spawn.stops == 0 and swap.answers == [(hits[0], None)]
+    assert seats.load_state().active("claude") == C1
+
+
+def test_an_approval_lapsing_while_the_child_stops_resumes_on_the_same_seat(seats):
+    """Swap off: the approved crossing restarts; the approval is gone by the commit. The work is
+    resumed where it was, not ended."""
+    _drop(seats, C3)
+    kinds = FakeKinds({C1: "business", C2: "personal"})
+
+    def approve():
+        _approve(seats, C1, C2)
+
+    spawn = Spawn(([lambda: _rest(seats, C1), None, approve, None], 1), ([None], 0))
+    real = spawn.__call__
+
+    def spawning(*a, **kw):
+        status = real(*a, **kw)
+        if len(spawn.calls) == 1:
+            kinds.lapse, kinds.yes_left = True, 0   # expired: no longer approved, nothing to spend
+        return status
+
+    notes = []
+    assert run(seats, "claude", [], spawn=spawning, get=fake_get({}), notify=notes.append,
+               swap_factory=lambda _ctx: None, seatkind=kinds) == 0
+    assert spawn.stops == 1 and spawn.calls[1][-2:] == ["--resume", _session(spawn)]
+    assert seats.load_state().active("claude") == C1
+    assert any("lapsed" in n and f"resuming your work on {C1}" in n for n in notes)
 
 
 def test_open_crossing_questions_are_withdrawn_when_the_session_ends(seats, tokens):
@@ -749,12 +832,13 @@ def test_manual_switch_moves_claude_in_place(seats, tokens):
     assert spawn.stops == 0 and swap.binds == [Seat(C2, "tok-c2")]
 
 
-def test_manual_switch_restarts_claude_without_the_swap(seats):
-    spawn = Spawn(([lambda: _click(seats, C2), None], 1), ([None], 0))
-    assert run(seats, "claude", [], spawn=spawn, get=fake_get({}), notify=lambda m: None,
+def test_a_click_never_restarts_claude_when_it_cannot_move_in_place(seats):
+    spawn = Spawn(([lambda: _click(seats, C2), None, None], 0))
+    notes = []
+    assert run(seats, "claude", [], spawn=spawn, get=fake_get({}), notify=notes.append,
                swap_factory=lambda _ctx: None) == 0
-    assert spawn.stops == 1 and spawn.calls[1][-2:] == ["--resume", _session(spawn)]
-    assert seats.load_state().active("claude") == C2
+    assert spawn.stops == 0 and len(spawn.calls) == 1
+    assert sum("applies to the next session" in n for n in notes) == 1
 
 
 @pytest.mark.crossings
@@ -787,3 +871,212 @@ def test_a_click_moves_even_when_no_approval_is_on_record(seats, tokens):
     spawn = Spawn(([click_without_approval, None], 0))
     assert _run(seats, spawn, swap) == 0
     assert swap.binds == [Seat(C2, "tok-c2")]
+
+
+# --- review round: robustness, gates, origins -----------------------------------------------------
+
+@pytest.mark.parametrize("method", ["maintain", "pending", "bind", "answer", "set_home", "env"])
+def test_no_swap_error_ever_leaves_run_or_stops_the_child(seats, tokens, method):
+    swap = FakeSwap()
+    swap.raising = {method}
+    spawn = Spawn(([lambda: swap.post("limit", C1), None, None], 0))
+    assert _run(seats, spawn, swap) == 0
+    assert spawn.stops == 0 and len(spawn.calls) == 1
+
+
+def test_a_failed_preflight_runs_the_session_without_the_proxy(seats):
+    swap = FakeSwap()
+    swap.preflight_says = "TLS: certificate verify failed"
+    spawn = Spawn(([None], 0))
+    assert _run(seats, spawn, swap) == 0
+    assert "ANTHROPIC_BASE_URL" not in spawn.envs[0] and spawn.wakes == [None]
+    assert swap.stopped and swap.homes == []
+
+
+def test_no_hop_in_place_before_the_child_has_used_the_proxy(seats, tokens):
+    """A client that ignores ANTHROPIC_BASE_URL bills its own login whatever we bind."""
+    swap = FakeSwap()
+    swap.used = False
+    spawn = Spawn(([lambda: _rest(seats, C1), None], 1), ([None], 0))
+    assert _run(seats, spawn, swap) == 0
+    assert swap.binds == [] and spawn.stops == 1
+    assert spawn.calls[1][-2:] == ["--resume", _session(spawn)]
+
+
+def test_switching_the_setting_off_mid_run_stops_hops_in_place_at_once(seats, tokens):
+    swap = FakeSwap()
+
+    def setting_off():
+        st = seats.load_state()
+        st.set_setting("in_place_switch", False)
+        st.save()
+
+    spawn = Spawn(([setting_off, None, lambda: swap.post("limit", C1)], 1), ([None], 0))
+    assert _run(seats, spawn, swap) == 0
+    assert swap.binds == [] and [seat for _h, seat in swap.answers] == [None]
+    assert spawn.stops == 1
+
+
+def test_a_401_on_a_renewed_token_replays_on_the_new_one(seats, tokens):
+    swap = FakeSwap()
+    hits = []
+
+    def renewed_then_401():
+        tokens[C2] = "tok-c2-renewed"
+        hits.append(swap.post("auth", C2))
+
+    spawn = Spawn(([lambda: swap.post("limit", C1), None, renewed_then_401, None], 0))
+    assert _run(seats, spawn, swap) == 0
+    assert swap.answers[-1] == (hits[0], Seat(C2, "tok-c2-renewed"))
+    assert seats.load_state().active("claude") == C2 and spawn.stops == 0
+
+
+def test_a_401_never_restarts_the_child(seats, tokens, monkeypatch):
+    """Nowhere to go in place (budget spent): the 401 is passed through, the child lives."""
+    monkeypatch.setattr(L, "MAX_INPLACE_SWITCHES", 1)
+    swap = FakeSwap()
+    hits = []
+    spawn = Spawn(([lambda: swap.post("limit", C1), None,
+                    lambda: hits.append(swap.post("auth", C2)), None], 0))
+    assert _run(seats, spawn, swap) == 0
+    assert spawn.stops == 0 and swap.answers[-1] == (hits[0], None)
+
+
+def test_a_401_does_not_write_the_seat_off_for_the_run(seats, tokens):
+    """c2's token got a 401 and the session went home; once c2's login renews, a later limit
+    may land on c2 in place again."""
+    _drop(seats, C3)
+    swap = FakeSwap()
+
+    def renewed():
+        tokens[C2] = "tok-c2-renewed"
+
+    spawn = Spawn(([lambda: _click(seats, C2), None, lambda: swap.post("auth", C2), None,
+                    renewed, lambda: swap.post("limit", C1), None], 0))
+    assert _run(seats, spawn, swap) == 0
+    assert swap.answers[-1][1] == Seat(C2, "tok-c2-renewed")
+    assert seats.load_state().active("claude") == C2 and spawn.stops == 0
+
+
+def test_a_dead_borrowed_token_is_not_bound_again(seats, tokens):
+    """After a 401 sent the session home, the same dead c2 token must not be re-bound for the
+    next limit (that would ping-pong between 401s and 429s): restart onto c2's own login."""
+    _drop(seats, C3)
+    swap = FakeSwap()
+    spawn = Spawn(([lambda: _click(seats, C2), None, lambda: swap.post("auth", C2), None,
+                    lambda: swap.post("limit", C1)], 1), ([None], 0))
+    assert _run(seats, spawn, swap) == 0
+    assert spawn.stops == 1 and swap.homes == [C1, C2]
+
+
+def test_a_restart_launches_on_the_seat_it_committed(seats, tokens):
+    """Another terminal moves active between our commit and the relaunch: ours still goes to c2."""
+    tokens.clear()
+    swap = FakeSwap()
+
+    def notify(message):
+        if "hopping to" in message:
+            st = seats.load_state()
+            st.set_active("claude", C3)
+            st.save()
+
+    spawn = Spawn(([lambda: swap.post("limit", C1)], 1), ([None], 0))
+    assert _run(seats, spawn, swap, notify=notify) == 0
+    assert swap.homes == [C1, C2]
+
+
+def test_the_exit_time_net_judges_the_billed_seat(seats, tokens):
+    """The child exits after an in-place hop to c2 while another terminal points active at c3:
+    the post-exit usage check is about c2, the seat this child was billed to."""
+    from tests.test_usage import claude_ok_body
+    from acctsw import paths as P
+    swap = FakeSwap()
+
+    def other_terminal():
+        st = seats.load_state()
+        st.set_active("claude", C3)
+        st.save()
+
+    get = fake_get({P.CLAUDE_USAGE_URL: (200, claude_ok_body(
+        five=100.0, five_reset=iso(now() + timedelta(hours=2))))})
+    spawn = Spawn(([lambda: _click(seats, C2), None, other_terminal], 1))
+    assert run(seats, "claude", [], spawn=spawn, get=get, notify=lambda m: None,
+               swap_factory=lambda _ctx: swap) == 1
+    st = seats.load_state()
+    assert st.get_seat("claude", C2).get("limited_until") is not None
+    assert st.get_seat("claude", C3).get("limited_until") is None
+
+
+@pytest.mark.crossings
+def test_going_back_home_is_never_a_crossing(seats, tokens):
+    """Business c1 is home; after an approved move to personal c2, c2's limit takes the session
+    back to c1 without asking."""
+    from acctsw import seatkind
+    _drop(seats, C3)
+    _plans(seats, **{C1: "team", C2: "max"})
+    swap = FakeSwap()
+
+    def approve():
+        st = seats.load_state()
+        seatkind.approve(st, "claude", C1, C2, "once")
+        st.save()
+
+    def c1_back():
+        st = seats.load_state()
+        st.get_seat("claude", C1).pop("limited_until")
+        st.save()
+
+    spawn = Spawn(([lambda: swap.post("limit", C1), None, approve, None, c1_back,
+                    lambda: swap.post("limit", C2), None], 0))
+    notes = []
+    assert _run(seats, spawn, swap, notify=notes.append) == 0
+    assert swap.answers[-1][1] == Seat(C1, None)
+    assert seats.load_state().active("claude") == C1
+    assert sum("approve in ai guest list" in n for n in notes) == 1   # only the first move asked
+
+
+@pytest.mark.crossings
+def test_a_cold_start_whose_only_free_seat_crosses_asks_and_starts_there_once_approved(
+        seats, tokens):
+    from acctsw import seatkind
+    _drop(seats, C3)
+    _plans(seats, **{C1: "team", C2: "max"})
+    _rest(seats, C1)
+    swap = FakeSwap()
+    notes = []
+
+    def sleep(_seconds):
+        st = seats.load_state()
+        seatkind.approve(st, "claude", C1, C2, "once")
+        st.save()
+
+    spawn = Spawn(([None], 0))
+    assert _run(seats, spawn, swap, notify=notes.append, sleep=sleep) == 0
+    assert any("approve in ai guest list" in n for n in notes)
+    assert swap.homes == [C2] and seats.load_state().active("claude") == C2
+    assert not seatkind.approved(seats.load_state(), "claude", C1, C2)   # spent by the start
+
+
+def test_a_dead_borrowed_token_falls_back_to_the_clients_own_login(seats, tokens):
+    """c1 is resting and c2's token got a 401: the only place left is the child's own login."""
+    _drop(seats, C3)
+    swap = FakeSwap()
+    hits = []
+    spawn = Spawn(([lambda: swap.post("limit", C1), None,
+                    lambda: hits.append(swap.post("auth", C2))], 1), ([None], 0))
+    assert _run(seats, spawn, swap) == 0
+    assert (hits[0], Seat(C1, None)) in swap.answers
+
+
+def test_a_limit_whose_approval_is_refused_at_the_commit_stays_and_asks_again(seats, tokens):
+    """The decision saw a live approval for c1 -> c2; the commit finds nothing to spend."""
+    _drop(seats, C3)
+    kinds = FakeKinds({C1: "business", C2: "personal"})
+    _approve(seats, C1, C2)
+    kinds.lapse = True   # approved() still says yes; consume() finds nothing to spend
+    swap = FakeSwap()
+    hits = []
+    spawn = Spawn(([lambda: hits.append(swap.post("limit", C1))], 0))
+    assert _run(seats, spawn, swap, seatkind=kinds) == 0
+    assert spawn.stops == 0 and swap.answers == [(hits[0], None)]
+    assert {r[:2] for r in kinds.requests} == {(C1, C2)}   # asked again, never killed
