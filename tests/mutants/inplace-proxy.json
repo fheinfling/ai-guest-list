@@ -396,5 +396,213 @@
   "test": [
    "tests/test_seatproxy.py::test_upstream_proxy_refusal_answers_502"
   ]
+ },
+ {
+  "label": "proxy r3: any handshake failure counts as a certificate reject",
+  "file": "acctsw/seatproxy.py",
+  "old": "if reason.rpartition(\"ALERT_\")[2] in CERT_ALERTS:",
+  "new": "if True:",
+  "test": [
+   "tests/test_seatproxy.py::test_other_handshake_failures_are_not_a_tls_reject",
+   "tests/test_seatproxy.py::test_plain_http_or_a_hang_up_after_connect_is_not_a_tls_reject"
+  ]
+ },
+ {
+  "label": "proxy r3: bad_certificate / certificate_unknown alerts are not a reject",
+  "file": "acctsw/seatproxy.py",
+  "old": "CERT_ALERTS = frozenset({\"UNKNOWN_CA\", \"BAD_CERTIFICATE\", \"CERTIFICATE_UNKNOWN\",",
+  "new": "CERT_ALERTS = frozenset({\"UNKNOWN_CA\",",
+  "test": [
+   "tests/test_seatproxy.py::test_certificate_alerts_are_a_tls_reject"
+  ]
+ },
+ {
+  "label": "proxy r3: unsupported_certificate / access_denied alerts are not a reject",
+  "file": "acctsw/seatproxy.py",
+  "old": "                         \"UNSUPPORTED_CERTIFICATE\", \"ACCESS_DENIED\"})",
+  "new": "                         })",
+  "test": [
+   "tests/test_seatproxy.py::test_certificate_alerts_are_a_tls_reject"
+  ]
+ },
+ {
+  "label": "proxy r3: a certificate alert is only logged, never reported",
+  "file": "acctsw/seatproxy.py",
+  "old": "return self._tls_reject(reason)\n        # A dropped",
+  "new": "pass\n        # A dropped",
+  "test": [
+   "tests/test_seatproxy.py::test_certificate_alerts_are_a_tls_reject"
+  ]
+ },
+ {
+  "label": "proxy r3: intercepts_ok never counts",
+  "file": "acctsw/seatproxy.py",
+  "old": "proxy._intercepts_ok += 1",
+  "new": "proxy._intercepts_ok += 0",
+  "test": [
+   "tests/test_seatproxy.py::test_intercepts_ok_counts_completed_handshakes_only"
+  ]
+ },
+ {
+  "label": "proxy r3: an upstream answer does not reset upstream_failures",
+  "file": "acctsw/seatproxy.py",
+  "old": "                resp = conn.getresponse()\n                self._upstream_result(True)\n",
+  "new": "                resp = conn.getresponse()\n",
+  "test": [
+   "tests/test_seatproxy.py::test_upstream_failures_count_in_a_row_and_reset_on_an_answer"
+  ]
+ },
+ {
+  "label": "proxy r3: an upstream connect failure is not counted",
+  "file": "acctsw/seatproxy.py",
+  "old": "self._upstream_result(False)    # never reached upstream",
+  "new": "pass    # never reached upstream",
+  "test": [
+   "tests/test_seatproxy.py::test_upstream_failures_count_in_a_row_and_reset_on_an_answer"
+  ]
+ },
+ {
+  "label": "proxy r3: a failure after the request was sent counts as a connect failure",
+  "file": "acctsw/seatproxy.py",
+  "old": "                if not sent:\n                    self._upstream_result(False)",
+  "new": "                if True:\n                    self._upstream_result(False)",
+  "test": [
+   "tests/test_seatproxy.py::test_upstream_failures_ignore_a_stale_pooled_retry_and_failures_after_the_send"
+  ]
+ },
+ {
+  "label": "proxy r3: a stale pooled socket counts as an upstream failure",
+  "file": "acctsw/seatproxy.py",
+  "old": "                if reused and not sent and not fresh:\n",
+  "new": "                if not sent:\n                    self._upstream_result(False)\n                if reused and not sent and not fresh:\n",
+  "test": [
+   "tests/test_seatproxy.py::test_upstream_failures_ignore_a_stale_pooled_retry_and_failures_after_the_send"
+  ]
+ },
+ {
+  "label": "proxy r3: an unreachable upgrade upstream is not counted",
+  "file": "acctsw/seatproxy.py",
+  "old": "        except OSError as e:\n            self._upstream_result(False)\n",
+  "new": "        except OSError as e:\n            pass\n",
+  "test": [
+   "tests/test_seatproxy.py::test_an_unreachable_upgrade_upstream_answers_502_and_counts"
+  ]
+ },
+ {
+  "label": "proxy r3: an answered upgrade does not reset upstream_failures",
+  "file": "acctsw/seatproxy.py",
+  "old": "            self._upstream_result(True)\n            self._log(\"upgrade\"",
+  "new": "            self._log(\"upgrade\"",
+  "test": [
+   "tests/test_seatproxy.py::test_websocket_upgrade_is_relayed_verbatim_and_spliced"
+  ]
+ },
+ {
+  "label": "proxy r3: upgrades go through the plain request path (Upgrade dropped, no 101 relay)",
+  "file": "acctsw/seatproxy.py",
+  "old": "if authority is not None and _upgrading(self.headers):",
+  "new": "if False:",
+  "test": [
+   "tests/test_seatproxy.py::test_websocket_upgrade_is_relayed_verbatim_and_spliced"
+  ]
+ },
+ {
+  "label": "proxy r3: an upgrade forwards the client's proxy headers",
+  "file": "acctsw/seatproxy.py",
+  "old": "if not k.lower().startswith(\"proxy-\") and k.lower() != \"host\"]",
+  "new": "if k.lower() != \"host\"]",
+  "test": [
+   "tests/test_seatproxy.py::test_websocket_upgrade_is_relayed_verbatim_and_spliced"
+  ]
+ },
+ {
+  "label": "proxy r3: the splice ignores bytes TLS already decrypted (select waits forever)",
+  "file": "acctsw/seatproxy.py",
+  "old": "ready = [s for s in open_ if _pending(s)]",
+  "new": "ready = []",
+  "test": [
+   "tests/test_seatproxy.py::test_websocket_upgrade_is_relayed_verbatim_and_spliced"
+  ]
+ },
+ {
+  "label": "proxy r3: the upgrade response is read buffered (bytes after the 101 are lost)",
+  "file": "acctsw/seatproxy.py",
+  "old": "return self.sock.makefile(mode, buffering=0)",
+  "new": "return self.sock.makefile(mode)",
+  "test": [
+   "tests/test_seatproxy.py::test_websocket_upgrade_is_relayed_verbatim_and_spliced"
+  ]
+ },
+ {
+  "label": "proxy r3: decrypted requests are read buffered (bytes after an upgrade head are lost)",
+  "file": "acctsw/seatproxy.py",
+  "old": "        rbufsize = 0\n",
+  "new": "        rbufsize = 0 if authority is None else -1\n",
+  "test": [
+   "tests/test_seatproxy.py::test_websocket_upgrade_is_relayed_verbatim_and_spliced"
+  ]
+ },
+ {
+  "label": "proxy r3: a refused upgrade is spliced instead of relayed and closed",
+  "file": "acctsw/seatproxy.py",
+  "old": "if resp.status != 101:",
+  "new": "if False:",
+  "test": [
+   "tests/test_seatproxy.py::test_a_refused_upgrade_is_relayed_and_the_connection_closes"
+  ]
+ },
+ {
+  "label": "proxy r3: an upgrade with an absolute-form target goes upstream",
+  "file": "acctsw/seatproxy.py",
+  "old": "        if not target.startswith(\"/\"):\n",
+  "new": "        if False:\n",
+  "test": [
+   "tests/test_seatproxy.py::test_an_upgrade_needs_an_origin_form_target"
+  ]
+ },
+ {
+  "label": "proxy r3: the CONNECT 200 carries a content-length",
+  "file": "acctsw/seatproxy.py",
+  "old": "b\"HTTP/1.1 200 Connection Established\\r\\n\\r\\n\"",
+  "new": "b\"HTTP/1.1 200 Connection Established\\r\\ncontent-length: 0\\r\\n\\r\\n\"",
+  "test": [
+   "tests/test_seatproxy.py::test_connect_200_has_no_content_length"
+  ]
+ },
+ {
+  "label": "proxy r3: a quiet tunnel is cut after the client idle timeout",
+  "file": "acctsw/seatproxy.py",
+  "old": "_pump(self.connection, far)    # no idle cut",
+  "new": "_pump(self.connection, far, CLIENT_IDLE_TIMEOUT)    # no idle cut",
+  "test": [
+   "tests/test_seatproxy.py::test_a_quiet_tunnel_is_not_cut"
+  ]
+ },
+ {
+  "label": "proxy r3: a tunnel send to a peer that stops reading blocks without bound",
+  "file": "acctsw/seatproxy.py",
+  "old": "    for sock in (a, b):\n        sock.settimeout(TUNNEL_SEND_TIMEOUT)\n",
+  "new": "",
+  "test": [
+   "tests/test_seatproxy.py::test_a_tunnel_peer_that_stops_reading_ends_the_tunnel"
+  ]
+ },
+ {
+  "label": "proxy r3: an IPv6 literal goes unbracketed into the upstream CONNECT",
+  "file": "acctsw/seatproxy.py",
+  "old": "target = f\"[{host}]:{port}\" if \":\" in host else f\"{host}:{port}\"",
+  "new": "target = f\"{host}:{port}\"",
+  "test": [
+   "tests/test_seatproxy.py::test_upstream_proxy_connect_brackets_ipv6_literals"
+  ]
+ },
+ {
+  "label": "proxy r3: the listener keeps the default backlog of 5",
+  "file": "acctsw/seatproxy.py",
+  "old": "    request_queue_size = 128",
+  "new": "    request_queue_size = 5",
+  "test": [
+   "tests/test_seatproxy.py::test_the_listener_queues_a_burst_of_connections"
+  ]
  }
 ]

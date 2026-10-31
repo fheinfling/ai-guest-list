@@ -7,8 +7,10 @@ keeps talking to api.anthropic.com itself and stays a first-party client. The li
 
 - ``CONNECT api.anthropic.com:443`` (the upstream's own host and port) with a per-run ``ca``: the
   client's TLS is terminated with ``ca.server_context()`` and its requests are served below. A
-  client that rejects the certificate reports through ``on_tls_reject(reason)``, once.
-- any other host, or no ``ca``: a blind byte tunnel. Never decrypted.
+  client that rejects the certificate (a certificate alert, nothing else) reports through
+  ``on_tls_reject(reason)``, once. A ``Connection: upgrade`` request (voice mode's WebSocket) goes
+  out verbatim on a fresh upstream connection and, after a 101, is spliced both ways.
+- any other host, or no ``ca``: a blind byte tunnel. Never decrypted, never cut for being quiet.
 
 Both go out directly or through ``upstream_proxy`` (the user's own proxy) by CONNECT, unless the
 launcher's ``NO_PROXY`` exempts the host. Plain requests under the random path ``/<secret>/`` are
@@ -40,6 +42,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import http.client
+import io
 import json
 import os
 import secrets
@@ -64,6 +67,11 @@ MAX_BODY = 64 * 1024 * 1024
 MAX_TRIES = 8                  # upstream sends per request, whatever ``decide`` answers
 UPSTREAM_TIMEOUT = 660.0       # long thinking pauses between SSE events
 CLIENT_IDLE_TIMEOUT = 900.0    # an idle keep-alive client connection frees its thread after this
+TUNNEL_SEND_TIMEOUT = 300.0    # a tunnel peer that takes no bytes for this long ends the tunnel
+# The alerts a client sends when it does not accept the certificate (OpenSSL's reason, after
+# "TLSV1_ALERT_" or "SSLV3_ALERT_"). Any other handshake failure says nothing about our CA.
+CERT_ALERTS = frozenset({"UNKNOWN_CA", "BAD_CERTIFICATE", "CERTIFICATE_UNKNOWN",
+                         "UNSUPPORTED_CERTIFICATE", "ACCESS_DENIED"})
 CHUNK = 65536
 PROXY_USER = "acctsw"
 
@@ -181,7 +189,8 @@ def _connect_via(proxy: tuple[str, int, dict] | None, host: str, port: int, time
         return socket.create_connection((host, port), timeout=timeout)
     sock = socket.create_connection((proxy[0], proxy[1]), timeout=timeout)
     try:
-        lines = [f"CONNECT {host}:{port} HTTP/1.1", f"Host: {host}:{port}"]
+        target = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"    # an IPv6 literal
+        lines = [f"CONNECT {target} HTTP/1.1", f"Host: {target}"]
         lines += [f"{k}: {v}" for k, v in proxy[2].items()]
         sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1"))
         head = b""
@@ -261,6 +270,17 @@ class _Upstream:
         """A raw connection to any ``host:port`` for a blind tunnel, through the same proxy."""
         return _connect_via(_parse_proxy(self.proxy, host), host, port, self.timeout)
 
+    def open_upstream(self) -> socket.socket:
+        """A fresh raw connection to the upstream itself, TLS-verified when https (an upgrade)."""
+        sock = _connect_via(self.tunnel, self.host, self.port, self.timeout)
+        if not self.https:
+            return sock
+        try:
+            return self.ssl.wrap_socket(sock, server_hostname=self.host)
+        except BaseException:
+            sock.close()
+            raise
+
     def close(self) -> None:
         with self._lock:
             idle, self._idle = self._idle, []
@@ -338,6 +358,32 @@ def _response_headers(resp) -> list[tuple[str, str]]:
     return [(k, v) for k, v in resp.getheaders() if k.lower() not in HOP_BY_HOP]
 
 
+def _upgrading(headers) -> bool:
+    """Whether the request asks to switch protocols (``Connection: upgrade``)."""
+    items = headers.items() if hasattr(headers, "items") else headers
+    return any(t.strip().lower() == "upgrade"
+               for k, v in items if k.lower() == "connection" for t in v.split(","))
+
+
+def _upgrade_head(method: str, url: str, headers, netloc: str) -> bytes:
+    """The client's request head as it came, minus its proxy headers; Connection and Upgrade stay."""
+    items = headers.items() if hasattr(headers, "items") else headers
+    lines = [f"{method} {url} HTTP/1.1", f"Host: {netloc}"]
+    lines += [f"{k}: {v}" for k, v in items if not k.lower().startswith("proxy-") and k.lower() != "host"]
+    return ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1")
+
+
+class _Unbuffered:
+    """Hands ``http.client.HTTPResponse`` an unbuffered reader: it reads the head byte by byte, so
+    nothing past it is read ahead (those bytes belong to the upgraded stream)."""
+
+    def __init__(self, sock):
+        self.sock = sock
+
+    def makefile(self, mode, *_args, **_kwargs):
+        return self.sock.makefile(mode, buffering=0)
+
+
 # --- the proxy ---------------------------------------------------------------------------------
 
 class SeatProxy:
@@ -352,6 +398,8 @@ class SeatProxy:
         self._ca = ca                      # a SessionCA: server_context() for the intercepted host
         self._on_tls_reject = on_tls_reject
         self._tls_rejected = False
+        self._intercepts_ok = 0
+        self._upstream_failures = 0
         self._secret = secrets.token_urlsafe(24)
         self._lock = threading.Lock()
         self._decide_lock = threading.Lock()
@@ -411,6 +459,12 @@ class SeatProxy:
     def _intercepts(self, host: str, port: int) -> bool:
         return self._ca is not None and f"{host}:{port}" == self._authority
 
+    def _handshake_failed(self, reason: str) -> None:
+        if reason.rpartition("ALERT_")[2] in CERT_ALERTS:
+            return self._tls_reject(reason)
+        # A dropped connection, plain HTTP or a protocol mismatch: not a verdict on the CA.
+        self._log("tls_handshake_failed", reason=reason)
+
     def _tls_reject(self, reason: str) -> None:
         with self._lock:
             first, self._tls_rejected = not self._tls_rejected, True
@@ -442,6 +496,20 @@ class SeatProxy:
         talks to the API through this proxy. An API-key script in the child does not count."""
         with self._lock:
             return self._messages
+
+    def intercepts_ok(self) -> int:
+        """Intercepted CONNECTs whose client completed the TLS handshake with the session CA."""
+        with self._lock:
+            return self._intercepts_ok
+
+    def upstream_failures(self) -> int:
+        """Upstream connect, proxy or TLS failures in a row, since the upstream last answered."""
+        with self._lock:
+            return self._upstream_failures
+
+    def _upstream_result(self, ok: bool) -> None:
+        with self._lock:
+            self._upstream_failures = 0 if ok else self._upstream_failures + 1
 
     def preflight(self, timeout: float = 5.0) -> str | None:
         """Connect to the upstream the way real requests do (tunnel, TLS trust) and send a tokenless
@@ -561,6 +629,7 @@ class SeatProxy:
                              headers=_forward_headers(headers, token, self._transport.netloc, length))
                 sent = True
                 resp = conn.getresponse()
+                self._upstream_result(True)
                 kind = classify(resp.status, resp.headers) if seat is not None else None
                 if kind == "auth" and seat.token is None:
                     kind = None    # the client's own login: it re-reads its own credentials
@@ -594,9 +663,47 @@ class SeatProxy:
                     # have acted on it. Once it is sent, a resend could run it twice.
                     fresh = True
                     continue
+                if not sent:
+                    self._upstream_result(False)    # never reached upstream: connect, proxy or TLS
                 self._log("upstream_error", path=path, error=error)
                 reply.error(502, "api_error", "seat proxy: upstream unreachable")
                 return True
+
+    def upgrade(self, method: str, target: str, headers, client, wfile) -> None:
+        """Relay a ``Connection: upgrade`` request from a decrypted CONNECT on a fresh upstream
+        connection; after a 101, splice ``client`` and upstream until either ends. Any other answer
+        is relayed and the connection closes. The client's headers go out as they came: an upgrade
+        never carries a seat token and is not a message."""
+        reply = _Reply(wfile)
+        if not target.startswith("/"):
+            self._log("forbidden", method=method)
+            return reply.error(403, "permission_error", "seat proxy: unknown path")
+        path = target.split("?")[0]
+        try:
+            far = self._transport.open_upstream()
+        except OSError as e:
+            self._upstream_result(False)
+            self._log("upstream_error", path=path, error=f"{e.__class__.__name__}: {e}"[:200])
+            return reply.error(502, "api_error", "seat proxy: upstream unreachable")
+        with far:
+            try:
+                far.sendall(_upgrade_head(method, self._transport.base + target, headers,
+                                          self._transport.netloc))
+                resp = http.client.HTTPResponse(_Unbuffered(far), method=method)
+                resp.begin()
+            except (OSError, http.client.HTTPException) as e:
+                self._log("upstream_error", path=path, error=f"{e.__class__.__name__}: {e}"[:200])
+                return reply.error(502, "api_error", "seat proxy: upstream unreachable")
+            self._upstream_result(True)
+            self._log("upgrade", path=path, status=resp.status)
+            if resp.status != 101:
+                resp.fp = io.BufferedReader(resp.fp)    # nothing follows this answer: buffer away
+                return self._relay(resp, reply)
+            reply.head(resp.status, resp.reason, resp.getheaders())
+            try:
+                _pump(client, far)
+            except OSError:
+                pass
 
     def _done(self, conn, resp) -> None:
         if resp.will_close:
@@ -675,6 +782,7 @@ class SeatProxy:
 
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
+    request_queue_size = 128    # a client opening many connections at once is not refused
     proxy: SeatProxy
 
     def handle_error(self, request, client_address):
@@ -682,19 +790,34 @@ class _Server(ThreadingHTTPServer):
         self.proxy._log("connection_error")
 
 
-def _pump(a: socket.socket, b: socket.socket, idle: float) -> None:
-    """Copy bytes both ways until both directions have ended (or nothing moves for ``idle``)."""
+def _pending(sock) -> bool:
+    return isinstance(sock, ssl.SSLSocket) and sock.pending() > 0
+
+
+def _pump(a: socket.socket, b: socket.socket, idle: float | None = None) -> None:
+    """Copy bytes both ways until both directions have ended (or nothing moves for ``idle``).
+
+    Every send is bounded by ``TUNNEL_SEND_TIMEOUT``: a peer that stops reading ends the tunnel
+    instead of holding its thread forever. A TLS socket can hold decrypted bytes the kernel no longer
+    reports as readable (``pending()``); those are copied before waiting in ``select``. TLS has no
+    half-close here, so the end of either side of a TLS splice ends both."""
+    for sock in (a, b):
+        sock.settimeout(TUNNEL_SEND_TIMEOUT)
     peer = {a: b, b: a}
     open_ = [a, b]
     while open_:
-        ready, _, _ = select.select(open_, [], [], idle)
+        ready = [s for s in open_ if _pending(s)]
         if not ready:
-            return
+            ready, _, _ = select.select(open_, [], [], idle)
+            if not ready:
+                return
         for src in ready:
             data = src.recv(CHUNK)
             if data:
                 peer[src].sendall(data)
                 continue
+            if isinstance(a, ssl.SSLSocket) or isinstance(b, ssl.SSLSocket):
+                return
             open_.remove(src)
             try:
                 peer[src].shutdown(socket.SHUT_WR)
@@ -709,14 +832,17 @@ def _make_handler(proxy: SeatProxy, authority: str | None = None):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         timeout = CLIENT_IDLE_TIMEOUT
-        # Unbuffered on the raw listener socket: nothing past the CONNECT head may be read ahead,
-        # those bytes belong to the tunnel or the TLS handshake.
-        rbufsize = 0 if authority is None else -1
+        # Unbuffered: nothing past a head may be read ahead. After a CONNECT those bytes belong to
+        # the tunnel or the TLS handshake, after an upgrade to the spliced stream.
+        rbufsize = 0
 
         def log_message(self, *_args):
             pass
 
         def _serve(self):
+            if authority is not None and _upgrading(self.headers):
+                self.close_connection = True    # the socket now belongs to the upgraded stream
+                return proxy.upgrade(self.command, self.path, self.headers, self.connection, self.wfile)
             try:
                 body = self._body()
             except (ValueError, OSError):
@@ -734,7 +860,7 @@ def _make_handler(proxy: SeatProxy, authority: str | None = None):
         def _read(self, n: int) -> bytes:
             parts = []
             while n > 0:
-                data = self.rfile.read(n)
+                data = self.rfile.read(min(n, CHUNK))    # unbuffered: a read allocates its size
                 if not data:
                     raise ValueError("request body cut short")
                 parts.append(data)
@@ -764,6 +890,11 @@ def _make_handler(proxy: SeatProxy, authority: str | None = None):
             self.wfile.write(f"HTTP/1.1 {status} {reason}\r\n{extra}content-length: 0\r\n\r\n".encode())
             self.wfile.flush()
 
+        def _established(self) -> None:
+            # No content-length: a 200 to CONNECT has no body, what follows is the tunnel.
+            self.wfile.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            self.wfile.flush()
+
         def do_CONNECT(self):
             self.close_connection = True    # the socket now belongs to the tunnel
             if authority is not None:
@@ -788,22 +919,23 @@ def _make_handler(proxy: SeatProxy, authority: str | None = None):
                 return self._answer(502, "Bad Gateway")
             proxy._log("tunnel", host=host, port=port)
             try:
-                self._answer(200, "Connection Established")
-                far.settimeout(None)
-                _pump(self.connection, far, CLIENT_IDLE_TIMEOUT)
+                self._established()
+                _pump(self.connection, far)    # no idle cut: a quiet tunnel may be a live stream
             except OSError:
                 pass
             finally:
                 far.close()
 
         def _intercept(self, target: str) -> None:
-            self._answer(200, "Connection Established")
+            self._established()
             try:
                 tls = proxy._ca.server_context().wrap_socket(self.connection, server_side=True)
             except ssl.SSLError as e:
-                return proxy._tls_reject(f"{getattr(e, 'reason', None) or e}"[:200])
+                return proxy._handshake_failed(f"{getattr(e, 'reason', None) or e}"[:200])
             except OSError:
                 return
+            with proxy._lock:
+                proxy._intercepts_ok += 1
             proxy._log("intercept", authority=target)
             try:
                 _make_handler(proxy, target)(tls, self.client_address, self.server)
