@@ -31,7 +31,12 @@ from functools import lru_cache
 from typing import Any, Callable
 
 from . import paths as P
+from .keychain import KeychainError
 from .util import iso, now
+
+# A credential that could not be read (a locked keychain, a failing disk) proves nothing about the
+# login: a poll that meets one keeps the seat's stored verdict and writes nothing.
+UNREADABLE = (KeychainError, OSError)
 
 # A transport: (url, headers, timeout) -> (status_code, body_text)
 HttpGet = Callable[[str, dict, float], "tuple[int, str]"]
@@ -408,21 +413,94 @@ def classify_signin(tool: str, blobs, at=None) -> SignIn:
     return SignIn(True)
 
 
-def _signin_for(ctx, tool: str, email: str, blob: str | None,
-                at=None) -> tuple[SignIn, str | None]:
-    """Classify a seat from the blob a poll already read, consulting its snapshot only when that
-    blob is unusable (a usable snapshot means the launcher can still put the login back). Returns
-    the verdict and a digest of every credential it read, so a later poll can tell whether anything
-    changed. An unreadable snapshot is no proof of logout: the seat is then left signed in."""
-    at = at or now()
-    if login_usable(tool, blob, at):
-        return classify_signin(tool, [blob], at), _credential_digest(blob)
+def claude_login_present(blob: str | None) -> bool:
+    """A Claude credential item Claude Code can sign in with: raw JSON carrying both OAuth tokens."""
     try:
-        snapshot = ctx.snapshot_get(tool, email)
-    except Exception:
-        return SignIn(False), None
+        oauth = json.loads(blob)["claudeAiOauth"]
+    except (TypeError, ValueError, KeyError):
+        return False
+    return isinstance(oauth, dict) and all(
+        isinstance(oauth.get(k), str) and oauth[k] for k in ("accessToken", "refreshToken"))
+
+
+def claude_login_wiped(blob: str | None) -> bool:
+    """Claude's own verdict on the bytes it held: after an invalid_grant it blanks the tokens in
+    place (refreshToken "", expiresAt 0) — so whatever it last had there is known dead."""
+    try:
+        return json.loads(blob)["claudeAiOauth"]["refreshToken"] == ""
+    except (TypeError, ValueError, KeyError):
+        return False
+
+
+def claude_launch_login(current: str | None, read_snapshot: Callable[[], str | None],
+                        last: str | None) -> tuple[str, str] | None:
+    """Which login a launch on a seeded Claude home would run on: ``("home", current)``,
+    ``("snapshot", snapshot)`` when the launcher would reinstall the seat's snapshot, or None when
+    it has nothing it may use. ``current`` is the home item's bytes, ``last`` the last copy this
+    process saw there; the snapshot is read only when the home item is not a login.
+
+    Claude rotates refresh tokens, so a snapshot taken before the child last refreshed carries a
+    consumed refresh token, and installing it would end in another invalid_grant — after which
+    Claude blanks the item for every process sharing it. Hence the home item always wins when it is
+    a login, and a snapshot is offered only when it is not older (by ``expiresAt``) than the last
+    login seen in that home; when Claude itself wiped the item it must be strictly newer, since
+    the bytes Claude last held there are the ones it just proved dead.
+
+    plan_claude_login acts on this, and the sign-in verdict reports it, so a seat reads signed in
+    exactly when a launch on it would get a login."""
+    if claude_login_present(current):
+        return "home", current
+    snapshot = read_snapshot()
+    if not claude_login_present(snapshot):
+        return None
+    from . import claudesync
+    last = last if claude_login_present(last) else None
+    wiped = claude_login_wiped(current)
+    if last is not None and last != snapshot:
+        mine, theirs = claudesync.expiry(snapshot), claudesync.expiry(last)
+        if mine is None or theirs is None or mine < theirs or (wiped and mine == theirs):
+            return None
+    elif wiped:
+        return None   # Claude blanked exactly these bytes (or ones we never saw): nothing fresher
+    return "snapshot", snapshot
+
+
+def _signin_for(ctx, tool: str, email: str, blob: str | None,
+                at=None) -> tuple[SignIn, str | None, str | None]:
+    """Classify a seat from the blob a poll already read. Returns the verdict, a digest of every
+    credential it read (so a later poll can tell whether anything changed), and the blob a usage
+    fetch must send: the login the verdict rests on, which need not be ``blob``.
+
+    A seeded Claude home is signed in exactly when a launch there would get a login that is still
+    usable (``claude_launch_login``). Elsewhere the snapshot is consulted only when ``blob`` is
+    unusable (a usable snapshot means the launcher can still put the login back). A credential
+    that cannot be read raises KeychainError: that proves nothing, so the caller keeps the stored
+    verdict and writes nothing."""
+    at = at or now()
+    if tool == "claude" and ctx.claude_home(email).exists():
+        from . import claudesync
+        if (ctx.claude_home(email) / ".acctsw-quarantined").exists():
+            return SignIn(True), _credential_digest(blob), None
+        read = [blob]
+
+        def snapshot() -> str | None:
+            read.append(ctx.snapshot_get(tool, email))
+            return read[-1]
+        seen = claudesync.tracker(ctx).seen.get(email)
+        last = seen.blob if seen else None
+        launch = claude_launch_login(blob, snapshot, last)
+        login = launch[1] if launch else None
+        verdict = classify_signin(tool, [login], at)
+        digest = (_credential_digest(blob) if len(read) == 1
+                  else _credential_digest(json.dumps([*read, last])))
+        return verdict, digest, None if verdict.signed_out else login
+    if login_usable(tool, blob, at):
+        return classify_signin(tool, [blob], at), _credential_digest(blob), blob
+    snapshot = ctx.snapshot_get(tool, email)
     blobs = [blob, snapshot]
-    return classify_signin(tool, blobs, at), _credential_digest(json.dumps(blobs))
+    verdict = classify_signin(tool, blobs, at)
+    login = next((b for b in blobs if login_usable(tool, b, at)), None)
+    return verdict, _credential_digest(json.dumps(blobs)), login
 
 
 @lru_cache(maxsize=8)
@@ -860,18 +938,22 @@ def refresh(ctx, state, tool: str | None = None, *, only: str | None = None,
                     prev_usage, at, min_seconds, active=(state.active(t) == email)):
                 summary[t][email] = "cached"
                 continue
-            blob = _seat_blob(ctx, state, t, email)
-            signin, digest = _signin_for(ctx, t, email, blob, at)
+            try:
+                blob = _seat_blob(ctx, state, t, email)
+                signin, digest, login = _signin_for(ctx, t, email, blob, at)
+            except UNREADABLE:
+                summary[t][email] = "unreadable"
+                continue
             if not force and _dead_unchanged(prev_usage, digest, at):
                 summary[t][email] = "cached"
                 continue
             if signin.signed_out:
                 u = Usage(error="no_token", fetched_at=iso(at))
-            elif not blob:
+            elif not login:
                 summary[t][email] = "no_creds"
                 continue
             else:
-                u = _fetch_for(t, blob, get, ua)
+                u = _fetch_for(t, login, get, ua)
             # NOTE (KR-B2): Codex's refresh tokens are single-use; rotating the active auth.json
             # can invalidate Codex's own session, so active seats remain observers. Parked seats
             # differ: no child renews their expired token, leaving usage too stale for handoff.
@@ -882,7 +964,7 @@ def refresh(ctx, state, tool: str | None = None, *, only: str | None = None,
             # prevents a lost race from being called revocation. This accepts, rather than closes,
             # the remaining window: cx launching on this seat between the session check and the
             # token POST can still double-spend the token. No network I/O runs under the flock.
-            summary[t][email] = store_fetch(state, t, email, u, at=at, blob=blob,
+            summary[t][email] = store_fetch(state, t, email, u, at=at, blob=login,
                                             signin=signin, signin_digest=digest)
     state.save()
     return summary
@@ -945,7 +1027,13 @@ def _commit_fetch_result(ctx, result: UsageFetchResult) -> str:
     was_active = before.active(job.tool) == job.email
     # Keychain reads are subprocesses on macOS.  Keep them outside the flock, then verify below that
     # the active pointer did not change while the credential bytes were being read.
-    current_blob = _detached_blob(ctx, before, job.tool, job.email, active=was_active)
+    try:
+        current_blob = _detached_blob(ctx, before, job.tool, job.email, active=was_active)
+        # A verdict that rested on more than the primary blob (the snapshot) is re-derived too.
+        current_signin = (_signin_for(ctx, job.tool, job.email, current_blob)[1]
+                          if job.signin_digest != job.credential_digest else job.signin_digest)
+    except UNREADABLE:
+        return "unreadable"
     with ctx.locked():
         state = ctx.load_state()
         # Credential reads above are intentionally outside the flock.  Any intervening mutation may
@@ -960,7 +1048,8 @@ def _commit_fetch_result(ctx, result: UsageFetchResult) -> str:
             return "stale"
         if (state.active(job.tool) == job.email) != was_active:
             return "stale"
-        if (_credential_digest(current_blob) or "") != job.credential_digest:
+        if ((_credential_digest(current_blob) or "") != job.credential_digest
+                or current_signin != job.signin_digest):
             return "stale"
         # Two independent processes may poll at once.  A response that started earlier may finish
         # later; never let it replace the newer attempt already stored by the faster request.
@@ -1036,6 +1125,7 @@ def _recover_parked_codex(ctx, job: UsageFetchJob, *, post,
         if new_blob:
             return replace(job, blob=new_blob,
                            credential_digest=_credential_digest(new_blob) or "",
+                           signin_digest=_credential_digest(new_blob),
                            recover_codex=False), None
         # Only the still-current refresh credential can prove revocation. A different token
         # above means another consumer succeeded, even though our POST reported invalidated.
@@ -1088,17 +1178,22 @@ def refresh_live(ctx, tool: str | None = None, *, only: str | None = None,
 
     prepared: list[UsageFetchJob] = []
     for t, email, added_at, was_active in candidates:
-        blob = _detached_blob(ctx, initial, t, email, active=was_active)
-        signin, digest = _signin_for(ctx, t, email, blob, at)
+        try:
+            blob = _detached_blob(ctx, initial, t, email, active=was_active)
+            signin, digest, login = _signin_for(ctx, t, email, blob, at)
+        except UNREADABLE:
+            summary[t][email] = "unreadable"
+            continue
         # Not even ``force`` re-tries a dead credential: the same bytes give the same answer.
         if _dead_unchanged((initial.get_seat(t, email) or {}).get("usage"), digest, at):
             summary[t][email] = "cached"
             continue
-        if not blob and not signin.signed_out:
+        if not login and not signin.signed_out:
             summary[t][email] = "no_creds"
             continue
+        # ``blob`` is what the commit re-reads to detect a change; ``login`` is what is sent.
         prepared.append(UsageFetchJob(
-            tool=t, email=email, blob=blob or "",
+            tool=t, email=email, blob=login or "",
             credential_digest=_credential_digest(blob) or "",
             added_at=added_at, active=was_active,
             user_agent=ua if t == "claude" else None,
@@ -1237,6 +1332,12 @@ def store_fetch(state, tool: str, email: str, u: Usage, at=None, *,
             d["error_streak"] = int(prev_usage.get("error_streak", 0) or 0) + 1
         state.set_usage(tool, email, d)
     seat = state.get_seat(tool, email)
+    if (u.ok and signin is None and seat is not None
+            and (seat.get("signin") or {}).get("signed_out")):
+        # An authenticated answer proves a login, also from a caller that passes no verdict (the
+        # launcher's in-session probe): a seat that just worked is not left asking for a sign-in.
+        expires = signin_expires_at(tool, blob)
+        signin = SignIn(False, iso(expires) if expires else None)
     if signin is not None and seat is not None:
         seat["signin"] = signin.to_dict()
     return u.error or "ok"
