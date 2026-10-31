@@ -20,8 +20,8 @@
  {
   "label": "proxy: the path allowlist is dropped (every request carries the seat token)",
   "file": "acctsw/seatproxy.py",
-  "old": "inject = method == \"POST\" and urlsplit(path).path in INJECT_PATHS",
-  "new": "inject = True",
+  "old": "inject = method == \"POST\" and endpoint in INJECT_PATHS and oauth",
+  "new": "inject = oauth",
   "test": [
    "tests/test_seatproxy.py::test_only_message_posts_carry_the_seat_token"
   ]
@@ -137,8 +137,8 @@
  {
   "label": "proxy: a fresh connection that fails is retried (only a stale pooled one may be)",
   "file": "acctsw/seatproxy.py",
-  "old": "if reused and not fresh:",
-  "new": "if not fresh:",
+  "old": "if reused and not sent and not fresh:",
+  "new": "if not sent and not fresh:",
   "test": [
    "tests/test_seatproxy.py::test_connect_failure_answers_502_without_retry"
   ]
@@ -159,6 +159,124 @@
   "new": "answer = self._ask(hit)",
   "test": [
    "tests/test_seatproxy.py::test_a_burst_waits_for_one_decide_timeout_only"
+  ]
+ },
+ {
+  "label": "proxy #5: any client (API key, no auth) gets the seat token on message posts",
+  "file": "acctsw/seatproxy.py",
+  "old": " and endpoint in INJECT_PATHS and oauth",
+  "new": " and endpoint in INJECT_PATHS",
+  "test": [
+   "tests/test_seatproxy.py::test_only_oauth_bearer_clients_get_a_seat_token"
+  ]
+ },
+ {
+  "label": "proxy #5: a bearer next to an x-api-key still counts as Claude's own login",
+  "file": "acctsw/seatproxy.py",
+  "old": " and _header(headers, \"x-api-key\") is None",
+  "new": "",
+  "test": [
+   "tests/test_seatproxy.py::test_only_oauth_bearer_clients_get_a_seat_token"
+  ]
+ },
+ {
+  "label": "proxy #3: NODE_EXTRA_CA_CERTS is not trusted",
+  "file": "acctsw/seatproxy.py",
+  "old": "                      (\"NODE_EXTRA_CA_CERTS\", \"cafile\")):",
+  "new": "                      ):",
+  "test": [
+   "tests/test_seatproxy.py::test_tls_context_adds_the_users_ca_files",
+   "tests/test_seatproxy.py::test_preflight_real_tls_needs_the_users_ca"
+  ]
+ },
+ {
+  "label": "proxy #3: upstream TLS is not verified",
+  "file": "acctsw/seatproxy.py",
+  "old": "    ctx = ssl.create_default_context()\n",
+  "new": "    ctx = ssl._create_unverified_context()\n",
+  "test": [
+   "tests/test_seatproxy.py::test_preflight_real_tls_needs_the_users_ca"
+  ]
+ },
+ {
+  "label": "proxy #3: preflight sends the bound seat's token",
+  "file": "acctsw/seatproxy.py",
+  "old": "headers={\"Host\": self._transport.netloc})",
+  "new": "headers={\"Host\": self._transport.netloc, \"Authorization\": f\"Bearer {self.bound().token}\"})",
+  "test": [
+   "tests/test_seatproxy.py::test_preflight_sends_a_tokenless_head_on_a_fresh_connection"
+  ]
+ },
+ {
+  "label": "proxy #3: preflight probes a pooled connection instead of a fresh one",
+  "file": "acctsw/seatproxy.py",
+  "old": "conn, _ = self._transport.acquire(fresh=True)",
+  "new": "conn, _ = self._transport.acquire()",
+  "test": [
+   "tests/test_seatproxy.py::test_preflight_sends_a_tokenless_head_on_a_fresh_connection"
+  ]
+ },
+ {
+  "label": "proxy #3: preflight hides an unreachable upstream",
+  "file": "acctsw/seatproxy.py",
+  "old": "return f\"unreachable: {e.__class__.__name__}: {e}\"[:200]",
+  "new": "return None",
+  "test": [
+   "tests/test_seatproxy.py::test_preflight_reports_why_upstream_is_unusable"
+  ]
+ },
+ {
+  "label": "proxy: the inject path is matched after URL parsing ('//x/v1/messages' matches)",
+  "file": "acctsw/seatproxy.py",
+  "old": "endpoint = path.split(\"?\")[0]",
+  "new": "endpoint = urlsplit(path).path",
+  "test": [
+   "tests/test_seatproxy.py::test_inject_path_matches_exactly"
+  ]
+ },
+ {
+  "label": "proxy: messages_seen never counts",
+  "file": "acctsw/seatproxy.py",
+  "old": "                self._messages += 1\n",
+  "new": "                pass\n",
+  "test": [
+   "tests/test_seatproxy.py::test_messages_seen_counts_client_message_posts"
+  ]
+ },
+ {
+  "label": "proxy: messages_seen counts count_tokens too",
+  "file": "acctsw/seatproxy.py",
+  "old": "if method == \"POST\" and endpoint == \"/v1/messages\" and oauth:",
+  "new": "if method == \"POST\" and endpoint in INJECT_PATHS and oauth:",
+  "test": [
+   "tests/test_seatproxy.py::test_messages_seen_counts_client_message_posts"
+  ]
+ },
+ {
+  "label": "proxy: a reused connection that failed after the request was sent is resent",
+  "file": "acctsw/seatproxy.py",
+  "old": "if reused and not sent and not fresh:",
+  "new": "if reused and not fresh:",
+  "test": [
+   "tests/test_seatproxy.py::test_reused_connection_failing_after_send_is_not_resent"
+  ]
+ },
+ {
+  "label": "proxy: a pooled connection the upstream closed is used anyway",
+  "file": "acctsw/seatproxy.py",
+  "old": "if not _dropped(conn):",
+  "new": "if True:",
+  "test": [
+   "tests/test_seatproxy.py::test_dropped_pooled_connection_is_discarded_before_use"
+  ]
+ },
+ {
+  "label": "proxy: messages_seen counts API-key requests (an SDK script proves the proxy is used)",
+  "file": "acctsw/seatproxy.py",
+  "old": "if method == \"POST\" and endpoint == \"/v1/messages\" and oauth:",
+  "new": "if method == \"POST\" and endpoint == \"/v1/messages\":",
+  "test": [
+   "tests/test_seatproxy.py::test_messages_seen_ignores_non_oauth_clients"
   ]
  }
 ]

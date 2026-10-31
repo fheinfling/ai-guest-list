@@ -107,6 +107,8 @@ class FakeConn:
         self._pending = (method, url, dict(headers or {}), body or b"")
 
     def getresponse(self):
+        if self.t.fail_response:
+            raise self.t.fail_response.pop(0)
         if self.t.before_response:
             self.t.before_response(self)
         method, url, headers, body = self._pending
@@ -127,6 +129,7 @@ class FakeTransport:
         self.sent: list[dict] = []
         self.idle: list[FakeConn] = []
         self.fail: list[BaseException | None] = []   # raised by the next request() calls, in order
+        self.fail_response: list[BaseException] = []  # raised by the next getresponse() calls
         self.before_response = None
         self.break_after: int | None = None
         self.wire: Wire | None = None
@@ -171,11 +174,12 @@ class Harness:
         return f"/{self.proxy._secret}{path}"
 
     def send(self, path="/v1/messages?beta=true", *, method="POST", body=MSG, headers=None,
-             raw_target=None):
+             raw_target=None, auth=f"Bearer {CLIENT_TOKEN}"):
         wire = Wire()
         self.t.wire = wire
-        hdrs = [("Content-Type", "application/json"), ("Authorization", f"Bearer {CLIENT_TOKEN}"),
-                ("anthropic-beta", "oauth-2025-04-20"), ("Content-Length", str(len(body)))]
+        hdrs = [("Content-Type", "application/json"), ("anthropic-beta", "oauth-2025-04-20"),
+                ("Content-Length", str(len(body)))]
+        hdrs += [("Authorization", auth)] if auth is not None else []
         hdrs += list(headers or [])
         target = self.url(path) if raw_target is None else raw_target
         keep = self.proxy.handle(method, target, hdrs, body, wire)
@@ -272,12 +276,12 @@ def test_the_secret_is_stripped_before_forwarding(suffix, upstream):
 def test_message_posts_carry_the_bound_seat_token(path):
     h = Harness()
     h.proxy.bind(B)
-    resp, _ = h.send(path, headers=[("x-api-key", "client-key")])
+    # lower-case, as node sends it: the client's header must not survive next to the seat's
+    resp, _ = h.send(path, auth=None, headers=[("authorization", f"Bearer {CLIENT_TOKEN}")])
     assert resp.status == 200
     sent = h.t.sent[0]["headers"]
     auth = [v for k, v in sent.items() if k.lower() == "authorization"]
     assert auth == [f"Bearer {B.token}"]
-    assert not any(k.lower() == "x-api-key" for k in sent)
     assert sent["Host"] == "api.anthropic.com"
     assert sent["anthropic-beta"] == "oauth-2025-04-20"
 
@@ -298,10 +302,80 @@ def test_only_message_posts_carry_the_seat_token(method, path):
 def test_home_seat_is_pure_passthrough():
     h = Harness()
     h.proxy.bind(HOME)
-    h.send(headers=[("x-api-key", "client-key")])
+    h.send(headers=[("x-custom", "1")])
     sent = h.t.sent[0]["headers"]
     assert sent["Authorization"] == f"Bearer {CLIENT_TOKEN}"
-    assert sent["x-api-key"] == "client-key"
+    assert sent["x-custom"] == "1"
+
+
+@pytest.mark.parametrize("auth,extra", [
+    (None, [("x-api-key", "sk-ant-api03-user-script")]),             # an SDK script with an API key
+    (f"Bearer {CLIENT_TOKEN}", [("x-api-key", "sk-ant-api03-both")]),  # bearer AND key: not Claude's login
+    ("Basic dXNlcjpwYXNz", []),
+    ("sk-ant-oat01-no-scheme", []),
+    (None, []),                                                     # no credentials at all
+])
+def test_only_oauth_bearer_clients_get_a_seat_token(auth, extra):
+    h = Harness()
+    h.proxy.bind(B)
+    rules(h, client=429)
+    h.fake.update({"next": [429]})    # even a limit on such a request is not the proxy's business
+    h.answers = [C]
+    resp, _ = h.send(auth=auth, headers=extra)
+    assert resp.status == 429
+    sent = h.t.sent[0]["headers"]
+    assert [v for k, v in sent.items() if k.lower() == "authorization"] == ([auth] if auth else [])
+    assert [v for k, v in sent.items() if k.lower() == "x-api-key"] == [v for _, v in extra]
+    assert h.hits == [] and len(h.t.sent) == 1
+
+
+def test_bearer_scheme_is_case_insensitive():
+    h = Harness()
+    h.proxy.bind(B)
+    h.send(auth=f"bearer {CLIENT_TOKEN}")
+    assert h.t.sent[0]["headers"]["Authorization"] == f"Bearer {B.token}"
+
+
+@pytest.mark.parametrize("path", ["//x/v1/messages", "//api.anthropic.com/v1/messages", "/v1/messages/",
+                                  "/V1/messages", "/v1/messages;x", "/v1//messages",
+                                  "/v1/messages/count_tokens/", "/x/v1/messages"])
+def test_inject_path_matches_exactly(path):
+    h = Harness()
+    h.proxy.bind(B)
+    h.send(path)
+    assert h.t.sent[0]["headers"]["Authorization"] == f"Bearer {CLIENT_TOKEN}"
+
+
+def test_messages_seen_counts_client_message_posts():
+    h = Harness()
+    h.proxy.bind(A)
+    assert h.proxy.messages_seen() == 0
+    h.send("/v1/messages?beta=true")
+    rules(h, a=429)
+    h.send("/v1/messages")                          # a passed-through limit still counts
+    h.proxy.bind(HOME)
+    h.send("/v1/messages")                          # eligible but not injected (home): counts
+    h.send("/v1/messages/count_tokens")
+    h.send("/v1/messages", method="GET", body=b"")
+    h.send(raw_target="/v1/messages")               # forbidden: never reached the proxy proper
+    h.send("/api/oauth/profile")
+    assert h.proxy.messages_seen() == 3
+
+
+@pytest.mark.parametrize("auth,extra", [
+    (None, [("x-api-key", "sk-ant-api03-user-script")]),
+    (f"Bearer {CLIENT_TOKEN}", [("x-api-key", "sk-ant-api03-both")]),
+    ("Basic dXNlcjpwYXNz", []),
+    (None, []),
+])
+def test_messages_seen_ignores_non_oauth_clients(auth, extra):
+    """An SDK script in the child must not prove that Claude Code talks through the proxy."""
+    h = Harness()
+    h.proxy.bind(B)
+    for _ in range(3):
+        resp, _ = h.send("/v1/messages", auth=auth, headers=extra)
+        assert resp.status == 200
+    assert h.proxy.messages_seen() == 0
 
 
 def test_unbound_proxy_is_pure_passthrough():
@@ -610,6 +684,18 @@ def test_stale_pooled_connection_is_retried_once_on_a_fresh_one():
     assert h.t.acquired == [False, True, False]
 
 
+def test_reused_connection_failing_after_send_is_not_resent():
+    h = Harness()
+    h.proxy.bind(B)
+    h.send()
+    assert h.t.idle
+    h.t.fail_response = [http.client.RemoteDisconnected("closed after the request went out")]
+    resp, keep = h.send()
+    assert resp.status == 502 and keep
+    assert h.t.acquired == [False, True]
+    assert len(h.fake.requests) == 1    # upstream answered the first request only
+
+
 def test_connect_failure_answers_502_without_retry():
     h = Harness()
     h.proxy.bind(B)
@@ -740,6 +826,137 @@ def test_bind_failure_raises_and_stop_is_safe(monkeypatch):
         p.start()
     p.stop()
     p.stop()
+
+
+# --- pooled connections the upstream closed --------------------------------------------------
+
+def test_dropped_pooled_connection_is_discarded_before_use(no_proxy_env):
+    up = SP._Upstream("http://127.0.0.1:9")
+    gone, alive = http.client.HTTPConnection("127.0.0.1", 9), http.client.HTTPConnection("127.0.0.1", 9)
+    gone.sock, far = socket.socketpair()
+    far.close()                                 # the upstream closed the idle keep-alive connection
+    alive.sock, peer = socket.socketpair()
+    try:
+        up.release(gone)
+        conn, reused = up.acquire()
+        assert conn is not gone and not reused and gone.sock is None
+        up.release(alive)
+        assert up.acquire() == (alive, True)
+    finally:
+        peer.close()
+        alive.close()
+
+
+# --- TLS trust and preflight -------------------------------------------------------------------
+
+class _Ctx:
+    def __init__(self, fail=()):
+        self.loaded = []
+        self.fail = fail
+
+    def load_verify_locations(self, cafile=None, capath=None):
+        if (cafile or capath) in self.fail:
+            raise FileNotFoundError(cafile or capath)
+        self.loaded.append(("cafile", cafile) if cafile else ("capath", capath))
+
+
+def test_tls_context_adds_the_users_ca_files(no_proxy_env):
+    ctx = _Ctx(fail=("/missing.pem",))
+    no_proxy_env.setattr(SP.ssl, "create_default_context", lambda: ctx)
+    no_proxy_env.setenv("SSL_CERT_FILE", "/missing.pem")
+    no_proxy_env.setenv("SSL_CERT_DIR", "/etc/corp-certs")
+    no_proxy_env.setenv("NODE_EXTRA_CA_CERTS", "/etc/corp-ca.pem")
+    up = SP._Upstream("https://api.anthropic.com")
+    assert up.ssl is ctx
+    assert ctx.loaded == [("capath", "/etc/corp-certs"), ("cafile", "/etc/corp-ca.pem")]
+
+
+def test_tls_context_without_extras_is_the_default(no_proxy_env):
+    for var in ("SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS"):
+        no_proxy_env.delenv(var, raising=False)
+    ctx = SP._tls_context()
+    assert ctx.verify_mode == SP.ssl.CERT_REQUIRED and ctx.check_hostname
+
+
+def test_preflight_sends_a_tokenless_head_on_a_fresh_connection():
+    h = Harness()
+    h.proxy.bind(B)
+    h.send()                                     # leaves a pooled connection that must not be used
+    assert h.proxy.preflight(timeout=1.5) is None
+    probe = h.t.sent[-1]
+    assert (probe["method"], probe["url"], probe["reused"]) == ("HEAD", "/", False)
+    assert probe["headers"] == {"Host": "api.anthropic.com"}
+    assert h.t.acquired[-1] is False
+    assert h.proxy.messages_seen() == 1
+
+
+@pytest.mark.parametrize("exc,reason", [
+    (SP.ssl.SSLCertVerificationError(1, "certificate verify failed"), "tls: "),
+    (SP.ssl.SSLError(1, "wrong version"), "tls: "),
+    (ConnectionRefusedError(61, "Connection refused"), "unreachable: ConnectionRefusedError"),
+    (TimeoutError("timed out"), "unreachable: TimeoutError"),
+])
+def test_preflight_reports_why_upstream_is_unusable(exc, reason):
+    h = Harness()
+    h.t.fail = [exc]
+    got = h.proxy.preflight()
+    assert got is not None and got.startswith(reason) and len(got) <= 200
+
+
+def test_preflight_real_tls_needs_the_users_ca(tmp_path, no_proxy_env):
+    """A TLS handshake over a socketpair against a certificate from a private CA: it fails with the
+    default trust and passes once NODE_EXTRA_CA_CERTS names the CA."""
+    certs = _make_certs(tmp_path)
+    server_ctx = SP.ssl.SSLContext(SP.ssl.PROTOCOL_TLS_SERVER)
+    server_ctx.load_cert_chain(certs["leaf"], certs["key"])
+    fake = FA.FakeAnthropic()
+    handler = FA.make_handler(fake)
+
+    def serve(sock):
+        try:
+            with server_ctx.wrap_socket(sock, server_side=True) as tls:
+                handler(tls, ("127.0.0.1", 0), None)
+        except (OSError, SP.ssl.SSLError):
+            sock.close()
+
+    def connect(*_args, **_kwargs):
+        a, b = socket.socketpair()
+        threading.Thread(target=serve, args=(b,), daemon=True).start()
+        return _NoDelaySocket(fileno=a.detach())
+
+    no_proxy_env.setattr(socket, "create_connection", connect)
+    for var in ("SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS"):
+        no_proxy_env.delenv(var, raising=False)
+    untrusted = SeatProxy(lambda hit: None).preflight(timeout=5)
+    assert untrusted is not None and untrusted.startswith("tls: "), untrusted
+    no_proxy_env.setenv("NODE_EXTRA_CA_CERTS", str(certs["ca"]))
+    assert SeatProxy(lambda hit: None).preflight(timeout=5) is None
+    assert [r["method"] for r in fake.requests] == ["HEAD"]
+    assert fake.requests[0]["bearer"] is None
+
+
+class _NoDelaySocket(socket.socket):
+    def setsockopt(self, *_args):
+        pass
+
+
+def _make_certs(tmp: Path) -> dict:
+    import shutil
+    import subprocess
+    if not shutil.which("openssl"):
+        pytest.skip("openssl not available to mint a throwaway CA")
+    run = lambda *a: subprocess.run(["openssl", *a], cwd=tmp, check=True, capture_output=True)
+    run("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", "ca.key", "-out", "ca.pem", "-days", "1",
+        "-subj", "/CN=seatproxy test CA", "-addext", "basicConstraints=critical,CA:TRUE",
+        "-addext", "keyUsage=critical,keyCertSign,cRLSign")
+    run("req", "-newkey", "rsa:2048", "-nodes", "-keyout", "leaf.key", "-out", "leaf.csr",
+        "-subj", "/CN=api.anthropic.com")
+    (tmp / "leaf.ext").write_text("subjectAltName=DNS:api.anthropic.com\nbasicConstraints=CA:FALSE\n"
+                                  "extendedKeyUsage=serverAuth\nsubjectKeyIdentifier=hash\n"
+                                  "authorityKeyIdentifier=keyid,issuer\n")
+    run("x509", "-req", "-in", "leaf.csr", "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial",
+        "-out", "leaf.pem", "-days", "1", "-extfile", "leaf.ext")
+    return {"ca": tmp / "ca.pem", "leaf": tmp / "leaf.pem", "key": tmp / "leaf.key"}
 
 
 # --- over the wire: socketpairs always, TCP on 127.0.0.1 where binding is allowed ---------------
