@@ -1843,6 +1843,7 @@ def test_websocket_upgrade_is_relayed_verbatim_and_spliced(monkeypatch, no_proxy
     assert B.token not in sent                     # an upgrade never carries a seat token
     assert up.addresses == [("api.anthropic.com", 443)]
     assert proxy.messages_seen() == 0 and proxy.upstream_failures() == 0
+    assert proxy.upstream_successes() == 1
 
 
 def test_a_refused_upgrade_is_relayed_and_the_connection_closes(monkeypatch, no_proxy_env, session_ca):
@@ -2053,3 +2054,29 @@ def test_repeated_plain_http_is_never_a_reject(session_ca):
             sock.sendall(b"GET / HTTP/1.1\r\nHost: api.anthropic.com\r\n\r\n")
             assert outcomes.acquire(timeout=10)
     assert rejects == []
+
+
+def test_upstream_successes_count_every_answer_and_nothing_else():
+    h = Harness()
+    h.t.fail = [OSError("connection refused")]
+    assert h.send()[0].status == 502
+    assert h.proxy.upstream_successes() == 0
+    rules(h, client=429)                                  # an error status is still an answer
+    statuses = [h.send()[0].status for _ in range(2)]
+    assert statuses == [429, 429] and h.proxy.upstream_successes() == 2
+    h.t.fail_response = [ConnectionResetError("reset while waiting for the answer")]
+    assert h.send()[0].status == 502
+    assert h.proxy.upstream_successes() == 2
+
+
+@pytest.mark.parametrize("resets,fired", [(2, False), (3, True)])
+def test_resets_mid_handshake_count_like_hang_ups(resets, fired):
+    rejects, outcomes = [], threading.Semaphore(0)
+    ca = SimpleCA(_FailingCtx(ConnectionResetError(54, "Connection reset by peer")))
+    proxy = SeatProxy(lambda hit: None, ca=ca, on_tls_reject=rejects.append,
+                      log=lambda event, **f: event == "tls_handshake_failed" and outcomes.release())
+    for _ in range(resets):
+        sock, status, _ = _connect(proxy, "api.anthropic.com:443")
+        sock.close()
+        assert status == 200 and outcomes.acquire(timeout=10)
+    assert rejects == (["eof x3"] if fired else [])
