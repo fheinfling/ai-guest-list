@@ -190,9 +190,10 @@ def _connect_via(proxy: tuple[str, int, dict] | None, host: str, port: int, time
             if not data or len(head) > 65536:
                 raise OSError("upstream proxy closed during CONNECT")
             head += data
-        status = head.split(b"\r\n", 1)[0].split()
+        first = head.split(b"\r\n", 1)[0]
+        status = first.split()
         if len(status) < 2 or status[1] != b"200":
-            raise OSError(f"upstream proxy refused CONNECT: {head.split(b'\r\n', 1)[0][:100]!r}")
+            raise OSError(f"upstream proxy refused CONNECT: {first[:100]!r}")
         return sock
     except BaseException:
         sock.close()
