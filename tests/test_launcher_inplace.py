@@ -56,6 +56,10 @@ class FakeSwap:
         self.preflight_says = None    # a reason string: the proxy can't reach the API
         self.used = True              # the child has sent /v1/messages through the proxy
         self.raising = set()          # method names that blow up
+        self.in_flight = 0            # the proxy's own view of the child's traffic
+        self.idle = 999.0
+        self.proxy = types.SimpleNamespace(in_flight=lambda: self.in_flight,
+                                           idle_for=lambda: self.idle)
         self.stopped = False
         self._bound = None
 
@@ -772,8 +776,12 @@ def test_recovery_looks_for_a_landing_from_the_billed_seat(seats, tokens, monkey
     clock = Clock(monkeypatch)
     _plans(seats, **{C1: "team", C2: "max", C3: "team"})
     _rest(seats, C2)
-    _rest(seats, C3, until=iso(now() + timedelta(seconds=0.4)))
     swap = FakeSwap()
+
+    def c3_resting_briefly_then_c1_hits_its_limit():
+        # Stamped here, not before run(): its startup must not eat the short rest.
+        _rest(seats, C3, until=iso(now() + timedelta(seconds=0.4)))
+        swap.post("limit", C1)
 
     def other_terminal_moves_active():
         st = seats.load_state()
@@ -784,8 +792,8 @@ def test_recovery_looks_for_a_landing_from_the_billed_seat(seats, tokens, monkey
         time.sleep(0.5)
         clock.advance(L.TICK_BLOCK_S + 1)
 
-    spawn = Spawn(([lambda: swap.post("limit", C1), None, other_terminal_moves_active, None,
-                    c3_rest_runs_out], 0))
+    spawn = Spawn(([c3_resting_briefly_then_c1_hits_its_limit, None,
+                    other_terminal_moves_active, None, c3_rest_runs_out], 0))
     assert _run(seats, spawn, swap) == 0
     assert swap.binds == [Seat(C3, "tok-c3")]
     assert seats.load_state().active("claude") == C3
@@ -842,35 +850,41 @@ def test_a_click_never_restarts_claude_when_it_cannot_move_in_place(seats):
 
 
 @pytest.mark.crossings
-def test_a_click_across_kinds_moves_in_place_without_spending_the_approval(seats, tokens):
-    """A click is the user's choice: this session moves without needing or spending an approval.
-    switch(manual=True) leaves none behind (review LOW): a later AUTOMATIC c1->c2 still asks."""
+def test_a_click_across_kinds_asks_this_session_instead_of_moving_it(seats, tokens):
+    """Review N8: a click that would carry THIS session business -> personal raises a question
+    for it; once approved, the session moves in place."""
     from acctsw import seatkind
     _plans(seats, **{C1: "team", C2: "max", C3: "max"})
     swap = FakeSwap()
-    spawn = Spawn(([lambda: _click(seats, C2), None], 0))
-    assert _run(seats, spawn, swap) == 0
+    asked = []
+
+    def approve():
+        st = seats.load_state()
+        asked.extend((r["from"], r["to"]) for r in seatkind.pending(st, "claude"))
+        seatkind.approve(st, "claude", C1, C2, "once")
+        st.save()
+
+    spawn = Spawn(([lambda: _click(seats, C2), lambda: asked.append(list(swap.binds)), approve,
+                    None], 0))
+    notes = []
+    assert _run(seats, spawn, swap, notify=notes.append) == 0
+    assert asked[0] == [] and (C1, C2) in asked[1:]   # no move on the click, a question instead
+    assert any("approve in ai guest list" in n for n in notes)
     assert swap.binds == [Seat(C2, "tok-c2")]
-    assert not seatkind.approved(seats.load_state(), "claude", C1, C2)
 
 
-@pytest.mark.crossings
-def test_a_click_moves_even_when_no_approval_is_on_record(seats, tokens):
-    """A manual switch is the user's choice: it is never gated on approved()/consume(), even when
-    no approval exists for it (an older app, or another session already spent it)."""
-    _plans(seats, **{C1: "team", C2: "max", C3: "max"})
-    swap = FakeSwap()
+def test_a_click_still_lets_the_heartbeat_see_a_rest_in_the_same_write(seats):
+    """Review N12: a click claude can't take in place must not swallow the rest of the tick."""
+    def click_and_rest():
+        _click(seats, C2)
+        _rest(seats, C1)
 
-    def click_without_approval():
-        with seats.locked():
-            st = seats.load_state()
-            st.set_active("claude", C2)
-            st.data["tools"]["claude"]["manual_switch"] = {"id": 999, "email": C2}
-            st.save()
+    spawn = Spawn(([click_and_rest, None], 1), ([None], 0))
+    assert run(seats, "claude", [], spawn=spawn, get=fake_get({}), notify=lambda m: None,
+               swap_factory=lambda _ctx: None) == 0
+    assert spawn.stops == 1 and spawn.calls[1][-2:] == ["--resume", _session(spawn)]
 
-    spawn = Spawn(([click_without_approval, None], 0))
-    assert _run(seats, spawn, swap) == 0
-    assert swap.binds == [Seat(C2, "tok-c2")]
+
 
 
 # --- review round: robustness, gates, origins -----------------------------------------------------
@@ -932,14 +946,20 @@ def test_a_401_on_a_renewed_token_replays_on_the_new_one(seats, tokens):
 
 
 def test_a_401_never_restarts_the_child(seats, tokens, monkeypatch):
-    """Nowhere to go in place (budget spent): the 401 is passed through, the child lives."""
+    """No other seat in place (budget spent): the 401 goes home, the child lives on."""
     monkeypatch.setattr(L, "MAX_INPLACE_SWITCHES", 1)
     swap = FakeSwap()
     hits = []
-    spawn = Spawn(([lambda: swap.post("limit", C1), None,
+
+    def click_away_from_a_reactively_rested_c1():
+        _rest(seats, C1, source="reactive")   # out of choose(); not a signal the tick acts on
+        _click(seats, C2)
+
+    spawn = Spawn(([click_away_from_a_reactively_rested_c1, None,
                     lambda: hits.append(swap.post("auth", C2)), None], 0))
     assert _run(seats, spawn, swap) == 0
-    assert spawn.stops == 0 and swap.answers[-1] == (hits[0], None)
+    # Going home is no switch, so it is never out of budget: the child's own login takes it.
+    assert spawn.stops == 0 and swap.answers[-1] == (hits[0], Seat(C1, None))
 
 
 def test_a_401_does_not_write_the_seat_off_for_the_run(seats, tokens):
@@ -1080,3 +1100,206 @@ def test_a_limit_whose_approval_is_refused_at_the_commit_stays_and_asks_again(se
     assert _run(seats, spawn, swap, seatkind=kinds) == 0
     assert spawn.stops == 0 and swap.answers == [(hits[0], None)]
     assert {r[:2] for r in kinds.requests} == {(C1, C2)}   # asked again, never killed
+
+
+# --- review round 2 -------------------------------------------------------------------------------
+
+def test_a_failing_in_place_commit_stays_put_and_never_restarts(seats, tokens, monkeypatch):
+    """N2: switch() blowing up inside the hop is logged; the child is neither moved nor killed
+    (a restart would only run into the same failure)."""
+    swap = FakeSwap()
+
+    def broken_switch(*a, **kw):
+        raise OSError("keychain locked")
+
+    hits = []
+
+    def hit_with_switch_broken():
+        monkeypatch.setattr(L, "switch", broken_switch)
+        hits.append(swap.post("limit", C1))
+
+    spawn = Spawn(([hit_with_switch_broken, None], 0))
+    assert _run(seats, spawn, swap) == 0
+    assert spawn.stops == 0 and swap.answers == [(hits[0], None)] and swap.binds == []
+
+
+@pytest.mark.parametrize("where", ["output", "state"])
+def test_a_decision_that_raises_never_unwinds_the_child(seats, monkeypatch, where):
+    """N2: whatever path a decision comes from, an exception in it leaves the child running."""
+    from tests.test_usage import claude_ok_body
+    from acctsw import paths as P
+
+    def boom(*a, **kw):
+        raise RuntimeError("decision bug")
+
+    monkeypatch.setattr(L, "handle_limit", boom)
+    get = fake_get({P.CLAUDE_USAGE_URL: (200, claude_ok_body(
+        five=100.0, five_reset=iso(now() + timedelta(hours=2))))})
+    step = (b"You've hit your usage limit \xc2\xb7 resets 8pm\n" if where == "output"
+            else (lambda: _rest(seats, C1)))
+    spawn = Spawn(([step, None], 0))
+    assert run(seats, "claude", [], spawn=spawn, get=get, notify=lambda m: None,
+               swap_factory=lambda _ctx: None) == 0
+    assert spawn.stops == 0
+
+
+def test_an_auth_banner_restarts_instead_of_moving_in_place(seats, tokens):
+    """N3: the child's own login is dead; only a restart gives it another one."""
+    swap = FakeSwap()
+    spawn = Spawn(([b"API Error: OAuth token has expired. Please obtain a new token.\n"], 1),
+                  ([None], 0))
+    assert _run(seats, spawn, swap) == 0
+    assert swap.binds == [] and spawn.stops == 1
+    assert spawn.calls[1][-2:] == ["--resume", _session(spawn)]
+
+
+def test_an_approved_crossing_waits_while_auto_switch_is_off(seats, tokens):
+    """N4: an approved crossing is still an automatic move: auto-switch off means no move."""
+    _drop(seats, C3)
+    kinds = FakeKinds({C1: "business", C2: "personal"})
+    swap = FakeSwap()
+
+    def auto_off_then_approve():
+        st = seats.load_state()
+        st.set_setting("auto_switch", False)
+        st.save()
+        _approve(seats, C1, C2)
+
+    spawn = Spawn(([lambda: swap.post("limit", C1), None, auto_off_then_approve, None], 0))
+    assert _run(seats, spawn, swap, seatkind=kinds) == 0
+    assert swap.binds == [] and seats.load_state().active("claude") == C1
+
+
+def test_an_approved_crossing_to_a_seat_that_rested_since_is_not_taken(seats, tokens):
+    """N4: the approval arrives after the target itself hit its limit: nothing to take."""
+    _drop(seats, C3)
+    kinds = FakeKinds({C1: "business", C2: "personal"})
+    swap = FakeSwap()
+
+    def c2_rests_then_approve():
+        _rest(seats, C2)
+        _approve(seats, C1, C2)
+
+    spawn = Spawn(([lambda: swap.post("limit", C1), None, c2_rests_then_approve, None], 0))
+    assert _run(seats, spawn, swap, seatkind=kinds) == 0
+    assert swap.binds == [] and seats.load_state().active("claude") == C1
+
+
+def _handover_run(seats, swap, clock, *, args=(), extra=(), second=True):
+    def token_running_out():
+        swap.maintain_result = "handover"
+        clock.advance(L.HANDOVER_QUIET_S + 1)
+
+    scripts = [([lambda: swap.post("limit", C1), None, token_running_out, *extra], 1)]
+    if second:
+        scripts.append(([None], 0))
+    spawn = Spawn(*scripts)
+    rc = run(seats, "claude", list(args), spawn=spawn, get=fake_get({}),
+             notify=lambda m: None, swap_factory=lambda _ctx: swap)
+    return rc, spawn
+
+
+def test_a_handover_request_lapses_when_maintain_stops_asking(seats, tokens, monkeypatch):
+    """N5: maintain() returning None clears a handover it asked for earlier."""
+    clock = Clock(monkeypatch)
+    swap = FakeSwap()
+    swap.in_flight = 1   # busy at first: the handover has to wait
+
+    def stops_asking_and_goes_quiet():
+        swap.maintain_result = None
+        swap.in_flight = 0
+
+    rc, spawn = _handover_run(seats, swap, clock, extra=(stops_asking_and_goes_quiet, None),
+                              second=False)
+    assert rc == 1 and spawn.stops == 0
+
+
+def test_a_handover_waits_for_the_proxy_to_be_quiet(seats, tokens, monkeypatch):
+    """N5: a request in flight (or one that just finished) holds the handover back."""
+    clock = Clock(monkeypatch)
+    swap = FakeSwap()
+    swap.idle = 1.0
+    rc, spawn = _handover_run(seats, swap, clock, extra=(None,), second=False)
+    assert rc == 1 and spawn.stops == 0
+
+
+def test_no_handover_restart_for_a_print_run(seats, tokens, monkeypatch):
+    """N5: `claude -p` has no prompt to go quiet at; it is never handed over."""
+    clock = Clock(monkeypatch)
+    swap = FakeSwap()
+    rc, spawn = _handover_run(seats, swap, clock, args=("-p", "do it"), extra=(None,),
+                              second=False)
+    assert rc == 1 and spawn.stops == 0
+
+
+def test_no_handover_onto_a_seat_without_a_loadable_login(seats, tokens, monkeypatch):
+    """N5: restarting onto a seat whose login can't be loaded would end in "Not logged in"."""
+    clock = Clock(monkeypatch)
+    monkeypatch.setattr(L, "plan_claude_login", lambda ctx, state, email: None)
+    swap = FakeSwap()
+    rc, spawn = _handover_run(seats, swap, clock, extra=(None,), second=False)
+    assert rc == 1 and spawn.stops == 0
+
+
+def test_handover_prefers_home_over_a_restart(seats, tokens, monkeypatch):
+    clock = Clock(monkeypatch)
+    swap = FakeSwap()
+
+    def home_back_and_token_running_out():
+        st = seats.load_state()
+        st.get_seat("claude", C1).pop("limited_until")
+        st.save()
+        swap.maintain_result = "handover"
+        clock.advance(L.HANDOVER_QUIET_S + 1)
+
+    spawn = Spawn(([lambda: swap.post("limit", C1), None, home_back_and_token_running_out], 0))
+    assert run(seats, "claude", [], spawn=spawn, get=fake_get({}), notify=lambda m: None,
+               swap_factory=lambda _ctx: swap) == 0
+    assert spawn.stops == 0 and swap.bound() is None   # home: the child's own login
+    assert seats.load_state().active("claude") == C1
+
+
+def test_going_home_ignores_the_budget_and_the_toggle(seats, tokens, monkeypatch):
+    """N6: going back to the child's own login is no switch: no budget, no toggle."""
+    monkeypatch.setattr(L, "MAX_INPLACE_SWITCHES", 1)
+    _drop(seats, C3)
+    swap = FakeSwap()
+
+    def toggle_off_and_home_back():
+        st = seats.load_state()
+        st.set_setting("in_place_switch", False)
+        st.get_seat("claude", C1).pop("limited_until")
+        st.save()
+
+    hits = []
+    spawn = Spawn(([lambda: swap.post("limit", C1), None, toggle_off_and_home_back, None,
+                    lambda: hits.append(swap.post("limit", C2)), None], 0))
+    assert _run(seats, spawn, swap) == 0
+    assert swap.answers[-1] == (hits[0], Seat(C1, None)) and spawn.stops == 0
+
+
+@pytest.mark.crossings
+def test_a_cold_start_on_a_dead_seat_asks_and_waits_for_the_crossing(seats, tokens):
+    """N7a: the active seat is signed out and the only other one crosses: ask, wait, then start
+    there once approved — never launch on the dead seat."""
+    from acctsw import seatkind
+    _drop(seats, C3)
+    _plans(seats, **{C1: "team", C2: "max"})
+    st = seats.load_state()
+    st.get_seat("claude", C1)["auth_error"] = "refresh_token_revoked"
+    st.save()
+    swap = FakeSwap()
+    sleeps, notes = [], []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 2:
+            st = seats.load_state()
+            seatkind.approve(st, "claude", C1, C2, "once")
+            st.save()
+
+    spawn = Spawn(([None], 0))
+    assert _run(seats, spawn, swap, notify=notes.append, sleep=sleep) == 0
+    assert any("approve in ai guest list" in n for n in notes)
+    assert swap.homes == [C2]
+    assert sleeps and max(sleeps) <= L.CROSSING_POLL_S   # N7b: an open question polls fast
