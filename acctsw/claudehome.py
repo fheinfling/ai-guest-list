@@ -36,6 +36,7 @@ from .util import email_key
 import hashlib
 from contextlib import contextmanager
 import json
+import logging
 import os
 from pathlib import Path
 import threading
@@ -44,6 +45,7 @@ import unicodedata
 
 from . import codexhome
 from .errors import AcctswError, CredentialIdentityMismatch, MissingSnapshot
+from .keychain import KeychainError
 from .util import atomic_write_text
 
 PRIVATE = frozenset({
@@ -271,8 +273,14 @@ def prepare(ctx, email: str) -> None:
 
 
 def prepare_all(ctx) -> None:
+    """Prepare readable homes; ensure_home still requires the actual launch seat to be readable."""
     for email in ctx.load_state().accounts("claude"):
-        prepare(ctx, email)
+        try:
+            prepare(ctx, email)
+        except (KeychainError, OSError):
+            # Unknown is not missing. Leave this home alone; the selected seat's strict
+            # ensure_home read will still fail before spawn if it is the unreadable one.
+            logging.getLogger(__name__).warning("Skipping unreadable Claude home for %s", email)
 
 
 def ensure_home(ctx, email: str, *, promote: bool = False, capture: bool = False) -> Path:

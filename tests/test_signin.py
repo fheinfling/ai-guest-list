@@ -212,6 +212,35 @@ def test_a_locked_keychain_signs_nobody_out(ctx, monkeypatch):
     assert accounts.take_signin_notices(ctx.load_state())[0] == []
 
 
+@pytest.mark.parametrize("unreadable", ["a@test", "b@test"])
+def test_launch_skips_unreadable_parked_home_but_requires_launch_home(ctx, monkeypatch,
+                                                                  caplog, unreadable):
+    state = _seed_claude(ctx)
+    assert state.active("claude") == "b@test"
+    item = ctx.claude_cred(unreadable)
+    read_raw = ctx.keychain.get_raw
+    before = read_raw(item.service, item.account)
+    snapshot = ctx.snapshot_get("claude", unreadable)
+    _lock_keychain(ctx, monkeypatch, reads=lambda service: service == item.service)
+    launches = []
+
+    def spawn(argv, on_output, on_tick=None, *, env=None):
+        launches.append(env["CLAUDE_CONFIG_DIR"])
+        return 0
+
+    if unreadable == "b@test":
+        with pytest.raises(KeychainError):
+            launcher.run(ctx, "claude", [], spawn=spawn)
+        assert launches == []
+    else:
+        assert launcher.run(ctx, "claude", [], spawn=spawn) == 0
+        assert launches == [str(ctx.claude_home("b@test"))]
+        # Both the initial pass and the final pre-spawn pass must skip the parked seat.
+        assert caplog.text.count("Skipping unreadable Claude home for a@test") >= 2
+    assert read_raw(item.service, item.account) == before
+    assert ctx.snapshot_get("claude", unreadable) == snapshot
+
+
 # --- polling ----------------------------------------------------------------------------------
 
 def test_signed_out_seat_is_recorded_without_any_request_or_retry_streak(ctx):
@@ -629,6 +658,55 @@ def test_expiring_is_announced_once_until_the_seat_leaves_the_window(ctx):
     assert accounts.take_signin_notices(state) == ([], True)
     _flag(state, "a@test", False, iso(now() + timedelta(days=2)))   # ...and its own expiry nears
     assert len(accounts.take_signin_notices(state)[0]) == 1
+
+
+def test_expiring_notice_survives_convergence_and_an_active_only_poll(ctx, monkeypatch):
+    _seed_claude(ctx)
+    expiry = _ms(timedelta(days=2))
+    old = _claude(access="a@test", expires=_ms(timedelta(hours=1)), refresh_expires=expiry)
+    ctx.claude_cred("a@test").set_live(old)
+    ctx.snapshot_set("claude", "a@test", old)
+    U.refresh_live(ctx, "claude", force=True, get=_counting([]), user_agent="test")
+    notices = bridge._take_signin_notices(ctx)
+    assert len(notices) == 1 and "a@test" in notices[0]["text"]
+    marks = ctx.load_state().get_seat("claude", "a@test")["signin_notified"].copy()
+
+    # Claude rotates access credentials while retaining the same refresh-token expiry.
+    rotated = _claude(access="a@test", expires=_ms(timedelta(hours=2)), refresh_expires=expiry)
+    ctx.claude_cred("a@test").set_live(rotated)
+
+    def resolve(ctx, *, email=None):
+        from acctsw.identity import ClaudeLiveIdentity
+        item = ctx.claude_cred(email) if email else ctx.cred["claude"]
+        blob = item.get_live()
+        return ClaudeLiveIdentity(blob, json.loads(blob)["claudeAiOauth"]["accessToken"])
+
+    monkeypatch.setattr(claudesync.identity, "claude_live_identity", resolve)
+    claudesync.converge(ctx)
+    assert ctx.snapshot_get("claude", "a@test") == rotated
+    assert "signin" not in ctx.load_state().get_seat("claude", "a@test")
+
+    summary = U.refresh_live(ctx, "claude", active_only=True, force=True,
+                             get=_counting([]), user_agent="test")
+    assert set(summary["claude"]) == {"b@test"}
+    notices.extend(bridge._take_signin_notices(ctx))
+    assert ctx.load_state().get_seat("claude", "a@test")["signin_notified"] == marks
+
+    U.refresh_live(ctx, "claude", force=True, get=_counting([]), user_agent="test")
+    notices.extend(bridge._take_signin_notices(ctx))
+    assert len(notices) == 1
+    assert ctx.load_state().get_seat("claude", "a@test")["signin"]["expires_at"] == marks["expiring"]
+
+
+@pytest.mark.parametrize("verdict", [None, {}])
+def test_unknown_signin_verdict_preserves_all_notification_marks(ctx, verdict):
+    state = _seed_claude(ctx)
+    seat = state.get_seat("claude", "a@test")
+    seat["signin"] = verdict
+    marks = {"signed_out": True, "expiring": iso(now() + timedelta(days=2))}
+    seat["signin_notified"] = dict(marks)
+    assert accounts.take_signin_notices(state) == ([], False)
+    assert seat["signin_notified"] == marks
 
 
 def test_bridge_poll_delivers_each_notice_once_and_honours_the_setting(ctx, monkeypatch):

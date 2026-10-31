@@ -1,4 +1,16 @@
 [
+  {"label": "launch: an unreadable parked home aborts preparation before the active seat spawns",
+   "file": "acctsw/claudehome.py",
+   "old": "        except (KeychainError, OSError):\n            # Unknown is not missing.",
+   "new": "        except ZeroDivisionError:\n            # Unknown is not missing.",
+   "test": ["tests/test_signin.py::test_launch_skips_unreadable_parked_home_but_requires_launch_home"]},
+
+  {"label": "notify: an unknown sign-in verdict clears notification marks between convergence and a full poll",
+   "file": "acctsw/accounts.py",
+   "old": "            if not seat.get(\"signin\"):\n                continue  # credential convergence cleared the verdict, not the notification history\n",
+   "new": "",
+   "test": ["tests/test_signin.py::test_expiring_notice_survives_convergence_and_an_active_only_poll"]},
+
   {"label": "classifier: a Claude refresh token never expires (refreshTokenExpiresAt ignored)",
    "file": "acctsw/usage.py",
    "old": "_live_token(oauth.get(\"refreshToken\"), oauth.get(\"refreshTokenExpiresAt\"), at)",
