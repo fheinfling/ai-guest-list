@@ -1,4 +1,5 @@
 import os
+import re
 import socket
 import ssl
 import stat
@@ -25,6 +26,7 @@ def _walk(root):
 
 def _handshake(ca, hostname):
     client_ctx = ssl.create_default_context(cafile=None, cadata=ca.ca_pem())
+    client_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     client_ctx.set_alpn_protocols(["h2", "http/1.1"])
     a, b = socket.socketpair()
     res = {}
@@ -79,6 +81,7 @@ def test_leaf_san_and_validity(ca):
     t = threading.Thread(target=serve)
     t.start()
     ctx = ssl.create_default_context(cadata=ca.ca_pem())
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     with ctx.wrap_socket(a, server_hostname="api.anthropic.com") as c:
         cert = c.getpeercert()
     t.join(10)
@@ -99,7 +102,8 @@ def test_ca_properties(ca):
 
 
 def test_name_constraints_present(ca):
-    assert "api.anthropic.com" in _text(ca, "-text").split("Name Constraints")[1]
+    constraints = _text(ca, "-text").split("Name Constraints")[1]
+    assert re.search(r"Permitted:\s+DNS:api\.anthropic\.com\s", constraints)
 
 
 def test_no_key_files_remain(tmp_path):
