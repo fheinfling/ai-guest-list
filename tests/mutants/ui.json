@@ -1,0 +1,301 @@
+[
+ {
+  "label": "signedOut ignores the signed_out flag",
+  "file": "app/web/render.mjs",
+  "old": "if (typeof seat?.signed_out === \"boolean\") return seat.signed_out;",
+  "new": "if (false) return seat.signed_out;",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "signedOut ignores needs_login (old engine field)",
+  "file": "app/web/render.mjs",
+  "old": "return !entitlementRevoked(seat) && (seat?.needs_login === true ||",
+  "new": "return !entitlementRevoked(seat) && (false ||",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "signed-out seat still counts as usable",
+  "file": "app/web/render.mjs",
+  "old": "&& !signedOut(seat);\n}\n\n// A window whose",
+  "new": "&& true;\n}\n\n// A window whose",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "roster renders usage numbers for a signed-out seat",
+  "file": "app/web/render.mjs",
+  "old": "const used = out || seat.usage_unknown",
+  "new": "const used = seat.usage_unknown",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "roster keeps reset times for a signed-out seat",
+  "file": "app/web/render.mjs",
+  "old": "const reset = absent || out ? null",
+  "new": "const reset = absent ? null",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "signed-out active seat loses 'on now' honesty",
+  "file": "app/web/render.mjs",
+  "old": "out ? (active ? \"on now \u00b7 signed out\" : \"signed out\") : active ? \"active\"",
+  "new": "out ? \"signed out\" : active ? \"active\"",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "signed-out row still gets active styling",
+  "file": "app/web/render.mjs",
+  "old": "${active && !out && !signinNeeded(seat) && !entitlementRevoked(seat) ? \"roster-active\"",
+  "new": "${active && !signinNeeded(seat) && !entitlementRevoked(seat) ? \"roster-active\"",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "signed-out seat gets no sign in action",
+  "file": "app/web/render.mjs",
+  "old": "  if (signinNeeded(seat)) return add(\"sign in\");\n  if (signedOut(seat)) return add(\"sign in\");",
+  "new": "",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "signed-out seat card keeps the usage bars",
+  "file": "app/web/render.mjs",
+  "old": "${out ? `<p class=\"usage-error\" role=\"status\">signed out; sign in to see usage</p>` : `",
+  "new": "${false ? `<p class=\"usage-error\" role=\"status\">signed out; sign in to see usage</p>` : `",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "past roster reset renders 'in now'",
+  "file": "app/web/render.mjs",
+  "old": "${resetIsPast(reset) ? \"resetting\u2026\" : `in ${fmtCountdown(reset)}`}",
+  "new": "${`in ${fmtCountdown(reset)}`}",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "past window bar reset renders 'resets in now'",
+  "file": "app/web/render.mjs",
+  "old": "${resetIsPast(reset) ? \"resetting\u2026\" : `window resets in ${fmtCountdown(reset)}`}",
+  "new": "${`window resets in ${fmtCountdown(reset)}`}",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "clock tick lets a passed reset say 'in now'",
+  "file": "app/web/render.mjs",
+  "old": "node.dataset.pastText && resetIsPast(node.dataset.resetAt, now) ? node.dataset.pastText\n      : ",
+  "new": "false ? node.dataset.pastText\n      : ",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "past reset check treats future as past",
+  "file": "app/web/render.mjs",
+  "old": "return Number.isFinite(t) && t <= now;",
+  "new": "return Number.isFinite(t) && t >= now;",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "expiring ignores the signin_expiring flag",
+  "file": "app/web/render.mjs",
+  "old": "seat?.signin_expiring === true && !signedOut(seat)",
+  "new": "!signedOut(seat)",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "expiring still shown after the date passed",
+  "file": "app/web/render.mjs",
+  "old": "&& Date.parse(seat.signin_expires_at) > now;",
+  "new": "&& true;",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "expiring seat offers no sign in again",
+  "file": "app/web/render.mjs",
+  "old": "const again = signinExpiring(seat) ? add(\"sign in again\") : \"\";",
+  "new": "const again = \"\";",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "expiring line dropped from the roster row",
+  "file": "app/web/render.mjs",
+  "old": "${!out && signinExpiring(seat) ? signinExpiryLine",
+  "new": "${false ? signinExpiryLine",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "headline claims all is fine with a signed-out seat",
+  "file": "app/web/render.mjs",
+  "old": "return out ? `you can keep working, but",
+  "new": "return false ? `you can keep working, but",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "verdict counts signed-out seats as ready",
+  "file": "app/web/render.mjs",
+  "old": "const ready = seats.filter(usable);\n  let headline",
+  "new": "const ready = seats.filter((s) => [\"ready\", \"active\"].includes(s.status));\n  let headline",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "old engine: absent fields turn on signed-out",
+  "file": "app/web/render.mjs",
+  "old": "if (typeof seat?.signed_out === \"boolean\") return seat.signed_out;",
+  "new": "if (seat?.signed_out !== false) return true;",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "signedOut overrides signed_out:false with needs_login",
+  "file": "app/web/render.mjs",
+  "old": "if (typeof seat?.signed_out === \"boolean\") return seat.signed_out;",
+  "new": "if (seat?.signed_out === true) return true;",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "isActive ignores seat.active",
+  "file": "app/web/render.mjs",
+  "old": "seat?.active === true || seat?.status",
+  "new": "false || seat?.status",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "expiring seat loses its switch action",
+  "file": "app/web/render.mjs",
+  "old": "if (isActive(seat)) return again;",
+  "new": "if (isActive(seat) || again) return again;",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "expiring seat loses row switch target",
+  "file": "app/web/render.mjs",
+  "old": "const rowAction = action && !active && !out",
+  "new": "const rowAction = action && !active && !out && !signinExpiring(seat)",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "sign in again dropped beside switch",
+  "file": "app/web/render.mjs",
+  "old": "${limited ? \"switch anyway\" : \"switch\"}</button>${again}`",
+  "new": "${limited ? \"switch anyway\" : \"switch\"}</button>`",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "signed-in auth failure loses its sign-in affordance",
+  "file": "app/web/render.mjs",
+  "old": "  if (signinNeeded(seat)) return add(\"sign in\");",
+  "new": "",
+  "cmd": [
+   "node",
+   "--test",
+   "--test-name-pattern=signed-in login failure",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "revoked entitlement is mistaken for a sign-in failure",
+  "file": "app/web/render.mjs",
+  "old": "  return seat?.entitlement_revoked === true || seat?.usage?.error === \"forbidden\";",
+  "new": "  return false;",
+  "cmd": [
+   "node",
+   "--test",
+   "--test-name-pattern=revoked subscription",
+   "app/web/render.test.mjs"
+  ]
+ }
+]

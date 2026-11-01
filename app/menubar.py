@@ -557,6 +557,9 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
         def finishUsagePoll_(self, result):
             self._usage_poll_inflight = False
             self.applyResult_(result)
+            # Raised once each by the engine (deduped in persisted state, notify setting applied).
+            for notice in result.get("signin_notices") or []:
+                self._notify(notice["title"], notice["text"])
             handoff = result.get("auto_switch") or {}
             if handoff.get("status") == "switched":
                 notify_on = ((result.get("state") or {}).get("settings") or {}).get("notify", True)
@@ -821,7 +824,14 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
                 # my seat" tapped before sign-in completes (creds unchanged) is rejected instead of
                 # silently re-adding the old seat. (sync_back doesn't change live creds, so capturing
                 # here == capturing just before launch.) Reading creds is a quick, lock-free read.
-                self._login_baseline[msg["tool"]] = (op, self._credDigest(msg["tool"]))
+                from acctsw.keychain import KeychainError
+                try:
+                    digest = self._credDigest(msg["tool"])
+                except (KeychainError, OSError):
+                    self._pushResult({"ok": False, "add_op": True, "tool": msg["tool"],
+                                      "error": "couldn't read the current login; unlock Keychain and try again"})
+                    return
+                self._login_baseline[msg["tool"]] = (op, digest)
                 # Off the main thread: prepare_then_login holds ctx.locked() and spawns `open` to launch
                 # the sign-in terminal — on the main thread it would beachball behind a usage poll
                 # holding the same lock.

@@ -294,8 +294,8 @@ def _auto_switch_after_usage(ctx: Context, summary: dict[str, Any], *,
     def saved_blob(tool, email):
         if tool == "claude":
             from . import claudehome
-            return claudehome.load(ctx, email)
-        return ctx.snapshot_get(tool, email)
+            return claudehome.load(ctx, email, strict=True)
+        return ctx.snapshot_get(tool, email, strict=True)
 
     excluded_by_tool = excluded_by_tool or {}
     for tool, tool_summary in summary.items():
@@ -348,10 +348,13 @@ def _auto_switch_after_usage(ctx: Context, summary: dict[str, Any], *,
 
         # Keychain access is a subprocess on macOS.  Pin both snapshots with no state flock held;
         # the receipt revision below makes a state writer invalidate this decision before commit.
-        outgoing_blob = saved_blob(tool, active) if tool == "claude" else ctx.cred[tool].get_live()
-        outgoing_digest = _blob_digest(outgoing_blob)
-        active_snapshot_digest = _blob_digest(saved_blob(tool, active))
-        candidate_digest_before = _blob_digest(saved_blob(tool, candidate))
+        try:
+            outgoing_blob = saved_blob(tool, active) if tool == "claude" else ctx.cred[tool].get_live(strict=True)
+            outgoing_digest = _blob_digest(outgoing_blob)
+            active_snapshot_digest = _blob_digest(saved_blob(tool, active))
+            candidate_digest_before = _blob_digest(saved_blob(tool, candidate))
+        except usage_mod.UNREADABLE:
+            continue  # unknown credentials cannot authorize a handoff
         if not outgoing_digest or not candidate_digest_before:
             continue
         if (active_seat.get("usage") or {}).get("credential_digest") != outgoing_digest:
@@ -367,10 +370,13 @@ def _auto_switch_after_usage(ctx: Context, summary: dict[str, Any], *,
             excluded_by_tool.setdefault(tool, {active}).add(candidate)
             return _auto_switch_after_usage(ctx, summary, excluded_by_tool=excluded_by_tool)
 
-        candidate_digest_after = _blob_digest(saved_blob(tool, candidate))
-        if tool == "claude":
-            from . import claudehome
-            claudehome.prepare(ctx, candidate)
+        try:
+            candidate_digest_after = _blob_digest(saved_blob(tool, candidate))
+            if tool == "claude":
+                from . import claudehome
+                claudehome.prepare(ctx, candidate)
+        except usage_mod.UNREADABLE:
+            continue
         receipt_state = ctx.load_state()
         receipt_rev = receipt_state.data.get("rev")
         if candidate_digest_after is None or candidate_digest_after != candidate_digest_before:
@@ -379,13 +385,16 @@ def _auto_switch_after_usage(ctx: Context, summary: dict[str, Any], *,
 
         # Claude's identity query may block; resolve before taking the handoff lock.  `do_switch`
         # verifies this exact blob again before it writes, so a login racing this probe is harmless.
-        if tool == "claude":
-            from . import claudesync
-            live_identity = claudesync.cached_identity(ctx, email=active)
-        else:
-            live_identity = None
-        outgoing_after = saved_blob(tool, active) if tool == "claude" else ctx.cred[tool].get_live()
-        candidate_after = saved_blob(tool, candidate)
+        try:
+            if tool == "claude":
+                from . import claudesync
+                live_identity = claudesync.cached_identity(ctx, email=active)
+            else:
+                live_identity = None
+            outgoing_after = saved_blob(tool, active) if tool == "claude" else ctx.cred[tool].get_live(strict=True)
+            candidate_after = saved_blob(tool, candidate)
+        except usage_mod.UNREADABLE:
+            continue
         outgoing_unchanged = _blob_digest(outgoing_after) == outgoing_digest
         candidate_unchanged = _blob_digest(candidate_after) == candidate_digest_before
         with ctx.locked():
@@ -436,6 +445,19 @@ def _auto_switch_after_usage(ctx: Context, summary: dict[str, Any], *,
 
 # Engine commands for every browser sign-in entry point. Official argv lives in authflows.
 LOGIN_SUBCMD = {tool: ["signin", tool] for tool in TOOLS}
+
+
+def _take_signin_notices(ctx: Context) -> list[dict[str, str]]:
+    """Sign-in notices this poll raised, each once ever (marks persist in state). With
+    notifications off they are still consumed, so turning them on later doesn't replay old news."""
+    if not acct.take_signin_notices(ctx.load_state())[1]:
+        return []   # the common case: nothing new, so no flock and no state write
+    with ctx.locked():
+        state = ctx.load_state()
+        notices, changed = acct.take_signin_notices(state)
+        if changed:
+            state.save()
+    return notices if state.settings().get("notify", True) else []
 
 
 def login_command(tool: str, method: str = "browser", *, seat: str | None = None) -> str:
@@ -619,16 +641,23 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
                                    if want_codex else None)
             reconcile_claude = False
             live_identity = None
+            unreadable = set()
             if want_claude and before.accounts("claude"):
                 active_claude = before.active("claude")
-                live_claude = ctx.cred["claude"].get_live()
-                saved_claude = (ctx.snapshot_get("claude", active_claude)
-                                if active_claude else None)
-                captured = before.data["tools"]["claude"].get("captured_stock_digest")
-                if live_claude != saved_claude and (
-                        not live_claude or acct._claude_digest(live_claude) != captured):
-                    live_identity = claudesync.cached_identity(ctx)
-                    reconcile_claude = True
+                try:
+                    live_claude = ctx.cred["claude"].get_live(strict=True)
+                    saved_claude = (ctx.snapshot_get("claude", active_claude, strict=True)
+                                    if active_claude else None)
+                    captured = before.data["tools"]["claude"].get("captured_stock_digest")
+                    if live_claude != saved_claude and (
+                            not live_claude or acct._claude_digest(live_claude) != captured):
+                        live_identity = claudesync.cached_identity(ctx)
+                        reconcile_claude = True
+                except usage_mod.UNREADABLE:
+                    # Locked/denied is unknown; preserve this seat and refresh the others.
+                    reconcile_claude = False
+                    if active_claude:
+                        unreadable.add(("claude", active_claude))
                 claude_ua = usage_mod.claude_user_agent(ctx.claude_bin)
             else:
                 claude_ua = P.CLAUDE_USER_AGENT_FALLBACK
@@ -640,19 +669,29 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
                 # our slow PID check, leave its private home alone and let the next poll reconcile.
                 if (want_codex and codex_session_live is None
                         and session_mod.session_mtime_ns(ctx.data_dir, "codex") == codex_session_sig):
-                    acct.reconcile_codex(ctx, state)
+                    try:
+                        acct.reconcile_codex(ctx, state)
+                    except usage_mod.UNREADABLE:
+                        if state.active("codex"):
+                            unreadable.add(("codex", state.active("codex")))
                 if reconcile_claude:
                     # The slow identity answer was resolved above and remains a no-op if its exact
                     # live bytes changed before this short reconciliation write.
-                    acct.reconcile_claude(ctx, state, live_identity=live_identity)
+                    try:
+                        acct.reconcile_claude(ctx, state, live_identity=live_identity)
+                    except usage_mod.UNREADABLE:
+                        if active_claude:
+                            unreadable.add(("claude", active_claude))
+                        if live_identity and live_identity.email:
+                            unreadable.add(("claude", live_identity.email))
             summary = usage_mod.refresh_live(
                 ctx, requested_tool, only=message.get("only"),
                 active_only=(scope == "active"), force=bool(message.get("force", False)),
-                user_agent=claude_ua,
+                user_agent=claude_ua, unreadable=unreadable,
             )
             handoff = _auto_switch_after_usage(ctx, summary)
             return {"ok": True, "refresh": summary, "auto_switch": handoff,
-                    "state": snapshot_state(ctx)}
+                    "signin_notices": _take_signin_notices(ctx), "state": snapshot_state(ctx)}
 
         if action == "paste":
             # Codex no-browser path only: install a pasted auth.json, then register it as a seat.

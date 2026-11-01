@@ -297,7 +297,7 @@ def _verify_capacity(ctx: Context, tool: str, get, *, at, force: bool,
     exponential error backoff — sustained 429s stretch a seat's polls instead of hammering it."""
     with ctx.locked():
         state = ctx.load_state()
-        pending = []
+        due = []
         for email in list(state.accounts(tool)):
             if email in exclude:
                 continue   # auth-dead this run: choose() skips it, so its fetch is a wasted 401
@@ -307,23 +307,36 @@ def _verify_capacity(ctx: Context, tool: str, get, *, at, force: bool,
             if not force and not usage_mod._due(prev, at, POLL_MIN_FETCH_S,
                                                 active=(state.active(tool) == email)):
                 continue
-            blob = usage_mod._seat_blob(ctx, state, tool, email)
-            if blob:
-                pending.append((email, blob))
+            due.append((email, prev))
+    pending = []
+    for email, prev in due:   # Keychain reads are subprocesses — no lock held; the commit re-checks
+        try:
+            blob = usage_mod._seat_blob(ctx, state, tool, email, strict=True)
+            # Same verdict and dead-credential gate as the app's poll: a signed-out seat is
+            # recorded without a request, and identical dead bytes are not re-read until max backoff.
+            signin, digest, login = usage_mod._signin_for(ctx, tool, email, blob, at)
+        except usage_mod.UNREADABLE:
+            continue   # proves nothing: the seat keeps its stored verdict
+        if not force and usage_mod._dead_unchanged(prev, digest, at):
+            continue
+        if login or signin.signed_out:
+            pending.append((email, blob, signin, digest, login))
     results = []
-    for email, blob in pending:   # network — no lock held
+    for email, blob, signin, digest, login in pending:   # network — no lock held
         try:
             # Carry the EXACT blob the fetch used into store_fetch: it re-derives plan/account_id
             # from it, so a re-subscription is caught here too — not only on the menubar's poll.
-            results.append((email, blob, usage_mod._fetch_for(tool, blob, get, ua)))
+            u = (usage_mod.Usage(error="no_token", fetched_at=iso(now())) if signin.signed_out
+                 else usage_mod._fetch_for(tool, login, get, ua))
+            results.append((email, blob, signin, digest, login, u))
         except Exception:
             pass  # a broken blob/transport must not kill the wait — the seat just isn't refreshed
     with ctx.locked():
         state = ctx.load_state()
         changed = False
-        for email, blob, u in results:
+        for email, blob, signin, digest, login, u in results:
             seat = state.get_seat(tool, email)
-            if seat is None or usage_mod._seat_blob(ctx, state, tool, email) != blob:
+            if seat is None or not _same_signin(ctx, state, tool, email, blob, digest, at):
                 continue  # removed, re-authenticated, or changed identity while the request ran
             previous = seat.get("usage") or {}
             previous_attempt = parse_iso(previous.get("last_attempted_at") or previous.get("fetched_at"))
@@ -331,7 +344,8 @@ def _verify_capacity(ctx: Context, tool: str, get, *, at, force: bool,
             if previous_attempt and fetched_at and previous_attempt > fetched_at:
                 continue  # a newer GUI/launcher observation already superseded this result
             usage_mod.store_fetch(state, tool, email, u, at=at,
-                                  trust_reactive_lag=trust_reactive_lag, blob=blob)
+                                  trust_reactive_lag=trust_reactive_lag, blob=login,
+                                  signin=signin, signin_digest=digest)
             changed = True
         # Trust the clock for markers the fetches did not re-stamp: clear EVERY seat whose rest has
         # expired by ``at`` (the old wait cleared only the one chosen seat, leaving stale siblings).
@@ -343,6 +357,21 @@ def _verify_capacity(ctx: Context, tool: str, get, *, at, force: bool,
         if changed:
             state.save()   # skip the fsync'd rewrite on idle polls (nothing fetched, nothing expired)
         return choose(state, tool, at=at, exclude=exclude)
+
+
+def _same_signin(ctx: Context, state, tool: str, email: str, blob: str | None,
+                 digest: str | None, at) -> bool:
+    """Whether a seat still holds the credentials a verdict was read from: the primary blob and,
+    when the verdict also rested on the snapshot, every credential behind it (its digest). An
+    unreadable credential counts as changed: nothing is committed on it."""
+    try:
+        current = usage_mod._seat_blob(ctx, state, tool, email, strict=True)
+        if current != blob:
+            return False
+        return (digest == usage_mod._credential_digest(current)
+                or usage_mod._signin_for(ctx, tool, email, current, at)[1] == digest)
+    except usage_mod.UNREADABLE:
+        return False
 
 
 def _wait_for_unlock(ctx: Context, tool: str, notify: Notifier,
@@ -594,25 +623,6 @@ def handle_auth_dead(ctx: Context, state, tool: str, *, exclude: set | frozenset
     return _hop_or_give_up(state, tool, exclude=skip, active=active)
 
 
-def _claude_login_usable(blob: str | None) -> bool:
-    """A Claude credential item Claude Code can sign in with: raw JSON carrying both OAuth tokens."""
-    try:
-        oauth = json.loads(blob)["claudeAiOauth"]
-    except (TypeError, ValueError, KeyError):
-        return False
-    return isinstance(oauth, dict) and all(
-        isinstance(oauth.get(k), str) and oauth[k] for k in ("accessToken", "refreshToken"))
-
-
-def _claude_login_wiped(blob: str | None) -> bool:
-    """Claude's own verdict on the bytes it held: after an invalid_grant it blanks the tokens in
-    place (refreshToken "", expiresAt 0) — so whatever it last had there is known dead."""
-    try:
-        return json.loads(blob)["claudeAiOauth"]["refreshToken"] == ""
-    except (TypeError, ValueError, KeyError):
-        return False
-
-
 def plan_claude_login(ctx: Context, state, email: str) -> tuple[str, str, str | None] | None:
     """A child on ``email`` says it is not logged in. Which login of this seat could it use, and
     what would putting it back where THAT child reads it (the seat home's private item, keyed by
@@ -628,13 +638,9 @@ def plan_claude_login(ctx: Context, state, email: str) -> tuple[str, str, str | 
     no usable login: removed/quarantined, or no snapshot that is provably not stale. Caller holds
     ctx.locked(); this only reads (a base64 item is healed by the read itself, as everywhere).
 
-    Claude rotates refresh tokens, so a snapshot taken before the child last refreshed carries a
-    consumed refresh token, and installing it would end in another invalid_grant — after which
-    Claude blanks the item for every process sharing it. Hence the home item always wins when it is
-    usable, and a snapshot is offered only when it is not older (by ``expiresAt``) than the last
-    usable copy this process saw in that home; when Claude itself wiped the item it must be strictly
-    newer, since the bytes Claude last held there are the ones it just proved dead. The caller still
-    has to verify the snapshot against the usage endpoint before installing it."""
+    Which login that is, is ``usage.claude_launch_login`` — the same decision the seat's sign-in
+    verdict reports, so a seat shown signed in is one this can put back. The caller still has to
+    verify a snapshot against the usage endpoint before installing it."""
     if state.get_seat("claude", email) is None \
             or (ctx.claude_home(email) / ".acctsw-quarantined").exists():
         return None
@@ -642,20 +648,14 @@ def plan_claude_login(ctx: Context, state, email: str) -> tuple[str, str, str | 
     item = ctx.claude_cred(email)
     raw = item.keychain.get_raw(item.service, item.account)
     current = item.get_live()
-    if _claude_login_usable(current):
-        return ("intact" if raw == current else "repair"), current, raw
-    blob = ctx.snapshot_get("claude", email)
-    if not _claude_login_usable(blob):
-        return None
     seen = claudesync.tracker(ctx).seen.get(email)
-    last = seen.blob if seen and _claude_login_usable(seen.blob) else None
-    wiped = _claude_login_wiped(current)
-    if last is not None and last != blob:
-        mine, theirs = claudesync.expiry(blob), claudesync.expiry(last)
-        if mine is None or theirs is None or mine < theirs or (wiped and mine == theirs):
-            return None
-    elif wiped:
-        return None   # Claude blanked exactly these bytes (or ones we never saw): nothing fresher
+    launch = usage_mod.claude_launch_login(current, lambda: ctx.snapshot_get("claude", email),
+                                           seen.blob if seen else None)
+    if launch is None:
+        return None
+    where, blob = launch
+    if where == "home":
+        return ("intact" if raw == current else "repair"), current, raw
     return "restore", blob, raw
 
 
@@ -671,7 +671,7 @@ def apply_claude_login(ctx: Context, email: str, how: str, blob: str, raw: str |
     if stored == blob:
         return True
     if how == "intact" or stored != raw:
-        return _claude_login_usable(item.get_live())
+        return usage_mod.login_usable("claude", item.get_live())
     item.set_live(blob)
     return True
 

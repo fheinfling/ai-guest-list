@@ -5,6 +5,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   buildHTML, dotState, dotKey, doorKey, doorMark, creditLeft, pct, fmtCountdown, needsHello,
+  signedOut, isActive, signinExpiring, usable, resetIsPast,
   buildSettings, buildAddSeat, reduceReply, supervisionBanner, engineBanner, fmtUsageAge, fmtSessionAge, updateClockText,
 } from "./render.mjs";
 
@@ -95,7 +96,7 @@ test("seat summaries retain status, countdown, switch and sign-in actions", () =
   assert.match(mk("ready"), /data-action="switch" data-tool="codex" data-email="work@x.com"/);
   assert.match(mk("resting", { limited_until: new Date(Date.now() + 6e6).toISOString() }), /data-clock-prefix="back in"/);
   assert.match(mk("queued"), /class="seat-state">up next/);
-  assert.match(mk("needs-login"), /data-action="add" data-tool="codex" data-email="work@x.com">sign in again/);
+  assert.match(mk("needs-login"), /data-action="add" data-tool="codex" data-email="work@x.com">sign in/);
 });
 
 for (const kind of ["seat", "roster"]) {
@@ -214,7 +215,7 @@ test("terminal ages expose long-lived sessions without inventing missing start t
   assert.equal(fmtSessionAge("invalid", at), "");
 });
 
-test("revoked entitlement retains the sign-in action on a non-active seat", () => {
+test("revoked entitlement asks for a subscription check on a non-active seat", () => {
   const html = buildHTML(state({ tools: {
     codex: { seats: [seat({
       status: "needs-login",
@@ -223,7 +224,8 @@ test("revoked entitlement retains the sign-in action on a non-active seat", () =
     })] },
     claude: { seats: [] },
   } }));
-  assert.match(html, /data-action="add" data-tool="codex" data-email="work@x.com">sign in again</);
+  assert.match(html, /check your subscription to refresh usage/);
+  assert.doesNotMatch(html, /data-action="add" data-tool="codex" data-email="work@x.com">sign in</);
   assert.doesNotMatch(html, />log in</);
 });
 
@@ -1528,7 +1530,7 @@ for (const tool of ["codex", "claude"]) {
         if (status === "active") {
           assert.doesNotMatch(surface, /data-action="switch"/);
         } else if (status === "needs-login") {
-          assert.match(surface, new RegExp(`data-action="add" data-tool="${tool}" data-email="[^" ]+">sign in again`));
+          assert.match(surface, new RegExp(`data-action="add" data-tool="${tool}" data-email="[^" ]+">sign in`));
           assert.doesNotMatch(surface, /data-action="switch"/);
         } else {
           assert.ok(surface.includes(`class="row-action" data-action="switch" data-tool="${tool}" data-email="${email}"`));
@@ -1545,7 +1547,7 @@ for (const tool of ["codex", "claude"]) {
 
 test("unauthorized usage takes precedence over switch on both subscription surfaces", () => {
   const html = buildHTML(state({ tools: { codex: { seats: [seat({ usage: { error: "unauthorized" } })] } } }));
-  assert.equal((html.match(/>sign in again<\/button>/g) || []).length, 2);
+  assert.equal((html.match(/>sign in<\/button>/g) || []).length, 2);
   assert.doesNotMatch(html, /data-action="switch"/);
 });
 
@@ -2089,7 +2091,7 @@ test("sign-in buttons carry escaped seat identity on the row and attention promp
   for (const tool of ["codex", "claude"]) {
     const html = buildHTML(state({ tools: { [tool]: { seats: [seat({ email, status: "needs-login" })] } } }));
     const target = `data-action="add" data-tool="${tool}" data-email="alpha&quot;&lt;&amp;@example.test"`;
-    assert.ok(html.includes(`${target}>sign in again`));
+    assert.ok(html.includes(`${target}>sign in`));
     assert.ok(html.includes(`${target}>sign in to`));
   }
 });
@@ -2109,3 +2111,200 @@ test("engine drift warnings render as alerts, with the consented fix only for th
                               engine_warnings: st.engine_warnings })).includes(banner));
   assert.equal(engineBanner(state({})), "");
 });
+
+// --- signed-out, expiring sign-in and past resets ---------------------------------------------
+const HOUR = 3600e3;
+const inHours = (h) => new Date(Date.now() + h * HOUR).toISOString();
+const win = (resets_at) => ({ used_pct: 20, resets_at });
+const claudeState = (...seats) => state({ tools: { claude: { seats }, codex: { seats: [] } } });
+const rosterOf = (html) => html.slice(html.indexOf('<table class="roster"'), html.indexOf("</table>"));
+const rowOf = (html, email) => {
+  const table = rosterOf(html);
+  const rows = table.split("<tr").filter((r) => r.includes('scope="row"') && r.includes("roster-identity"));
+  return rows.find((r) => r.includes(email)) || rows[0];
+};
+
+test("signed-out active seat is never shown as active with numbers", () => {
+  const s = seat({ status: "needs-login", active: true, signed_out: true, needs_login: true, usage: { error: "no_token", windows: { "5h": win(inHours(1)), weekly: win(inHours(30)) } } });
+  const html = buildHTML(claudeState(s));
+  const row = rosterOf(html);
+  assert.match(row, /on now · signed out/);
+  assert.doesNotMatch(row, />active</);
+  assert.doesNotMatch(row, /\d+%/);
+  assert.doesNotMatch(row, /roster-reset/);
+  assert.doesNotMatch(row, /roster-active/);
+  assert.match(row, /roster-signedout/);
+  assert.match(row, /data-action="add" data-tool="claude" data-email="work@x.com">sign in</);
+  assert.equal((row.match(/roster-unknown/g) || []).length, 2);
+});
+
+test("signed-out parked seat reads signed out with a sign in action and no numbers", () => {
+  const s = seat({ status: "ready", signed_out: true, usage: { windows: { "5h": win(inHours(1)) } } });
+  const row = rosterOf(buildHTML(claudeState(s, seat({ email: "b@x.com", name: "B" }))));
+  const mine = rowOf(row, "work@x.com");
+  assert.match(mine, />signed out</);
+  assert.doesNotMatch(mine, />ready</);
+  assert.doesNotMatch(mine, /\d+%/);
+  assert.match(mine, />sign in<\/button>/);
+  assert.doesNotMatch(mine, /data-action="switch"/);
+});
+
+test("signed-out seat card in the drawer hides bars and offers sign in", () => {
+  const html = buildHTML(claudeState(seat({ status: "needs-login", active: true, signed_out: true, usage: { error: "no_token" } })));
+  const card = html.slice(html.indexOf("<article"), html.indexOf("</article>"));
+  assert.match(card, /on now · signed out/);
+  assert.doesNotMatch(card, /% left|usage unknown|class="window"/);
+  assert.match(card, />sign in<\/button>/);
+});
+
+test("signed-out is recognised from needs_login or status alone (old engine fields)", () => {
+  assert.equal(signedOut(seat({ needs_login: true })), true);
+  assert.equal(signedOut(seat({ status: "needs-login" })), true);
+  assert.equal(signedOut(seat({ signed_out: true })), true);
+  assert.equal(usable(seat({ signed_out: true, status: "active" })), false);
+  assert.equal(usable(seat({ status: "active" })), true);
+});
+
+test("expiring sign-in shows a relative line and a sign in again action", () => {
+  const s = seat({ signin_expiring: true, signin_expires_at: inHours(50) });
+  const html = buildHTML(claudeState(s, seat({ email: "b@x.com", name: "B" })));
+  const mine = rowOf(rosterOf(html), "work@x.com");
+  assert.match(mine, /sign-in expires in 2d\d*h?/);
+  assert.match(mine, />sign in again<\/button>/);
+  assert.match(mine, /data-reset-at=/);
+  assert.match(mine, /\d+%/, "still usable, numbers stay");
+  assert.equal(signinExpiring(s), true);
+  assert.doesNotMatch(rowOf(rosterOf(html), "b@x.com"), /sign-in expires/);
+});
+
+test("sign-in not flagged expiring when signin_expiring is false, even with a date", () => {
+  const s = seat({ signin_expiring: false, signin_expires_at: inHours(20 * 24) });
+  const html = buildHTML(claudeState(s));
+  assert.doesNotMatch(html, /sign-in expires/);
+  assert.doesNotMatch(html, /sign in again/);
+});
+
+test("expiring flag with a date already past does not render a countdown", () => {
+  const html = buildHTML(claudeState(seat({ signin_expiring: true, signin_expires_at: inHours(-1) })));
+  assert.doesNotMatch(html, /sign-in expires/);
+});
+
+test("a window reset in the past never renders 'in now'", () => {
+  const s = seat({ usage: { windows: { "5h": win(inHours(-2)), weekly: win(inHours(40)) } } });
+  const html = buildHTML(claudeState(s));
+  assert.doesNotMatch(html, /in now|resets in now/);
+  const row = rosterOf(html);
+  assert.match(row, /roster-reset"[^>]*data-past-text="resetting…"[^>]*>resetting…</);
+  assert.match(row, />in 1d/);
+  assert.equal(resetIsPast(inHours(-1)), true);
+  assert.equal(resetIsPast(inHours(1)), false);
+  assert.equal(resetIsPast("garbage"), false);
+  assert.match(html, /usage-reset[^>]*>resetting…</);
+});
+
+test("clock tick turns a reset that has just passed into resetting…", () => {
+  const node = { dataset: { resetAt: inHours(-1), clockPrefix: "in", pastText: "resetting…" }, textContent: "" };
+  const live = { dataset: { resetAt: inHours(2), clockPrefix: "in", pastText: "resetting…" }, textContent: "" };
+  const root = { querySelectorAll: (q) => (q === "[data-reset-at]" ? [node, live] : []) };
+  updateClockText(root);
+  assert.equal(node.textContent, "resetting…");
+  assert.match(live.textContent, /^in 2h/);
+});
+
+test("headline does not claim all is fine when a seat is signed out", () => {
+  const html = buildHTML(claudeState(seat({ status: "ready" }), seat({ email: "b@x.com", name: "B", status: "needs-login", signed_out: true })));
+  const h1 = html.match(/<h1 role="status">([^<]*)<\/h1>/)[1];
+  assert.match(h1, /signed out/);
+  assert.doesNotMatch(h1, /^you can keep working\.$/);
+  assert.match(html, /<span class="reading-value">|1 subscription seat ready|roster-glance/);
+});
+
+test("headline with only a signed-out active seat does not say you can keep working", () => {
+  const html = buildHTML(claudeState(seat({ status: "needs-login", active: true, signed_out: true, usage: { error: "no_token" } })));
+  assert.doesNotMatch(html, /you can keep working/);
+  assert.match(html, /your seats need attention\./);
+  assert.match(html, /<span class="reading-value">0<\/span>/);
+  assert.match(html, /data-action="add" data-tool="claude" data-email="work@x.com">sign in to Work</);
+});
+
+test("headline stays plain when nobody is signed out", () => {
+  const html = buildHTML(claudeState(seat({ status: "active" })));
+  assert.match(html, /<h1 role="status">you can keep working\.<\/h1>/);
+});
+
+test("old engine without the new fields renders as before", () => {
+  const html = buildHTML(claudeState(seat({ status: "active" })));
+  assert.match(html, />active</);
+  assert.match(html, /80%/);
+  assert.doesNotMatch(html, /signed out|sign-in expires|resetting/);
+});
+
+test("revoked subscription is not signed out: keeps check your subscription, no sign in", () => {
+  const s = seat({ status: "ready", signed_out: false, needs_login: true, usage: { error: "forbidden" } });
+  assert.equal(signedOut(s), false);
+  const html = buildHTML(claudeState(s));
+  const card = html.slice(html.indexOf("<article"), html.indexOf("</article>"));
+  assert.match(card, /check your subscription to refresh usage/);
+  assert.doesNotMatch(card, />sign in<\/button>/);
+  assert.doesNotMatch(card, /signed out/);
+});
+
+test("active signed-out seat is keyed on seat.active, not status", () => {
+  const s = seat({ status: "needs-login", active: true, signed_out: true });
+  assert.equal(isActive(s), true);
+  assert.equal(isActive(seat({ status: "needs-login", active: false })), false);
+  const other = seat({ email: "b@x.com", name: "B", status: "ready" });
+  const html = buildHTML(claudeState(other, s));
+  const table = rosterOf(html);
+  assert.ok(table.indexOf("work@x.com") < table.indexOf("b@x.com") || table.indexOf("Work") < table.indexOf(">B<"), "active seat leads");
+  assert.match(table, /on now · signed out/);
+  assert.doesNotMatch(table, /roster-active/);
+});
+
+test("expiring seat keeps its switch action beside sign in again", () => {
+  const s = seat({ status: "ready", signin_expiring: true, signin_expires_at: inHours(50) });
+  const html = buildHTML(claudeState(s, seat({ email: "b@x.com", name: "B" })));
+  const mine = rowOf(rosterOf(html), "work@x.com");
+  assert.match(mine, /data-action="switch"[^>]*>switch<\/button>/);
+  assert.match(mine, />sign in again<\/button>/);
+  const row = rosterOf(html).split("<tr").find((r) => r.includes("work@x.com") && r.includes("roster-identity"));
+  assert.match(row, /^[^>]*data-action="switch"/, "row itself is a switch target");
+  const active = seat({ status: "active", active: true, signin_expiring: true, signin_expires_at: inHours(50) });
+  const a = rowOf(rosterOf(buildHTML(claudeState(active))), "work@x.com");
+  assert.doesNotMatch(a, />switch</);
+  assert.match(a, />sign in again</);
+});
+
+test("headline counts a signed_out seat as not ready even when its status says ready", () => {
+  const html = buildHTML(claudeState(seat({ status: "ready", signed_out: true, usage: { error: "no_token" } })));
+  assert.doesNotMatch(html, /you can keep working/);
+  assert.match(html, /<span class="reading-value">0<\/span>/);
+});
+
+for (const auth of [
+  { status: "ready", auth_error: "refresh_token_revoked" },
+  { status: "needs-login", auth_error: "refresh_token_revoked" },
+  { status: "active", active: true, usage: { error: "unauthorized" } },
+]) test(`signed-in login failure offers sign in: ${auth.status}`, () => {
+  const s = seat({ ...auth, signed_out: false, needs_login: true });
+  const html = buildHTML(state({ tools: { codex: { seats: [s] }, claude: { seats: [] } } }));
+  assert.equal(signedOut(s), false);
+  assert.equal(usable(s), false);
+  for (const part of [rosterOf(html), html.slice(html.indexOf("<article"), html.indexOf("</article>"))]) {
+    assert.match(part, />sign-in needed</);
+    assert.match(part, /data-action="add"[^>]*>sign in<\/button>/);
+    assert.doesNotMatch(part, /signed out|data-action="switch"|class="roster-active"/);
+  }
+});
+
+for (const revoked of [{ entitlement_revoked: true }, { usage: { error: "forbidden" } }]) {
+  test(`revoked subscription has no sign-in affordance: ${JSON.stringify(revoked)}`, () => {
+    const s = seat({ signed_out: false, needs_login: true, signin_expiring: true,
+      signin_expires_at: inHours(1), ...revoked });
+    const html = buildHTML(claudeState(s));
+    for (const part of [rosterOf(html), html.slice(html.indexOf("<article"), html.indexOf("</article>"))]) {
+      assert.match(part, /check your subscription to refresh usage/);
+      assert.doesNotMatch(part, /sign-in needed|signed out|data-action="add"|data-action="switch"/);
+    }
+  });
+}
