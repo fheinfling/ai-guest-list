@@ -154,7 +154,7 @@ export function updateClockText(root, now = Date.now()) {
       : `${node.dataset.clockPrefix ?? "resets in"}${node.dataset.clockPrefix === "" ? "" : " "}${node.dataset.clockApprox === "true" ? "~" : ""}${fmtCountdown(node.dataset.resetAt, now)}`;
   }
   for (const node of root.querySelectorAll("[data-session-at]")) {
-    node.textContent = fmtSessionAge(node.dataset.sessionAt, now).replace(" · ", "; ");
+    node.textContent = fmtSessionAge(node.dataset.sessionAt, now);
   }
 }
 
@@ -686,6 +686,17 @@ function backAt(seat) {
 function backText(seat, prefix = "back in") {
   return `${seat.usage_stale ? '<span class="sr-only">approximate, last known reading: </span>' : ""}${timed(backAt(seat), prefix, "resetting…", seat.usage_stale)}`;
 }
+// Match local calendar days, including across DST boundaries.
+function detailClock(iso, now = Date.now()) {
+  const date = new Date(iso);
+  if (!Number.isFinite(date.getTime())) return "";
+  const today = date.toDateString() === new Date(now).toDateString();
+  const day = today ? "" : `${date.toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" }).replace(/,/g, "")} · `;
+  return `${day}${fmtClock(iso)}`;
+}
+function detailGroup(label, rows) {
+  return rows ? `<section class="detail-group" aria-label="${label}"><h3>${label}</h3><dl>${rows}</dl></section>` : "";
+}
 function rowDetails(tool, seat, peers, openDetails) {
   const key = tool === "key", email = key ? seat.id : seat.email;
   const open = openDetails.has(JSON.stringify([tool, email]));
@@ -693,16 +704,20 @@ function rowDetails(tool, seat, peers, openDetails) {
   if (key) rows = keySeatDetails(seat);
   else {
     const fetched = seat.usage_fetched_at || seat.usage?.fetched_at || "";
-    rows = `<dt>seat</dt><dd>${esc(seat.email)}</dd><dt>plan</dt><dd>${esc(seatIdentity(seat, peers))}</dd>`;
-    if (signedOut(seat)) rows += '<dt>usage</dt><dd>signed out; sign in to see usage</dd>';
-    else rows += seatWindows(seat).map((w) => `<dt>${w.label}</dt><dd>${w.left == null ? "usage unknown" : `${seat.usage_stale ? "~" : ""}${w.left}% left`}${w.reset ? `, <time datetime="${esc(w.reset)}">${esc(new Date(w.reset).toLocaleString())}</time> (${timed(w.reset, "in")})` : ""}</dd>`).join("");
-    rows += `<dt>updated</dt><dd>${seat.usage_stale ? "last known reading; " : ""}<span data-usage-at="${esc(fetched)}">${fmtUsageAge(fetched)}</span></dd>`;
-    if (limitedSeat(seat) || (!isActive(seat) && !signedOut(seat) && !usable(seat))) rows += `<dt>action</dt><dd>${seatAction(tool, seat, "switch")}</dd>`;
-    if (seat.in_session) rows += `<dt>terminal</dt><dd>terminal attached<span data-session-at="${esc(seat.session_started_at)}">${fmtSessionAge(seat.session_started_at).replace(" · ", "; ")}</span></dd>`;
-    if (seat.last_on_floor) rows += `<dt>last used</dt><dd>last on the floor ${esc(fmtClock(seat.last_on_floor))}</dd>`;
-    rows += `<dt>manage</dt><dd><button class="row-action" data-action="remove" data-tool="${esc(tool)}" data-email="${esc(seat.email)}">remove seat</button></dd>`;
+    rows = "";
+    if (signedOut(seat)) rows += '<dt>status</dt><dd>signed out; sign in to see usage</dd>';
+    else rows += seatWindows(seat).map((w) => `<dt>${w.label}</dt><dd>${w.left == null ? "usage unknown" : `${seat.usage_stale ? "~" : ""}${w.left}% left`}${w.reset ? ` · resets <time datetime="${esc(w.reset)}">${esc(detailClock(w.reset))}</time> (${timed(w.reset, "in")})` : ""}</dd>`).join("");
+    const action = limitedSeat(seat) || (!isActive(seat) && !signedOut(seat) && !usable(seat)) ? seatAction(tool, seat, "switch") : "";
+    if (action) rows += `<dt>action</dt><dd>${action}</dd>`;
+    rows = detailGroup("usage", rows + `<dt class="sr-only">updated</dt><dd class="detail-note">${seat.usage_stale ? "last known reading; " : ""}<span data-usage-at="${esc(fetched)}">${fmtUsageAge(fetched)}</span></dd>`);
+    let session = "";
+    if (seat.in_session) session += `<dt class="sr-only">terminal</dt><dd class="detail-note">terminal attached<span data-session-at="${esc(seat.session_started_at)}">${fmtSessionAge(seat.session_started_at)}</span></dd>`;
+    if (seat.last_on_floor) session += `<dt class="sr-only">last used</dt><dd class="detail-note">last used <time datetime="${esc(seat.last_on_floor)}">${esc(detailClock(seat.last_on_floor))}</time></dd>`;
+    rows += detailGroup("session", session);
+    rows += detailGroup("account", `<dt>email</dt><dd>${esc(seat.email)}</dd><dt>plan</dt><dd>${esc(seatIdentity(seat, peers))}</dd>`);
+    rows += `<div class="detail-actions"><button class="row-action destructive" data-action="remove" data-tool="${esc(tool)}" data-email="${esc(seat.email)}">remove seat</button></div>`;
   }
-  return `<dl class="details" id="${detailId(tool, email)}"${open ? "" : " hidden"}>${rows}</dl>`;
+  return `<div class="details" id="${detailId(tool, email)}"${open ? "" : " hidden"}>${rows}</div>`;
 }
 function toolPlan(tool, state) {
   const seats = state?.tools?.[tool]?.seats || [];
@@ -907,12 +922,12 @@ export function keyProofStatus(seat) {
 export function keySeatDetails(seat) {
   const unproven = (seat.responses_verified === false || seat.last_proof?.outcome === "incompatible") && seat.harness !== "claude";
   const checked = seat.last_validation;
-  return `<dt>provider</dt><dd>${esc(providerName(seat))}</dd><dt>model</dt><dd>${esc(seat.model)}</dd><dt>billing</dt><dd>paid per token; no app spend cap</dd><dt>use</dt><dd>opens a new terminal, never switches one</dd>
+  return `${detailGroup("key details", `<dt>provider</dt><dd>${esc(providerName(seat))}</dd><dt>model</dt><dd>${esc(seat.model)}</dd><dt>billing</dt><dd>paid per token; no app spend cap</dd><dt>use</dt><dd>opens a new terminal, never switches one</dd>
     ${keyProofStatus(seat) ? `<dt>endpoint</dt><dd>${keyProofStatus(seat)}</dd>` : ""}
-    <dt>manage</dt><dd class="key-management">
+    `)}<div class="detail-actions key-management"><h3>manage</h3>
     ${checked ? `<p class="key-check-status" role="status">${checked.operation_permitted ? "key check passed; account access confirmed" : "key check was not permitted; check access with your provider"}</p>` : ""}
     ${unproven ? `<div class="proof-gate"><input class="local-check" type="checkbox" id="proof-${esc(seat.id)}"><label class="proof-open" for="proof-${esc(seat.id)}">check this endpoint</label><div class="proof-choice"><p>this sends a paid request. price unavailable here; check provider pricing. this app does not cap spend.</p><div class="equal-choices"><label class="choice" for="proof-${esc(seat.id)}">not now</label><button class="choice" data-action="key-prove" data-id="${esc(seat.id)}">send paid check</button></div></div></div>` : ""}
-    <div class="seat-actions"><button class="row-action" data-action="key-validate" data-id="${esc(seat.id)}">check key</button><button class="row-action" data-action="key-remove" data-id="${esc(seat.id)}">remove key</button></div></dd>`;
+    <div class="seat-actions"><button class="row-action" data-action="key-validate" data-id="${esc(seat.id)}">check key</button><button class="row-action destructive" data-action="key-remove" data-id="${esc(seat.id)}">remove key</button></div></div>`;
 }
 
 // A session waits on a move between a business and a personal seat (or one whose kind is

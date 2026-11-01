@@ -444,8 +444,8 @@
   {
     "label": "remove seat disappears from inline details",
     "file": "app/web/render.mjs",
-    "old": "<dt>manage</dt><dd><button class=\"row-action\" data-action=\"remove\"",
-    "new": "<dt>manage</dt><dd><button class=\"row-action\" data-action=\"missing-remove\"",
+    "old": "<button class=\"row-action destructive\" data-action=\"remove\"",
+    "new": "<button class=\"row-action destructive\" data-action=\"missing-remove\"",
     "cmd": [
       "node",
       "--test",
@@ -582,6 +582,18 @@
       "node",
       "--test",
       "--test-name-pattern=empty state guidance",
+      "app/web/render.test.mjs"
+    ]
+  },
+  {
+    "label": "expanded seat details lose usage grouping",
+    "file": "app/web/render.mjs",
+    "old": "rows = detailGroup(\"usage\", rows +",
+    "new": "rows = detailGroup(\"readings\", rows +",
+    "cmd": [
+      "node",
+      "--test",
+      "--test-name-pattern=expanded details group",
       "app/web/render.test.mjs"
     ]
   }

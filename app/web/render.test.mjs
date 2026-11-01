@@ -80,7 +80,7 @@ test("fmtCountdown", () => {
 test("local clickdummy type and tabular readings require no remote resources", () => {
   const html = buildHTML(state({ tools: { codex: { seats: [seat()] } } }));
   assert.match(html, /class="app-icon"[^>]*aria-label="ai guest list"/);
-  assert.match(html, /<dt>seat<\/dt><dd>work@x\.com/);
+  assert.match(html, /<dt>email<\/dt><dd>work@x\.com/);
   assert.match(html, /class="seat-identity" title="Work · business">Work</);
   const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
   assert.match(css, /--sans:"Hanken Grotesk",ui-rounded,/);
@@ -171,7 +171,7 @@ test("active seats distinguish a live session from loaded-but-idle credentials",
   });
   assert.match(live, /class="tag">on now/);
   assert.match(live, /terminal attached/);
-  assert.match(live, /last on the floor/);
+  assert.match(live, /last used/);
   assert.match(live, /data-session-at="2026-06-28T12:12:00Z"/);
 
   const idle = mk({ in_session: false });
@@ -289,7 +289,7 @@ test("clock ticks update age and reset text without replacing the DOM", () => {
   assert.equal(reset.textContent, "resets in 2m");
   assert.equal(rest.textContent, "back in 3m");
   assert.equal(long.textContent, "resets in 7d 1h");
-  assert.equal(terminal.textContent, "; 11d");
+  assert.equal(terminal.textContent, " · 11d");
 });
 
 test("provider throttling is visible alongside retained usage", () => {
@@ -1434,11 +1434,14 @@ function elements(html, tag, predicate = () => true) {
   }
   return found.sort((a, b) => a.start - b.start).map((x) => x.html);
 }
-const visibleMarkup = (html) => html.replace(/<dl class="details"[^>]*hidden>[\s\S]*?<\/dl>/g, "");
+const visibleMarkup = (html) => {
+  for (const detail of elements(html, "div", (tag) => tag.includes('class="details"') && tag.includes(" hidden"))) html = html.replace(detail, "");
+  return html;
+};
 const rosterHTML = (snapshot) => rosterOf(buildHTML(snapshot));
 const toolOf = (html, tool) => elements(html, "section", (tag) => tag.includes('class="tool"') && tag.includes(`data-tool="${tool}"`))[0] || "";
 const issuesOf = (html, email) => elements(html, "div", (tag) => tag.includes('class="issue ') && tag.includes(`data-email="${email}"`)).join("");
-const detailsOf = (html, tool, email) => elements(html, "dl", (tag) => tag.includes(`id="seat-detail-${encodeURIComponent(tool)}-${encodeURIComponent(email)}"`))[0] || "";
+const detailsOf = (html, tool, email) => elements(html, "div", (tag) => tag.includes(`id="seat-detail-${encodeURIComponent(tool)}-${encodeURIComponent(email)}"`))[0] || "";
 const answerOf = (html) => elements(html, "div", (tag) => tag.includes('class="answer"'))[0] || "";
 const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
 
@@ -1566,7 +1569,10 @@ const h = rosterHTML(state({ tools, keys: [keySeat({ model: "literal/model-id" }
 assert.equal(elements(h, "section", (tag) => tag.includes('class="tool"')).length, 2);
 assert.match(toolOf(h, "codex"), /Active C.*[\s\S]*on now/);
 assert.match(toolOf(h, "claude"), /Active A.*[\s\S]*on now/);
-assert.ok(h.indexOf('class="sheet"') > h.lastIndexOf('</section>'));
+for (const tool of ["codex", "claude"]) {
+  const block = toolOf(h, tool);
+  assert.ok(h.indexOf('class="sheet"') > h.indexOf(block) + block.length);
+}
 const row = rowOf(h, "key-1");
 assert.doesNotMatch(row, /literal\/model-id|\d+%/);
 assert.match(row, /class="seat-identity"[^>]*>late-night<\/span>/);
@@ -1798,7 +1804,7 @@ test("clock hooks in actual seat markup update usage, resets, session age and co
   assert.ok(nodes.some((n) => n.textContent === "updated 30s ago"));
   assert.ok(nodes.some((n) => n.textContent === "1h"));
   assert.ok(nodes.some((n) => n.textContent === "in 1d"));
-  assert.ok(nodes.some((n) => n.textContent === "; 2h"));
+  assert.ok(nodes.some((n) => n.textContent === " · 2h"));
   assert.ok(nodes.some((n) => n.textContent === "0s"));
 });
 
@@ -2753,7 +2759,7 @@ test("remove seat lives in every subscription's inline details with its original
       const email = 'seat"<&@example.test', s = seat({ email, status });
       const snapshot = state({ tools: { [tool]: { seats: [s] } } });
       const html = buildHTML(snapshot), detail = detailsOf(html, tool, email);
-      assert.match(detail, /^<dl class="details"[^>]* hidden>/);
+      assert.match(detail, /^<div class="details"[^>]* hidden>/);
       assert.ok(detail.includes(`data-action="remove" data-tool="${tool}" data-email="seat&quot;&lt;&amp;@example.test">remove seat</button>`));
       assert.equal((html.match(/data-action="remove"/g) || []).length, 1);
       assert.doesNotMatch(visibleMarkup(html), /data-action="remove"/);
@@ -2779,7 +2785,7 @@ test("paid key management lives in the key row's details and preserves each acti
       last_validation: { operation_permitted: true } });
     const snapshot = state({ keys: [key] }), html = buildHTML(snapshot);
     const detail = detailsOf(html, "key", key.id);
-    assert.match(detail, /^<dl class="details"[^>]* hidden>/);
+    assert.match(detail, /^<div class="details"[^>]* hidden>/);
     assert.match(detail, /key check passed; account access confirmed/);
     for (const action of ["key-validate", "key-remove", ...(harness === "codex" ? ["key-prove"] : [])]) {
       assert.ok(detail.includes(`data-action="${action}" data-id="key-1"`));
@@ -2855,4 +2861,59 @@ test("empty state guidance is in the main view, including with a pending paid ap
     assert.doesNotMatch(html, /guest-drawer|seat-options/);
   }
   assert.doesNotMatch(rosterHTML(state({ keys: [keySeat()] })), /use ＋ above to add/);
+});
+
+
+test("expanded details group usage, session and account with short local reset times", () => {
+  const originalNow = Date.now;
+  const now = new Date(2026, 10, 1, 15, 49).getTime();
+  Date.now = () => now;
+  try {
+    const today = new Date(2026, 10, 1, 17, 10).toISOString();
+    const later = new Date(2026, 10, 3, 18).toISOString();
+    const fetched = new Date(now - 29000).toISOString();
+    const started = new Date(now - 11 * 60000).toISOString();
+    const last = new Date(2026, 10, 1, 12, 31).toISOString();
+    for (const status of ["active", "ready"]) {
+      const s = seat({ status, usage5h: 13, usageWeek: 50, in_session: true,
+        session_started_at: started, last_on_floor: last, usage_fetched_at: fetched,
+        usage: { windows: { "5h": { resets_at: today }, weekly: { resets_at: later } } } });
+      const html = buildHTML(state({ tools: { claude: { seats: [s] } } }), null,
+        new Set([JSON.stringify(["claude", s.email])]));
+      const detail = detailsOf(html, "claude", s.email);
+      const groups = elements(detail, "section", (tag) => tag.includes('class="detail-group"'));
+      assert.deepEqual(groups.map((group) => group.match(/<h3>(.*?)<\/h3>/)[1]), ["usage", "session", "account"]);
+      assert.match(groups[0], /87% left · resets <time[^>]*>5:10 PM<\/time> \(<span[^>]*>in 1h 21m<\/span>\)/);
+      assert.match(groups[0], /<time[^>]*>Tue 3 Nov · 6:00 PM<\/time>/);
+      assert.match(groups[0], /updated 29s ago/);
+      assert.match(groups[0], new RegExp(`data-usage-at="${fetched}"`));
+      assert.ok(groups[0].includes(`datetime="${today}"`));
+      assert.ok(groups[0].includes(`data-reset-at="${today}"`));
+      assert.doesNotMatch(detail.replace(/<[^>]*>/g, ""), /11\/1\/2026|2026,|:00:00 PM|updated updated/);
+      assert.match(groups[1], /terminal attached<span[^>]*> · 11m<\/span>/);
+      assert.match(groups[1], /last used <time[^>]*>12:31 PM<\/time>/);
+      assert.match(groups[1], new RegExp(`data-session-at="${started}"`));
+      assert.match(groups[2], /<dt>email<\/dt><dd>work@x.com<\/dd><dt>plan<\/dt>/);
+      const actions = elements(detail, "div", (tag) => tag.includes('class="detail-actions"'))[0];
+      assert.match(actions, /class="row-action destructive" data-action="remove"/);
+      assert.ok(detail.endsWith(`${actions}</div>`));
+    }
+    const idle = detailsOf(buildHTML(state({ tools: { codex: { seats: [seat()] } } })), "codex", "work@x.com");
+    assert.doesNotMatch(idle, /aria-label="session"|<h3>session<\/h3>/);
+    assert.match(idle, /<h3>usage<\/h3>/);
+    assert.match(idle, /<h3>account<\/h3>/);
+  } finally { Date.now = originalNow; }
+});
+
+test("key details share the inset panel and end with separate management actions", () => {
+  const key = keySeat();
+  const detail = detailsOf(buildHTML(state({ keys: [key] })), "key", key.id);
+  assert.match(detail, /^<div class="details"/);
+  assert.match(detail, /<h3>key details<\/h3><dl><dt>provider/);
+  assert.doesNotMatch(detail, /<h3>(usage|session|account)<\/h3>/);
+  const actions = elements(detail, "div", (tag) => tag.includes('class="detail-actions key-management"'))[0];
+  assert.match(actions, /<h3>manage<\/h3>/);
+  assert.match(actions, /data-action="key-validate"/);
+  assert.match(actions, /class="row-action destructive" data-action="key-remove"/);
+  assert.ok(detail.endsWith(`${actions}</div>`));
 });
