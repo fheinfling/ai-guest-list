@@ -645,7 +645,7 @@ const detailId = (tool, email) => `seat-detail-${encodeURIComponent(tool)}-${enc
 function nameButton(tool, seat, peers, openDetails, showMetadata = false) {
   const label = tool === "key" ? seat.label : seatIdentity(seat, peers);
   const name = tool === "key" ? seat.label : seatIdentity(seat, peers, false);
-  const metadata = showMetadata && tool !== "key" ? `<span class="seat-metadata">${esc(seatMetadata(seat))}</span>` : "";
+  const metadata = showMetadata && tool !== "key" ? `<span class="seat-metadata" title="${esc(seatMetadata(seat))}">${esc(seatMetadata(seat))}</span>` : "";
   const email = tool === "key" ? seat.id : seat.email;
   return `<button class="seatname" data-action="seat-details" data-tool="${esc(tool)}" data-email="${esc(email)}" aria-expanded="${openDetails.has(JSON.stringify([tool, email]))}" aria-controls="${detailId(tool, email)}" aria-label="${esc(label)}, details"><span class="seat-identity" title="${esc(label)}">${esc(name)}</span>${metadata}${ICON.chev}</button>`;
 }

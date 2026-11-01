@@ -2623,7 +2623,7 @@ test("one tool block shows the tighter window, its companion, and the hooked nex
   assert.match(visible, /needs approval/);
   assert.equal(elements(rosterOf(html), "section", (tag) => tag.includes('class="tool"')).length, 2);
   const sheet = elements(html, "div", (tag) => tag.includes('class="sheet"'))[0];
-  assert.match(sheet, /class="seat-identity"[^>]*>personal<\/span><span class="seat-metadata">personal · plus<\/span>/);
+  assert.match(sheet, /class="seat-identity"[^>]*>personal<\/span><span class="seat-metadata"[^>]*>personal · plus<\/span>/);
   assert.doesNotMatch(sheet, /work@x.com/);
 });
 
@@ -2640,7 +2640,7 @@ test("block heading keeps only the seat name and disambiguator, with kind and pl
   assert.doesNotMatch(heading, /class="seat-metadata"|>[^<]*(?:business|team)[^<]*</);
   assert.match(meta, /business · team · <span[^>]*>5h resets in 3h<\/span>/);
   const sheet = elements(buildHTML(snapshot), "div", (tag) => tag.includes('class="sheet"'))[0];
-  assert.match(sheet, /class="seat-identity"[^>]*>Studio · icloud<\/span><span class="seat-metadata">personal · max<\/span>/);
+  assert.match(sheet, /class="seat-identity"[^>]*>Studio · icloud<\/span><span class="seat-metadata"[^>]*>personal · max<\/span>/);
   assert.match(css, /\.now-seat \{[^}]*flex-wrap:nowrap/);
   assert.match(css, /\.seat-identity \{[^}]*overflow:hidden; text-overflow:ellipsis; white-space:nowrap/);
   assert.match(css, /\.seat-metadata \{[^}]*flex:none;[^}]*font-weight:400;[^}]*white-space:nowrap/);
@@ -2917,4 +2917,48 @@ test("key details share the inset panel and end with separate management actions
   assert.match(actions, /data-action="key-validate"/);
   assert.match(actions, /class="row-action destructive" data-action="key-remove"/);
   assert.ok(detail.endsWith(`${actions}</div>`));
+});
+
+test("one-line seat rows reserve state and action width and truncate metadata before names", () => {
+  const longName = "Franz Heinfling with a very long workspace name";
+  const snapshot = claudeState(
+    seat({ name: longName, status: "active", email: "active@x.com" }),
+    seat({ name: longName, email: "next@x.com", plan: "team", usage5h: 16, usageWeek: 16 }));
+  const html = buildHTML(snapshot);
+  const row = elements(html, "div", (tag) => tag.includes('class="row"'))[0];
+  assert.match(row, /class="seat-identity"[^>]*>Franz Heinfling with a very long workspace name/);
+  assert.match(row, /class="seat-metadata" title="business · team">business · team<\/span>/);
+  assert.match(row, /<span class="state"><span class="state--strong">next<\/span>, 84% left<\/span><button class="row-action" data-action="switch"/);
+  // Check the final declarations for selectors that occur more than once in the stylesheet.
+  const rule = (selector) => [...css.replace(/\/\*[\s\S]*?\*\//g, "").matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+    .filter((m) => m[1].trim().split(/,\s*/).includes(selector)).map((m) => m[2]).join(" ");
+  assert.match(rule(".row"), /display:grid/);
+  assert.match(rule(".row"), /grid-template-columns:58px minmax\(0,1fr\) max-content max-content/);
+  assert.match(rule(".row"), /column-gap:6px/);
+  assert.match(rule(".row .state"), /white-space:nowrap/);
+  assert.match(rule(".row-action"), /flex:none/);
+  assert.doesNotMatch(rule(".row-action"), /position:\s*(?:absolute|fixed)/);
+  assert.doesNotMatch(rule(".row > .row-action"), /position:\s*(?:absolute|fixed)/);
+  assert.match(rule(".seat-identity"), /flex:0 1 auto/);
+  for (const selector of [".seat-identity", ".seat-metadata"]) {
+    for (const declaration of ["min-width:0", "overflow:hidden", "text-overflow:ellipsis", "white-space:nowrap"]) {
+      assert.ok(rule(selector).includes(declaration), `${selector} needs ${declaration}`);
+    }
+  }
+  assert.match(rule(".seat-metadata"), /flex:none/);
+  assert.match(rule(".seat-metadata"), /max-width:calc\(100% - 17px\)/);
+  assert.match(rule(".row .seat-identity"), /flex:none/);
+  assert.match(rule(".row .seat-identity"), /max-width:calc\(100% - 17px\)/);
+  assert.match(rule(".row .seat-metadata"), /flex:0 1 auto/);
+  assert.match(rule(".row .seat-metadata"), /max-width:none/);
+  // The heading reserves both the on-now badge and the natural-width usage reading.
+  const heading = elements(toolOf(html, "claude"), "div", (tag) => tag.includes('class="now"'))[0];
+  assert.match(heading, /class="seat-identity"[^>]*>Franz Heinfling/);
+  assert.match(heading, /class="tag">on now<\/span>/);
+  assert.match(rule(".now"), /grid-template-columns:minmax\(0,1fr\) auto auto/);
+  assert.match(rule(".now-seat"), /min-width:0/);
+  assert.match(rule(".now-seat"), /flex-wrap:nowrap/);
+  assert.match(rule(".now-seat > .seatname"), /flex:0 1 auto/);
+  assert.match(rule(".now-seat > .tag"), /flex:none/);
+  assert.match(rule(".seatname .chev"), /flex:none/);
 });
