@@ -1337,6 +1337,7 @@ def test_start_url_carries_the_proxy_credentials(monkeypatch):
 
 def _tls(sock, ca: SessionCA | None):
     ctx = SP.ssl.create_default_context(cadata=ca.ca_pem() if ca else None)
+    ctx.minimum_version = SP.ssl.TLSVersion.TLSv1_2
     ctx.verify_flags |= SP.ssl.VERIFY_X509_STRICT
     return ctx.wrap_socket(sock, server_hostname="api.anthropic.com")
 
@@ -1504,6 +1505,7 @@ def _tcp_client(url: str, ca: SessionCA | None, *, auth: bool = True):
     from urllib.parse import unquote, urlsplit
     u = urlsplit(url)
     ctx = SP.ssl.create_default_context(cadata=ca.ca_pem() if ca else None)
+    ctx.minimum_version = SP.ssl.TLSVersion.TLSv1_2
     conn = http.client.HTTPSConnection(u.hostname, u.port, timeout=10, context=ctx)
     headers = {}
     if auth:
