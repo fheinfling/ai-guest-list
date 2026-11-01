@@ -596,5 +596,17 @@
       "--test-name-pattern=expanded details group",
       "app/web/render.test.mjs"
     ]
+  },
+  {
+    "label": "one-line seat names truncate before kind and plan",
+    "file": "app/web/styles.css",
+    "old": ".row .seat-identity { flex:none; max-width:calc(100% - 17px); }\n.row .seat-metadata { flex:0 1 auto; max-width:none; }",
+    "new": ".row .seat-identity { flex:0 1 auto; max-width:none; }\n.row .seat-metadata { flex:none; max-width:calc(100% - 17px); }",
+    "cmd": [
+      "node",
+      "--test",
+      "--test-name-pattern=one-line seat rows",
+      "app/web/render.test.mjs"
+    ]
   }
 ]
