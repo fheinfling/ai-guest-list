@@ -46,8 +46,8 @@
  {
   "label": "roster keeps reset times for a signed-out seat",
   "file": "app/web/render.mjs",
-  "old": "const reset = absent || out ? null",
-  "new": "const reset = absent ? null",
+  "old": "const reset = out ? null : nextReset(seat, resets);",
+  "new": "const reset = out ? seat.usage?.windows?.[\"5h\"]?.resets_at : nextReset(seat, resets);",
   "cmd": [
    "node",
    "--test",
@@ -57,7 +57,7 @@
  {
   "label": "signed-out active seat loses 'on now' honesty",
   "file": "app/web/render.mjs",
-  "old": "out ? (active ? \"on now · signed out\" : \"signed out\") : limited ? \"limited\"",
+  "old": "out ? (active ? \"on now \u00b7 signed out\" : \"signed out\") : limited ? \"limited\"",
   "new": "out ? \"signed out\" : limited ? \"limited\"",
   "cmd": [
    "node",
@@ -99,10 +99,10 @@
   ]
  },
  {
-  "label": "past roster reset renders 'in now'",
+  "label": "past roster reset renders 'now'",
   "file": "app/web/render.mjs",
-  "old": "${resetIsPast(reset) ? \"resetting…\" : `in ${fmtCountdown(reset)}`}",
-  "new": "${`in ${fmtCountdown(reset)}`}",
+  "old": "${resetIsPast(reset) ? \"resetting\u2026\" : `${resetPrefix}${resetPrefix ? \" \" : \"\"}${fmtCountdown(reset)}`}",
+  "new": "${`${resetPrefix}${resetPrefix ? \" \" : \"\"}${fmtCountdown(reset)}`}",
   "cmd": [
    "node",
    "--test",
@@ -112,7 +112,7 @@
  {
   "label": "past window bar reset renders 'resets in now'",
   "file": "app/web/render.mjs",
-  "old": "${resetIsPast(reset) ? \"resetting…\" : `window resets in ${fmtCountdown(reset)}`}",
+  "old": "${resetIsPast(reset) ? \"resetting\u2026\" : `window resets in ${fmtCountdown(reset)}`}",
   "new": "${`window resets in ${fmtCountdown(reset)}`}",
   "cmd": [
    "node",
@@ -189,8 +189,8 @@
  {
   "label": "fact line claims all is fine with a signed-out seat",
   "file": "app/web/render.mjs",
-  "old": "if (signedOut(seat)) facts.push(`${name} signed out`);",
-  "new": "if (false) facts.push(`${name} signed out`);",
+  "old": "else if (signedOut(seat)) problems.push(`${name} signed out`);",
+  "new": "else if (false) problems.push(`${name} signed out`);",
   "cmd": [
    "node",
    "--test",
@@ -277,7 +277,7 @@
  {
   "label": "crossing automatic switching link missing",
   "file": "app/web/render.mjs",
-  "old": "      <p class=\"support\"><button class=\"pricing-link\" data-action=\"crossing-auto\" data-scope=\"once\" ${data}>always switch automatically</button></p>\n",
+  "old": "      <button class=\"pricing-link\" data-action=\"crossing-auto\" data-scope=\"once\" ${data}>always switch automatically</button>\n",
   "new": "",
   "cmd": [
    "node",
@@ -288,8 +288,8 @@
  {
   "label": "ledger summary omits the signed-out warning",
   "file": "app/web/render.mjs",
-  "old": "    else if (signedOut(seat)) facts.push(`${name} signed out`);",
-  "new": "    else if (false) facts.push(`${name} signed out`);",
+  "old": "else if (signedOut(seat)) problems.push(`${name} signed out`);",
+  "new": "else if (false) problems.push(`${name} signed out`);",
   "cmd": [
    "node",
    "--test",
@@ -351,6 +351,30 @@
   "cmd": [
    "node",
    "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "limited seat duplicates its reset in an inline issue",
+  "file": "app/web/render.mjs",
+  "old": "        const error = usageIssue(tool, seat);",
+  "new": "        if (limited) issues.push(`limited; ${returnTime(seat)}`);\n        const error = usageIssue(tool, seat);",
+  "cmd": [
+   "node",
+   "--test",
+   "--test-name-pattern=all limited includes",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "API key model leaks back into the seat column",
+  "file": "app/web/render.mjs",
+  "old": "${esc(key.label)}</span><svg class=\"row-chevron\"",
+  "new": "${esc(key.label)} ${esc(key.model)}</span><svg class=\"row-chevron\"",
+  "cmd": [
+   "node",
+   "--test",
+   "--test-name-pattern=roster groups tools once",
    "app/web/render.test.mjs"
   ]
  }

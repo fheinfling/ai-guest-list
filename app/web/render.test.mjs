@@ -77,7 +77,7 @@ test("fmtCountdown", () => {
   assert.equal(fmtCountdown("2026-07-05T13:00:00Z", now), "7d1h");
 });
 
-test("rounded system type and tabular readings require no remote resources", () => {
+test("local clickdummy type and tabular readings require no remote resources", () => {
   const html = buildHTML(state({ tools: { codex: { seats: [seat()] } } }));
   assert.match(html, /class="app-icon"[^>]*aria-label="ai guest list"/);
   assert.match(html, /class="seat-email">work@x\.com/);
@@ -85,7 +85,8 @@ test("rounded system type and tabular readings require no remote resources", () 
   const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
   assert.match(css, /--sans:ui-rounded,/);
   assert.match(css, /font-variant-numeric:tabular-nums/);
-  assert.doesNotMatch(css, /@font-face|https?:/);
+  assert.match(css, /font-family:"Hanken Grotesk"; src:url\("fonts\/hankengrotesk.woff2"\)/);
+  assert.doesNotMatch(css, /https?:/);
 });
 
 test("seat summaries retain status, countdown, switch and sign-in actions", () => {
@@ -241,7 +242,7 @@ test("both remaining windows are visible before opening either tool disclosure",
     })] } } }));
     const glance = html.slice(0, html.indexOf('<details class="guest-drawer"'));
     assert.match(glance, /aria-label="5-hour left">5h left</);
-    assert.match(glance, /aria-label="weekly left">week left</);
+    assert.match(glance, /aria-label="weekly left">week</);
     assert.match(glance, />100%<span class="ledger-bar"/);
     assert.match(glance, />35%<span class="ledger-bar"/);
     assert.doesNotMatch(glance, /class="track/);
@@ -347,7 +348,7 @@ test("tool markers and written seat status do not rely on colour or emoji", () =
 test("ledger has no headline and management remains in seat options", () => {
   const html = buildHTML(state({ tools: { codex: { seats: [seat({ plan: "Business" })] } } }));
   assert.doesNotMatch(html, /<h1|you can keep working/);
-  assert.match(html, /class="roster-tool"[^>]*><span class="group-rule"><span>Codex</);
+  assert.match(html, /class="roster-tool"[^>]*><span class="group-rule"><span>codex</);
   assert.match(html, /class="roster-identity" title="Work">Work/);
   assert.match(html, /class="roster-meta sr-only"><span class="mono chip">Business/);
   assert.match(html, /class="mono chip">Business/);
@@ -1475,7 +1476,7 @@ for (const screen of ["spending", "nothing-ready"]) {
     for (const name of ["Resting Codex", "Weekly Codex", "Resting Claude", "late-night", "other key"]) {
       assert.ok(compact.includes(`>${name}</span>`), `${name} is in the roster`);
     }
-    assert.match(compact, />5h left<.*>week left</);
+    assert.match(compact, />5h left<.*>week</);
     assert.match(compact, />0%<span class="ledger-bar"/);
     assert.match(compact, />79%<span class="ledger-bar"/);
     assert.match(compact, />62%<span class="ledger-bar"/);
@@ -1486,12 +1487,12 @@ for (const screen of ["spending", "nothing-ready"]) {
     assert.equal((compact.match(/no app spend cap/g) || []).length, 2);
     const nodes = [...compact.matchAll(/class="roster-reset" data-reset-at="([^"]+)" data-clock-prefix="([^"]+)"/g)]
       .map(([, resetAt, clockPrefix]) => ({ dataset: { resetAt, clockPrefix } }));
-    assert.equal(nodes.length, 5);
+    assert.equal(nodes.length, 3);
     const root = { querySelectorAll: (selector) => selector === "[data-reset-at]" ? nodes : [] };
     updateClockText(root, now);
-    assert.deepEqual(nodes.map((node) => node.textContent), ["in 2h 30m", "in 3d", "in 3d", "in 2h 30m", "in 3d"]);
+    assert.deepEqual(nodes.map((node) => node.textContent), ["back 2h 30m", "back 3d", "back 3d"]);
     updateClockText(root, now + 60000);
-    assert.deepEqual(nodes.map((node) => node.textContent), ["in 2h 29m", "in 2d23h", "in 2d23h", "in 2h 29m", "in 2d23h"]);
+    assert.deepEqual(nodes.map((node) => node.textContent), ["back 2h 29m", "back 2d23h", "back 2d23h"]);
   });
 }
 
@@ -1573,8 +1574,8 @@ test("roster groups tools once in one table, active seats lead each group, and h
   assert.equal(rows.length, 5);
   assert.equal((h.match(/<table/g) || []).length, 1);
   assert.equal((h.match(/scope="rowgroup"/g) || []).length, 2);
-  assert.equal((h.match(/<span>Codex<\/span>/g) || []).length, 1);
-  assert.equal((h.match(/<span>Claude<\/span>/g) || []).length, 1);
+  assert.equal((h.match(/<span>codex<\/span>/g) || []).length, 1);
+  assert.equal((h.match(/<span>claude<\/span>/g) || []).length, 1);
   assert.match(rows[0], /roster-active.*>Active C/);
   assert.match(rows[3], /roster-active.*>Active A/);
   assert.match(rows[0], /roster-status">on now/);
@@ -1582,7 +1583,16 @@ test("roster groups tools once in one table, active seats lead each group, and h
   assert.match(rows[1], /Rest/);
   assert.match(rows[4], /Ready/);
   assert.match(rows[2], /roster-key/);
-  assert.match(rows[2], /literal\/model-id/);
+  assert.doesNotMatch(rows[2], /literal\/model-id|roster-meta/);
+  assert.match(rows[2], /class="roster-identity"[^>]*>late-night<\/span>/);
+  const keyToggle = rows[2].match(/data-action="seat-details" data-tool="key" data-email="key-1"[^>]*aria-expanded="false" aria-controls="([^"]+)"/);
+  assert.ok(keyToggle);
+  const detail = h.match(new RegExp(`<tr class="roster-detail" id="${keyToggle[1]}" hidden>[\\s\\S]*?<\\/tr>`))[0];
+  assert.match(detail, /<dt>model<\/dt><dd>literal\/model-id<\/dd>/);
+  const open = buildHTML(state({ tools, keys: [keySeat({ model: "literal/model-id" })] }), null,
+    new Set([JSON.stringify(["key", "key-1"])]));
+  assert.ok(open.includes(`class="roster-detail" id="${keyToggle[1]}">`));
+  assert.match(css, /\.key-identity \.roster-identity \{[^}]*overflow:visible; white-space:normal; text-overflow:clip; overflow-wrap:anywhere/);
   assert.match(rows[2], /paid per token.*no app spend cap/);
   // The key seat's own action lives on the band, not only inside the sheet: burying the one
   // thing a key seat is for was the defect this replaced. It is a credential-free id handoff to
@@ -1615,7 +1625,7 @@ test("roster escapes names and titles, key labels, literal models and unknown ha
   const hostile = '<img src=x onerror="bad()">&';
   const h = rosterHTML(state({ tools: { codex: { seats: [seat({ name: hostile, plan: hostile })] } },
     keys: [keySeat({ label: hostile, model: hostile, harness: hostile })] }));
-  assert.equal((h.match(/&lt;img src=x onerror=&quot;bad\(\)&quot;&gt;&amp;/g) || []).length, 11);
+  assert.equal((h.match(/&lt;img src=x onerror=&quot;bad\(\)&quot;&gt;&amp;/g) || []).length, 12);
   assert.doesNotMatch(h, /<img|onerror="|<script/);
   const noModel = rosterHTML(state({ tools: { codex: { seats: [seat()] } }, keys: [keySeat({ model: null })] }));
   assert.doesNotMatch(noModel, /null|undefined|unknown model/);
@@ -1645,12 +1655,12 @@ test("roster omits absent or invalid reset times and resets for unreported windo
   }
 });
 
-test("roster long identities and literal models have full-value titles and single-line ellipsis", () => {
+test("roster long identities retain titles, key names wrap and literal models stay in details", () => {
   const name = "Wilhelmina Featherstone +codex / a realistically long name";
   const h = rosterHTML(state({ tools: { codex: { seats: [seat({ name })] } },
     keys: [keySeat({ label: name, model: "literal/long-model-id" })] }));
   assert.equal((h.match(new RegExp(`title="${name.replaceAll('+', '\\+')}"`, 'g')) || []).length, 2);
-  assert.match(h, /class="roster-meta" title="literal\/long-model-id">literal\/long-model-id/);
+  assert.match(h, /<dt>model<\/dt><dd>literal\/long-model-id<\/dd>/);
   assert.match(css, /\.roster-identity, \.roster-meta\s*\{[^}]*overflow:hidden; white-space:nowrap; text-overflow:ellipsis/);
 });
 
@@ -1771,7 +1781,8 @@ function disclosureDOM(animations = []) {
     querySelector: (selector) => selector === ".main-body, .set-body" ? body
       : selector === "details.guest-drawer" ? nodes.find((n) => n.classes.includes("guest-drawer"))
       : selector === "details.guest-drawer[open]" ? nodes.find((n) => n.classes.includes("guest-drawer") && n.open) : null,
-    querySelectorAll: (selector) => selector.includes("details.") ? nodes : [],
+    querySelectorAll: (selector) => selector.includes("details.") ? nodes.filter((node) => selector.split(",").some((part) =>
+      node.classes.includes(part.match(/details\.([\w-]+)/)?.[1]) && (!part.includes("[open]") || node.open))) : [],
     get nodes() { return nodes; },
     get body() { return body; },
   };
@@ -2041,7 +2052,8 @@ test("toast remains outside root and uses textContent and theme tokens; there is
   assert.equal(classes.has("celebrate"), true);
   callbacks.find((c) => c.ms === 600).fn();
   assert.equal(classes.has("celebrate"), false);
-  assert.doesNotMatch(css, /@keyframes|animation:(?!none)|transition:(?!none)/);
+  assert.doesNotMatch(css, /@keyframes|animation:(?!none)/);
+  assert.match(css, /transition:transform \.15s/);
   assert.match(css, /prefers-reduced-motion:reduce[\s\S]*animation:none !important/);
   callbacks.find((c) => c.ms === 3000).fn();
   assert.equal(overlay.innerHTML, "");
@@ -2202,7 +2214,7 @@ test("a window reset in the past never renders 'in now'", () => {
   const html = buildHTML(claudeState(s));
   assert.doesNotMatch(html, /in now|resets in now/);
   const row = rosterOf(html);
-  assert.match(row, /roster-reset"[^>]*data-past-text="resetting…"[^>]*>resetting…</);
+  assert.match(row, /class="roster-detail"[\s\S]*data-past-text="resetting…"[^>]*>resetting…</);
   assert.match(row, />in 1d/);
   assert.equal(resetIsPast(inHours(-1)), true);
   assert.equal(resetIsPast(inHours(1)), false);
@@ -2222,7 +2234,7 @@ test("clock tick turns a reset that has just passed into resetting…", () => {
 test("fact line names a signed-out seat while another seat remains usable", () => {
   const html = buildHTML(claudeState(seat({ status: "ready" }), seat({ email: "b@x.com", name: "B", status: "needs-login", signed_out: true })));
   const facts = html.match(/<div class="ledger-facts"[\s\S]*?<\/div>/)[0];
-  assert.match(facts, /Claude B signed out/);
+  assert.match(facts, /claude: B signed out/);
   assert.doesNotMatch(facts, /no subscription seat ready/);
   assert.doesNotMatch(html, /you can keep working|<h1/);
   assert.ok(html.indexOf(facts) < html.indexOf('<table'));
@@ -2232,7 +2244,7 @@ test("fact line with only a signed-out active seat says no subscription is ready
   const html = buildHTML(claudeState(seat({ status: "needs-login", active: true, signed_out: true, usage: { error: "no_token" } })));
   assert.doesNotMatch(html, /you can keep working/);
   assert.match(html, /class="ledger-facts"[\s\S]*no subscription seat ready/);
-  assert.match(html, /Claude Work signed out/);
+  assert.match(html, /claude: Work signed out/);
   assert.match(html, /data-action="add" data-tool="claude" data-email="work@x.com">sign in</);
 });
 
@@ -2319,7 +2331,7 @@ const crossing = (over = {}) => ({ tool: "claude", from: "w@x", to: "p@x", at: "
 
 test("a limit crossing offers switch now, not now and an automatic switching link", () => {
   const html = buildHTML(state({ pending_crossings: [crossing({ reason: "limit" })] }));
-  assert.match(html, /needs you/);
+  assert.match(html, /approval[s]?:/);
   assert.match(html, /Work is out\. continue this session on Home \(personal seat\)\?/);
   for (const scope of ["once", "deny"]) {
     assert.match(html, new RegExp(`data-action="crossing-answer" data-scope="${scope}" data-tool="claude" data-from="w@x" data-to="p@x"`));
@@ -2341,7 +2353,7 @@ test("a switch crossing asks about the other running session", () => {
 test("limit crossings omit a kind already present in the seat name", () => {
   for (const [to_name, to_kind] of [["Business", "business"], ["my personal", "personal"]]) {
     const html = crossingRequests({ pending_crossings: [crossing({ to_name, to_kind })] });
-    assert.ok(html.includes(`<h2>Work is out. continue this session on ${to_name}?</h2>`));
+    assert.ok(html.includes(`<span class="issue-text">Work is out. continue this session on ${to_name}?</span>`));
   }
 });
 
@@ -2400,7 +2412,7 @@ test("settings offers the cross-tier toggle, off by default", () => {
 test("a pending tier request is a needs-you item with pair, all tiers and no", () => {
   const req = { tool: "claude", a: "max", b: "team", at: "2026-10-31T10:00:00Z" };
   const html = buildHTML(state({ pending_tier_requests: [req] }));
-  assert.match(html, /needs you/);
+  assert.match(html, /approval[s]?:/);
   assert.match(html, /models may differ/);
   assert.match(html, /until you say yes, these moves restart the session/);
   assert.match(html, />always for max↔team</);
@@ -2456,20 +2468,20 @@ test("fact line and inline sign-in problem escape and name the same seat", () =>
   const html = buildHTML(claudeState(seat({ name, email, signed_out: true }), seat({ email: "ok@x", name: "Healthy" })));
   const facts = factsOf(html);
   assert.match(facts, /role="status"/);
-  assert.match(facts, /Claude Work &lt;img src=x&gt; &amp; &quot;personal&quot; signed out/);
+  assert.match(facts, /claude: Work &lt;img src=x&gt; &amp; &quot;personal&quot; signed out/);
   assert.doesNotMatch(facts, /<img|no subscription seat ready/);
   const row = rowOf(html, "seat&quot;&lt;&amp;@example.test");
   assert.match(row, /<\/tr><tr class="roster-issue issue-danger"/);
   assert.match(row, /signed out; sign in to see usage/);
   assert.match(row, /data-action="add" data-tool="claude" data-email="seat&quot;&lt;&amp;@example.test">sign in</);
-  assert.doesNotMatch(row, /data-action="switch"|\d+%|data-reset-at/);
+  assert.doesNotMatch(row, /data-action="switch"|>\d+%|data-reset-at/);
   assert.doesNotMatch(rowOf(html, "ok@x"), /roster-issue|sign in/);
 });
 
 test("expiring active sign-in appears in the fact line and inline with its renewal action", () => {
   const at = inHours(50);
   const html = buildHTML(claudeState(seat({ active: true, status: "active", signin_expiring: true, signin_expires_at: at })));
-  assert.match(factsOf(html), /Claude Work:.*sign-in expires in 2d/);
+  assert.match(factsOf(html), /claude: Work .*expires in 2d/);
   const row = rowOf(html, "work@x.com");
   assert.match(row, /roster-active/);
   assert.match(row, /80%/);
@@ -2478,7 +2490,7 @@ test("expiring active sign-in appears in the fact line and inline with its renew
   assert.ok(row.includes(`data-reset-at="${at}"`));
 });
 
-test("all limited includes the selected seat, earliest return, inline actions and paid alternatives", () => {
+test("all limited includes the selected seat, earliest return, detail actions and paid alternatives", () => {
   const first = inHours(1), later = inHours(3);
   const snapshot = claudeState(
     seat({ active: true, status: "active", limited: true, limited_until: later, usage5h: 100 }),
@@ -2487,10 +2499,16 @@ test("all limited includes the selected seat, earliest return, inline actions an
   snapshot.keys = [keySeat({ label: "Emergency", harness: "claude" })];
   const html = buildHTML(snapshot), facts = factsOf(html);
   assert.match(facts, /all seats limited/);
-  assert.match(facts, /Claude Personal:.*back in 1h/);
+  assert.match(facts, /claude Personal:.*back in 1h/);
   assert.match(facts, /Emergency available for paid use/);
   assert.match(html, /mood-resting/);
-  assert.match(rowOf(html, "personal@x"), /limited;.*back in 1h[\s\S]*>switch anyway</);
+  const row = rowOf(html, "personal@x");
+  assert.match(row, /class="roster-reset"[^>]*data-clock-prefix="back"[^>]*>back 1h</);
+  assert.doesNotMatch(row, /roster-issue|limited;|data-action="switch"|switch anyway/);
+  const details = rosterHTML(snapshot).match(/<tr class="roster-detail" id="seat-detail-claude-personal%40x" hidden>[\s\S]*?<\/tr>/)[0];
+  assert.match(details, /data-action="switch" data-tool="claude" data-email="personal@x"[^>]*>switch anyway<\/button>/);
+  const open = buildHTML(snapshot, null, new Set([JSON.stringify(["claude", "personal@x"])]));
+  assert.ok(open.includes('class="roster-detail" id="seat-detail-claude-personal%40x">'));
   assert.doesNotMatch(rowOf(html, "work@x.com"), /data-action="switch"/);
   assert.equal(usable(snapshot.tools.claude.seats[0]), false);
   assert.match(rosterHTML(snapshot), /data-action="key-terminal" data-id="key-1"/);
@@ -2504,7 +2522,7 @@ test("fact line counts live approvals and keeps crossing, tier and paid choices 
   snapshot.pending_tier_requests = [{ tool: "claude", a: "Max", b: "Pro" }];
   snapshot.pending_key_switches = [keyPrompt()];
   const html = buildHTML(snapshot);
-  assert.match(factsOf(html), /3 approvals need you/);
+  assert.match(factsOf(html), /3 approvals:/);
   for (const action of ["crossing-answer", "crossing-auto", "tier-answer", "key-answer"]) assert.ok(html.includes(`data-action="${action}"`));
   assert.match(html, />switch now</);
   assert.match(html, />not now</);
@@ -2528,18 +2546,20 @@ test("group rules use engine selection, exclude signed-out and limited seats, an
   assert.equal(next(), 'needs approval: <b>Client</b>');
 });
 
-test("stale, throttled, unknown and resetting problems stay inline beside their seat", () => {
+test("stale, throttled and unknown problems stay inline; limited resets stay in their column", () => {
   for (const [over, message] of [
     [{ usage_stale: true, usage_fetched_at: inHours(-1) }, /last known reading;.*updated 1h ago/],
     [{ usage_stale: true, usage: { error: "rate_limited" } }, /updates throttled; retrying automatically/],
     [{ usage_unknown: true }, /usage unknown;.*waiting for first reading/],
-    [{ limited: true, status: "resting", limited_until: inHours(-1) }, /limited;.*resetting…/],
   ]) {
     const row = rowOf(buildHTML(claudeState(seat(over))), "work@x.com");
     assert.match(row, /<tr class="roster-issue"/);
     assert.match(row, message);
     assert.doesNotMatch(row, /back in now|resets in now/);
   }
+  const row = rowOf(buildHTML(claudeState(seat({ limited: true, status: "resting", limited_until: inHours(-1) }))), "work@x.com");
+  assert.match(row, /class="roster-reset"[^>]*>resetting…<\/span>/);
+  assert.doesNotMatch(row, /roster-issue|limited;|back in now|resets in now/);
 });
 
 for (const tool of ["codex", "claude"]) {
@@ -2557,12 +2577,12 @@ test("expiring approvals update the fact count and restore the ledger without an
   const app = keyApp({ setInterval: (fn) => { tick = fn; return 1; } });
   const first = keyPrompt(), second = keyPrompt({ id: "prompt-2" });
   app.window.AGL.update(state({ tools: { codex: { seats: [seat()] } }, pending_key_switches: [first, second] }));
-  assert.match(factsOf(app.root.innerHTML), /2 approvals need you/);
+  assert.match(factsOf(app.root.innerHTML), /2 approvals:/);
   assert.doesNotMatch(app.root.innerHTML, /<table/);
   app.window.AGL.setVisible(true);
   first.expires_at = inHours(-1);
   tick();
-  assert.match(factsOf(app.root.innerHTML), /1 approval needs you/);
+  assert.match(factsOf(app.root.innerHTML), /1 approval:/);
   assert.doesNotMatch(app.root.innerHTML, /<table/);
   second.expires_at = inHours(-1);
   tick();
@@ -2652,3 +2672,136 @@ for (const tool of ["codex", "claude"]) {
     });
   }
 }
+
+// Compact clickdummy layout: row summary, inline decisions, footer and disclosures.
+test("each seat summary has a single reset from its tighter window; details retain both", () => {
+  const five = inHours(2), week = inHours(48), back = inHours(5);
+  for (const [extra, expected, prefix] of [
+    [{ usage5h: 80, usageWeek: 20 }, five, ""],
+    [{ usage5h: 20, usageWeek: 80 }, week, ""],
+    [{ usage5h: 80, usageWeek: 80 }, five, ""],
+    [{ usage: { reported_windows: ["weekly"], windows: { "5h": win(five), weekly: win(week) } } }, week, ""],
+    [{ limited: true, limited_until: back }, back, "back"],
+  ]) {
+    const snapshot = claudeState(seat({ active: true, status: "active", usage: { windows: { "5h": win(five), weekly: win(week) } }, ...extra }));
+    const table = rosterHTML(snapshot);
+    const row = table.match(/<tr\b[^>]*data-seat-email="work@x.com"[\s\S]*?<\/tr>/)[0];
+    assert.equal((row.match(/class="roster-reset"/g) || []).length, 1);
+    assert.ok(row.includes(`data-reset-at="${expected}" data-clock-prefix="${prefix}"`));
+    assert.doesNotMatch(row, /reset-window|>5h in|>week in|<br/);
+    const detail = table.match(/<tr class="roster-detail"[\s\S]*?<\/tr>/)[0];
+    assert.match(detail, / hidden>/);
+    assert.ok(detail.includes(`datetime="${week}"`));
+    if (!extra.usage?.reported_windows) assert.ok(detail.includes(`datetime="${five}"`));
+    const node = { dataset: { resetAt: expected, clockPrefix: prefix, pastText: "resetting…" } };
+    updateClockText({ querySelectorAll: (selector) => selector === "[data-reset-at]" ? [node] : [] });
+    assert.equal(node.textContent, `${prefix}${prefix ? " " : ""}${fmtCountdown(expected)}`);
+  }
+});
+
+test("crossing approval follows its target row once, without a separate needs-you block", () => {
+  const snapshot = claudeState(seat({ email: "w@x", name: "Work", status: "active", kind: "business" }),
+    seat({ email: "p@x", name: "Personal", kind: "personal" }), seat({ email: "other@x", name: "Other" }));
+  snapshot.pending_crossings = [crossing({ to_name: "Personal" })];
+  const html = buildHTML(snapshot), target = rowOf(html, "p@x"), source = rowOf(html, "w@x");
+  assert.match(target, /<\/tr><tr class="roster-issue roster-approval"/);
+  assert.match(target, /class="issue-line crossing-confirm"/);
+  for (const action of ["crossing-answer", "crossing-auto"]) assert.ok(target.includes(`data-action="${action}"`));
+  assert.doesNotMatch(source, /crossing-answer/);
+  assert.equal((html.match(/class="issue-line crossing-confirm"/g) || []).length, 1);
+  assert.doesNotMatch(html, /crossing-prompts|crossing-tag|needs you|<h2>.*continue this session|orphan-issues/);
+});
+
+test("cross-tier approval follows the matching plan row with all existing choices", () => {
+  const snapshot = claudeState(seat({ email: "max@x", status: "active", plan: "Max" }),
+    seat({ email: "team@x", name: "Team", plan: "Team" }));
+  snapshot.pending_tier_requests = [{ tool: "claude", a: "max", b: "team" }];
+  const html = buildHTML(snapshot), target = rowOf(html, "team@x");
+  assert.match(target, /<\/tr><tr class="roster-issue roster-approval"/);
+  for (const scope of ["pair", "all", "deny"]) assert.ok(target.includes(`data-action="tier-answer" data-scope="${scope}"`));
+  assert.equal((html.match(/class="issue-line tier-confirm"/g) || []).length, 1);
+  assert.doesNotMatch(rowOf(html, "max@x"), /tier-answer/);
+});
+
+test("one compact fact groups sign-in problems by tool and gives an approval question", () => {
+  const snapshot = claudeState(seat({ name: "Personal", signed_out: true }),
+    seat({ email: "b@x", name: "Business", status: "active", signin_expiring: true, signin_expires_at: inHours(48) }));
+  let facts = factsOf(buildHTML(snapshot));
+  assert.match(facts, /claude: Personal signed out, Business .*expires in/);
+  assert.equal((facts.match(/claude:/g) || []).length, 1);
+  assert.doesNotMatch(facts, /<br\b|<p\b|<h[12]\b/);
+  snapshot.pending_crossings = [crossing({ to_name: "Personal" })];
+  facts = factsOf(buildHTML(snapshot));
+  assert.match(facts, /1 approval: switch claude to Personal\?/);
+  assert.doesNotMatch(facts, /signed out|expires in/);
+  assert.match(css, /\.ledger-facts > span \{[^}]*white-space:nowrap; text-overflow:ellipsis/);
+  assert.equal(factsOf(buildHTML(claudeState(seat({ status: "active" })))), "");
+});
+
+test("footer seat-options link opens, closes and preserves the existing management drawer", () => {
+  const snapshot = state({ tools: { codex: { seats: [seat()] } } });
+  const html = buildHTML(snapshot), footer = html.match(/<footer class="ledger-footer">[\s\S]*?<\/footer>/)[0];
+  assert.match(footer, /type="checkbox" data-action="toggle" data-key="auto_switch" checked/);
+  assert.match(footer, /<button class="footer-options" data-action="seat-options" aria-controls="seat-options" aria-expanded="false">seat options<\/button>/);
+  assert.match(footer, /strategy: <b>soonest back<\/b>/);
+  assert.match(buildHTML({ ...snapshot, settings: { strategy: "most_headroom" } }), /strategy: <b>most headroom<\/b>/);
+  const app = drawerApp(true);
+  app.window.AGL.update(snapshot);
+  app.click({ action: "seat-options" });
+  assert.equal(app.drawer().open, true);
+  assert.match(app.root.innerHTML, /data-action="remove" data-tool="codex"/);
+  app.click({ action: "seat-options" });
+  assert.equal(app.drawer().open, false);
+  for (const checked of [false, true]) {
+    app.handlers.change({ target: { closest: () => ({ dataset: { key: "auto_switch" }, checked }) } });
+    assert.deepEqual(JSON.parse(JSON.stringify(app.sent.at(-1))), { action: "toggle", key: "auto_switch", value: checked });
+  }
+});
+
+test("row detail buttons disclose locally and survive a poll without sending a seat switch", () => {
+  for (const [tool, email, snapshot] of [
+    ["claude", "work@x.com", claudeState(seat({ status: "active" }))],
+    ["key", "key-1", state({ keys: [keySeat()] })],
+  ]) {
+    const app = keyApp();
+    app.window.AGL.update({ ...snapshot, rev: 1 });
+    const id = app.root.innerHTML.match(/data-action="seat-details"[^>]*aria-controls="([^"]+)"/)[1];
+    const detail = { hidden: true }, attributes = { "aria-controls": id };
+    const button = { dataset: { action: "seat-details", tool, email },
+      setAttribute: (key, value) => { attributes[key] = value; }, getAttribute: (key) => attributes[key] };
+    app.document.getElementById = (key) => key === id ? detail : app.root;
+    const click = () => app.handlers.click({ target: { closest: (selector) => selector === "[data-action]" ? button : null } });
+    click();
+    assert.equal(detail.hidden, false);
+    assert.equal(attributes["aria-expanded"], "true");
+    app.window.AGL.update({ ...snapshot, rev: 2 });
+    assert.ok(app.root.innerHTML.includes(`class="roster-detail" id="${id}">`));
+    click();
+    assert.equal(detail.hidden, true);
+    assert.equal(attributes["aria-expanded"], "false");
+    assert.equal(app.sent.filter((msg) => ["switch", "key-terminal"].includes(msg.action)).length, 0);
+  }
+});
+
+test("ledger uses clickdummy row, column, glyph, bar and control dimensions", () => {
+  assert.match(css, /height:30px; border-bottom:1px solid var\(--line\)/);
+  assert.match(css, /\.roster-window-col \{ width:50px; \}/);
+  assert.match(css, /\.ledger-bar \{[^}]*height:3px;[^}]*margin-top:3px/);
+  assert.match(css, /\.issue-line \{[^}]*padding:0 8px 5px 90px; font-size:11.5px; line-height:1.25/);
+  assert.match(css, /\.row-action \{[^}]*min-height:0; padding:3px 7px;[^}]*border-radius:5px/);
+  const html = rosterHTML(claudeState(seat({ status: "active" })));
+  assert.match(html, /r="5.2" stroke-width="1.2"/);
+  assert.match(html, /r="2.8" fill="currentColor"/);
+});
+
+test("a selected seat's single past reset summary says resetting while the other reset stays in details", () => {
+  const past = inHours(-1), future = inHours(48);
+  const html = rosterHTML(claudeState(seat({ status: "active", usage5h: 90, usageWeek: 20,
+    usage: { windows: { "5h": win(past), weekly: win(future) } } })));
+  const row = html.match(/<tr\b[^>]*data-seat-email="work@x.com"[\s\S]*?<\/tr>/)[0];
+  assert.match(row, /class="roster-reset"[^>]*>resetting…<\/span>/);
+  assert.doesNotMatch(row, />now<|>in now<|reset-window/);
+  assert.equal((row.match(/class="roster-reset"/g) || []).length, 1);
+  assert.ok(!row.includes(future));
+  assert.ok(html.match(/<tr class="roster-detail"[\s\S]*?<\/tr>/)[0].includes(future));
+});

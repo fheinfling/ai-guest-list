@@ -154,7 +154,7 @@ function updateClockText(root, now = Date.now()) {
   }
   for (const node of root.querySelectorAll("[data-reset-at]")) {
     node.textContent = node.dataset.pastText && resetIsPast(node.dataset.resetAt, now) ? node.dataset.pastText
-      : `${node.dataset.clockPrefix || "resets in"} ${fmtCountdown(node.dataset.resetAt, now)}`;
+      : `${node.dataset.clockPrefix ?? "resets in"}${node.dataset.clockPrefix === "" ? "" : " "}${fmtCountdown(node.dataset.resetAt, now)}`;
   }
   for (const node of root.querySelectorAll("[data-session-at]")) {
     node.textContent = fmtSessionAge(node.dataset.sessionAt, now).replace(" · ", "; ");
@@ -218,9 +218,10 @@ function seatAction(tool, seat, placement = "all") {
   return `<button class="row-action" data-action="switch" data-tool="${tool}" data-email="${esc(seat.email)}" aria-label="${esc(label)}" title="${esc(label)}">${limited ? "switch anyway" : "switch"}</button>${again}`;
 }
 
-function signinExpiryLine(seat, tag) {
+function signinExpiryLine(seat, tag, compact = false) {
   const at = seat.signin_expires_at;
-  return `<${tag} class="signin-expiry" data-reset-at="${esc(at)}" data-clock-prefix="sign-in expires in" title="${esc(new Date(at).toLocaleString())}">sign-in expires in ${fmtCountdown(at)}</${tag}>`;
+  const prefix = compact ? "expires in" : "sign-in expires in";
+  return `<${tag} class="signin-expiry" data-reset-at="${esc(at)}" data-clock-prefix="${prefix}" title="${esc(new Date(at).toLocaleString())}">${prefix} ${fmtCountdown(at)}</${tag}>`;
 }
 
 function switchNeedsConfirmation(state, tool, email) {
@@ -651,12 +652,12 @@ function paidCount(state) {
 // Distinct shapes and written states keep the ledger readable without colour.
 function stateGlyph(kind) {
   const paths = {
-    active: '<circle cx="6" cy="6" r="4.7"/><circle cx="6" cy="6" r="2.4" fill="currentColor" stroke="none"/>',
-    ready: '<circle cx="6" cy="6" r="4.7"/>',
-    limited: '<circle cx="6" cy="6" r="4.7"/><path d="M3.5 6h5"/>',
-    out: '<circle cx="6" cy="6" r="4.7"/><path d="m2.7 9.3 6.6-6.6"/>',
-    key: '<rect x="2" y="2" width="8" height="8" rx="1.5"/>',
-    warn: '<path d="M6 1 11 10.5H1Z M6 4v3 M6 8.5v.1"/>',
+    active: '<circle cx="6" cy="6" r="5.2" stroke-width="1.2"/><circle cx="6" cy="6" r="2.8" fill="currentColor" stroke="none"/>',
+    ready: '<circle cx="6" cy="6" r="4.6" stroke-width="1.4"/>',
+    limited: '<circle cx="6" cy="6" r="4.6" stroke-width="1.4"/><path d="M3.4 6h5.2" stroke-width="1.6"/>',
+    out: '<circle cx="6" cy="6" r="4.6" stroke-width="1.4"/><path d="M2.8 9.2l6.4-6.4" stroke-width="1.6"/>',
+    key: '<rect x="2" y="2" width="8" height="8" rx="1.5" stroke-width="1.4"/>',
+    warn: '<path d="M6 1.4L11 10.4H1z"/><path d="M6 4.6v2.7M6 8.6v.1" stroke-width="1.4"/>',
   };
   return `<svg class="state-glyph" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[kind] || paths.ready}</svg>`;
 }
@@ -675,23 +676,34 @@ function ledgerFacts(state) {
   const seats = subscriptionSeats(state);
   const ready = seats.filter(usable);
   const facts = [];
-  const approvals = (state?.pending_crossings || []).length + (state?.pending_tier_requests || []).length
-    + (state?.pending_key_switches || []).filter((r) => r.status === "pending" && Date.parse(r.expires_at) > Date.now()).length;
-  if (approvals) facts.push(`${approvals} ${approvals === 1 ? "approval needs" : "approvals need"} you`);
-  if (seats.length && !ready.length) {
-    facts.push(seats.every(limitedSeat) ? "all seats limited" : "no subscription seat ready");
-    const first = seats.filter((s) => limitedSeat(s) && Number.isFinite(Date.parse(s.limited_until)))
-      .sort((a, b) => Date.parse(a.limited_until) - Date.parse(b.limited_until))[0];
-    if (first) facts.push(`${esc(TOOL_META[first.tool].label)} ${esc(first.name || first.email)}: ${returnTime(first)}`);
-    const key = (state?.keys || [])[0];
-    if (key) facts.push(`${esc(key.label)} ${key.responses_verified === false || key.last_proof?.outcome === "incompatible" ? "may help with paid use; endpoint unproven" : "available for paid use"}`);
-  }
-  for (const seat of seats) {
-    const name = `${esc(TOOL_META[seat.tool].label)} ${esc(seat.name || seat.email)}`;
-    if (entitlementRevoked(seat)) facts.push(`${name}: check your subscription to refresh usage`);
-    else if (signedOut(seat)) facts.push(`${name} signed out`);
-    else if (signinNeeded(seat)) facts.push(`${name}: sign-in needed`);
-    else if (signinExpiring(seat)) facts.push(`${name}: ${signinExpiryLine(seat, "span")}`);
+  const crossings = state?.pending_crossings || [];
+  const tiers = state?.pending_tier_requests || [];
+  const keys = (state?.pending_key_switches || []).filter((r) => r.status === "pending" && Date.parse(r.expires_at) > Date.now());
+  const approvals = crossings.length + tiers.length + keys.length;
+  if (approvals) {
+    const request = crossings[0];
+    const question = request ? `switch ${esc(request.tool)} to ${esc(request.to_name || request.to)}?`
+      : tiers.length ? "switch across plan tiers?" : "use a paid key?";
+    facts.push(`${approvals} ${approvals === 1 ? "approval" : "approvals"}: ${question}`);
+  } else {
+    for (const tool of ["codex", "claude"]) {
+      const problems = [];
+      for (const seat of seats.filter((seat) => seat.tool === tool)) {
+        const name = esc(seat.name || seat.email);
+        if (entitlementRevoked(seat)) problems.push(`${name}: check your subscription to refresh usage`);
+        else if (signedOut(seat)) problems.push(`${name} signed out`);
+        else if (signinNeeded(seat)) problems.push(`${name}: sign-in needed`);
+        else if (signinExpiring(seat)) problems.push(`${name} ${signinExpiryLine(seat, "span", true)}`);
+      }
+      if (problems.length) facts.push(`${tool}: ${problems.join(", ")}`);
+    }
+    if (seats.length && !ready.length) {
+      const first = seats.filter((s) => limitedSeat(s) && Number.isFinite(Date.parse(s.limited_until)))
+        .sort((a, b) => Date.parse(a.limited_until) - Date.parse(b.limited_until))[0];
+      facts.unshift(seats.every(limitedSeat) ? `all seats limited${first ? `; ${esc(first.tool)} ${esc(first.name || first.email)}: ${returnTime(first)}` : ""}` : "no subscription seat ready");
+      const key = (state?.keys || [])[0];
+      if (key) facts.push(`${esc(key.label)} ${key.responses_verified === false || key.last_proof?.outcome === "incompatible" ? "may help with paid use; endpoint unproven" : "available for paid use"}`);
+    }
   }
   return facts.length ? `<div class="ledger-facts" role="status">${stateGlyph("warn")}<span>${facts.join("; ")}</span></div>` : "";
 }
@@ -718,19 +730,43 @@ function usageIssue(tool, seat) {
     token_expired: `open ${TOOL_META[tool].label} to refresh usage`, unauthorized: "sign in to refresh usage", forbidden: "check your subscription to refresh usage", no_token: "sign in to refresh usage" })[error] || (error ? "usage update failed; retrying automatically" : "");
 }
 
-function rosterTable(state, pending) {
+function nextReset(seat, resets) {
+  if (limitedSeat(seat) && Number.isFinite(Date.parse(seat.limited_until))) return seat.limited_until;
+  return resets.sort((a, b) => (b.used ?? -1) - (a.used ?? -1) || Date.parse(a.at) - Date.parse(b.at))[0]?.at;
+}
+
+function rowDetails(tool, seat, id, open) {
+  const action = limitedSeat(seat) ? seatAction(tool, seat, "switch") : "";
+  const fetched = seat.usage_fetched_at || seat.usage?.fetched_at || "";
+  const resets = signedOut(seat) ? "" : ["5h", "weekly"].map((win) => {
+    const reported = seat.usage?.reported_windows;
+    const at = seat.usage?.windows?.[win]?.resets_at;
+    if ((Array.isArray(reported) && !reported.includes(win)) || !Number.isFinite(Date.parse(at))) return "";
+    return `<div><dt>${win === "5h" ? "5h" : "week"} resets</dt><dd><time datetime="${esc(at)}">${esc(new Date(at).toLocaleString())}</time> (<span data-reset-at="${esc(at)}" data-clock-prefix="in" data-past-text="resetting…">${resetIsPast(at) ? "resetting…" : `in ${fmtCountdown(at)}`}</span>)</dd></div>`;
+  }).join("");
+  return `<tr class="roster-detail" id="${id}"${open ? "" : " hidden"}><td colspan="5"><dl class="ledger-detail"><div><dt>seat</dt><dd>${esc(seat.email)} ${planChip(seat.plan)}</dd></div><div><dt>updated</dt><dd data-usage-at="${esc(fetched)}">${fmtUsageAge(fetched)}</dd></div>${resets}${action ? `<div><dt>action</dt><dd>${action}</dd></div>` : ""}</dl></td></tr>`;
+}
+
+// Tier requests carry a plan pair, not an email. Attach once to the matching target plan.
+function tierTarget(request, seats) {
+  return seats.find((s) => String(s.plan).toLowerCase() === String(request.b).toLowerCase())
+    || seats.find(isActive) || seats[0];
+}
+
+function rosterTable(state, pending, openDetails) {
   const seats = subscriptionSeats(state);
   const spending = new Set([...(state?.running_key_seats || []),
     ...(state?.pinned_sessions || []).map((session) => session.key_seat?.id || session.email)]);
   return `<table class="roster" aria-label="seats and remaining headroom">
       <colgroup><col class="roster-state-col"><col class="roster-seat-col"><col class="roster-window-col"><col class="roster-window-col"><col class="roster-action-col"></colgroup>
-      <thead><tr><th scope="col">state</th><th scope="col">seat</th><th scope="col" aria-label="5-hour left">5h left</th><th scope="col" aria-label="weekly left">week left</th><th scope="col">resets / action</th></tr></thead>
+      <thead><tr><th scope="col">state</th><th scope="col">seat</th><th scope="col" aria-label="5-hour left">5h left</th><th scope="col" aria-label="weekly left">week</th><th scope="col">resets</th></tr></thead>
       ${[...new Set(["codex", "claude", ...(state?.keys || []).map((key) => key.harness)])].map((tool) => {
         const subscriptions = seats.filter((seat) => seat.tool === tool);
         const keys = (state?.keys || []).filter((key) => key.harness === tool);
         if (!subscriptions.length && !keys.length) return "";
         const accent = TOOL_META[tool]?.accent || "var(--support)";
-        return `<tbody style="--accent:${accent}"><tr><th class="roster-tool" scope="rowgroup" colspan="5"><span class="group-rule"><span>${esc(TOOL_META[tool]?.label || tool || "API key")}</span><span class="group-next">${groupNext(tool, subscriptions, state)}</span></span></th></tr>${subscriptions.sort((a, b) => Number(isActive(b)) - Number(isActive(a))).map((seat) => {
+        const edge = tool === "codex" ? "var(--codex-edge)" : tool === "claude" ? "var(--claude-edge)" : "var(--line)";
+        return `<tbody style="--accent:${accent};--group-edge:${edge}"><tr><th class="roster-tool" scope="rowgroup" colspan="5"><span class="group-rule"><span>${esc(tool || "api key")}</span><span class="group-next">${groupNext(tool, subscriptions, state)}</span></span></th></tr>${subscriptions.sort((a, b) => Number(isActive(b)) - Number(isActive(a))).map((seat) => {
         const active = isActive(seat);
         const out = signedOut(seat);
         const limited = limitedSeat(seat);
@@ -746,32 +782,43 @@ function rosterTable(state, pending) {
                              : "usage reading unavailable";
           const missing = left === null;
           const reset = absent || out ? null : seat.usage?.windows?.[win]?.resets_at;
-          if (reset && Number.isFinite(Date.parse(reset))) resets.push(`<span class="reset-window">${win === "5h" ? "5h" : "week"} <span class="roster-reset" data-reset-at="${esc(reset)}" data-clock-prefix="in" data-past-text="resetting…" title="window resets at ${esc(new Date(reset).toLocaleString())}">${resetIsPast(reset) ? "resetting…" : `in ${fmtCountdown(reset)}`}</span></span>`);
+          if (reset && Number.isFinite(Date.parse(reset))) resets.push({ at: reset, used });
           return `<td class="roster-value${missing ? " roster-unknown" : left === 0 ? " roster-zero" : left <= 20 ? " roster-low" : ""}"${missing ? ` title="${esc(why)}" aria-label="${esc(why)}"` : ` aria-label="${seat.usage_stale ? "last known: " : ""}${left}% left"`}>${missing ? "—" : `${seat.usage_stale ? "~" : ""}${left}%<span class="ledger-bar${seat.usage_stale ? " stale" : ""}" aria-hidden="true"><i style="width:${left}%"></i></span>`}</td>`;
         }).join("");
         const action = seatAction(tool, seat, "switch");
         const signin = seatAction(tool, seat, "signin");
-        const identity = `<span class="roster-identity" title="${esc(seat.name || seat.email)}">${esc(seat.name || seat.email)}</span><span class="roster-meta sr-only">${planChip(seat.plan)}</span>`;
-        const rowAction = action && !active && !out
+        const detailKey = JSON.stringify([tool, seat.email]);
+        const detailId = `seat-detail-${encodeURIComponent(tool)}-${encodeURIComponent(seat.email)}`;
+        const identity = `<button class="roster-details" data-action="seat-details" data-tool="${esc(tool)}" data-email="${esc(seat.email)}" aria-expanded="${openDetails.has(detailKey)}" aria-controls="${detailId}" aria-label="${esc(`${seat.name || seat.email}, details`)}"><span class="roster-identity" title="${esc(seat.name || seat.email)}">${esc(seat.name || seat.email)}</span><svg class="row-chevron" viewBox="0 0 8 8" aria-hidden="true"><path d="M2.5 1l3 3-3 3"/></svg></button><span class="roster-meta sr-only">${planChip(seat.plan)}</span>`;
+        const reset = out ? null : nextReset(seat, resets);
+        const resetPrefix = limited ? "back" : "";
+        const resetHTML = reset ? `<span class="roster-reset" data-reset-at="${esc(reset)}" data-clock-prefix="${resetPrefix}" data-past-text="resetting…" title="window resets at ${esc(new Date(reset).toLocaleString())}">${resetIsPast(reset) ? "resetting…" : `${resetPrefix}${resetPrefix ? " " : ""}${fmtCountdown(reset)}`}</span>` : "";
+        const rowAction = action && !active && !out && !limited
           ? ` data-action="switch" data-tool="${esc(tool)}" data-email="${esc(seat.email)}"` : "";
         const issues = [];
         if (out) issues.push("signed out; sign in to see usage");
         if (!out && signinNeeded(seat)) issues.push("sign-in needed");
         if (!out && signinExpiring(seat)) issues.push(signinExpiryLine(seat, "span"));
-        if (limited) issues.push(`limited; ${returnTime(seat)}`);
         const error = usageIssue(tool, seat);
         if (!out && error) issues.push(esc(error));
         if (!out && (seat.usage_stale || seat.usage_unknown)) issues.push(`${seat.usage_unknown ? "usage unknown" : "last known reading"}; <span data-usage-at="${esc(seat.usage_fetched_at || seat.usage?.fetched_at || "")}">${fmtUsageAge(seat.usage_fetched_at || seat.usage?.fetched_at)}</span>`);
         const confirmation = switchConfirmation(tool, seat, pending);
-        return `<tr class="${active && !out && !attention ? "roster-active" : ""}${out ? " roster-signedout" : ""}${limited ? " roster-limited" : ""}${rowAction ? " roster-actionable" : ""}"${rowAction} data-seat-email="${esc(seat.email)}"><td class="roster-state">${stateGlyph(out ? "out" : attention ? "warn" : limited ? "limited" : active ? "active" : "ready")}<span class="roster-status">${status}</span></td><th scope="row">${identity}</th>${windows}<td class="roster-last">${action && !limited ? action : ""}${resets.length ? `<span class="roster-resets${action && !limited ? " sr-only" : ""}">${resets.join("")}</span>` : ""}</td></tr>${confirmation ? `<tr class="roster-issue"><td colspan="5">${confirmation}</td></tr>` : ""}${issues.length ? `<tr class="roster-issue${out ? " issue-danger" : ""}" data-tool="${esc(tool)}" data-email="${esc(seat.email)}"><td colspan="5"><div class="issue-line" role="group" aria-label="${esc(TOOL_META[tool].label)} ${esc(seat.name || seat.email)} attention">${stateGlyph(out ? "out" : "warn")}<span class="issue-text">${issues.join("; ")}</span>${signin}${limited ? action : ""}</div></td></tr>` : ""}`;
-      }).join("")}${keys.map((key) => `<tr class="roster-key roster-actionable" data-action="key-terminal" data-id="${esc(key.id)}"><td class="roster-state">${stateGlyph("key")}<span class="roster-status">${spending.has(key.id) ? "spending now" : "api key"}</span></td><th scope="row"><span class="roster-identity" title="${esc(key.label)}">${esc(key.label)}</span>${key.model ? `<span class="roster-meta" title="${esc(key.model)}">${esc(key.model)}</span>` : ""}</th><td class="roster-key-terms" colspan="2"><span class="key-terms">paid per token<span class="sr-only">; no app spend cap</span></span></td><td class="roster-last"><button class="row-action key-use" data-action="key-terminal" data-id="${esc(key.id)}" aria-label="${esc(`use ${key.label} in a new paid terminal`)}" title="use in a new paid terminal">new terminal</button></td></tr>`).join("")}</tbody>`;
+        const approvals = crossingRequests({ pending_crossings: (state.pending_crossings || []).filter((r) => r.tool === tool && r.to === seat.email) })
+          + tierRequests({ pending_tier_requests: (state.pending_tier_requests || []).filter((r) => r.tool === tool && tierTarget(r, subscriptions) === seat) });
+        return `<tr class="${active && !out && !attention ? "roster-active" : ""}${out ? " roster-signedout" : ""}${limited ? " roster-limited" : ""}${rowAction ? " roster-actionable" : ""}"${rowAction} data-seat-email="${esc(seat.email)}"><td class="roster-state">${stateGlyph(out ? "out" : attention ? "warn" : limited ? "limited" : active ? "active" : "ready")}<span class="roster-status">${status}</span></td><th scope="row">${identity}</th>${windows}<td class="roster-last">${action && !limited ? action : ""}${action && !limited ? "" : resetHTML}</td></tr>${approvals ? `<tr class="roster-issue roster-approval"><td colspan="5">${approvals}</td></tr>` : ""}${confirmation ? `<tr class="roster-issue"><td colspan="5">${confirmation}</td></tr>` : ""}${issues.length ? `<tr class="roster-issue${out ? " issue-danger" : ""}" data-tool="${esc(tool)}" data-email="${esc(seat.email)}"><td colspan="5"><div class="issue-line" role="group" aria-label="${esc(TOOL_META[tool].label)} ${esc(seat.name || seat.email)} attention">${stateGlyph(out ? "out" : "warn")}<span class="issue-text">${issues.join("; ")}</span>${signin}</div></td></tr>` : ""}${rowDetails(tool, seat, detailId, openDetails.has(detailKey))}`;
+      }).join("")}${keys.map((key) => {
+        const detailKey = JSON.stringify(["key", key.id]);
+        const detailId = `key-detail-${encodeURIComponent(key.id)}`;
+        const open = openDetails.has(detailKey);
+        return `<tr class="roster-key roster-actionable" data-action="key-terminal" data-id="${esc(key.id)}"><td class="roster-state">${stateGlyph("key")}<span class="roster-status">${spending.has(key.id) ? "spending now" : "api key"}</span></td><th scope="row"><button class="roster-details key-identity" data-action="seat-details" data-tool="key" data-email="${esc(key.id)}" aria-expanded="${open}" aria-controls="${detailId}" aria-label="${esc(`${key.label}, details`)}"><span class="roster-identity" title="${esc(key.label)}">${esc(key.label)}</span><svg class="row-chevron" viewBox="0 0 8 8" aria-hidden="true"><path d="M2.5 1l3 3-3 3"/></svg></button></th><td class="roster-key-terms" colspan="2"><span class="key-terms">paid per token<span class="sr-only">; no app spend cap</span></span></td><td class="roster-last"><button class="row-action key-use" data-action="key-terminal" data-id="${esc(key.id)}" aria-label="${esc(`use ${key.label} in a new paid terminal`)}" title="use in a new paid terminal">new terminal</button></td></tr><tr class="roster-detail" id="${detailId}"${open ? "" : " hidden"}><td colspan="5"><dl class="ledger-detail"><div><dt>model</dt><dd>${esc(key.model)}</dd></div></dl></td></tr>`;
+      }).join("")}</tbody>`;
       }).join("")}
     </table>`;
 }
 
 // --- popover ----------------------------------------------------------------------------------
 
-function buildHTML(state, pendingSwitch = null) {
+function buildHTML(state, pendingSwitch = null, openDetails = new Set()) {
   const theme = state?.settings?.theme === "dark" ? "dark" : "light";
   const seats = subscriptionSeats(state);
   const paid = paidCount(state);
@@ -787,8 +834,9 @@ function buildHTML(state, pendingSwitch = null) {
     <header class="top">${appIcon()}<div class="top-actions"><details class="header-menu"><summary class="ibtn" aria-label="add a subscription seat or API key" title="add a seat or key">＋</summary><nav class="menu-panel"><button data-action="add">a subscription seat</button><button data-action="key-start">an API key</button></nav></details>
     <details class="header-menu"><summary class="ibtn" aria-label="app menu" title="app menu">⋯</summary><nav class="menu-panel"><button data-action="settings">settings</button><button data-action="quit">quit ai guest list</button></nav></details></div></header>
     ${ledgerFacts(state)}
-    <div class="ambient-stage">${prompts}${crossingRequests(state)}${tierRequests(state)}${paid ? paidUseControl(state) : ""}${!asking && (seats.length || state?.keys?.length) ? `<section class="${glance ? "roster-glance" : "roster-compact"}" aria-label="seat availability" tabindex="0">${rosterTable(state, pendingSwitch)}</section>` : !asking ? `<div class="ledger-empty"><p>no seats yet. add one to start switching.</p><button data-action="add">add your first seat</button><button data-action="key-start">add an API key</button></div>` : ""}</div>
-    <details class="guest-drawer"><summary class="drawer-handle"><span>seat options</span><span class="drawer-count">${seats.length + (state?.keys?.length || 0)} seats</span><span class="chevron" aria-hidden="true">⌃</span></summary>
+    <div class="ambient-stage">${prompts}${orphanRequests(state, asking)}${paid ? paidUseControl(state) : ""}${!asking && (seats.length || state?.keys?.length) ? `<section class="${glance ? "roster-glance" : "roster-compact"}" aria-label="seat availability" tabindex="0">${rosterTable(state, pendingSwitch, openDetails)}</section>` : !asking ? `<div class="ledger-empty"><p>no seats yet. add one to start switching.</p><button data-action="add">add your first seat</button><button data-action="key-start">add an API key</button></div>` : ""}</div>
+    <footer class="ledger-footer"><label class="footer-auto"><input type="checkbox" data-action="toggle" data-key="auto_switch" ${state?.settings?.auto_switch ? "checked" : ""}><span class="sw" aria-hidden="true"></span><span>auto-switch <span class="when-on">on</span><span class="when-off">off</span></span></label><button class="footer-options" data-action="seat-options" aria-controls="seat-options" aria-expanded="false">seat options</button><span class="footer-strategy">strategy: <b>${state?.settings?.strategy === "most_headroom" ? "most headroom" : "soonest back"}</b></span></footer>
+    <details class="guest-drawer" id="seat-options"><summary class="drawer-handle"><span>seat options</span><span class="drawer-count">${seats.length + (state?.keys?.length || 0)} seats</span><span class="chevron" aria-hidden="true">⌃</span></summary>
       <div class="drawer-content"><div class="main-body">${engineBanner(state)}${supervisionBanner(state)}${toolGroup("codex", state?.tools?.codex, (state?.keys || []).filter((k) => k.harness === "codex"), pendingSwitch)}${toolGroup("claude", state?.tools?.claude, (state?.keys || []).filter((k) => k.harness === "claude"), pendingSwitch)}
       ${!seats.length && !state?.keys?.length ? `<p class="empty">use ＋ above to add a subscription or API key.</p>` : ""}${moved}
       </div></div></details></div>`;
@@ -903,7 +951,7 @@ const KIND_WORD = { business: "work seat", personal: "personal seat", unknown: "
 function crossingRequests(state) {
   const requests = state?.pending_crossings || [];
   if (!requests.length) return "";
-  return `<div class="crossing-prompts">${requests.map((r) => {
+  return requests.map((r) => {
     const data = `data-tool="${esc(r.tool)}" data-from="${esc(r.from)}" data-to="${esc(r.to)}"`;
     const from = esc(r.from_name || r.from), to = esc(r.to_name || r.to);
     const fromKind = KIND_WORD[r.from_kind] || KIND_WORD.unknown;
@@ -913,28 +961,31 @@ function crossingRequests(state) {
     const prompt = r.reason === "switch"
       ? `you switched ${esc(r.tool || "claude")} to ${to}. move the other running session too? (${esc(fromKind)} → ${esc(toKind)})`
       : `${from} is out. continue this session on ${to}${namedKind ? "" : ` (${esc(toKind)})`}?`;
-    return `<section class="crossing-confirm" aria-label="needs you"><p class="crossing-tag">needs you</p>
-      <h2>${prompt}</h2>
-      <p class="crossing-why">${esc(r.from_name || r.from)} is ${esc(KIND_WORD[r.from_kind] || KIND_WORD.unknown)}; moving between work and personal seats needs your yes.</p>
-      <div class="crossing-acts"><button class="choice" data-action="crossing-answer" data-scope="once" ${data}>switch now</button><button class="choice" data-action="crossing-answer" data-scope="deny" ${data}>not now</button></div>
-      <p class="support"><button class="pricing-link" data-action="crossing-auto" data-scope="once" ${data}>always switch automatically</button></p>
-    </section>`;
-  }).join("")}</div>`;
+    return `<div class="issue-line crossing-confirm" role="group" aria-label="seat crossing approval">${stateGlyph("warn")}<span class="issue-text">${prompt}</span><span class="crossing-acts"><button class="row-action" data-action="crossing-answer" data-scope="once" ${data}>switch now</button><button class="row-action" data-action="crossing-answer" data-scope="deny" ${data}>not now</button></span>
+      <button class="pricing-link" data-action="crossing-auto" data-scope="once" ${data}>always switch automatically</button>
+    </div>`;
+  }).join("");
 }
 
 // A hop between plan tiers went by restart; asked once per pair. "no" is remembered.
 function tierRequests(state) {
   const requests = state?.pending_tier_requests || [];
   if (!requests.length) return "";
-  return `<div class="crossing-prompts">${requests.map((r) => {
+  return requests.map((r) => {
     const data = `data-tool="${esc(r.tool)}" data-a="${esc(r.a)}" data-b="${esc(r.b)}"`;
     const pair = `${esc(r.a)}\u2194${esc(r.b)}`;
-    return `<section class="crossing-confirm" aria-label="needs you"><p class="crossing-tag">needs you</p>
-      <h2>switch without restarting across plan tiers?</h2>
-      <p class="crossing-why">${esc(r.a)} and ${esc(r.b)} are different plans; models may differ. until you say yes, these moves restart the session.</p>
-      <div class="crossing-acts"><button class="choice" data-action="tier-answer" data-scope="pair" ${data}>always for ${pair}</button><button class="choice" data-action="tier-answer" data-scope="all" ${data}>always for all tiers</button><button class="choice" data-action="tier-answer" data-scope="deny" ${data}>no</button></div>
-    </section>`;
-  }).join("")}</div>`;
+    return `<div class="issue-line tier-confirm" role="group" aria-label="plan tier approval">${stateGlyph("warn")}<span class="issue-text">switch without restarting across plan tiers? ${esc(r.a)} and ${esc(r.b)} are different plans; models may differ. until you say yes, these moves restart the session.</span>
+      <span class="crossing-acts"><button class="row-action" data-action="tier-answer" data-scope="pair" ${data}>always for ${pair}</button><button class="row-action" data-action="tier-answer" data-scope="all" ${data}>always for all tiers</button><button class="row-action" data-action="tier-answer" data-scope="deny" ${data}>no</button></span>
+    </div>`;
+  }).join("");
+}
+
+function orphanRequests(state, asking) {
+  const seats = subscriptionSeats(state);
+  const crossings = (state.pending_crossings || []).filter((r) => asking || !seats.some((s) => s.tool === r.tool && s.email === r.to));
+  const tiers = (state.pending_tier_requests || []).filter((r) => asking || !seats.some((s) => s.tool === r.tool));
+  const issues = crossingRequests({ pending_crossings: crossings }) + tierRequests({ pending_tier_requests: tiers });
+  return issues ? `<div class="orphan-issues">${issues}</div>` : "";
 }
 
 function keyConfirmations(state, answering = new Set(), now = Date.now()) {
@@ -1151,6 +1202,7 @@ let pendingSwitch = null;
 let keySequence = 0;
 const answering = new Set();
 const proving = new Set();
+const openSeatDetails = new Set();
 let clockTimer = null;
 let mainKeyPromptCount = 0;
 let drawerMotion = null;
@@ -1163,8 +1215,9 @@ function moveDrawer(drawer, open, startedAt = Date.now()) {
   drawerMotion = null;
   const body = drawer.querySelector(".main-body");
   if (!open && drawer.contains(document.activeElement)) {
-    drawer.querySelector(".drawer-handle").focus({ preventScroll: true });
+    (root.querySelector('[data-action="seat-options"]') || drawer.querySelector(".drawer-handle")).focus({ preventScroll: true });
   }
+  root.querySelector('[data-action="seat-options"]')?.setAttribute("aria-expanded", String(open));
   drawer.open = true;
   drawer.classList.toggle("drawer-closing", !open);
   body.inert = !open;
@@ -1212,6 +1265,10 @@ function render() {
   // A background state push (the usage poll) re-renders whatever screen is up; carry the current
   // screen's body scroll position across the innerHTML swap so a poll doesn't snap it to the top.
   // Only when the screen is unchanged — navigating must start the new screen at the top.
+  const focusData = screen === renderedScreen && root.contains?.(document.activeElement)
+    && document.activeElement?.dataset?.action ? { ...document.activeElement.dataset } : null;
+  const prevRoster = root.querySelector(".roster-glance, .roster-compact");
+  const rosterScroll = screen === renderedScreen ? prevRoster?.scrollTop || 0 : 0;
   const prevBody = root.querySelector(".main-body, .set-body");
   const scrollTop = screen === renderedScreen && prevBody ? prevBody.scrollTop : 0;
   // Polls must keep native disclosures open, including the enclosing drawer. Identity follows
@@ -1233,7 +1290,7 @@ function render() {
     : screen === "add" ? buildAddSeat(state, add)
     : screen === "add-key" ? buildAddKey(state, keyFlow)
     : screen === "paid-key" ? buildPaidKeyGate(state, paidTerminal)
-    : buildHTML(state, pendingSwitch);
+    : buildHTML(state, pendingSwitch, openSeatDetails);
   if (!root.querySelector(".key-prompts")) {
     root.querySelector(".set-head")?.insertAdjacentHTML("afterend", keyConfirmations(state, answering));
   }
@@ -1252,6 +1309,7 @@ function render() {
   for (const details of root.querySelectorAll(disclosures)) {
     details.open = openDisclosures.has(disclosureKey(details));
   }
+  root.querySelector('[data-action="seat-options"]')?.setAttribute("aria-expanded", String(root.querySelector("details.guest-drawer")?.open || false));
   if (motion) {
     const drawer = root.querySelector("details.guest-drawer");
     if (drawer) moveDrawer(drawer, motion.open, motion.startedAt);
@@ -1259,6 +1317,13 @@ function render() {
   if (scrollTop) {
     const nextBody = root.querySelector(".main-body, .set-body");
     if (nextBody) nextBody.scrollTop = scrollTop;
+  }
+  const nextRoster = root.querySelector(".roster-glance, .roster-compact");
+  if (nextRoster) nextRoster.scrollTop = rosterScroll;
+  if (focusData) {
+    const control = [...root.querySelectorAll("button[data-action], input[data-action]")]
+      .find((node) => Object.entries(focusData).every(([key, value]) => node.dataset[key] === value));
+    control?.focus({ preventScroll: true });
   }
   // mirror the theme onto <body> so overlays (siblings of #root) get the same CSS vars
   const theme = (state.settings && state.settings.theme === "dark") ? "dark" : "light";
@@ -1320,7 +1385,8 @@ document.addEventListener("click", (e) => {
     return;
   }
   const drawer = root.querySelector("details.guest-drawer[open]");
-  if (drawer && !drawer.contains(e.target) && !drawer.classList.contains("drawer-closing")) moveDrawer(drawer, false);
+  if (drawer && e.target.closest("[data-action]")?.dataset.action !== "seat-options"
+      && !drawer.contains(e.target) && !drawer.classList.contains("drawer-closing")) moveDrawer(drawer, false);
   // The + and ⋯ menus are native <details>, which stay open until their own summary is clicked
   // again. Dismiss on any click outside, and never leave both open at once.
   for (const menu of root.querySelectorAll("details.header-menu[open]")) {
@@ -1331,6 +1397,24 @@ document.addEventListener("click", (e) => {
   const { action, tool, email, value } = el.dataset;
   if (el.disabled) return;
   switch (action) {
+    case "seat-options": {
+      const drawer = root.querySelector("details.guest-drawer");
+      if (drawer) {
+        const open = !drawer.open || drawer.classList.contains("drawer-closing");
+        moveDrawer(drawer, open);
+        if (open) drawer.querySelector(".drawer-handle").focus({ preventScroll: true });
+      }
+      break;
+    }
+    case "seat-details": {
+      const key = JSON.stringify([tool, email]);
+      const open = !openSeatDetails.has(key);
+      if (open) openSeatDetails.add(key); else openSeatDetails.delete(key);
+      el.setAttribute("aria-expanded", String(open));
+      const detail = document.getElementById(el.getAttribute("aria-controls"));
+      if (detail) detail.hidden = !open;
+      break;
+    }
     case "key-start":
       add = null;
       keyFlow = { step: "provider", label: "", secret: "", region: "eu", base_url: "", allow_unverified: false };

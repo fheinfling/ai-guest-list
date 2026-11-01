@@ -89,6 +89,7 @@ let pendingSwitch = null;
 let keySequence = 0;
 const answering = new Set();
 const proving = new Set();
+const openSeatDetails = new Set();
 let clockTimer = null;
 let mainKeyPromptCount = 0;
 let drawerMotion = null;
@@ -101,8 +102,9 @@ function moveDrawer(drawer, open, startedAt = Date.now()) {
   drawerMotion = null;
   const body = drawer.querySelector(".main-body");
   if (!open && drawer.contains(document.activeElement)) {
-    drawer.querySelector(".drawer-handle").focus({ preventScroll: true });
+    (root.querySelector('[data-action="seat-options"]') || drawer.querySelector(".drawer-handle")).focus({ preventScroll: true });
   }
+  root.querySelector('[data-action="seat-options"]')?.setAttribute("aria-expanded", String(open));
   drawer.open = true;
   drawer.classList.toggle("drawer-closing", !open);
   body.inert = !open;
@@ -150,6 +152,10 @@ function render() {
   // A background state push (the usage poll) re-renders whatever screen is up; carry the current
   // screen's body scroll position across the innerHTML swap so a poll doesn't snap it to the top.
   // Only when the screen is unchanged — navigating must start the new screen at the top.
+  const focusData = screen === renderedScreen && root.contains?.(document.activeElement)
+    && document.activeElement?.dataset?.action ? { ...document.activeElement.dataset } : null;
+  const prevRoster = root.querySelector(".roster-glance, .roster-compact");
+  const rosterScroll = screen === renderedScreen ? prevRoster?.scrollTop || 0 : 0;
   const prevBody = root.querySelector(".main-body, .set-body");
   const scrollTop = screen === renderedScreen && prevBody ? prevBody.scrollTop : 0;
   // Polls must keep native disclosures open, including the enclosing drawer. Identity follows
@@ -171,7 +177,7 @@ function render() {
     : screen === "add" ? buildAddSeat(state, add)
     : screen === "add-key" ? buildAddKey(state, keyFlow)
     : screen === "paid-key" ? buildPaidKeyGate(state, paidTerminal)
-    : buildHTML(state, pendingSwitch);
+    : buildHTML(state, pendingSwitch, openSeatDetails);
   if (!root.querySelector(".key-prompts")) {
     root.querySelector(".set-head")?.insertAdjacentHTML("afterend", keyConfirmations(state, answering));
   }
@@ -190,6 +196,7 @@ function render() {
   for (const details of root.querySelectorAll(disclosures)) {
     details.open = openDisclosures.has(disclosureKey(details));
   }
+  root.querySelector('[data-action="seat-options"]')?.setAttribute("aria-expanded", String(root.querySelector("details.guest-drawer")?.open || false));
   if (motion) {
     const drawer = root.querySelector("details.guest-drawer");
     if (drawer) moveDrawer(drawer, motion.open, motion.startedAt);
@@ -197,6 +204,13 @@ function render() {
   if (scrollTop) {
     const nextBody = root.querySelector(".main-body, .set-body");
     if (nextBody) nextBody.scrollTop = scrollTop;
+  }
+  const nextRoster = root.querySelector(".roster-glance, .roster-compact");
+  if (nextRoster) nextRoster.scrollTop = rosterScroll;
+  if (focusData) {
+    const control = [...root.querySelectorAll("button[data-action], input[data-action]")]
+      .find((node) => Object.entries(focusData).every(([key, value]) => node.dataset[key] === value));
+    control?.focus({ preventScroll: true });
   }
   // mirror the theme onto <body> so overlays (siblings of #root) get the same CSS vars
   const theme = (state.settings && state.settings.theme === "dark") ? "dark" : "light";
@@ -258,7 +272,8 @@ document.addEventListener("click", (e) => {
     return;
   }
   const drawer = root.querySelector("details.guest-drawer[open]");
-  if (drawer && !drawer.contains(e.target) && !drawer.classList.contains("drawer-closing")) moveDrawer(drawer, false);
+  if (drawer && e.target.closest("[data-action]")?.dataset.action !== "seat-options"
+      && !drawer.contains(e.target) && !drawer.classList.contains("drawer-closing")) moveDrawer(drawer, false);
   // The + and ⋯ menus are native <details>, which stay open until their own summary is clicked
   // again. Dismiss on any click outside, and never leave both open at once.
   for (const menu of root.querySelectorAll("details.header-menu[open]")) {
@@ -269,6 +284,24 @@ document.addEventListener("click", (e) => {
   const { action, tool, email, value } = el.dataset;
   if (el.disabled) return;
   switch (action) {
+    case "seat-options": {
+      const drawer = root.querySelector("details.guest-drawer");
+      if (drawer) {
+        const open = !drawer.open || drawer.classList.contains("drawer-closing");
+        moveDrawer(drawer, open);
+        if (open) drawer.querySelector(".drawer-handle").focus({ preventScroll: true });
+      }
+      break;
+    }
+    case "seat-details": {
+      const key = JSON.stringify([tool, email]);
+      const open = !openSeatDetails.has(key);
+      if (open) openSeatDetails.add(key); else openSeatDetails.delete(key);
+      el.setAttribute("aria-expanded", String(open));
+      const detail = document.getElementById(el.getAttribute("aria-controls"));
+      if (detail) detail.hidden = !open;
+      break;
+    }
     case "key-start":
       add = null;
       keyFlow = { step: "provider", label: "", secret: "", region: "eu", base_url: "", allow_unverified: false };
