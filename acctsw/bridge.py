@@ -9,10 +9,13 @@ from __future__ import annotations
 from .util import email_key
 
 import hashlib
+import logging
+import threading
 from typing import Any
 
 from . import TOOLS, __version__, build_number
 from . import accounts as acct
+from . import claudehome as claudehome_mod
 from . import engine as engine_mod
 from . import identity as identity_mod
 from . import install as install_mod
@@ -22,6 +25,7 @@ from . import keyprove as keyprove_mod
 from . import paths as P
 from . import pricing as pricing_mod
 from . import providers as providers_mod
+from . import seatkind, seattier
 from . import session as session_mod
 from . import usage as usage_mod
 from .context import Context
@@ -36,8 +40,34 @@ from .web_dot import dot_for, door_for
 # Settings the UI may toggle (boolean only) — a whitelist so a stray key can't clobber e.g. theme.
 TOGGLE_KEYS = {
     "auto_switch", "notify", "restart_app", "celebrations", "same_tool_only", "supervise_shell",
-    "confirm_key_switch", "key_fallback",
+    "confirm_key_switch", "key_fallback", "in_place_switch", "in_place_cross_tier", "crossing_auto",
+    "keep_warm",
 }
+
+_KEEP_WARM_LOCK = threading.Lock()
+
+
+def _start_keep_warm(ctx: Context) -> None:
+    """Reserve the worker before starting it: overlapping polls never queue more children."""
+    if not _KEEP_WARM_LOCK.acquire(blocking=False):
+        return
+
+    def worker():
+        try:
+            claudehome_mod.keep_warm(ctx)
+        except Exception as exc:
+            logging.getLogger(__name__).warning("Claude keep-warm worker failed (%s)",
+                                                type(exc).__name__)
+        finally:
+            _KEEP_WARM_LOCK.release()
+
+    try:
+        threading.Thread(target=worker, name="claude-keep-warm", daemon=True).start()
+    except Exception as exc:
+        _KEEP_WARM_LOCK.release()
+        logging.getLogger(__name__).warning("Claude keep-warm thread failed (%s)",
+                                            type(exc).__name__)
+
 
 KEY_ACTIONS = {"key_add", "key_remove", "key_validate", "key_prove", "models_list", "answer_key_switch",
                "key_terminal", "end_pinned_session"}
@@ -112,8 +142,24 @@ def snapshot_state(ctx: Context) -> dict[str, Any]:
          and (parse_iso(record.get("expires_at")) or at) > at),
         key=lambda record: (record["created_at"], record["id"]),
     )
+    data["pending_crossings"] = _pending_crossings(state, at)
+    data["pending_tier_requests"] = [
+        {**r, "tool": tool} for tool in TOOLS for r in seattier.pending(state, tool)
+    ]
     data["rev"] = int(state.data.get("rev", 0))  # monotonic; the UI drops a snapshot older than one it applied
     return data
+
+
+def _pending_crossings(state, at) -> list[dict[str, Any]]:
+    """Sessions waiting for a yes to move between a business and a personal seat (seatkind)."""
+    out = []
+    for tool in TOOLS:
+        for r in seatkind.pending(state, tool, at):
+            a, b = state.get_seat(tool, r["from"]) or {}, state.get_seat(tool, r["to"]) or {}
+            out.append({**r, "tool": tool,
+                        "from_name": a.get("name") or r["from"], "to_name": b.get("name") or r["to"],
+                        "from_kind": seatkind.kind(a), "to_kind": seatkind.kind(b)})
+    return out
 
 
 class _KeyRequestError(AcctswError):
@@ -430,6 +476,10 @@ def _auto_switch_after_usage(ctx: Context, summary: dict[str, Any], *,
             if tool == "claude" and (live_identity is None or live_identity.blob != outgoing_after
                                       or email_key(live_identity.email or "") != email_key(active)):
                 continue
+            # A business/personal crossing choose() let through was approved; this switch spends
+            # a "once" approval in the same write, exactly as the launcher's hops do.
+            if not seatkind.consume(state, tool, active, candidate, now()):
+                continue
             try:
                 do_switch(ctx, state, tool, candidate, sync=(tool != "claude"),
                           live_identity=live_identity)
@@ -593,6 +643,46 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
                 state.save()
             return {"ok": True, "state": snapshot_state(ctx)}
 
+        if action in ("approve_crossing", "deny_crossing"):
+            tool, a, b = message["tool"], message["from"], message["to"]
+            if tool not in TOOLS or not isinstance(a, str) or not isinstance(b, str) or a == b:
+                return {"ok": False, "error": "bad crossing request"}
+            scope = message.get("scope", "once")
+            if action == "approve_crossing" and scope not in seatkind.SCOPES:
+                return {"ok": False, "error": f"bad crossing scope: {scope}"}
+            with ctx.locked():
+                state = ctx.load_state()
+                if a not in state.accounts(tool) or b not in state.accounts(tool):
+                    return {"ok": False, "error": "that seat is no longer on the list",
+                            "state": snapshot_state(ctx)}
+                if action == "approve_crossing":
+                    seatkind.approve(state, tool, a, b, scope)
+                else:
+                    seatkind.deny(state, tool, a, b)
+                state.save()
+            return {"ok": True, "state": snapshot_state(ctx)}
+
+        if action in ("approve_tier", "deny_tier"):
+            tool, a, b = message["tool"], message.get("a"), message.get("b")
+            if tool not in TOOLS or not isinstance(a, str) or not isinstance(b, str):
+                return {"ok": False, "error": "bad tier request"}
+            a, b = a.strip().lower(), b.strip().lower()
+            if not a or not b or a == b or "|" in a or "|" in b:
+                return {"ok": False, "error": "bad tier request"}
+            scope = message.get("scope", "pair")
+            if action == "approve_tier" and scope not in ("pair", "all"):
+                return {"ok": False, "error": f"bad tier scope: {scope}"}
+            with ctx.locked():
+                state = ctx.load_state()
+                if action == "deny_tier":
+                    seattier.deny(state, tool, a, b)
+                elif scope == "all":
+                    seattier.approve_all(state)
+                else:
+                    seattier.approve(state, tool, a, b)
+                state.save()
+            return {"ok": True, "state": snapshot_state(ctx)}
+
         if action == "switch":
             tool = message["tool"]
             # Resolve changed Claude token owners before taking the cross-process state flock.
@@ -610,6 +700,7 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
             with ctx.locked():
                 state = ctx.load_state()
                 do_switch(ctx, state, tool, message["email"], manual=True,
+                          confirmed_crossing=message.get("confirmed_crossing") is True,
                           live_identity=live_identity)
                 state.data["last_switch_at"] = iso(now())
                 state.save()
@@ -689,6 +780,8 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
                 active_only=(scope == "active"), force=bool(message.get("force", False)),
                 user_agent=claude_ua, unreadable=unreadable,
             )
+            if want_claude:
+                _start_keep_warm(ctx)
             handoff = _auto_switch_after_usage(ctx, summary)
             return {"ok": True, "refresh": summary, "auto_switch": handoff,
                     "signin_notices": _take_signin_notices(ctx), "state": snapshot_state(ctx)}

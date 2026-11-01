@@ -22,6 +22,14 @@ A seat the usage poll found signed out (``signin.signed_out``: no credential the
 carries a usable login) is never a candidate either: landing on it can only show "Not logged in".
 A new login clears the verdict.
 
+A move between a business and a personal seat (or one whose kind is unknown) is never picked
+automatically without the user's approval for that direction (see ``seatkind``): such a target is
+left out exactly like an excluded one, so a session whose only way on is a crossing behaves as if
+every seat were resting. ``origin`` is the seat being left (default: the active seat); ``home`` is
+the session's own launch seat, which a move back to is never a crossing;
+``allow_crossing=True`` is only for callers asking what the user COULD approve.
+``crossing_candidate`` names the best target held back only by that rule.
+
 Key fallback is a separate opt-in rule: metered seats only follow exhausted subscriptions of the
 same harness, and its result explains which gate prevented a candidate from being offered.
 """
@@ -31,6 +39,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
+from . import seatkind
 from .state import State
 from .util import now, parse_iso
 
@@ -52,10 +61,14 @@ def _limited_until(seat: dict, at: datetime) -> datetime | None:
 
 
 def choose(state: State, tool: str, at: datetime | None = None,
-           exclude: frozenset | set | tuple = ()) -> Selection:
+           exclude: frozenset | set | tuple = (), *, allow_crossing: bool = False,
+           origin: str | None = None, home: str | None = None) -> Selection:
     at = at or now()
+    origin = origin or state.active(tool)
     accounts = {e: s for e, s in state.accounts(tool).items()
-                if e not in exclude and not s.get("auth_error")
+                if e not in exclude
+                and (allow_crossing or seatkind.approved(state, tool, origin, e, at, home=home))
+                and not s.get("auth_error")
                 and (s.get("usage") or {}).get("error") != "forbidden"
                 and not (s.get("signin") or {}).get("signed_out")}
     if not accounts:
@@ -75,6 +88,22 @@ def choose(state: State, tool: str, at: datetime | None = None,
         unlocks_at=_limited_until(accounts[soonest_email], at),
         all_limited=True,
     )
+
+
+def crossing_candidate(state: State, tool: str, at: datetime | None = None,
+                       exclude: frozenset | set | tuple = (), *,
+                       origin: str | None = None, home: str | None = None) -> str | None:
+    """The seat ``choose`` would have moved to if crossings needed no approval — only when that
+    rule alone is what leaves the session without a usable seat. The launcher asks about it."""
+    at = at or now()
+    origin = origin or state.active(tool)
+    if choose(state, tool, at, exclude, origin=origin, home=home).available:
+        return None
+    wide = choose(state, tool, at, exclude, allow_crossing=True, origin=origin, home=home)
+    if (wide.available and wide.email
+            and not seatkind.approved(state, tool, origin, wide.email, at, home=home)):
+        return wide.email
+    return None
 
 
 @dataclass(frozen=True)

@@ -161,7 +161,7 @@ def test_workflow_drafts_on_push_and_tap_only_on_publication():
     assert "release:\n    types: [published]" in workflow
     build = jobs["build"]
     assert "if: github.event_name == 'push'" in build
-    assert "runs-on: macos-14" in build and 'python-version: "3.11"' in build
+    assert "runs-on: macos-15" in build and 'python-version: "3.11"' in build
     assert "needs: build" in jobs["sign"] and "needs: sign" in jobs["publish"]
     publish = jobs["publish"]
     assert "draft: true" in publish

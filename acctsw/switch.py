@@ -11,6 +11,8 @@ Supervised children use private homes. The canonical location is only the stock-
 """
 from __future__ import annotations
 
+from collections import Counter
+
 from .context import Context
 from .errors import MissingSnapshot, UnknownSeat
 from .identity import ClaudeLiveIdentity
@@ -59,7 +61,7 @@ def sync_back(ctx: Context, state: State, tool: str, *,
 
 
 def switch(ctx: Context, state: State, tool: str, email: str, *, sync: bool = True,
-           manual: bool = False,
+           manual: bool = False, confirmed_crossing: bool = False,
            mirror: bool = True,
            save: bool = True,
            live_identity: ClaudeLiveIdentity | None = None) -> None:
@@ -67,7 +69,10 @@ def switch(ctx: Context, state: State, tool: str, email: str, *, sync: bool = Tr
 
     ``sync=False`` skips sync-back from the stock mirror. Both supervised tools maintain their
     own homes; ``mirror=False`` also leaves stock credentials alone (supervised Claude hops).
-    ``manual=True`` records a request for supervised Codex sessions to resume on the selected seat.
+    ``manual=True`` records a request for supervised sessions to resume on the selected seat. It
+    answers the business/personal question for sessions whose move does not cross and raises one
+    (``seatkind.request``, session id = the supervisor's pid) for each session it would cross.
+    ``confirmed_crossing=True`` on a manual switch approves those live crossings once instead.
     ``save=False`` lets a lock-owning caller persist additional hop metadata in the same write.
     """
     if email not in state.accounts(tool):
@@ -103,7 +108,7 @@ def switch(ctx: Context, state: State, tool: str, email: str, *, sync: bool = Tr
     # 3. record active
     state.set_active(tool, email)
     state.set_last_on_floor(tool, email, iso(now()))
-    if manual and tool == "codex":
+    if manual:
         # An explicit click/CLI request authorizes a live handoff. Ordinary active-pointer
         # changes (login reconciliation, usage polling) must never interrupt a healthy child.
         # The caller holds the state lock and save() increments this revision. It already
@@ -111,5 +116,28 @@ def switch(ctx: Context, state: State, tool: str, email: str, *, sync: bool = Tr
         state.data["tools"][tool]["manual_switch"] = {
             "id": int(state.data.get("rev", 0)) + 1, "email": email,
         }
+        # The user picked this seat. For a terminal whose move onto it does not cross business/
+        # personal (or takes it back to its own home seat) that answers any open question; such
+        # terminals move on this click. Crossing terminals need the inline confirmation before
+        # this click can approve their moves; other callers continue to raise questions.
+        from . import seatkind
+        from .session import active_sessions
+        sessions = sorted(active_sessions(ctx.data_dir, tool), key=lambda s: s["pid"])
+        asks = []
+        for record in sessions:
+            origin, home = record["email"], record.get("home") or record["email"]
+            if origin == email:
+                continue
+            if seatkind.crosses(state, tool, origin, email, home=home):
+                asks.append((origin, str(record["pid"]), home))
+            else:
+                seatkind.chosen(state, tool, origin, email)
+        # After chosen(), which closes a direction's requests and spends any old once grant.
+        if confirmed_crossing:
+            for origin, count in Counter(origin for origin, _sid, _home in asks).items():
+                seatkind.approve(state, tool, origin, email, "once", via="manual", uses=count)
+        else:
+            for origin, sid, home in asks:
+                seatkind.request(state, tool, origin, email, sid, home=home, reason="switch")
     if save:
         state.save()

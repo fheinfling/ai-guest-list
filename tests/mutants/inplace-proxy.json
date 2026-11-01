@@ -1,0 +1,854 @@
+[
+ {
+  "label": "proxy: a broken stream is resent after the first byte reached the client",
+  "file": "acctsw/seatproxy.py",
+  "old": "                if reply.started:\n                    # The client holds",
+  "new": "                if False:\n                    # The client holds",
+  "test": [
+   "tests/test_seatproxy.py::test_no_replay_once_the_response_started"
+  ]
+ },
+ {
+  "label": "proxy: any 429 counts as a seat limit (transient 429s replayed)",
+  "file": "acctsw/seatproxy.py",
+  "old": "return \"limit\" if verdict == \"rejected\" else None",
+  "new": "return \"limit\"",
+  "test": [
+   "tests/test_seatproxy.py::test_transient_429_and_529_pass_through"
+  ]
+ },
+ {
+  "label": "proxy: the path allowlist is dropped (every request carries the seat token)",
+  "file": "acctsw/seatproxy.py",
+  "old": "inject = method == \"POST\" and endpoint in INJECT_PATHS and oauth",
+  "new": "inject = oauth",
+  "test": [
+   "tests/test_seatproxy.py::test_only_message_posts_carry_the_seat_token"
+  ]
+ },
+ {
+  "label": "proxy: the per-run secret is not checked",
+  "file": "acctsw/seatproxy.py",
+  "old": "secrets.compare_digest(head.encode(), self._secret.encode())",
+  "new": "True",
+  "test": [
+   "tests/test_seatproxy.py::test_requests_without_the_secret_are_forbidden"
+  ]
+ },
+ {
+  "label": "proxy: a 401 on the home seat (client's own login) calls decide",
+  "file": "acctsw/seatproxy.py",
+  "old": "                if kind == \"auth\" and seat.token is None:\n                    kind = None",
+  "new": "                if False:\n                    kind = None",
+  "test": [
+   "tests/test_seatproxy.py::test_home_401_passes_through_without_decide"
+  ]
+ },
+ {
+  "label": "proxy: one try per credential is not enforced",
+  "file": "acctsw/seatproxy.py",
+  "old": "if answer is not None and _key(answer) not in done:",
+  "new": "if answer is not None:",
+  "test": [
+   "tests/test_seatproxy.py::test_each_credential_is_tried_once"
+  ]
+ },
+ {
+  "label": "proxy: the hard cap on upstream sends per request is removed",
+  "file": "acctsw/seatproxy.py",
+  "old": "if kind and not reply.started and len(tried) < MAX_TRIES:",
+  "new": "if kind and not reply.started:",
+  "test": [
+   "tests/test_seatproxy.py::test_upstream_sends_are_capped"
+  ]
+ },
+ {
+  "label": "proxy: a token reaches the logs as text (replay event)",
+  "file": "acctsw/seatproxy.py",
+  "old": "self._log(\"replay\", kind=kind, seat=_label(seat), token=tok(token),",
+  "new": "self._log(\"replay\", kind=kind, seat=_label(seat), token=token,",
+  "test": [
+   "tests/test_seatproxy.py::test_logs_never_carry_token_text"
+  ]
+ },
+ {
+  "label": "proxy: exception texts quoting a token are logged unredacted",
+  "file": "acctsw/seatproxy.py",
+  "old": "text = text.replace(s, f\"<{tok(s)}>\")",
+  "new": "text = text",
+  "test": [
+   "tests/test_seatproxy.py::test_logs_never_carry_token_text"
+  ]
+ },
+ {
+  "label": "proxy: decide is waited on without a timeout (limit never passes through)",
+  "file": "acctsw/seatproxy.py",
+  "old": "if not done.wait(self._decide_timeout):",
+  "new": "if not done.wait():",
+  "test": [
+   "tests/test_seatproxy.py::test_decide_timeout_passes_the_limit_through"
+  ]
+ },
+ {
+  "label": "proxy: an injected 401 without an answer is passed through instead of failing open",
+  "file": "acctsw/seatproxy.py",
+  "old": "return Seat(\"\", None)    # fail open",
+  "new": "return None    # fail open",
+  "test": [
+   "tests/test_seatproxy.py::test_injected_401_without_answer_fails_open"
+  ]
+ },
+ {
+  "label": "proxy: decide's answer is not bound for later requests",
+  "file": "acctsw/seatproxy.py",
+  "old": "                self.bind(answer)\n",
+  "new": "                pass\n",
+  "test": [
+   "tests/test_seatproxy.py::test_limit_replays_on_the_decided_seat_and_binds_it"
+  ]
+ },
+ {
+  "label": "proxy: the client's own Authorization goes out next to the injected seat token",
+  "file": "acctsw/seatproxy.py",
+  "old": "(token is not None and low in CLIENT_AUTH)",
+  "new": "False",
+  "test": [
+   "tests/test_seatproxy.py::test_message_posts_carry_the_bound_seat_token"
+  ]
+ },
+ {
+  "label": "proxy: SSE chunks are not flushed one by one",
+  "file": "acctsw/seatproxy.py",
+  "old": "self.wfile.write(f\"{len(data):x}\\r\\n\".encode() + data + b\"\\r\\n\" if self.chunked else data)\n        self.wfile.flush()",
+  "new": "self.wfile.write(f\"{len(data):x}\\r\\n\".encode() + data + b\"\\r\\n\" if self.chunked else data)",
+  "test": [
+   "tests/test_seatproxy.py::test_stream_is_flushed_per_chunk"
+  ]
+ },
+ {
+  "label": "proxy: a handler exception leaves the client without a 502",
+  "file": "acctsw/seatproxy.py",
+  "old": "reply.error(502, \"api_error\", \"seat proxy: internal error\")",
+  "new": "pass",
+  "test": [
+   "tests/test_seatproxy.py::test_handler_exception_answers_502_and_the_proxy_keeps_serving"
+  ]
+ },
+ {
+  "label": "proxy: a fresh connection that fails is retried (only a stale pooled one may be)",
+  "file": "acctsw/seatproxy.py",
+  "old": "if reused and not sent and not fresh:",
+  "new": "if not sent and not fresh:",
+  "test": [
+   "tests/test_seatproxy.py::test_connect_failure_answers_502_without_retry"
+  ]
+ },
+ {
+  "label": "proxy: a concurrent rebind is not followed (every request in a burst asks decide)",
+  "file": "acctsw/seatproxy.py",
+  "old": "if _key(current) != _key(seat) and _key(current) not in done:",
+  "new": "if False:",
+  "test": [
+   "tests/test_seatproxy.py::test_concurrent_rebind_is_followed_without_asking"
+  ]
+ },
+ {
+  "label": "proxy: after a decide timeout every request of the burst waits for its own timeout",
+  "file": "acctsw/seatproxy.py",
+  "old": "answer = self._ask(hit) if time.monotonic() >= self._stalled_until else None",
+  "new": "answer = self._ask(hit)",
+  "test": [
+   "tests/test_seatproxy.py::test_a_burst_waits_for_one_decide_timeout_only"
+  ]
+ },
+ {
+  "label": "proxy #5: any client (API key, no auth) gets the seat token on message posts",
+  "file": "acctsw/seatproxy.py",
+  "old": " and endpoint in INJECT_PATHS and oauth",
+  "new": " and endpoint in INJECT_PATHS",
+  "test": [
+   "tests/test_seatproxy.py::test_only_oauth_bearer_clients_get_a_seat_token"
+  ]
+ },
+ {
+  "label": "proxy #5: a bearer next to an x-api-key still counts as Claude's own login",
+  "file": "acctsw/seatproxy.py",
+  "old": " and _header(headers, \"x-api-key\") is None",
+  "new": "",
+  "test": [
+   "tests/test_seatproxy.py::test_only_oauth_bearer_clients_get_a_seat_token"
+  ]
+ },
+ {
+  "label": "proxy #3: NODE_EXTRA_CA_CERTS is not trusted",
+  "file": "acctsw/seatproxy.py",
+  "old": "                      (\"NODE_EXTRA_CA_CERTS\", \"cafile\")):",
+  "new": "                      ):",
+  "test": [
+   "tests/test_seatproxy.py::test_tls_context_adds_the_users_ca_files",
+   "tests/test_seatproxy.py::test_preflight_real_tls_needs_the_users_ca"
+  ]
+ },
+ {
+  "label": "proxy #3: upstream TLS is not verified",
+  "file": "acctsw/seatproxy.py",
+  "old": "    ctx = ssl.create_default_context()\n",
+  "new": "    ctx = ssl._create_unverified_context()\n",
+  "test": [
+   "tests/test_seatproxy.py::test_preflight_real_tls_needs_the_users_ca"
+  ]
+ },
+ {
+  "label": "proxy #3: preflight sends the bound seat's token",
+  "file": "acctsw/seatproxy.py",
+  "old": "headers={\"Host\": self._transport.netloc})",
+  "new": "headers={\"Host\": self._transport.netloc, \"Authorization\": f\"Bearer {self.bound().token}\"})",
+  "test": [
+   "tests/test_seatproxy.py::test_preflight_sends_a_tokenless_head_on_a_fresh_connection"
+  ]
+ },
+ {
+  "label": "proxy #3: preflight probes a pooled connection instead of a fresh one",
+  "file": "acctsw/seatproxy.py",
+  "old": "conn, _ = self._transport.acquire(fresh=True)",
+  "new": "conn, _ = self._transport.acquire()",
+  "test": [
+   "tests/test_seatproxy.py::test_preflight_sends_a_tokenless_head_on_a_fresh_connection"
+  ]
+ },
+ {
+  "label": "proxy #3: preflight hides an unreachable upstream",
+  "file": "acctsw/seatproxy.py",
+  "old": "return f\"unreachable: {e.__class__.__name__}: {e}\"[:200]",
+  "new": "return None",
+  "test": [
+   "tests/test_seatproxy.py::test_preflight_reports_why_upstream_is_unusable"
+  ]
+ },
+ {
+  "label": "proxy: the inject path is matched after URL parsing ('//x/v1/messages' matches)",
+  "file": "acctsw/seatproxy.py",
+  "old": "endpoint = path.split(\"?\")[0]",
+  "new": "endpoint = urlsplit(path).path",
+  "test": [
+   "tests/test_seatproxy.py::test_inject_path_matches_exactly"
+  ]
+ },
+ {
+  "label": "proxy: messages_seen never counts",
+  "file": "acctsw/seatproxy.py",
+  "old": "                self._messages += 1\n",
+  "new": "                pass\n",
+  "test": [
+   "tests/test_seatproxy.py::test_messages_seen_counts_client_message_posts"
+  ]
+ },
+ {
+  "label": "proxy: messages_seen counts count_tokens too",
+  "file": "acctsw/seatproxy.py",
+  "old": "if method == \"POST\" and endpoint == \"/v1/messages\" and oauth:",
+  "new": "if method == \"POST\" and endpoint in INJECT_PATHS and oauth:",
+  "test": [
+   "tests/test_seatproxy.py::test_messages_seen_counts_client_message_posts"
+  ]
+ },
+ {
+  "label": "proxy: a reused connection that failed after the request was sent is resent",
+  "file": "acctsw/seatproxy.py",
+  "old": "if reused and not sent and not fresh:",
+  "new": "if reused and not fresh:",
+  "test": [
+   "tests/test_seatproxy.py::test_reused_connection_failing_after_send_is_not_resent"
+  ]
+ },
+ {
+  "label": "proxy: a pooled connection the upstream closed is used anyway",
+  "file": "acctsw/seatproxy.py",
+  "old": "if not _dropped(conn):",
+  "new": "if True:",
+  "test": [
+   "tests/test_seatproxy.py::test_dropped_pooled_connection_is_discarded_before_use"
+  ]
+ },
+ {
+  "label": "proxy: messages_seen counts API-key requests (an SDK script proves the proxy is used)",
+  "file": "acctsw/seatproxy.py",
+  "old": "if method == \"POST\" and endpoint == \"/v1/messages\" and oauth:",
+  "new": "if method == \"POST\" and endpoint == \"/v1/messages\":",
+  "test": [
+   "tests/test_seatproxy.py::test_messages_seen_ignores_non_oauth_clients"
+  ]
+ },
+ {
+  "label": "proxy N14: a bearer without an oauth- anthropic-beta is treated as Claude Code's login",
+  "file": "acctsw/seatproxy.py",
+  "old": "            and \"oauth-\" in beta)",
+  "new": "            )",
+  "test": [
+   "tests/test_seatproxy.py::test_bearer_without_the_oauth_beta_is_not_claude_code"
+  ]
+ },
+ {
+  "label": "proxy N14: only the first anthropic-beta header is read (oauth- in a second one missed)",
+  "file": "acctsw/seatproxy.py",
+  "old": "    beta = \",\".join(v for k, v in items if k.lower() == \"anthropic-beta\").lower()",
+  "new": "    beta = (_header(headers, \"anthropic-beta\") or \"\").lower()",
+  "test": [
+   "tests/test_seatproxy.py::test_oauth_beta_anywhere_in_anthropic_beta_counts"
+  ]
+ },
+ {
+  "label": "proxy N10: the limit Hit drops the representative claim",
+  "file": "acctsw/seatproxy.py",
+  "old": "_header(headers, \"anthropic-ratelimit-unified-representative-claim\"))",
+  "new": "None)",
+  "test": [
+   "tests/test_seatproxy.py::test_limit_hit_carries_the_representative_claim"
+  ]
+ },
+ {
+  "label": "proxy v2: a CONNECT to a non-anthropic host is decrypted",
+  "file": "acctsw/seatproxy.py",
+  "old": "return self._ca is not None and f\"{host}:{port}\" == self._authority",
+  "new": "return self._ca is not None",
+  "test": [
+   "tests/test_seatproxy.py::test_other_hosts_are_blind_tunnels_even_with_a_ca"
+  ]
+ },
+ {
+  "label": "proxy v2: a CONNECT without the proxy credentials is accepted",
+  "file": "acctsw/seatproxy.py",
+  "old": "if not proxy._proxy_auth_ok(self.headers.get(\"proxy-authorization\")):",
+  "new": "if False:",
+  "test": [
+   "tests/test_seatproxy.py::test_connect_requires_the_proxy_credentials"
+  ]
+ },
+ {
+  "label": "proxy v2: the proxy user name is not checked",
+  "file": "acctsw/seatproxy.py",
+  "old": "given, f\"{PROXY_USER}:{self._secret}\".encode())",
+  "new": "given.partition(b\":\")[2], self._secret.encode())",
+  "test": [
+   "tests/test_seatproxy.py::test_connect_requires_the_proxy_credentials"
+  ]
+ },
+ {
+  "label": "proxy v2: on_tls_reject is not called when the client rejects the session CA",
+  "file": "acctsw/seatproxy.py",
+  "old": "                self._on_tls_reject(reason)\n",
+  "new": "                pass\n",
+  "test": [
+   "tests/test_seatproxy.py::test_tls_reject_is_reported_once"
+  ]
+ },
+ {
+  "label": "proxy v2: on_tls_reject is called for every rejected handshake, not once",
+  "file": "acctsw/seatproxy.py",
+  "old": "if first and self._on_tls_reject is not None:",
+  "new": "if self._on_tls_reject is not None:",
+  "test": [
+   "tests/test_seatproxy.py::test_tls_reject_is_reported_once"
+  ]
+ },
+ {
+  "label": "proxy v2: blind tunnels ignore the upstream proxy",
+  "file": "acctsw/seatproxy.py",
+  "old": "return _connect_via(_parse_proxy(self.proxy, host), host, port, self.timeout)",
+  "new": "return _connect_via(None, host, port, self.timeout)",
+  "test": [
+   "tests/test_seatproxy.py::test_tunnel_chains_through_the_upstream_proxy"
+  ]
+ },
+ {
+  "label": "proxy v2: the API upstream ignores the upstream proxy",
+  "file": "acctsw/seatproxy.py",
+  "old": "self.tunnel = _parse_proxy(proxy, self.host)",
+  "new": "self.tunnel = None",
+  "test": [
+   "tests/test_seatproxy.py::test_upstream_tunnels_through_https_proxy"
+  ]
+ },
+ {
+  "label": "proxy v2: the launcher's NO_PROXY is not honoured for the upstream proxy",
+  "file": "acctsw/seatproxy.py",
+  "old": "if not proxy or urllib.request.proxy_bypass_environment(host, urllib.request.getproxies_environment()):",
+  "new": "if not proxy:",
+  "test": [
+   "tests/test_seatproxy.py::test_tunnel_honours_the_launchers_no_proxy",
+   "tests/test_seatproxy.py::test_no_proxy_bypasses_the_tunnel"
+  ]
+ },
+ {
+  "label": "proxy v2: a decrypted request for another origin is forwarded (and injected)",
+  "file": "acctsw/seatproxy.py",
+  "old": "            if authority != self._authority:\n",
+  "new": "            if False:\n",
+  "test": [
+   "tests/test_seatproxy.py::test_decrypted_request_for_another_origin_is_refused"
+  ]
+ },
+ {
+  "label": "proxy v2: a refused upstream-proxy CONNECT counts as a tunnel",
+  "file": "acctsw/seatproxy.py",
+  "old": "if len(status) < 2 or status[1] != b\"200\":",
+  "new": "if len(status) < 2:",
+  "test": [
+   "tests/test_seatproxy.py::test_upstream_proxy_refusal_answers_502"
+  ]
+ },
+ {
+  "label": "proxy r3: any handshake failure counts as a certificate reject",
+  "file": "acctsw/seatproxy.py",
+  "old": "if reason.rpartition(\"ALERT_\")[2] in CERT_ALERTS:",
+  "new": "if True:",
+  "test": [
+   "tests/test_seatproxy.py::test_other_handshake_failures_are_not_a_tls_reject",
+   "tests/test_seatproxy.py::test_plain_http_or_a_hang_up_after_connect_is_not_a_tls_reject"
+  ]
+ },
+ {
+  "label": "proxy r3: bad_certificate / certificate_unknown alerts are not a reject",
+  "file": "acctsw/seatproxy.py",
+  "old": "CERT_ALERTS = frozenset({\"UNKNOWN_CA\", \"BAD_CERTIFICATE\", \"CERTIFICATE_UNKNOWN\",",
+  "new": "CERT_ALERTS = frozenset({\"UNKNOWN_CA\",",
+  "test": [
+   "tests/test_seatproxy.py::test_certificate_alerts_are_a_tls_reject"
+  ]
+ },
+ {
+  "label": "proxy r3: unsupported_certificate / access_denied alerts are not a reject",
+  "file": "acctsw/seatproxy.py",
+  "old": "                         \"UNSUPPORTED_CERTIFICATE\", \"ACCESS_DENIED\"})",
+  "new": "                         })",
+  "test": [
+   "tests/test_seatproxy.py::test_certificate_alerts_are_a_tls_reject"
+  ]
+ },
+ {
+  "label": "proxy r3: a certificate alert is only logged, never reported",
+  "file": "acctsw/seatproxy.py",
+  "old": "return self._tls_reject(reason)\n        # Plain HTTP",
+  "new": "pass\n        # Plain HTTP",
+  "test": [
+   "tests/test_seatproxy.py::test_certificate_alerts_are_a_tls_reject"
+  ]
+ },
+ {
+  "label": "proxy r3: intercepts_ok never counts",
+  "file": "acctsw/seatproxy.py",
+  "old": "proxy._intercepts_ok += 1",
+  "new": "proxy._intercepts_ok += 0",
+  "test": [
+   "tests/test_seatproxy.py::test_intercepts_ok_counts_completed_handshakes_only"
+  ]
+ },
+ {
+  "label": "proxy r3: an upstream answer does not reset upstream_failures",
+  "file": "acctsw/seatproxy.py",
+  "old": "                resp = conn.getresponse()\n                self._upstream_result(True)\n",
+  "new": "                resp = conn.getresponse()\n",
+  "test": [
+   "tests/test_seatproxy.py::test_upstream_failures_count_in_a_row_and_reset_on_an_answer"
+  ]
+ },
+ {
+  "label": "proxy r3: an upstream connect failure is not counted",
+  "file": "acctsw/seatproxy.py",
+  "old": "self._upstream_result(False)    # never reached upstream",
+  "new": "pass    # never reached upstream",
+  "test": [
+   "tests/test_seatproxy.py::test_upstream_failures_count_in_a_row_and_reset_on_an_answer"
+  ]
+ },
+ {
+  "label": "proxy r3: a failure after the request was sent counts as a connect failure",
+  "file": "acctsw/seatproxy.py",
+  "old": "                if not sent:\n                    self._upstream_result(False)",
+  "new": "                if True:\n                    self._upstream_result(False)",
+  "test": [
+   "tests/test_seatproxy.py::test_upstream_failures_ignore_a_stale_pooled_retry_and_failures_after_the_send"
+  ]
+ },
+ {
+  "label": "proxy r3: a stale pooled socket counts as an upstream failure",
+  "file": "acctsw/seatproxy.py",
+  "old": "                if reused and not sent and not fresh:\n",
+  "new": "                if not sent:\n                    self._upstream_result(False)\n                if reused and not sent and not fresh:\n",
+  "test": [
+   "tests/test_seatproxy.py::test_upstream_failures_ignore_a_stale_pooled_retry_and_failures_after_the_send"
+  ]
+ },
+ {
+  "label": "proxy r3: an unreachable upgrade upstream is not counted",
+  "file": "acctsw/seatproxy.py",
+  "old": "        except OSError as e:\n            self._upstream_result(False)\n",
+  "new": "        except OSError as e:\n            pass\n",
+  "test": [
+   "tests/test_seatproxy.py::test_an_unreachable_upgrade_upstream_answers_502_and_counts"
+  ]
+ },
+ {
+  "label": "proxy r3: an answered upgrade does not reset upstream_failures",
+  "file": "acctsw/seatproxy.py",
+  "old": "            self._upstream_result(True)\n            self._log(\"upgrade\"",
+  "new": "            self._log(\"upgrade\"",
+  "test": [
+   "tests/test_seatproxy.py::test_websocket_upgrade_is_relayed_verbatim_and_spliced"
+  ]
+ },
+ {
+  "label": "proxy r3: upgrades go through the plain request path (Upgrade dropped, no 101 relay)",
+  "file": "acctsw/seatproxy.py",
+  "old": "if authority is not None and _upgrading(self.headers):",
+  "new": "if False:",
+  "test": [
+   "tests/test_seatproxy.py::test_websocket_upgrade_is_relayed_verbatim_and_spliced"
+  ]
+ },
+ {
+  "label": "proxy r3: an upgrade forwards the client's proxy headers",
+  "file": "acctsw/seatproxy.py",
+  "old": "if not k.lower().startswith(\"proxy-\") and k.lower() != \"host\"]",
+  "new": "if k.lower() != \"host\"]",
+  "test": [
+   "tests/test_seatproxy.py::test_websocket_upgrade_is_relayed_verbatim_and_spliced"
+  ]
+ },
+ {
+  "label": "proxy r3: the splice ignores bytes TLS already decrypted (select waits forever)",
+  "file": "acctsw/seatproxy.py",
+  "old": "ready = [s for s in open_ if _pending(s)]",
+  "new": "ready = []",
+  "test": [
+   "tests/test_seatproxy.py::test_websocket_upgrade_is_relayed_verbatim_and_spliced"
+  ]
+ },
+ {
+  "label": "proxy r3: the upgrade response is read buffered (bytes after the 101 are lost)",
+  "file": "acctsw/seatproxy.py",
+  "old": "return self.sock.makefile(mode, buffering=0)",
+  "new": "return self.sock.makefile(mode)",
+  "test": [
+   "tests/test_seatproxy.py::test_websocket_upgrade_is_relayed_verbatim_and_spliced"
+  ]
+ },
+ {
+  "label": "proxy r3: decrypted requests are read buffered (bytes after an upgrade head are lost)",
+  "file": "acctsw/seatproxy.py",
+  "old": "        rbufsize = 0\n",
+  "new": "        rbufsize = 0 if authority is None else -1\n",
+  "test": [
+   "tests/test_seatproxy.py::test_websocket_upgrade_is_relayed_verbatim_and_spliced"
+  ]
+ },
+ {
+  "label": "proxy r3: a refused upgrade is spliced instead of relayed and closed",
+  "file": "acctsw/seatproxy.py",
+  "old": "if resp.status != 101:",
+  "new": "if False:",
+  "test": [
+   "tests/test_seatproxy.py::test_a_refused_upgrade_is_relayed_and_the_connection_closes"
+  ]
+ },
+ {
+  "label": "proxy r3: an upgrade with an absolute-form target goes upstream",
+  "file": "acctsw/seatproxy.py",
+  "old": "        if not target.startswith(\"/\"):\n",
+  "new": "        if False:\n",
+  "test": [
+   "tests/test_seatproxy.py::test_an_upgrade_needs_an_origin_form_target"
+  ]
+ },
+ {
+  "label": "proxy r3: the CONNECT 200 carries a content-length",
+  "file": "acctsw/seatproxy.py",
+  "old": "b\"HTTP/1.1 200 Connection Established\\r\\n\\r\\n\"",
+  "new": "b\"HTTP/1.1 200 Connection Established\\r\\ncontent-length: 0\\r\\n\\r\\n\"",
+  "test": [
+   "tests/test_seatproxy.py::test_connect_200_has_no_content_length"
+  ]
+ },
+ {
+  "label": "proxy r3: a quiet tunnel is cut after the client idle timeout",
+  "file": "acctsw/seatproxy.py",
+  "old": "_pump(self.connection, far)    # no idle cut",
+  "new": "_pump(self.connection, far, CLIENT_IDLE_TIMEOUT)    # no idle cut",
+  "test": [
+   "tests/test_seatproxy.py::test_a_quiet_tunnel_is_not_cut"
+  ]
+ },
+ {
+  "label": "proxy r3: a tunnel send to a peer that stops reading blocks without bound",
+  "file": "acctsw/seatproxy.py",
+  "old": "    for sock in (a, b):\n        sock.settimeout(TUNNEL_SEND_TIMEOUT)\n",
+  "new": "",
+  "test": [
+   "tests/test_seatproxy.py::test_a_tunnel_peer_that_stops_reading_ends_the_tunnel"
+  ]
+ },
+ {
+  "label": "proxy r3: an IPv6 literal goes unbracketed into the upstream CONNECT",
+  "file": "acctsw/seatproxy.py",
+  "old": "target = f\"[{host}]:{port}\" if \":\" in host else f\"{host}:{port}\"",
+  "new": "target = f\"{host}:{port}\"",
+  "test": [
+   "tests/test_seatproxy.py::test_upstream_proxy_connect_brackets_ipv6_literals"
+  ]
+ },
+ {
+  "label": "proxy r3: the listener keeps the default backlog of 5",
+  "file": "acctsw/seatproxy.py",
+  "old": "    request_queue_size = 128",
+  "new": "    request_queue_size = 5",
+  "test": [
+   "tests/test_seatproxy.py::test_the_listener_queues_a_burst_of_connections"
+  ]
+ },
+ {
+  "label": "proxy r3: an unbuffered body read asks for the whole remaining body each time",
+  "file": "acctsw/seatproxy.py",
+  "old": "data = self.rfile.read(min(n, CHUNK))",
+  "new": "data = self.rfile.read(n)",
+  "test": [
+   "tests/test_gaps_proxy.py::test_an_unbuffered_body_read_never_asks_for_more_than_a_chunk"
+  ]
+ },
+ {
+  "label": "proxy r3: a TLS splice half-closes instead of ending both ways",
+  "file": "acctsw/seatproxy.py",
+  "old": "            if isinstance(a, ssl.SSLSocket) or isinstance(b, ssl.SSLSocket):\n                return\n",
+  "new": "",
+  "test": [
+   "tests/test_seatproxy.py::test_a_tls_splice_ends_both_ways_when_either_side_ends"
+  ]
+ },
+ {
+  "label": "proxy r3: two hang-ups mid-handshake already count as a reject",
+  "file": "acctsw/seatproxy.py",
+  "old": "if streak >= EOF_REJECT_COUNT:",
+  "new": "if streak >= EOF_REJECT_COUNT - 1:",
+  "test": [
+   "tests/test_seatproxy.py::test_hang_ups_mid_handshake_count_as_a_reject"
+  ]
+ },
+ {
+  "label": "proxy r3: a hang-up mid-handshake (Bun's reject) is never counted",
+  "file": "acctsw/seatproxy.py",
+  "old": "eof = isinstance(e, ssl.SSLEOFError) or reason == \"UNEXPECTED_EOF_WHILE_READING\"",
+  "new": "eof = False",
+  "test": [
+   "tests/test_seatproxy.py::test_hang_ups_mid_handshake_count_as_a_reject"
+  ]
+ },
+ {
+  "label": "proxy r3: plain HTTP / version mismatches count as hang-ups",
+  "file": "acctsw/seatproxy.py",
+  "old": "eof = isinstance(e, ssl.SSLEOFError) or reason == \"UNEXPECTED_EOF_WHILE_READING\"",
+  "new": "eof = True",
+  "test": [
+   "tests/test_seatproxy.py::test_repeated_plain_http_is_never_a_reject"
+  ]
+ },
+ {
+  "label": "proxy r3: hang-ups count even after a completed handshake (no reset, no trust)",
+  "file": "acctsw/seatproxy.py",
+  "old": "if eof and self._intercepts_ok == 0:",
+  "new": "if eof:",
+  "test": [
+   "tests/test_seatproxy.py::test_a_completed_handshake_breaks_the_hang_up_streak",
+   "tests/test_seatproxy.py::test_after_a_completed_handshake_hang_ups_never_count"
+  ]
+ },
+ {
+  "label": "proxy r3: hang-ups count however far apart",
+  "file": "acctsw/seatproxy.py",
+  "old": "[t for t in self._eofs if now - t <= EOF_REJECT_WINDOW]",
+  "new": "list(self._eofs)",
+  "test": [
+   "tests/test_seatproxy.py::test_hang_ups_spread_beyond_the_window_do_not_count"
+  ]
+ },
+ {
+  "label": "proxy r3: upstream_successes never counts an answer",
+  "file": "acctsw/seatproxy.py",
+  "old": "self._upstream_successes += 1 if ok else 0",
+  "new": "self._upstream_successes += 0",
+  "test": [
+   "tests/test_seatproxy.py::test_upstream_successes_count_every_answer_and_nothing_else",
+   "tests/test_seatproxy.py::test_websocket_upgrade_is_relayed_verbatim_and_spliced"
+  ]
+ },
+ {
+  "label": "proxy r3: upstream_successes counts failures too",
+  "file": "acctsw/seatproxy.py",
+  "old": "self._upstream_successes += 1 if ok else 0",
+  "new": "self._upstream_successes += 1",
+  "test": [
+   "tests/test_seatproxy.py::test_upstream_successes_count_every_answer_and_nothing_else"
+  ]
+ },
+ {
+  "label": "proxy r3: a reset mid-handshake is not counted like a hang-up",
+  "file": "acctsw/seatproxy.py",
+  "old": "                return proxy._handshake_failed(\"connection reset\", True)",
+  "new": "                return",
+  "test": [
+   "tests/test_seatproxy.py::test_resets_mid_handshake_count_like_hang_ups"
+  ]
+ },
+ {
+  "label": "proxy model: a model error on the home seat (the client's own login) posts a hit",
+  "file": "acctsw/seatproxy.py",
+  "old": "if kind is None and seat is not None and seat.token is not None \\",
+  "new": "if kind is None and seat is not None \\",
+  "test": [
+   "tests/test_seatproxy.py::test_a_model_error_on_the_home_seat_is_the_clients"
+  ]
+ },
+ {
+  "label": "proxy model: any 4xx/5xx status can be a model rejection",
+  "file": "acctsw/seatproxy.py",
+  "old": "and resp.status in MODEL_STATUSES:",
+  "new": "and resp.status >= 400:",
+  "test": [
+   "tests/test_seatproxy.py::test_other_errors_are_not_a_model_rejection"
+  ]
+ },
+ {
+  "label": "proxy model: only 404 counts (400/403 model errors missed)",
+  "file": "acctsw/seatproxy.py",
+  "old": "MODEL_STATUSES = frozenset({400, 403, 404})",
+  "new": "MODEL_STATUSES = frozenset({404})",
+  "test": [
+   "tests/test_seatproxy.py::test_model_rejection_on_a_seat_replays_on_the_answer"
+  ]
+ },
+ {
+  "label": "proxy model: any error type counts",
+  "file": "acctsw/seatproxy.py",
+  "old": "err.get(\"type\") in MODEL_ERRORS",
+  "new": "True",
+  "test": [
+   "tests/test_seatproxy.py::test_other_errors_are_not_a_model_rejection"
+  ]
+ },
+ {
+  "label": "proxy model: only not_found_error counts",
+  "file": "acctsw/seatproxy.py",
+  "old": "MODEL_ERRORS = frozenset({\"not_found_error\", \"permission_error\", \"invalid_request_error\"})",
+  "new": "MODEL_ERRORS = frozenset({\"not_found_error\"})",
+  "test": [
+   "tests/test_seatproxy.py::test_model_rejection_on_a_seat_replays_on_the_answer"
+  ]
+ },
+ {
+  "label": "proxy model: an error that never mentions the model counts",
+  "file": "acctsw/seatproxy.py",
+  "old": "            and \"model\" in str(err.get(\"message\") or \"\").lower())",
+  "new": "            )",
+  "test": [
+   "tests/test_seatproxy.py::test_other_errors_are_not_a_model_rejection"
+  ]
+ },
+ {
+  "label": "proxy model: the model match is case-sensitive",
+  "file": "acctsw/seatproxy.py",
+  "old": "\"model\" in str(err.get(\"message\") or \"\").lower()",
+  "new": "\"model\" in str(err.get(\"message\") or \"\")",
+  "test": [
+   "tests/test_seatproxy.py::test_model_rejection_matches_any_case_and_truncates_the_detail"
+  ]
+ },
+ {
+  "label": "proxy model: the body is not checked (any candidate status posts)",
+  "file": "acctsw/seatproxy.py",
+  "old": "if kind == \"model\" and not _model_rejection(_decoded(resp.headers, data)):",
+  "new": "if False:",
+  "test": [
+   "tests/test_seatproxy.py::test_other_errors_are_not_a_model_rejection"
+  ]
+ },
+ {
+  "label": "proxy model: model rejections are never detected",
+  "file": "acctsw/seatproxy.py",
+  "old": "kind = \"model\"    # a candidate",
+  "new": "kind = None    # a candidate",
+  "test": [
+   "tests/test_seatproxy.py::test_model_rejection_on_a_seat_replays_on_the_answer",
+   "tests/test_seatproxy.py::test_model_rejection_without_an_answer_passes_through_verbatim"
+  ]
+ },
+ {
+  "label": "proxy model: a gzipped error body is read compressed",
+  "file": "acctsw/seatproxy.py",
+  "old": "return zlib.decompressobj(47).decompress(data, 1 << 20)",
+  "new": "return data",
+  "test": [
+   "tests/test_seatproxy.py::test_a_gzipped_model_rejection_is_recognised_and_passed_on_compressed"
+  ]
+ },
+ {
+  "label": "proxy model: the hit detail is taken from the still-encoded body",
+  "file": "acctsw/seatproxy.py",
+  "old": "_error_detail(_decoded(headers, data)),",
+  "new": "_error_detail(data),",
+  "test": [
+   "tests/test_seatproxy.py::test_a_gzipped_model_rejection_is_recognised_and_passed_on_compressed"
+  ]
+ },
+ {
+  "label": "proxy model: an unanswered model rejection fails open onto the client's login like a 401",
+  "file": "acctsw/seatproxy.py",
+  "old": "if kind == \"auth\" and (\"client\",) not in done:",
+  "new": "if (\"client\",) not in done:",
+  "test": [
+   "tests/test_seatproxy.py::test_model_rejection_without_an_answer_passes_through_verbatim"
+  ]
+ },
+ {
+  "label": "proxy model: a rejection after response bytes have been sent is replayed",
+  "file": "acctsw/seatproxy.py",
+  "old": "if kind and not reply.started and len(tried) < MAX_TRIES:",
+  "new": "if kind and len(tried) < MAX_TRIES:",
+  "test": [
+   "tests/test_seatproxy.py::test_a_model_rejection_after_the_response_started_is_not_replayed"
+  ]
+ },
+ {
+  "label": "proxy model: the detail is not truncated",
+  "file": "acctsw/seatproxy.py",
+  "old": "return str(message)[:200] if message else None",
+  "new": "return str(message) if message else None",
+  "test": [
+   "tests/test_seatproxy.py::test_model_rejection_matches_any_case_and_truncates_the_detail"
+  ]
+ },
+ {
+  "label": "proxy model: model hits are reported as limits",
+  "file": "acctsw/seatproxy.py",
+  "old": "hit = Hit(kind, seat.email,",
+  "new": "hit = Hit(\"limit\" if kind == \"model\" else kind, seat.email,",
+  "test": [
+   "tests/test_seatproxy.py::test_a_model_rejection_is_not_a_limit"
+  ]
+ },
+ {
+  "label": "proxy model: a 429 mentioning a model is reported as a model rejection",
+  "file": "acctsw/seatproxy.py",
+  "old": "hit = Hit(kind, seat.email,",
+  "new": "hit = Hit(\"model\" if kind == \"limit\" else kind, seat.email,",
+  "test": [
+   "tests/test_seatproxy.py::test_a_429_with_a_model_message_is_still_a_limit"
+  ]
+ },
+ {
+  "label": "proxy model: replay ignores the returned seat and uses the client login",
+  "file": "acctsw/seatproxy.py",
+  "old": "                        seat = nxt\n",
+  "new": "                        seat = Seat(\"\", None)\n",
+  "test": [
+   "tests/test_seatproxy.py::test_model_rejection_on_a_seat_replays_on_the_answer"
+  ]
+ }
+]

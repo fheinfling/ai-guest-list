@@ -41,7 +41,8 @@ PORT = 8917
 SHOT_CSS = """
   html { zoom: 2; }                    /* headless dpr is 1; zoom gives true 2x pixels */
   html, body { margin: 0; padding: 0; }
-  html, body, #root, #root .app { height: auto !important; overflow: visible !important; }
+  html, body, #root, #root .app { height: auto !important; max-height: none !important;
+                                     overflow: visible !important; }
   #root .main-body, #root .set-body { flex: none !important; min-height: 0 !important;
                                       overflow: visible !important; }
   body { width: 424px; padding: 24px; box-sizing: border-box;

@@ -1,0 +1,1690 @@
+[
+ {
+  "label": "MIN_TTL margin dropped",
+  "file": "acctsw/seatswap.py",
+  "old": "MIN_TTL = timedelta(minutes=15)",
+  "new": "MIN_TTL = timedelta(minutes=0)",
+  "test": [
+   "tests/test_seatswap.py::test_eligible_needs_more_than_the_minimum_ttl"
+  ]
+ },
+ {
+  "label": "unknown expiry counted as live",
+  "file": "acctsw/seatswap.py",
+  "old": "expiry = _oauth(blob).get(\"expiresAt\")",
+  "new": "expiry = _oauth(blob).get(\"expiresAt\") or 1e15",
+  "test": [
+   "tests/test_seatswap.py::test_unknown_expiry_is_not_eligible"
+  ]
+ },
+ {
+  "label": "env gate skipped",
+  "file": "acctsw/seatswap.py",
+  "old": "    found = _env_gate(environ)\n",
+  "new": "    found = None\n",
+  "test": [
+   "tests/test_seatswap.py::test_env_routing_or_auth_turns_it_off"
+  ]
+ },
+ {
+  "label": "settings.json env gate skipped",
+  "file": "acctsw/seatswap.py",
+  "old": "found = (_env_gate(env) or _settings_tls_gate(env)) if isinstance(env, dict) else None",
+  "new": "found = _settings_tls_gate(env) if isinstance(env, dict) else None",
+  "test": [
+   "tests/test_seatswap.py::test_claude_settings_routing_turns_it_off"
+  ]
+ },
+ {
+  "label": "settings.json apiKeyHelper ignored",
+  "file": "acctsw/seatswap.py",
+  "old": "if _set(data.get(\"apiKeyHelper\")):",
+  "new": "if False:",
+  "test": [
+   "tests/test_seatswap.py::test_claude_settings_routing_turns_it_off"
+  ]
+ },
+ {
+  "label": "falsy ACCTSW_IN_PLACE_SWITCH ignored",
+  "file": "acctsw/seatswap.py",
+  "old": "    if switch.lower() in FALSY:\n",
+  "new": "    if switch == \"0\":\n",
+  "test": [
+   "tests/test_seatswap.py::test_a_falsy_env_switch_turns_it_off"
+  ]
+ },
+ {
+  "label": "tier check dropped",
+  "file": "acctsw/seatswap.py",
+  "old": "if tier and home_tier and tier != home_tier:",
+  "new": "if False:",
+  "test": [
+   "tests/test_seatswap.py::test_a_different_tier_than_home_is_not_eligible"
+  ]
+ },
+ {
+  "label": "quarantine marker ignored",
+  "file": "acctsw/seatswap.py",
+  "old": "    if (ctx.claude_home(email) / \".acctsw-quarantined\").exists():\n        return None, \"seat\"\n    blob = _load(ctx, email)",
+  "new": "    blob = ctx.claude_cred(email).get_live()",
+  "test": [
+   "tests/test_seatswap.py::test_quarantined_seat_is_not_eligible"
+  ]
+ },
+ {
+  "label": "crossing auto-picked by choose",
+  "file": "acctsw/selection.py",
+  "old": "and (allow_crossing or seatkind.approved(state, tool, origin, e, at, home=home))",
+  "new": "and True",
+  "test": [
+   "tests/test_seatkind.py::test_choose_never_auto_picks_an_unapproved_crossing"
+  ]
+ },
+ {
+  "label": "approval not directional",
+  "file": "acctsw/seatkind.py",
+  "old": "    return f\"{a}>{b}\"",
+  "new": "    return \">\".join(sorted((a, b)))",
+  "test": [
+   "tests/test_seatkind.py::test_approval_is_directional"
+  ]
+ },
+ {
+  "label": "once approval not consumed",
+  "file": "acctsw/seatkind.py",
+  "old": "    if record[\"scope\"] == \"once\":\n        del store[\"approvals\"][_key(a, b)]",
+  "new": "    if record[\"scope\"] == \"once\":\n        pass",
+  "test": [
+   "tests/test_seatkind.py::test_once_is_consumed_by_the_switch_that_uses_it"
+  ]
+ },
+ {
+  "label": "once approval never lapses",
+  "file": "acctsw/seatkind.py",
+  "old": "return granted is not None and at - granted < ONCE_TTL",
+  "new": "return granted is not None",
+  "test": [
+   "tests/test_seatkind.py::test_once_lapses_when_no_switch_uses_it"
+  ]
+ },
+ {
+  "label": "once downgrades always",
+  "file": "acctsw/seatkind.py",
+  "old": "    if not (scope == \"once\" and isinstance(current, dict) and current.get(\"scope\") == \"always\"):\n",
+  "new": "    if True:\n",
+  "test": [
+   "tests/test_seatkind.py::test_always_survives_use_until_denied"
+  ]
+ },
+ {
+  "label": "unknown kind treated as same-kind",
+  "file": "acctsw/seatkind.py",
+  "old": "return ka == \"unknown\" or kb == \"unknown\" or ka != kb",
+  "new": "return ka != kb",
+  "test": [
+   "tests/test_seatkind.py::test_crosses_on_kind_change_or_any_unknown",
+   "tests/test_seatkind.py::test_unknown_plans_are_crossings_for_choose"
+  ]
+ },
+ {
+  "label": "Team not business",
+  "file": "acctsw/seatkind.py",
+  "old": "BUSINESS = frozenset({\"team\", \"enterprise\", \"business\", \"edu\", \"education\"})",
+  "new": "BUSINESS = frozenset({\"enterprise\", \"business\", \"edu\", \"education\"})",
+  "test": [
+   "tests/test_seatkind.py::test_kind_comes_from_the_plan_label"
+  ]
+ },
+ {
+  "label": "manual switch does not answer the question",
+  "file": "acctsw/switch.py",
+  "old": "            else:\n                seatkind.chosen(state, tool, origin, email)\n",
+  "new": "            else:\n                pass\n",
+  "test": [
+   "tests/test_seatkind.py::test_a_manual_switch_moves_whom_it_does_not_cross_and_asks_the_rest"
+  ]
+ },
+ {
+  "label": "manual switch ignores terminal seats",
+  "file": "acctsw/switch.py",
+  "old": "        sessions = sorted(active_sessions(ctx.data_dir, tool), key=lambda s: s[\"pid\"])",
+  "new": "        sessions = []",
+  "test": [
+   "tests/test_seatkind.py::test_a_manual_switch_moves_whom_it_does_not_cross_and_asks_the_rest"
+  ]
+ },
+ {
+  "label": "in_place_switch setting ignored by the gate",
+  "file": "acctsw/seatswap.py",
+  "old": "if not ctx.load_state().settings().get(\"in_place_switch\", True):",
+  "new": "if False:",
+  "test": [
+   "tests/test_seatswap.py::test_the_setting_turns_it_off"
+  ]
+ },
+ {
+  "label": "in_place_switch not a UI toggle",
+  "file": "acctsw/bridge.py",
+  "old": "\"confirm_key_switch\", \"key_fallback\", \"in_place_switch\",",
+  "new": "\"confirm_key_switch\", \"key_fallback\",",
+  "test": [
+   "tests/test_seatkind.py::test_in_place_switch_is_a_default_on_toggle"
+  ]
+ },
+ {
+  "label": "in_place_switch default off",
+  "file": "acctsw/state.py",
+  "old": "\"in_place_switch\": True,",
+  "new": "\"in_place_switch\": False,",
+  "test": [
+   "tests/test_seatkind.py::test_in_place_switch_is_a_default_on_toggle",
+   "tests/test_seatswap.py::test_enabled_by_default"
+  ]
+ },
+ {
+  "label": "bridge approve action missing",
+  "file": "acctsw/bridge.py",
+  "old": "if action in (\"approve_crossing\", \"deny_crossing\"):",
+  "new": "if action in (\"deny_crossing\",):",
+  "test": [
+   "tests/test_seatkind.py::test_bridge_approve_crossing"
+  ]
+ },
+ {
+  "label": "bridge never shows pending crossings",
+  "file": "acctsw/bridge.py",
+  "old": "data[\"pending_crossings\"] = _pending_crossings(state, at)",
+  "new": "data[\"pending_crossings\"] = []",
+  "test": [
+   "tests/test_seatkind.py::test_bridge_approve_crossing"
+  ]
+ },
+ {
+  "label": "UI approve button sends deny",
+  "file": "app/web/bundle.js",
+  "old": "send(scope === \"deny\" ? \"deny_crossing\" : \"approve_crossing\", { tool, from, to, scope });",
+  "new": "send(\"deny_crossing\", { tool, from, to, scope });",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "UI switch-now button missing",
+  "file": "app/web/render.mjs",
+  "old": "<button class=\"choice\" data-action=\"crossing-answer\" data-scope=\"once\" ${data}>switch now</button>",
+  "new": "",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "UI needs-you item not rendered",
+  "file": "app/web/render.mjs",
+  "old": "${prompts}${crossingRequests(state)}${tierRequests(state)}${paid",
+  "new": "${prompts}${paid",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "UI toggle missing",
+  "file": "app/web/render.mjs",
+  "old": "      ${toggleRow(\"in_place_switch\", \"switch seats without restarting claude\", \"the conversation keeps running\", s.in_place_switch !== false)}\n",
+  "new": "",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "pick crosses without spending an approval",
+  "file": "acctsw/seatswap.py",
+  "old": "                if not seatkind.consume(state, TOOL, leaving, target.email, now(), home=self.home):\n                    return None\n",
+  "new": "",
+  "test": [
+   "tests/test_seatswap.py::test_pick_spends_a_once_approval_and_not_the_reverse"
+  ]
+ },
+ {
+  "label": "maintain reads the keychain every tick",
+  "file": "acctsw/seatswap.py",
+  "old": "self._next_read = t + MAINTAIN_EVERY_S",
+  "new": "self._next_read = t",
+  "test": [
+   "tests/test_seatswap.py::test_maintain_rebinds_a_newer_token_at_most_once_a_minute"
+  ]
+ },
+ {
+  "label": "handover while requests are in flight",
+  "file": "acctsw/seatswap.py",
+  "old": "if self.proxy.in_flight() == 0 and self.proxy.idle_for() >= HANDOVER_IDLE_S:",
+  "new": "if True:",
+  "test": [
+   "tests/test_seatswap.py::test_maintain_asks_for_a_handover_only_once_idle"
+  ]
+ },
+ {
+  "label": "late answer accepted after timeout",
+  "file": "acctsw/seatswap.py",
+  "old": "            if ask in self._asks:\n                self._asks.remove(ask)\n            if not ask.done or self._closed:\n                ask.done = True",
+  "new": "            if not ask.done or self._closed:\n                pass",
+  "test": [
+   "tests/test_seatswap.py::test_an_unanswered_hit_times_out_and_a_late_answer_is_refused"
+  ]
+ },
+ {
+  "label": "NO_PROXY not extended",
+  "file": "acctsw/seatswap.py",
+  "old": "parts += [h for h in (\"127.0.0.1\", \"localhost\") if h not in parts]",
+  "new": "parts += []",
+  "test": [
+   "tests/test_seatswap.py::test_start_binds_home_passthrough_and_env_points_at_the_proxy",
+   "tests/test_seatswap.py::test_env_takes_anthropic_out_of_no_proxy_and_keeps_the_rest"
+  ]
+ },
+ {
+  "label": "session home not recorded",
+  "file": "acctsw/session.py",
+  "old": "    if home is not None and home != email:\n        data[\"home\"] = home\n",
+  "new": "",
+  "test": [
+   "tests/test_seatkind.py::test_mark_session_records_a_home_that_differs"
+  ]
+ },
+ {
+  "label": "eligible lets a keychain error escape",
+  "file": "acctsw/seatswap.py",
+  "old": "    except _Unreadable:\n        return None",
+  "new": "    except ZeroDivisionError:\n        return None",
+  "test": [
+   "tests/test_seatswap.py::test_a_keychain_error_is_not_eligible"
+  ]
+ },
+ {
+  "label": "maintain moves the session on an unreadable keychain",
+  "file": "acctsw/seatswap.py",
+  "old": "            fresh = _eligible(ctx, seat.email, home_email=self.home)",
+  "new": "            fresh = eligible(ctx, seat.email, home_email=self.home)",
+  "test": [
+   "tests/test_seatswap.py::test_maintain_keeps_the_binding_when_the_keychain_is_unreadable"
+  ]
+ },
+ {
+  "label": "child --settings ignored",
+  "file": "acctsw/seatswap.py",
+  "old": "    for where, data in _cli_settings(args, cwd):",
+  "new": "    for where, data in []:",
+  "test": [
+   "tests/test_seatswap.py::test_child_settings_flag_gates"
+  ]
+ },
+ {
+  "label": "unreadable --settings treated as harmless",
+  "file": "acctsw/seatswap.py",
+  "old": "            return f\"{where} unreadable\"",
+  "new": "            continue",
+  "test": [
+   "tests/test_seatswap.py::test_an_unreadable_child_settings_flag_gates"
+  ]
+ },
+ {
+  "label": "managed-settings.d ignored",
+  "file": "acctsw/seatswap.py",
+  "old": "        files += sorted(MANAGED_SETTINGS_DIR.glob(\"*.json\"))",
+  "new": "        pass",
+  "test": [
+   "tests/test_seatswap.py::test_managed_settings_drop_ins_gate"
+  ]
+ },
+ {
+  "label": "home exemption dropped from crosses",
+  "file": "acctsw/seatkind.py",
+  "old": "    if not a or not b or a == b or (home and b == home):",
+  "new": "    if not a or not b or a == b:",
+  "test": [
+   "tests/test_seatkind.py::test_home_is_exempt_only_as_the_destination"
+  ]
+ },
+ {
+  "label": "home exemption applies when leaving home too",
+  "file": "acctsw/seatkind.py",
+  "old": "    if not a or not b or a == b or (home and b == home):",
+  "new": "    if not a or not b or a == b or (home and home in (a, b)):",
+  "test": [
+   "tests/test_seatkind.py::test_home_is_exempt_only_as_the_destination"
+  ]
+ },
+ {
+  "label": "choose ignores home",
+  "file": "acctsw/selection.py",
+  "old": "and (allow_crossing or seatkind.approved(state, tool, origin, e, at, home=home))",
+  "new": "and (allow_crossing or seatkind.approved(state, tool, origin, e, at))",
+  "test": [
+   "tests/test_seatkind.py::test_choose_and_candidate_let_a_session_go_home"
+  ]
+ },
+ {
+  "label": "request asks about a non-crossing",
+  "file": "acctsw/seatkind.py",
+  "old": "    if not crosses(state, tool, a, b, home=home):\n        return False\n    store = _store(state, tool)\n    sid",
+  "new": "    store = _store(state, tool)\n    sid",
+  "test": [
+   "tests/test_seatkind.py::test_home_is_exempt_only_as_the_destination"
+  ]
+ },
+ {
+  "label": "seatswap going home ignores home exemption",
+  "file": "acctsw/seatswap.py",
+  "old": "            home = choose(state, TOOL, at, exclude=seats - {self.home}, origin=leaving,\n                          home=self.home)",
+  "new": "            home = choose(state, TOOL, at, exclude=seats - {self.home}, origin=leaving)",
+  "test": [
+   "tests/test_seatswap.py::test_maintain_goes_home_without_approval_even_across_kinds"
+  ]
+ },
+ {
+  "label": "wake written after stop",
+  "file": "acctsw/seatswap.py",
+  "old": "            if self._closed:\n                return None\n            self._asks.append(ask)",
+  "new": "            self._asks.append(ask)",
+  "test": [
+   "tests/test_seatswap.py::test_a_hit_after_stop_never_writes_to_a_reused_descriptor"
+  ]
+ },
+ {
+  "label": "bridge auto-switch does not spend once",
+  "file": "acctsw/bridge.py",
+  "old": "            if not seatkind.consume(state, tool, active, candidate, now()):\n                continue",
+  "new": "            if False:\n                continue",
+  "test": [
+   "tests/test_seatkind.py::test_bridge_auto_switch_spends_a_once_approval"
+  ]
+ },
+ {
+  "label": "manual switch leaves a once approval",
+  "file": "acctsw/switch.py",
+  "old": "            else:\n                seatkind.chosen(state, tool, origin, email)\n",
+  "new": "            else:\n                seatkind.approve(state, tool, origin, email, \"once\", via=\"manual\")\n",
+  "test": [
+   "tests/test_seatkind.py::test_a_manual_switch_moves_whom_it_does_not_cross_and_asks_the_rest"
+  ]
+ },
+ {
+  "label": "manual switch drops an always approval",
+  "file": "acctsw/seatkind.py",
+  "old": "    if isinstance(record, dict) and record.get(\"scope\") != \"always\":",
+  "new": "    if isinstance(record, dict):",
+  "test": [
+   "tests/test_seatkind.py::test_a_manual_move_home_keeps_an_always_approval"
+  ]
+ },
+ {
+  "label": "proxy_used always true",
+  "file": "acctsw/seatswap.py",
+  "old": "        return self.proxy.messages_seen() > 0",
+  "new": "        return True",
+  "test": [
+   "tests/test_seatswap.py::test_proxy_used_delegates"
+  ]
+ },
+ {
+  "label": "preflight never reports",
+  "file": "acctsw/seatswap.py",
+  "old": "        reason = self.proxy.preflight()\n",
+  "new": "        reason = None\n",
+  "test": [
+   "tests/test_seatswap.py::test_preflight_verdict_is_cached_per_upstream_for_ten_minutes"
+  ]
+ },
+ {
+  "label": "N8 manual click answers a crossing session instead of asking",
+  "file": "acctsw/switch.py",
+  "old": "            if seatkind.crosses(state, tool, origin, email, home=home):\n                asks.append",
+  "new": "            if False:\n                asks.append",
+  "test": [
+   "tests/test_seatkind.py::test_a_manual_switch_moves_whom_it_does_not_cross_and_asks_the_rest"
+  ]
+ },
+ {
+  "label": "N8 crossing session not asked",
+  "file": "acctsw/switch.py",
+  "old": "            for origin, sid, home in asks:\n                seatkind.request(state, tool, origin, email, sid, home=home, reason=\"switch\")\n",
+  "new": "            pass\n",
+  "test": [
+   "tests/test_seatkind.py::test_a_manual_switch_moves_whom_it_does_not_cross_and_asks_the_rest"
+  ]
+ },
+ {
+  "label": "N8 session home ignored",
+  "file": "acctsw/switch.py",
+  "old": "origin, home = record[\"email\"], record.get(\"home\") or record[\"email\"]",
+  "new": "origin, home = record[\"email\"], record[\"email\"]",
+  "test": [
+   "tests/test_seatkind.py::test_a_manual_switch_moves_whom_it_does_not_cross_and_asks_the_rest"
+  ]
+ },
+ {
+  "label": "N9 third seat with auto_switch off",
+  "file": "acctsw/seatswap.py",
+  "old": "        if not (third_seat and settings.get(\"auto_switch\", True)\n",
+  "new": "        if not (third_seat\n",
+  "test": [
+   "tests/test_seatswap.py::test_maintain_never_moves_to_a_third_seat_with_a_setting_off"
+  ]
+ },
+ {
+  "label": "N9 third seat with in_place_switch off",
+  "file": "acctsw/seatswap.py",
+  "old": "                and settings.get(\"in_place_switch\", True)):\n            return None",
+  "new": "                and True):\n            return None",
+  "test": [
+   "tests/test_seatswap.py::test_maintain_never_moves_to_a_third_seat_with_a_setting_off"
+  ]
+ },
+ {
+  "label": "N9 hop budget ignored",
+  "file": "acctsw/seatswap.py",
+  "old": "        target = self.pick(ctx, seat.email, third_seat=third_seat)",
+  "new": "        target = self.pick(ctx, seat.email)",
+  "test": [
+   "tests/test_seatswap.py::test_maintain_never_moves_to_a_third_seat_past_the_hop_budget"
+  ]
+ },
+ {
+  "label": "N9 third-seat move not counted",
+  "file": "acctsw/seatswap.py",
+  "old": "                self.third_seat_moves += 1",
+  "new": "                pass",
+  "test": [
+   "tests/test_seatswap.py::test_a_third_seat_move_is_counted"
+  ]
+ },
+ {
+  "label": "N9 going home gated by the settings",
+  "file": "acctsw/seatswap.py",
+  "old": "                return _seat(self.home, None)   # the session's own login: never a crossing\n            skip.add(self.home)\n        settings = state.settings()\n        if not (third_seat",
+  "new": "                if third_seat and state.settings().get(\"auto_switch\", True) and state.settings().get(\"in_place_switch\", True):\n                    return _seat(self.home, None)\n            skip.add(self.home)\n        settings = state.settings()\n        if not (third_seat",
+  "test": [
+   "tests/test_seatswap.py::test_going_home_and_rebinding_ignore_the_settings_and_budget"
+  ]
+ },
+ {
+  "label": "N11 preflight cache ignored",
+  "file": "acctsw/seatswap.py",
+  "old": "        if at is not None and timedelta(0) <= now() - at < PREFLIGHT_TTL:",
+  "new": "        if False:",
+  "test": [
+   "tests/test_seatswap.py::test_preflight_verdict_is_cached_per_upstream_for_ten_minutes"
+  ]
+ },
+ {
+  "label": "N11 preflight cache never expires",
+  "file": "acctsw/seatswap.py",
+  "old": "        if at is not None and timedelta(0) <= now() - at < PREFLIGHT_TTL:",
+  "new": "        if at is not None:",
+  "test": [
+   "tests/test_seatswap.py::test_preflight_verdict_is_cached_per_upstream_for_ten_minutes"
+  ]
+ },
+ {
+  "label": "N11 preflight failure not cached",
+  "file": "acctsw/seatswap.py",
+  "old": "            return None if entry.get(\"ok\") is True else str(entry.get(\"reason\") or \"preflight failed\")",
+  "new": "            return None if entry.get(\"ok\") is True else self.proxy.preflight()",
+  "test": [
+   "tests/test_seatswap.py::test_preflight_verdict_is_cached_per_upstream_for_ten_minutes"
+  ]
+ },
+ {
+  "label": "N11 cache shared across upstreams",
+  "file": "acctsw/seatswap.py",
+  "old": "entry = cache.get(key)",
+  "new": "entry = next(iter(cache.values()), None)",
+  "test": [
+   "tests/test_seatswap.py::test_preflight_verdict_is_cached_per_upstream_for_ten_minutes"
+  ]
+ },
+ {
+  "label": "v2 env sets ANTHROPIC_BASE_URL",
+  "file": "acctsw/seatswap.py",
+  "old": "        out[\"HTTPS_PROXY\"] = out[\"https_proxy\"] = self.proxy_url\n",
+  "new": "        out[\"HTTPS_PROXY\"] = out[\"https_proxy\"] = out[\"ANTHROPIC_BASE_URL\"] = self.proxy_url\n",
+  "test": [
+   "tests/test_seatswap.py::test_env_routes_https_through_the_proxy_and_trusts_the_session_ca"
+  ]
+ },
+ {
+  "label": "v2 env leaves lowercase https_proxy to the user",
+  "file": "acctsw/seatswap.py",
+  "old": "        out[\"HTTPS_PROXY\"] = out[\"https_proxy\"] = self.proxy_url\n",
+  "new": "        out[\"HTTPS_PROXY\"] = self.proxy_url\n",
+  "test": [
+   "tests/test_seatswap.py::test_env_routes_https_through_the_proxy_and_trusts_the_session_ca"
+  ]
+ },
+ {
+  "label": "v2 env without the CA bundle",
+  "file": "acctsw/seatswap.py",
+  "old": "            out.update(self.ca.bundle_paths(base))",
+  "new": "            pass",
+  "test": [
+   "tests/test_seatswap.py::test_env_routes_https_through_the_proxy_and_trusts_the_session_ca"
+  ]
+ },
+ {
+  "label": "v2 NO_PROXY keeps anthropic entries",
+  "file": "acctsw/seatswap.py",
+  "old": "if p and p not in parts and not _routes_api(p):",
+  "new": "if p and p not in parts:",
+  "test": [
+   "tests/test_seatswap.py::test_env_takes_anthropic_out_of_no_proxy_and_keeps_the_rest"
+  ]
+ },
+ {
+  "label": "v2 NO_PROXY matcher misses the port form",
+  "file": "acctsw/seatswap.py",
+  "old": "    host = host.split(\":\", 1)[0].lstrip(\"*\").lstrip(\".\")",
+  "new": "    host = host.lstrip(\"*\").lstrip(\".\")",
+  "test": [
+   "tests/test_seatswap.py::test_env_takes_anthropic_out_of_no_proxy_and_keeps_the_rest"
+  ]
+ },
+ {
+  "label": "v2 NO_PROXY matcher drops look-alike hosts",
+  "file": "acctsw/seatswap.py",
+  "old": "API_HOST == host or API_HOST.endswith(\".\" + host)",
+  "new": "API_HOST == host or API_HOST.endswith(host)",
+  "test": [
+   "tests/test_seatswap.py::test_env_takes_anthropic_out_of_no_proxy_and_keeps_the_rest"
+  ]
+ },
+ {
+  "label": "v2 user's proxy not chained",
+  "file": "acctsw/seatswap.py",
+  "old": "        self.upstream_proxy = _upstream_proxy(self._environ)",
+  "new": "        self.upstream_proxy = None",
+  "test": [
+   "tests/test_seatswap.py::test_the_users_own_proxy_becomes_the_upstream_proxy"
+  ]
+ },
+ {
+  "label": "v2 ALL_PROXY not considered",
+  "file": "acctsw/seatswap.py",
+  "old": "    for name in (\"HTTPS_PROXY\", \"https_proxy\", \"ALL_PROXY\", \"all_proxy\"):",
+  "new": "    for name in (\"HTTPS_PROXY\", \"https_proxy\"):",
+  "test": [
+   "tests/test_seatswap.py::test_the_users_own_proxy_becomes_the_upstream_proxy"
+  ]
+ },
+ {
+  "label": "v2 CA not handed to the proxy",
+  "file": "acctsw/seatswap.py",
+  "old": "                transport = {\"ca\": self.ca, \"upstream_proxy\"",
+  "new": "                transport = {\"ca\": None, \"upstream_proxy\"",
+  "test": [
+   "tests/test_seatswap.py::test_the_users_own_proxy_becomes_the_upstream_proxy"
+  ]
+ },
+ {
+  "label": "v2 tls reject not flagged",
+  "file": "acctsw/seatswap.py",
+  "old": "            self._tls_rejected = True\n",
+  "new": "",
+  "test": [
+   "tests/test_seatswap.py::test_a_client_rejecting_the_ca_flags_and_wakes_once"
+  ]
+ },
+ {
+  "label": "v2 tls reject does not wake",
+  "file": "acctsw/seatswap.py",
+  "old": "            self._log(\"seatswap: client rejected the session CA\", reason=str(reason)[:200])\n            try:\n                os.write(self._wake_w, b\"!\")",
+  "new": "            self._log(\"seatswap: client rejected the session CA\", reason=str(reason)[:200])\n            try:\n                pass",
+  "test": [
+   "tests/test_seatswap.py::test_a_client_rejecting_the_ca_flags_and_wakes_once"
+  ]
+ },
+ {
+  "label": "v2 stop leaves the CA dir",
+  "file": "acctsw/seatswap.py",
+  "old": "                if self.ca is not None:\n                    self.ca.close()\n            finally:\n                self._close_fds()",
+  "new": "                pass\n            finally:\n                self._close_fds()",
+  "test": [
+   "tests/test_seatswap.py::test_stop_closes_the_session_ca_once"
+  ]
+ },
+ {
+  "label": "v2 failed start leaks the CA",
+  "file": "acctsw/seatswap.py",
+  "old": "            if self.ca is not None and ca is None:\n                self.ca.close()\n",
+  "new": "",
+  "test": [
+   "tests/test_seatswap.py::test_a_proxy_that_cannot_start_closes_the_ca_it_was_given_by_the_factory"
+  ]
+ },
+ {
+  "label": "v2 openssl missing not gated",
+  "file": "acctsw/seatswap.py",
+  "old": "    if not os.access(OPENSSL, os.X_OK):",
+  "new": "    if False:",
+  "test": [
+   "tests/test_seatswap.py::test_missing_openssl_turns_it_off"
+  ]
+ },
+ {
+  "label": "v2 first-party base URL still gates",
+  "file": "acctsw/seatswap.py",
+  "old": "        if _set(env.get(name)) and not (name == \"ANTHROPIC_BASE_URL\" and _first_party(env[name])):",
+  "new": "        if _set(env.get(name)):",
+  "test": [
+   "tests/test_seatswap.py::test_a_first_party_base_url_does_not_gate"
+  ]
+ },
+ {
+  "label": "v2 any api.anthropic.com URL counts as first-party",
+  "file": "acctsw/seatswap.py",
+  "old": "        return parts.scheme == \"https\" and parts.hostname == API_HOST and parts.port in (None, 443)",
+  "new": "        return parts.hostname == API_HOST",
+  "test": [
+   "tests/test_seatswap.py::test_a_first_party_base_url_does_not_gate"
+  ]
+ },
+ {
+  "label": "v2 a look-alike host counts as first-party",
+  "file": "acctsw/seatswap.py",
+  "old": "parts.hostname == API_HOST and parts.port",
+  "new": "(parts.hostname or \"\").startswith(API_HOST) and parts.port",
+  "test": [
+   "tests/test_seatswap.py::test_a_first_party_base_url_does_not_gate"
+  ]
+ },
+ {
+  "label": "v2 preflight skips the local CA self-test",
+  "file": "acctsw/seatswap.py",
+  "old": "        local = self._ca_selftest()\n        if local:\n            return local\n",
+  "new": "",
+  "test": [
+   "tests/test_seatswap.py::test_preflight_self_test_fails_when_the_ca_is_not_the_servers"
+  ]
+ },
+ {
+  "label": "v2 self-test client trusts the system roots",
+  "file": "acctsw/seatswap.py",
+  "old": "            client_ctx = ssl.create_default_context(cadata=self.ca.ca_pem())   # nothing else",
+  "new": "            client_ctx = ssl.create_default_context()",
+  "test": [
+   "tests/test_seatswap.py::test_preflight_self_test_passes_with_the_session_ca"
+  ]
+ },
+ {
+  "label": "v2 self-test checks no hostname",
+  "file": "acctsw/seatswap.py",
+  "old": "client_ctx.wrap_socket(client_sock, server_hostname=API_HOST).close()",
+  "new": "client_ctx.wrap_socket(client_sock, server_hostname=\"other.example\").close()",
+  "test": [
+   "tests/test_seatswap.py::test_preflight_self_test_passes_with_the_session_ca"
+  ]
+ },
+ {
+  "label": "nested session not gated",
+  "file": "acctsw/seatswap.py",
+  "old": "    if _nested(environ):\n",
+  "new": "    if False:\n",
+  "test": [
+   "tests/test_seatswap.py::test_a_launcher_nested_in_a_proxied_session_stays_off"
+  ]
+ },
+ {
+  "label": "nested check misses lowercase https_proxy",
+  "file": "acctsw/seatswap.py",
+  "old": "    for name in (\"HTTPS_PROXY\", \"https_proxy\"):\n        try:",
+  "new": "    for name in (\"HTTPS_PROXY\",):\n        try:",
+  "test": [
+   "tests/test_seatswap.py::test_a_launcher_nested_in_a_proxied_session_stays_off"
+  ]
+ },
+ {
+  "label": "nested check ignores the user name",
+  "file": "acctsw/seatswap.py",
+  "old": "            if parts.username == PROXY_USER and parts.hostname == \"127.0.0.1\":",
+  "new": "            if parts.hostname == \"127.0.0.1\":",
+  "test": [
+   "tests/test_seatswap.py::test_other_proxies_are_not_mistaken_for_ours"
+  ]
+ },
+ {
+  "label": "nested check ignores the host",
+  "file": "acctsw/seatswap.py",
+  "old": "            if parts.username == PROXY_USER and parts.hostname == \"127.0.0.1\":",
+  "new": "            if parts.username == PROXY_USER:",
+  "test": [
+   "tests/test_seatswap.py::test_other_proxies_are_not_mistaken_for_ours"
+  ]
+ },
+ {
+  "label": "verdict never consulted",
+  "file": "acctsw/seatswap.py",
+  "old": "    if _rejected_before(ctx, environ):\n",
+  "new": "    if False:\n",
+  "test": [
+   "tests/test_gaps_glue.py::test_a_tls_reject_is_remembered_for_that_claude_for_a_week"
+  ]
+ },
+ {
+  "label": "verdict never written",
+  "file": "acctsw/seatswap.py",
+  "old": "    entries[key] = iso(now())\n",
+  "new": "    pass\n",
+  "test": [
+   "tests/test_gaps_glue.py::test_a_tls_reject_is_remembered_for_that_claude_for_a_week"
+  ]
+ },
+ {
+  "label": "verdict ignores version",
+  "file": "acctsw/seatswap.py",
+  "old": "    return f\"{real}\\n{out}\" if out else real",
+  "new": "    return real",
+  "test": [
+   "tests/test_gaps_glue.py::test_a_tls_reject_is_remembered_for_that_claude_for_a_week"
+  ]
+ },
+ {
+  "label": "verdict never expires",
+  "file": "acctsw/seatswap.py",
+  "old": "    return at is not None and timedelta(0) <= now() - at < VERDICT_TTL\n\n\ndef _remember",
+  "new": "    return at is not None and timedelta(0) <= now() - at\n\n\ndef _remember",
+  "test": [
+   "tests/test_gaps_glue.py::test_a_tls_reject_is_remembered_for_that_claude_for_a_week"
+  ]
+ },
+ {
+  "label": "verdict ttl too short",
+  "file": "acctsw/seatswap.py",
+  "old": "VERDICT_TTL = timedelta(days=7)",
+  "new": "VERDICT_TTL = timedelta(days=1)",
+  "test": [
+   "tests/test_gaps_glue.py::test_a_tls_reject_is_remembered_for_that_claude_for_a_week"
+  ]
+ },
+ {
+  "label": "version timeout ignored",
+  "file": "acctsw/seatswap.py",
+  "old": "except (OSError, subprocess.SubprocessError, ValueError):",
+  "new": "except (OSError, ValueError):",
+  "test": [
+   "tests/test_gaps_glue.py::test_a_version_timeout_falls_back_to_the_path_alone"
+  ]
+ },
+ {
+  "label": "settings tls env ignored",
+  "file": "acctsw/seatswap.py",
+  "old": "(_env_gate(env) or _settings_tls_gate(env))",
+  "new": "_env_gate(env)",
+  "test": [
+   "tests/test_gaps_glue.py::test_settings_env_that_overrides_our_proxy_or_ca_turns_it_off",
+   "tests/test_gaps_glue.py::test_managed_settings_env_override_turns_it_off"
+  ]
+ },
+ {
+  "label": "settings no_proxy ignored",
+  "file": "acctsw/seatswap.py",
+  "old": "        if any(e == \"*\" or _routes_api(e) for e in entries):",
+  "new": "        if False:",
+  "test": [
+   "tests/test_gaps_glue.py::test_settings_env_that_overrides_our_proxy_or_ca_turns_it_off"
+  ]
+ },
+ {
+  "label": "settings no_proxy star ignored",
+  "file": "acctsw/seatswap.py",
+  "old": "e == \"*\" or _routes_api(e)",
+  "new": "_routes_api(e)",
+  "test": [
+   "tests/test_gaps_glue.py::test_settings_env_that_overrides_our_proxy_or_ca_turns_it_off"
+  ]
+ },
+ {
+  "label": "settings NODE_TLS dropped",
+  "file": "acctsw/seatswap.py",
+  "old": "\"NODE_TLS_REJECT_UNAUTHORIZED\")\nVERDICT",
+  "new": "\"X_UNUSED\")\nVERDICT",
+  "test": [
+   "tests/test_gaps_glue.py::test_settings_env_that_overrides_our_proxy_or_ca_turns_it_off"
+  ]
+ },
+ {
+  "label": "process env proxy/ca gates",
+  "file": "acctsw/seatswap.py",
+  "old": "    found = _env_gate(environ)\n    if found:",
+  "new": "    found = _env_gate(environ) or _settings_tls_gate(environ)\n    if found:",
+  "test": [
+   "tests/test_gaps_glue.py::test_process_env_proxy_and_ca_and_unrelated_settings_do_not_gate"
+  ]
+ },
+ {
+  "label": "preflight key upstream only",
+  "file": "acctsw/seatswap.py",
+  "old": "        return json.dumps([self.upstream, self.upstream_proxy,",
+  "new": "        return json.dumps([self.upstream, None,",
+  "test": [
+   "tests/test_gaps_glue.py::test_the_preflight_cache_key_covers_proxy_no_proxy_and_ca_files"
+  ]
+ },
+ {
+  "label": "intercepts_ok undelegated",
+  "file": "acctsw/seatswap.py",
+  "old": "        return self.proxy.intercepts_ok()",
+  "new": "        return 0",
+  "test": [
+   "tests/test_gaps_glue.py::test_intercepts_ok_delegates"
+  ]
+ },
+ {
+  "label": "upstream_failing ignores threshold",
+  "file": "acctsw/seatswap.py",
+  "old": "failing = self.proxy.upstream_failures() >= n and not self._upstream_worked",
+  "new": "failing = self.proxy.upstream_failures() >= 1 and not self._upstream_worked",
+  "test": [
+   "tests/test_gaps_glue.py::test_upstream_failing_needs_a_streak_and_no_prior_success"
+  ]
+ },
+ {
+  "label": "upstream_failing ignores success latch",
+  "file": "acctsw/seatswap.py",
+  "old": "failing = self.proxy.upstream_failures() >= n and not self._upstream_worked",
+  "new": "failing = self.proxy.upstream_failures() >= n",
+  "test": [
+   "tests/test_gaps_glue.py::test_upstream_failing_needs_a_streak_and_no_prior_success"
+  ]
+ },
+ {
+  "label": "maintain skips latch",
+  "file": "acctsw/seatswap.py",
+  "old": "        self.upstream_failing()   # keeps",
+  "new": "        # keeps",
+  "test": [
+   "tests/test_gaps_glue.py::test_maintain_latches_that_the_upstream_worked"
+  ]
+ },
+ {
+  "label": "no_proxy not merged",
+  "file": "acctsw/seatswap.py",
+  "old": "    for name in (\"NO_PROXY\", \"no_proxy\"):\n            for p in",
+  "new": "    for name in (\"NO_PROXY\",):\n            for p in",
+  "test": [
+   "tests/test_gaps_glue.py::test_no_proxy_is_merged_deduplicated_and_written_to_both"
+  ]
+ },
+ {
+  "label": "no_proxy not deduped",
+  "file": "acctsw/seatswap.py",
+  "old": "if p and p not in parts and not _routes_api(p):",
+  "new": "if p and not _routes_api(p):",
+  "test": [
+   "tests/test_gaps_glue.py::test_no_proxy_is_merged_deduplicated_and_written_to_both"
+  ]
+ },
+ {
+  "label": "latch on messages_seen",
+  "file": "acctsw/seatswap.py",
+  "old": "if self.proxy.upstream_successes() > 0:",
+  "new": "if self.proxy.messages_seen() > 0:",
+  "test": [
+   "tests/test_gaps_glue.py::test_messages_seen_alone_is_not_an_upstream_success"
+  ]
+ },
+ {
+  "label": "latch never set",
+  "file": "acctsw/seatswap.py",
+  "old": "            self._upstream_worked = True\n",
+  "new": "            pass\n",
+  "test": [
+   "tests/test_gaps_glue.py::test_upstream_failing_needs_a_streak_and_no_prior_success"
+  ]
+ },
+ {
+  "label": "preflight not marked failed",
+  "file": "acctsw/seatswap.py",
+  "old": "            self._cache_preflight(\"upstream failing: no request succeeded\")",
+  "new": "            pass",
+  "test": [
+   "tests/test_gaps_glue.py::test_upstream_failing_marks_the_preflight_cache_failed_once"
+  ]
+ },
+ {
+  "label": "preflight marked repeatedly",
+  "file": "acctsw/seatswap.py",
+  "old": "            self._preflight_marked = True\n",
+  "new": "",
+  "test": [
+   "tests/test_gaps_glue.py::test_upstream_failing_marks_the_preflight_cache_failed_once"
+  ]
+ },
+ {
+  "label": "late reject remembered",
+  "file": "acctsw/seatswap.py",
+  "old": "        if self.proxy.intercepts_ok() == 0:\n            _remember",
+  "new": "        if True:\n            _remember",
+  "test": [
+   "tests/test_gaps_glue.py::test_a_reject_after_a_good_handshake_is_another_tool_and_not_remembered"
+  ]
+ },
+ {
+  "label": "claude_bin ignored",
+  "file": "acctsw/seatswap.py",
+  "old": "    found = getattr(ctx, \"claude_bin\", None) or shutil.which(",
+  "new": "    found = shutil.which(",
+  "test": [
+   "tests/test_gaps_glue.py::test_the_verdict_is_keyed_on_the_launchers_claude_not_path"
+  ]
+ },
+ {
+  "label": "version spawned without live verdict",
+  "file": "acctsw/seatswap.py",
+  "old": "    if not any(_live(v) for v in entries.values()):",
+  "new": "    if not entries:",
+  "test": [
+   "tests/test_gaps_glue.py::test_gate_does_not_run_claude_without_a_live_verdict"
+  ]
+ },
+ {
+  "label": "process NO_PROXY star ignored",
+  "file": "acctsw/seatswap.py",
+  "old": "        if \"*\" in [e.strip() for e in str(environ.get(name) or \"\").split(\",\")]:",
+  "new": "        if False:",
+  "test": [
+   "tests/test_gaps_glue.py::test_a_process_no_proxy_star_gates_off"
+  ]
+ },
+ {
+  "label": "kind: exact plan names only (no word split)",
+  "file": "acctsw/seatkind.py",
+  "old": "    words = set(re.split(r\"[^a-z0-9]+\", plan.strip().lower()))",
+  "new": "    words = {plan.strip().lower()}",
+  "test": [
+   "tests/test_seatkind.py::test_kind_reads_the_words_in_free_form_plan_names"
+  ]
+ },
+ {
+  "label": "kind: personal word wins over business word",
+  "file": "acctsw/seatkind.py",
+  "old": "    if words & BUSINESS:\n        return \"business\"\n    if words & PERSONAL:\n        return \"personal\"",
+  "new": "    if words & PERSONAL:\n        return \"personal\"\n    if words & BUSINESS:\n        return \"business\"",
+  "test": [
+   "tests/test_seatkind.py::test_kind_reads_the_words_in_free_form_plan_names"
+  ]
+ },
+ {
+  "label": "tier: equal/unknown tiers need an answer",
+  "file": "acctsw/seattier.py",
+  "old": "if not a_tier or not b_tier or a_tier == b_tier:\n        return True",
+  "new": "if not a_tier or not b_tier:\n        return True",
+  "test": [
+   "tests/test_seattier.py::test_allowed_when_equal_or_unknown_or_setting_or_pair_approval"
+  ]
+ },
+ {
+  "label": "tier: unknown tier needs an answer",
+  "file": "acctsw/seattier.py",
+  "old": "if not a_tier or not b_tier or a_tier == b_tier:\n        return True",
+  "new": "if a_tier == b_tier:\n        return True",
+  "test": [
+   "tests/test_seattier.py::test_allowed_when_equal_or_unknown_or_setting_or_pair_approval"
+  ]
+ },
+ {
+  "label": "tier: setting ignored",
+  "file": "acctsw/seattier.py",
+  "old": "if state.settings().get(SETTING) is True:\n        return True",
+  "new": "if False:\n        return True",
+  "test": [
+   "tests/test_seattier.py::test_allowed_when_equal_or_unknown_or_setting_or_pair_approval"
+  ]
+ },
+ {
+  "label": "tier: truthy setting accepted",
+  "file": "acctsw/seattier.py",
+  "old": ".get(SETTING) is True:",
+  "new": ".get(SETTING):",
+  "test": [
+   "tests/test_seattier.py::test_the_setting_must_be_exactly_true"
+  ]
+ },
+ {
+  "label": "tier: pair key is directional",
+  "file": "acctsw/seattier.py",
+  "old": "return \"|\".join(sorted((a, b)))",
+  "new": "return \"|\".join((a, b))",
+  "test": [
+   "tests/test_seattier.py::test_allowed_when_equal_or_unknown_or_setting_or_pair_approval"
+  ]
+ },
+ {
+  "label": "tier: any approval allows any pair",
+  "file": "acctsw/seattier.py",
+  "old": "return isinstance(_peek(state, tool, \"tier_approvals\").get(pair(a_tier, b_tier)), dict)",
+  "new": "return bool(_peek(state, tool, \"tier_approvals\"))",
+  "test": [
+   "tests/test_seattier.py::test_allowed_when_equal_or_unknown_or_setting_or_pair_approval",
+   "tests/test_seattier.py::test_a_pair_approval_allows_only_that_pair"
+  ]
+ },
+ {
+  "label": "tier: asked again after an answer",
+  "file": "acctsw/seattier.py",
+  "old": "    if key in store:\n        return False\n",
+  "new": "",
+  "test": [
+   "tests/test_seattier.py::test_request_is_asked_once_per_pair_and_never_after_no"
+  ]
+ },
+ {
+  "label": "tier: asked although allowed",
+  "file": "acctsw/seattier.py",
+  "old": "if allowed(state, tool, a_tier, b_tier) or not a_tier or not b_tier:",
+  "new": "if not a_tier or not b_tier:",
+  "test": [
+   "tests/test_seattier.py::test_nothing_to_ask_when_allowed_or_unknown"
+  ]
+ },
+ {
+  "label": "tier: deny keeps the approval",
+  "file": "acctsw/seattier.py",
+  "old": "    _store(state, tool, \"tier_approvals\").pop(key, None)\n",
+  "new": "",
+  "test": [
+   "tests/test_seattier.py::test_approving_closes_the_question_and_deny_revokes"
+  ]
+ },
+ {
+  "label": "tier: deny not remembered",
+  "file": "acctsw/seattier.py",
+  "old": "\"status\": \"denied\"}",
+  "new": "\"status\": \"open\"}",
+  "test": [
+   "tests/test_seattier.py::test_request_is_asked_once_per_pair_and_never_after_no"
+  ]
+ },
+ {
+  "label": "tier: approve-all does not set the setting",
+  "file": "acctsw/seattier.py",
+  "old": "    state.set_setting(SETTING, True)\n",
+  "new": "",
+  "test": [
+   "tests/test_seattier.py::test_approve_all_sets_the_setting_and_clears_questions"
+  ]
+ },
+ {
+  "label": "tier: pending lists allowed pairs",
+  "file": "acctsw/seattier.py",
+  "old": "and not allowed(state, tool, a, b)):",
+  "new": "):",
+  "test": [
+   "tests/test_seattier.py::test_pending_ignores_a_request_that_became_allowed"
+  ]
+ },
+ {
+  "label": "tier: pending lists denied pairs",
+  "file": "acctsw/seattier.py",
+  "old": "rec.get(\"status\") == \"open\" and",
+  "new": "rec.get(\"status\") and",
+  "test": [
+   "tests/test_seattier.py::test_request_is_asked_once_per_pair_and_never_after_no"
+  ]
+ },
+ {
+  "label": "eligible: tier mismatch ignored",
+  "file": "acctsw/seatswap.py",
+  "old": "if not ok:\n                return None, \"tier\"",
+  "new": "if False:\n                return None, \"tier\"",
+  "test": [
+   "tests/test_seattier.py::test_tier_mismatch_is_refused_by_default_and_named_as_tier"
+  ]
+ },
+ {
+  "label": "eligible: allow_tier=False falls through to state",
+  "file": "acctsw/seatswap.py",
+  "old": "ok = allow_tier if allow_tier is not None else",
+  "new": "ok = allow_tier or",
+  "test": [
+   "tests/test_seattier.py::test_allow_tier_true_lets_it_through_and_false_refuses_despite_approval"
+  ]
+ },
+ {
+  "label": "eligible: tier refusal named seat",
+  "file": "acctsw/seatswap.py",
+  "old": "return None, \"tier\"",
+  "new": "return None, \"seat\"",
+  "test": [
+   "tests/test_seattier.py::test_tier_mismatch_is_refused_by_default_and_named_as_tier"
+  ]
+ },
+ {
+  "label": "eligible: seat refusal named tier",
+  "file": "acctsw/seatswap.py",
+  "old": "if not isinstance(token, str) or not token:\n        return None, \"seat\"",
+  "new": "if not isinstance(token, str) or not token:\n        return None, \"tier\"",
+  "test": [
+   "tests/test_seattier.py::test_reason_is_seat_when_something_else_blocks_and_tier_is_not_blamed"
+  ]
+ },
+ {
+  "label": "bridge: cross-tier setting not toggleable",
+  "file": "acctsw/bridge.py",
+  "old": "\"in_place_switch\", \"in_place_cross_tier\",",
+  "new": "\"in_place_switch\",",
+  "test": [
+   "tests/test_seattier.py::test_the_cross_tier_setting_is_a_default_off_toggle"
+  ]
+ },
+ {
+  "label": "bridge: bad tier answers accepted",
+  "file": "acctsw/bridge.py",
+  "old": "if not a or not b or a == b or \"|\" in a or \"|\" in b:",
+  "new": "if not a or not b or \"|\" in a or \"|\" in b:",
+  "test": [
+   "tests/test_seattier.py::test_bad_tier_answers_are_refused"
+  ]
+ },
+ {
+  "label": "bridge: unknown scope accepted",
+  "file": "acctsw/bridge.py",
+  "old": "if action == \"approve_tier\" and scope not in (\"pair\", \"all\"):",
+  "new": "if False:",
+  "test": [
+   "tests/test_seattier.py::test_bad_tier_answers_are_refused"
+  ]
+ },
+ {
+  "label": "bridge: pair scope sets the global setting",
+  "file": "acctsw/bridge.py",
+  "old": "                else:\n                    seattier.approve(state, tool, a, b)",
+  "new": "                else:\n                    seattier.approve_all(state)",
+  "test": [
+   "tests/test_seattier.py::test_approve_tier_pair_scope_records_the_pair_and_answers"
+  ]
+ },
+ {
+  "label": "tier: approval also approves the crossing",
+  "file": "acctsw/seattier.py",
+  "old": "    _store(state, tool, \"tier_approvals\")[key] = {\"at\": iso(at or now())}\n",
+  "new": "    _store(state, tool, \"tier_approvals\")[key] = {\"at\": iso(at or now())}\n    from . import seatkind\n    seatkind.approve(state, tool, a_tier, b_tier, \"always\")\n",
+  "test": [
+   "tests/test_seattier.py::test_a_tier_approval_does_not_approve_a_business_personal_crossing"
+  ]
+ },
+ {
+  "label": "bridge: tier requests missing from snapshot",
+  "file": "acctsw/bridge.py",
+  "old": "for r in seattier.pending(state, tool)",
+  "new": "for r in []",
+  "test": [
+   "tests/test_seattier.py::test_snapshot_lists_open_tier_requests"
+  ]
+ },
+ {
+  "label": "UI tier question not rendered",
+  "file": "app/web/render.mjs",
+  "old": "${crossingRequests(state)}${tierRequests(state)}",
+  "new": "${crossingRequests(state)}",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "UI tier answer not wired",
+  "file": "app/web/bundle.js",
+  "old": "send(scope === \"deny\" ? \"deny_tier\" : \"approve_tier\"",
+  "new": "send(\"approve_tier\"",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "UI cross-tier toggle missing",
+  "file": "app/web/render.mjs",
+  "old": "s.in_place_cross_tier === true)}",
+  "new": "false)}",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "tier: default permits all plans",
+  "file": "acctsw/state.py",
+  "old": "\"in_place_cross_tier\": False,",
+  "new": "\"in_place_cross_tier\": True,",
+  "test": [
+   "tests/test_seattier.py::test_the_cross_tier_setting_is_a_default_off_toggle"
+  ]
+ },
+ {
+  "label": "tier: seat plan ignored",
+  "file": "acctsw/seattier.py",
+  "old": "raw = seat_or_blob.get(\"plan\")",
+  "new": "raw = None",
+  "test": [
+   "tests/test_seattier.py::test_tier_reads_seats_blobs_and_plain_plans"
+  ]
+ },
+ {
+  "label": "tier: blob plan ignored",
+  "file": "acctsw/seattier.py",
+  "old": "raw = oauth.get(\"subscriptionType\") if isinstance(oauth, dict) else None",
+  "new": "raw = None",
+  "test": [
+   "tests/test_seattier.py::test_tier_reads_seats_blobs_and_plain_plans"
+  ]
+ },
+ {
+  "label": "tier: labels not normalized",
+  "file": "acctsw/seattier.py",
+  "old": "return raw.strip().lower() if isinstance(raw, str) and raw.strip() else None",
+  "new": "return raw if isinstance(raw, str) and raw.strip() else None",
+  "test": [
+   "tests/test_seattier.py::test_tier_reads_seats_blobs_and_plain_plans"
+  ]
+ },
+ {
+  "label": "tier: invalid blob becomes a known plan",
+  "file": "acctsw/seattier.py",
+  "old": "except ValueError:\n                data = None",
+  "new": "except ValueError:\n                data = {\"claudeAiOauth\": {\"subscriptionType\": \"max\"}}",
+  "test": [
+   "tests/test_seattier.py::test_tier_reads_seats_blobs_and_plain_plans"
+  ]
+ },
+ {
+  "label": "tier: approval timestamp ignored",
+  "file": "acctsw/seattier.py",
+  "old": "_store(state, tool, \"tier_approvals\")[key] = {\"at\": iso(at or now())}",
+  "new": "_store(state, tool, \"tier_approvals\")[key] = {\"at\": iso(now())}",
+  "test": [
+   "tests/test_seattier.py::test_pair_approval_persists_with_its_timestamp_and_is_tool_specific"
+  ]
+ },
+ {
+  "label": "tier: one tool approval affects another",
+  "file": "acctsw/seattier.py",
+  "old": "_peek(state, tool, \"tier_approvals\").get(pair(a_tier, b_tier))",
+  "new": "_peek(state, \"claude\", \"tier_approvals\").get(pair(a_tier, b_tier))",
+  "test": [
+   "tests/test_seattier.py::test_pair_approval_persists_with_its_timestamp_and_is_tool_specific"
+  ]
+ },
+ {
+  "label": "tier: request timestamp ignored",
+  "file": "acctsw/seattier.py",
+  "old": "store[key] = {\"at\": iso(at or now()), \"status\": \"open\"}",
+  "new": "store[key] = {\"at\": iso(now()), \"status\": \"open\"}",
+  "test": [
+   "tests/test_seattier.py::test_pending_requests_persist_and_sort_by_time"
+  ]
+ },
+ {
+  "label": "tier: newest question first",
+  "file": "acctsw/seattier.py",
+  "old": "return sorted(out, key=lambda r: (str(r[\"at\"]), r[\"a\"], r[\"b\"]))",
+  "new": "return sorted(out, key=lambda r: (str(r[\"at\"]), r[\"a\"], r[\"b\"]), reverse=True)",
+  "test": [
+   "tests/test_seattier.py::test_pending_requests_persist_and_sort_by_time"
+  ]
+ },
+ {
+  "label": "tier: approve all forgets answers when disabled",
+  "file": "acctsw/seattier.py",
+  "old": "rec[\"status\"] = \"approved\"",
+  "new": "rec[\"status\"] = \"open\"",
+  "test": [
+   "tests/test_seattier.py::test_approve_all_sets_the_setting_and_clears_questions"
+  ]
+ },
+ {
+  "label": "tier: approve all also approves crossings",
+  "file": "acctsw/seattier.py",
+  "old": "state.set_setting(SETTING, True)",
+  "new": "state.set_setting(SETTING, True)\n    from . import seatkind\n    for tool in state.data[\"tools\"]:\n        for a in state.accounts(tool):\n            for b in state.accounts(tool):\n                seatkind.approve(state, tool, a, b, \"always\")",
+  "test": [
+   "tests/test_seattier.py::test_a_tier_approval_does_not_approve_a_business_personal_crossing"
+  ]
+ },
+ {
+  "label": "eligible: true override ignored",
+  "file": "acctsw/seatswap.py",
+  "old": "ok = allow_tier if allow_tier is not None else seattier.allowed(",
+  "new": "ok = seattier.allowed(",
+  "test": [
+   "tests/test_seattier.py::test_allow_tier_true_lets_it_through_and_false_refuses_despite_approval"
+  ]
+ },
+ {
+  "label": "eligible: unreadable mistaken for tier mismatch",
+  "file": "acctsw/seatswap.py",
+  "old": "except _Unreadable:\n        return \"unreadable\"",
+  "new": "except _Unreadable:\n        return \"tier\"",
+  "test": [
+   "tests/test_seattier.py::test_unreadable_credentials_are_not_a_tier_refusal"
+  ]
+ },
+ {
+  "label": "selection: tier permission required for restart",
+  "file": "acctsw/selection.py",
+  "old": "if e not in exclude\n",
+  "new": "if e not in exclude\n                and s.get(\"plan\") == (state.get_seat(tool, origin) or {}).get(\"plan\")\n",
+  "test": [
+   "tests/test_seattier.py::test_tier_permission_never_blocks_selection_or_a_restart_switch"
+  ]
+ },
+ {
+  "label": "bridge: pair delimiter accepted",
+  "file": "acctsw/bridge.py",
+  "old": "if not a or not b or a == b or \"|\" in a or \"|\" in b:",
+  "new": "if not a or not b or a == b:",
+  "test": [
+   "tests/test_seattier.py::test_bad_tier_answers_are_refused"
+  ]
+ },
+ {
+  "label": "UI tier labels not escaped",
+  "file": "app/web/render.mjs",
+  "old": "const pair = `${esc(r.a)}\\u2194${esc(r.b)}`;",
+  "new": "const pair = `${r.a}\\u2194${r.b}`;",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "crossing auto setting ignored by approved",
+  "file": "acctsw/seatkind.py",
+  "old": "    if state.settings()[\"crossing_auto\"] or not crosses(state, tool, a, b, home=home):\n        return True\n    at = at or now()\n    return _live",
+  "new": "    if False or not crosses(state, tool, a, b, home=home):\n        return True\n    at = at or now()\n    return _live",
+  "test": [
+   "tests/test_seatkind.py::test_crossing_auto_is_a_default_off_toggle"
+  ]
+ },
+ {
+  "label": "crossing auto True treated as False by consume",
+  "file": "acctsw/seatkind.py",
+  "old": "    if state.settings()[\"crossing_auto\"] or not crosses(state, tool, a, b, home=home):\n        return True\n    at = at or now()\n    store = _peek",
+  "new": "    if False or not crosses(state, tool, a, b, home=home):\n        return True\n    at = at or now()\n    store = _peek",
+  "test": [
+   "tests/test_seatkind.py::test_crossing_auto_is_a_default_off_toggle"
+  ]
+ },
+ {
+  "label": "keep warm: default disabled",
+  "file": "acctsw/state.py",
+  "old": "\"keep_warm\": True,",
+  "new": "\"keep_warm\": False,",
+  "test": [
+   "tests/test_keep_warm.py::test_setting_defaults_on_and_bridge_toggle_persists"
+  ]
+ },
+ {
+  "label": "keep warm: toggle not whitelisted",
+  "file": "acctsw/bridge.py",
+  "old": "    \"keep_warm\",\n",
+  "new": "",
+  "test": [
+   "tests/test_keep_warm.py::test_setting_defaults_on_and_bridge_toggle_persists"
+  ]
+ },
+ {
+  "label": "keep warm: setting ignored",
+  "file": "acctsw/claudehome.py",
+  "old": "if not state.settings()[\"keep_warm\"]:",
+  "new": "if False:",
+  "test": [
+   "tests/test_keep_warm.py::test_skips_ineligible_seat[setting_off]"
+  ]
+ },
+ {
+  "label": "keep warm: active seat warmed",
+  "file": "acctsw/claudehome.py",
+  "old": "if email == state.active(\"claude\") or email_key(email) in busy:",
+  "new": "if email_key(email) in busy:",
+  "test": [
+   "tests/test_keep_warm.py::test_skips_ineligible_seat[active]"
+  ]
+ },
+ {
+  "label": "keep warm: billed seat warmed",
+  "file": "acctsw/claudehome.py",
+  "old": "for key in (\"email\", \"home\")}",
+  "new": "for key in (\"home\",)}",
+  "test": [
+   "tests/test_keep_warm.py::test_skips_ineligible_seat[billed]"
+  ]
+ },
+ {
+  "label": "keep warm: home seat warmed",
+  "file": "acctsw/claudehome.py",
+  "old": "for key in (\"email\", \"home\")}",
+  "new": "for key in (\"email\",)}",
+  "test": [
+   "tests/test_keep_warm.py::test_skips_ineligible_seat[homed]"
+  ]
+ },
+ {
+  "label": "keep warm: unseeded home warmed",
+  "file": "acctsw/claudehome.py",
+  "old": "not home.is_dir() or not (home / \".acctsw-seeded\").is_file()",
+  "new": "not home.is_dir()",
+  "test": [
+   "tests/test_keep_warm.py::test_skips_ineligible_seat[unseeded]"
+  ]
+ },
+ {
+  "label": "keep warm: quarantine ignored",
+  "file": "acctsw/claudehome.py",
+  "old": "or (home / \".acctsw-quarantined\").exists()):",
+  "new": "or False):",
+  "test": [
+   "tests/test_keep_warm.py::test_skips_ineligible_seat[quarantined]"
+  ]
+ },
+ {
+  "label": "keep warm: signed-out seat warmed",
+  "file": "acctsw/claudehome.py",
+  "old": "if (seat.get(\"signin\") or {}).get(\"signed_out\"):",
+  "new": "if False:",
+  "test": [
+   "tests/test_keep_warm.py::test_skips_ineligible_seat[signed_out]"
+  ]
+ },
+ {
+  "label": "keep warm: expiry window widened",
+  "file": "acctsw/claudehome.py",
+  "old": "before > (at + timedelta(minutes=30)).timestamp() * 1000",
+  "new": "before > (at + timedelta(minutes=60)).timestamp() * 1000",
+  "test": [
+   "tests/test_keep_warm.py::test_skips_ineligible_seat[non_expiring]"
+  ]
+ },
+ {
+  "label": "keep warm: refresh token not required",
+  "file": "acctsw/claudehome.py",
+  "old": "for k in (\"accessToken\", \"refreshToken\")):",
+  "new": "for k in (\"accessToken\",)):",
+  "test": [
+   "tests/test_keep_warm.py::test_skips_ineligible_seat[no_refresh]"
+  ]
+ },
+ {
+  "label": "keep warm: access token not required",
+  "file": "acctsw/claudehome.py",
+  "old": "for k in (\"accessToken\", \"refreshToken\")):",
+  "new": "for k in (\"refreshToken\",)):",
+  "test": [
+   "tests/test_keep_warm.py::test_skips_ineligible_seat[no_access]"
+  ]
+ },
+ {
+  "label": "keep warm: three-hour cooldown dropped",
+  "file": "acctsw/claudehome.py",
+  "old": "timedelta(hours=24 if warm.get(\"fails\", 0) >= 2 else 3)",
+  "new": "timedelta(hours=24 if warm.get(\"fails\", 0) >= 2 else 0)",
+  "test": [
+   "tests/test_keep_warm.py::test_failure_backoff_and_success_reset"
+  ]
+ },
+ {
+  "label": "keep warm: failure backoff dropped",
+  "file": "acctsw/claudehome.py",
+  "old": "timedelta(hours=24 if warm.get(\"fails\", 0) >= 2 else 3)",
+  "new": "timedelta(hours=3)",
+  "test": [
+   "tests/test_keep_warm.py::test_failure_backoff_and_success_reset"
+  ]
+ },
+ {
+  "label": "keep warm: backoff boundary widened",
+  "file": "acctsw/claudehome.py",
+  "old": "at - last <= cooldown:",
+  "new": "at - last < cooldown:",
+  "test": [
+   "tests/test_keep_warm.py::test_failure_backoff_and_success_reset"
+  ]
+ },
+ {
+  "label": "keep warm: unchanged expiry counted as renewed",
+  "file": "acctsw/claudehome.py",
+  "old": "ok = after is not None and after > before",
+  "new": "ok = after is not None and after >= before",
+  "test": [
+   "tests/test_keep_warm.py::test_failure_backoff_and_success_reset"
+  ]
+ },
+ {
+  "label": "keep warm: earlier expiry counted as renewed",
+  "file": "acctsw/claudehome.py",
+  "old": "ok = after is not None and after > before",
+  "new": "ok = after is not None and after != before",
+  "test": [
+   "tests/test_keep_warm.py::test_earlier_expiry_is_not_success"
+  ]
+ },
+ {
+  "label": "keep warm: success does not reset fails",
+  "file": "acctsw/claudehome.py",
+  "old": "\"fails\": 0 if ok else fails + 1",
+  "new": "\"fails\": fails + 1",
+  "test": [
+   "tests/test_keep_warm.py::test_failure_backoff_and_success_reset"
+  ]
+ },
+ {
+  "label": "keep warm: failure not counted",
+  "file": "acctsw/claudehome.py",
+  "old": "\"fails\": 0 if ok else fails + 1",
+  "new": "\"fails\": 0 if ok else fails",
+  "test": [
+   "tests/test_keep_warm.py::test_failure_backoff_and_success_reset"
+  ]
+ },
+ {
+  "label": "keep warm: one-seat limit dropped",
+  "file": "acctsw/claudehome.py",
+  "old": "            return email\n    except Exception as exc:",
+  "new": "            continue\n    except Exception as exc:",
+  "test": [
+   "tests/test_keep_warm.py::test_only_one_seat_per_call"
+  ]
+ },
+ {
+  "label": "keep warm: wrong config dir passed",
+  "file": "acctsw/claudehome.py",
+  "old": "env[\"CLAUDE_CONFIG_DIR\"] = str(home)",
+  "new": "env[\"CLAUDE_CONFIG_DIR\"] = str(ctx._claude_real)",
+  "test": [
+   "tests/test_keep_warm.py::test_picks_only_parked_idle_expiring_seat_and_records_success"
+  ]
+ },
+ {
+  "label": "keep warm: timeout not bounded to sixty seconds",
+  "file": "acctsw/claudehome.py",
+  "old": "stderr=subprocess.DEVNULL, timeout=60,",
+  "new": "stderr=subprocess.DEVNULL, timeout=None,",
+  "test": [
+   "tests/test_keep_warm.py::test_picks_only_parked_idle_expiring_seat_and_records_success"
+  ]
+ },
+ {
+  "label": "keep warm: poll warmer never started",
+  "file": "acctsw/bridge.py",
+  "old": "            if want_claude:\n                _start_keep_warm(ctx)",
+  "new": "            if False:\n                _start_keep_warm(ctx)",
+  "test": [
+   "tests/test_keep_warm.py::test_bridge_poll_does_not_wait_and_prevents_overlap"
+  ]
+ },
+ {
+  "label": "keep warm: poll runs warmer synchronously",
+  "file": "acctsw/bridge.py",
+  "old": "threading.Thread(target=worker, name=\"claude-keep-warm\", daemon=True).start()",
+  "new": "worker()",
+  "test": [
+   "tests/test_keep_warm.py::test_bridge_poll_does_not_wait_and_prevents_overlap"
+  ]
+ },
+ {
+  "label": "keep warm: worker overlap lock skipped",
+  "file": "acctsw/bridge.py",
+  "old": "if not _KEEP_WARM_LOCK.acquire(blocking=False):",
+  "new": "if False:",
+  "test": [
+   "tests/test_keep_warm.py::test_bridge_poll_does_not_wait_and_prevents_overlap"
+  ]
+ },
+ {
+  "label": "keep warm: worker is not a daemon",
+  "file": "acctsw/bridge.py",
+  "old": "threading.Thread(target=worker, name=\"claude-keep-warm\", daemon=True).start()",
+  "new": "threading.Thread(target=worker, name=\"claude-keep-warm\", daemon=False).start()",
+  "test": [
+   "tests/test_keep_warm.py::test_bridge_poll_does_not_wait_and_prevents_overlap"
+  ]
+ },
+ {
+  "label": "keep warm: UI defaults off",
+  "file": "app/web/render.mjs",
+  "old": "s.keep_warm !== false",
+  "new": "s.keep_warm === true",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "in-place: unreadable credentials are mistaken for absent tokens during maintenance",
+  "file": "acctsw/seatswap.py",
+  "old": "return claudehome.load(ctx, email, strict=True)",
+  "new": "return claudehome.load(ctx, email)",
+  "test": [
+   "tests/test_seatswap.py::test_failed_security_read_preserves_the_borrowed_binding"
+  ]
+ },
+ {
+  "label": "confirmed_crossing ignored by manual switch",
+  "file": "acctsw/switch.py",
+  "old": "        if confirmed_crossing:\n",
+  "new": "        if False:\n",
+  "test": [
+   "tests/test_seatkind.py::test_confirmed_manual_switch_approves_each_live_crossing"
+  ]
+ }
+]

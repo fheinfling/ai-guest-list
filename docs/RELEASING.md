@@ -62,7 +62,7 @@ under Notes.
    git tag vX.Y.Z origin/main
    git push origin vX.Y.Z
    ```
-   The build job keeps the macOS 14 / Python 3.11 build: tag verification, Python + web tests, web
+   The build job keeps the macOS 15 / Python 3.11 build (macOS 14 runners were retired on 2026-11-02): tag verification, Python + web tests, web
    build, py2app, debug-symbol stripping, archive scan and bundle smoke test.
 3. When the build job is done, approve the sign job: open the run, **Review deployments**, tick
    `release`, **Approve and deploy**. The sign job checks the zip's SHA-256 against the build job's

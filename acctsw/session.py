@@ -68,8 +68,11 @@ _START_CACHE: dict[int, str] = {}
 
 
 def mark_session(data_dir: Path, tool: str, email: str, *, pin: str | None = None,
-                 key_seat: dict | None = None) -> None:
+                 key_seat: dict | None = None, home: str | None = None) -> None:
     """Record this supervisor and its active seat at launch and after every successful hop.
+
+    ``email`` is the seat the session is billed to. ``home`` is the seat whose own login (and
+    config home) the child runs on, recorded only when an in-place switch made them differ.
 
     A process's ``ps`` start-time never changes, so cache it instead of spawning ``ps`` for every
     relaunch. An empty value means ``ps`` was unavailable and readers fall back to PID liveness.
@@ -89,6 +92,8 @@ def mark_session(data_dir: Path, tool: str, email: str, *, pin: str | None = Non
         "engine": __version__,
         "capabilities": list(CAPABILITIES),
     }
+    if home is not None and home != email:
+        data["home"] = home
     if pin is not None:
         data.update(pin=pin, paid=True, end_requested=False,
                     key_seat={k: key_seat[k] for k in ("id", "label", "provider", "model")})
@@ -238,6 +243,8 @@ def _read_session(path: Path, *, strict: bool = False) -> dict | None:
             discard()
             return None
         if strict:
+            if not isinstance(data.get('home', ''), str):
+                raise ValueError('invalid session home')
             if not isinstance(data.get('process_start', ''), str):
                 raise ValueError('invalid session process identity')
             if 'pin' in data:
@@ -274,6 +281,8 @@ def _read_session(path: Path, *, strict: bool = False) -> dict | None:
         discard()
         return None
     public = {"email": email, "pid": pid, "started_at": started_at}
+    if isinstance(data.get("home"), str) and data["home"] != email:
+        public["home"] = data["home"]
     # Absent from a heartbeat written before engines stamped themselves (necessarily older).
     if isinstance(data.get("engine"), str):
         public["engine"] = data["engine"]

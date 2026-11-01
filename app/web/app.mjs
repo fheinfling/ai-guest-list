@@ -1,12 +1,14 @@
 // Live glue: render state into the DOM and forward user actions to the Python bridge.
 // All rendering logic lives in render.mjs (pure, unit-tested); this file is the thin wiring.
-import { buildHTML, buildSettings, buildAddSeat, addUsesPaste, reduceReply, updateClockText, buildAddKey, KEY_PROVIDERS, keyRequest, reduceKeyReply, keyConfirmations, buildPaidKeyGate, buildModelResults } from "./render.mjs";
+import { buildHTML, switchNeedsConfirmation, buildSettings, buildAddSeat, addUsesPaste, reduceReply, updateClockText, buildAddKey, KEY_PROVIDERS, keyRequest, reduceKeyReply, keyConfirmations, buildPaidKeyGate, buildModelResults } from "./render.mjs";
 
 const root = document.getElementById("root");
 const overlay = document.createElement("div");   // toast surface only (siblings of #root)
 overlay.id = "overlay";
 document.body.appendChild(overlay);
 let state = { settings: { theme: "dark" }, tools: {} };
+let openMenu = null;
+let flashMessage = null, flashTimer = null;
 let lastRev = -1;   // highest state.rev applied; a lower one is a stale snapshot and is ignored
 
 // --- bridge -----------------------------------------------------------------------------------
@@ -32,9 +34,10 @@ window.AGL = {
     if (inKeyFlow || screen === "paid-key") out.screen = screen; // keep the current input/confirmation
     screen = out.screen; add = out.add; lastRev = out.lastRev; state = out.state;
     const keyChanged = reduceKeyReply(keyFlow, res);
-    let paidChanged = false, paidHandled = false;
+    let paidChanged = false, paidHandled = false, confirmation = null;
     if (paidTerminal && res.key_action === "key_terminal" && res.key_target_id === paidTerminal.id) {
       paidTerminal.pending = false;
+      if (res.ok) confirmation = `opened a new terminal on ${paidTerminal.label}`;
       if (res.code === "paid_use_disabled") {
         screen = "paid-key"; paidTerminal.error = null;
         paidHandled = true; paidChanged = true;
@@ -51,7 +54,11 @@ window.AGL = {
     if (out.flash && !res.key_request_id && !paidHandled) flash(out.flash);
     if (res.key_action === "key_validate" && res.ok) flash(res.validation?.operation_permitted
       ? "key check passed — this checks account access only" : "key check wasn't permitted — check access with your provider");
-    if (out.celebrate) celebrate();
+    if (confirmation) flash(confirmation);
+    if (out.celebrate) {
+      celebrate();
+      if (!out.flash) flash(state.moved_note || "seat switched");
+    }
     if (out.closeFlow) setTimeout(() => {      // auto-close this flow's "done" screen; scoped by
       if (screen === "add" && add === out.closeFlow && add.step === "done") {   // object identity so
         screen = "main"; add = null; render();  // a stale timer can't close a later add.
@@ -70,10 +77,73 @@ function celebrate() {
   root.firstElementChild?.classList.add("celebrate");
   setTimeout(() => root.firstElementChild?.classList.remove("celebrate"), 600);
 }
+function paintFlash() {
+  const status = root.querySelector(".footer-status");
+  if (status && flashMessage) {
+    status.textContent = flashMessage;
+    root.querySelector(".foot")?.classList.add("flash");
+  }
+}
 function flash(text) {
-  overlay.innerHTML = '<div class="toast" role="status"></div>';
-  overlay.firstElementChild.textContent = text;
-  setTimeout(() => { if (overlay.querySelector(".toast")) overlay.innerHTML = ""; }, 3000);
+  flashMessage = text;
+  if (flashTimer !== null) clearTimeout(flashTimer);
+  if (root.querySelector(".footer-status")) paintFlash();
+  else {
+    overlay.innerHTML = '<div class="toast" role="status"></div>';
+    overlay.firstElementChild.textContent = text;
+  }
+  reportHeight();
+  flashTimer = setTimeout(() => {
+    flashMessage = null; flashTimer = null;
+    overlay.innerHTML = "";
+    if (screen === "main") render();
+  }, 3000);
+}
+
+// Measure intrinsic content, not the current native viewport (which would prevent shrinking).
+// The body alone scrolls above 600; native is the final authority on the size limits.
+function contentHeight() {
+  const app = root.firstElementChild;
+  if (!app) return 0;
+  const body = root.querySelector(".body, .set-body");
+  if (!body) return app.scrollHeight;
+  const content = root.querySelector(".content");
+  let height = (root.querySelector(".top, .set-head")?.offsetHeight || 0)
+    + (content?.scrollHeight || body.scrollHeight) + (root.querySelector(".foot")?.offsetHeight || 0);
+  // Pushed screens pin live paid consent above their body.
+  if (screen !== "main") height += root.querySelector(".key-prompts")?.scrollHeight || 0;
+  for (const menu of root.querySelectorAll('.header-menu .menu:not([hidden])')) {
+    height = Math.max(height, menu.getBoundingClientRect().bottom - app.getBoundingClientRect().top + 8);
+  }
+  return Math.ceil(height);
+}
+let heightFrame = null, lastHeight = 0;
+function reportHeight() {
+  if (heightFrame !== null || !window.requestAnimationFrame) return;
+  heightFrame = window.requestAnimationFrame(() => {
+    heightFrame = null;
+    const height = contentHeight();
+    if (Number.isFinite(height) && height > 0 && height !== lastHeight) {
+      lastHeight = height;
+      send("resize", { height });
+    }
+  });
+}
+const sizeObserver = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(reportHeight);
+function observeSize() {
+  sizeObserver?.disconnect();
+  for (const node of root.querySelectorAll(".app, .content, .set-body, .key-prompts, .model-list")) sizeObserver?.observe(node);
+  reportHeight();
+}
+function paintMenus(focus = false) {
+  for (const button of root.querySelectorAll('[data-action="menu"]')) {
+    const open = button.dataset.menu === openMenu;
+    button.setAttribute("aria-expanded", String(open));
+    const menu = button.parentElement.querySelector(".menu");
+    menu.hidden = !open;
+    if (open && focus) menu.querySelector("button")?.focus();
+  }
+  reportHeight();
 }
 
 // which screen occupies the popover: "main", the settings sub-view, or the add-seat sub-view
@@ -85,49 +155,13 @@ let renderedScreen = null;  // what the last render() actually drew — gates sc
 let add = null;
 let keyFlow = null;
 let paidTerminal = null;
+let pendingSwitch = null;
 let keySequence = 0;
 const answering = new Set();
 const proving = new Set();
+const openSeatDetails = new Set();
 let clockTimer = null;
-let drawerMotion = null;
-const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
-
-// Animate our content wrapper without depending on WKWebView's ::details-content support.
-// `open` stays true until an exit finishes, but drawer-closing is logically dismissed.
-function moveDrawer(drawer, open, startedAt = Date.now()) {
-  drawerMotion?.animation.cancel();
-  drawerMotion = null;
-  const body = drawer.querySelector(".main-body");
-  if (!open && drawer.contains(document.activeElement)) {
-    drawer.querySelector(".drawer-handle").focus({ preventScroll: true });
-  }
-  drawer.open = true;
-  drawer.classList.toggle("drawer-closing", !open);
-  body.inert = !open;
-  const finish = () => {
-    drawer.open = open;
-    drawer.classList.remove("drawer-closing");
-    body.inert = false;
-    drawerMotion = null;
-  };
-  if (reducedMotion.matches) { finish(); return; }
-  const frames = [{ opacity: 0, transform: "translateY(12px)" }, { opacity: 1, transform: "translateY(0)" }];
-  const animation = drawer.querySelector(".drawer-content").animate(open ? frames : [...frames].reverse(), {
-    duration: 200, easing: "cubic-bezier(.2,.7,.2,1)", fill: "both",
-  });
-  drawerMotion = { animation, open, startedAt };
-  animation.onfinish = () => {
-    if (drawerMotion?.animation !== animation) return;
-    finish(); animation.cancel();
-  };
-  // A poll replaces the wrapper; resume its remaining time instead of replaying the motion.
-  animation.currentTime = Math.min(200, Math.max(0, Date.now() - startedAt));
-}
-
-reducedMotion.addEventListener("change", () => {
-  if (reducedMotion.matches && drawerMotion) drawerMotion.animation.finish();
-});
-
+let mainKeyPromptCount = 0;
 function setPopoverVisible(visible) {
   if (visible && clockTimer === null) {
     clockTimer = setInterval(() => {
@@ -135,6 +169,7 @@ function setPopoverVisible(visible) {
       updateClockText(root);
       // Expired consent is never left looking actionable, even without a state revision.
       refreshKeyPrompts();
+      reportHeight();
     }, 1000);
   } else if (!visible && clockTimer !== null) {
     clearInterval(clockTimer);
@@ -143,34 +178,25 @@ function setPopoverVisible(visible) {
 }
 
 function render() {
+  if (screen !== renderedScreen) openMenu = null;
+  if (screen !== "main" || (pendingSwitch &&
+      !switchNeedsConfirmation(state, pendingSwitch.tool, pendingSwitch.email))) pendingSwitch = null;
   // A background state push (the usage poll) re-renders whatever screen is up; carry the current
   // screen's body scroll position across the innerHTML swap so a poll doesn't snap it to the top.
   // Only when the screen is unchanged — navigating must start the new screen at the top.
-  const prevBody = root.querySelector(".main-body, .set-body");
-  const scrollTop = screen === renderedScreen && prevBody ? prevBody.scrollTop : 0;
-  // Polls must keep native disclosures open, including the enclosing drawer. Identity follows
-  // the seat or the menu's action, never its position in a reordered list.
-  const disclosureKey = (details) => {
-    const card = details.closest("[data-card]");
-    if (card) return JSON.stringify(["seat", card.dataset.tool, card.dataset.email]);
-    if (details.classList.contains("guest-drawer")) return "guest-drawer";
-    return JSON.stringify(["menu", details.querySelector("[data-action]")?.dataset.action]);
-  };
-  const disclosures = "details.seat-disclosure, details.guest-drawer, details.header-menu";
-  const openDisclosures = new Set(screen === renderedScreen
-    ? [...root.querySelectorAll(disclosures)].filter((node) => node.open && !node.classList.contains("drawer-closing")).map(disclosureKey)
-    : []);
-  const motion = screen === renderedScreen ? drawerMotion : null;
-  drawerMotion?.animation.cancel();
-  drawerMotion = null;
+  const focusData = screen === renderedScreen && root.contains?.(document.activeElement)
+    && document.activeElement?.dataset?.action ? { ...document.activeElement.dataset } : null;
+  const prevBody = root.querySelector(".body, .set-body");
+  const scrollTop = screen === renderedScreen ? prevBody?.scrollTop || 0 : 0;
   root.innerHTML = screen === "settings" ? buildSettings(state)
     : screen === "add" ? buildAddSeat(state, add)
     : screen === "add-key" ? buildAddKey(state, keyFlow)
     : screen === "paid-key" ? buildPaidKeyGate(state, paidTerminal)
-    : buildHTML(state);
+    : buildHTML(state, pendingSwitch, openSeatDetails);
   if (!root.querySelector(".key-prompts")) {
     root.querySelector(".set-head")?.insertAdjacentHTML("afterend", keyConfirmations(state, answering));
   }
+  mainKeyPromptCount = screen === "main" ? liveKeyRequests().length : 0;
   refreshKeyPrompts();
   for (const button of root.querySelectorAll('[data-action="key-prove"]')) {
     if (proving.has(button.dataset.id)) {
@@ -181,27 +207,35 @@ function render() {
     }
   }
   renderedScreen = screen;
-  // Restore before scrolling: a closed drawer has no scrollable height.
-  for (const details of root.querySelectorAll(disclosures)) {
-    details.open = openDisclosures.has(disclosureKey(details));
-  }
-  if (motion) {
-    const drawer = root.querySelector("details.guest-drawer");
-    if (drawer) moveDrawer(drawer, motion.open, motion.startedAt);
-  }
-  if (scrollTop) {
-    const nextBody = root.querySelector(".main-body, .set-body");
-    if (nextBody) nextBody.scrollTop = scrollTop;
+  const nextBody = root.querySelector(".body, .set-body");
+  if (nextBody) nextBody.scrollTop = scrollTop;
+  paintMenus(); // Reveal the preserved menu before restoring focus to one of its items.
+  if (focusData) {
+    const control = [...root.querySelectorAll("button[data-action], input[data-action]")]
+      .find((node) => Object.entries(focusData).every(([key, value]) => node.dataset[key] === value));
+    control?.focus({ preventScroll: true });
   }
   // mirror the theme onto <body> so overlays (siblings of #root) get the same CSS vars
   const theme = (state.settings && state.settings.theme === "dark") ? "dark" : "light";
   document.body.className = "theme-" + theme;
+  paintFlash();
+  observeSize();
+}
+
+function liveKeyRequests() {
+  return (state.pending_key_switches || []).filter((r) => r.status === "pending" && Date.parse(r.expires_at) > Date.now());
 }
 
 function refreshKeyPrompts() {
+  const pending = liveKeyRequests();
+  // Expiring consent updates the header verdict even before the next engine poll.
+  // Pushed views keep their inputs and focus.
+  if (screen === "main" && pending.length !== mainKeyPromptCount) {
+    render();
+    return;
+  }
   const prompts = root.querySelector(".key-prompts");
   if (!prompts) return;
-  const pending = (state.pending_key_switches || []).filter((r) => r.status === "pending" && Date.parse(r.expires_at) > Date.now());
   const signature = JSON.stringify([pending, [...answering]]);
   // Time passing must not rebuild focused approval buttons just to update a price's age.
   if (prompts.dataset.signature !== signature) {
@@ -233,26 +267,33 @@ function sendKeyFlow(action, extra = {}) {
 
 // --- event delegation (whole document, so overlay buttons work too) ---------------------------
 document.addEventListener("click", (e) => {
-  // Decide containment before a delegated action can replace the clicked DOM.
-  const handle = e.target.closest(".guest-drawer > summary");
-  if (handle) {
-    e.preventDefault();
-    const drawer = handle.parentElement;
-    moveDrawer(drawer, !drawer.open || drawer.classList.contains("drawer-closing"));
-    return;
-  }
-  const drawer = root.querySelector("details.guest-drawer[open]");
-  if (drawer && !drawer.contains(e.target) && !drawer.classList.contains("drawer-closing")) moveDrawer(drawer, false);
-  // The + and ⋯ menus are native <details>, which stay open until their own summary is clicked
-  // again. Dismiss on any click outside, and never leave both open at once.
-  for (const menu of root.querySelectorAll("details.header-menu[open]")) {
-    if (!menu.contains(e.target)) menu.open = false;
-  }
+  if (openMenu && !e.target.closest(".header-menu")) { openMenu = null; paintMenus(); }
   const el = e.target.closest("[data-action]");
-  if (!el) return; // Other summaries retain native disclosure toggling.
+  if (!el) return;
   const { action, tool, email, value } = el.dataset;
   if (el.disabled) return;
+  if (action !== "menu" && openMenu) { openMenu = null; paintMenus(); }
   switch (action) {
+    case "menu":
+      openMenu = openMenu === el.dataset.menu ? null : el.dataset.menu;
+      paintMenus(true); break;
+    case "attention": {
+      const target = root.querySelector('.issue button, .key-confirm button');
+      target?.scrollIntoView({ block: "nearest" }); target?.focus(); break;
+    }
+    case "toggle":
+      if (el.tagName === "BUTTON") send("toggle", { key: el.dataset.key, value: !state.settings?.[el.dataset.key] });
+      break;
+    case "seat-details": {
+      const key = JSON.stringify([tool, email]);
+      const open = !openSeatDetails.has(key);
+      if (open) openSeatDetails.add(key); else openSeatDetails.delete(key);
+      el.setAttribute("aria-expanded", String(open));
+      const detail = document.getElementById(el.getAttribute("aria-controls"));
+      if (detail) detail.hidden = !open;
+      reportHeight();
+      break;
+    }
     case "key-start":
       add = null;
       keyFlow = { step: "provider", label: "", secret: "", region: "eu", base_url: "", allow_unverified: false };
@@ -291,6 +332,18 @@ document.addEventListener("click", (e) => {
       if (answering.has(el.dataset.id)) break;
       answering.add(el.dataset.id); refreshKeyPrompts();
       send("answer_key_switch", { id: el.dataset.id, approved: el.dataset.approved === "true" }); break;
+    case "crossing-auto":
+    case "crossing-answer": {
+      const { tool, from, to, scope } = el.dataset;
+      if (el.dataset.action === "crossing-auto") send("toggle", { key: "crossing_auto", value: true });
+      send(scope === "deny" ? "deny_crossing" : "approve_crossing", { tool, from, to, scope });
+      break;
+    }
+    case "tier-answer": {
+      const { tool, a, b, scope } = el.dataset;
+      send(scope === "deny" ? "deny_tier" : "approve_tier", { tool, a, b, scope });
+      break;
+    }
     case "key-stop": send("toggle", { key: "key_fallback", value: false }); break;
     case "key-terminal":
       if (paidTerminal?.pending) break;
@@ -317,7 +370,21 @@ document.addEventListener("click", (e) => {
     case "key-remove-confirm": send("key_remove", { id: el.dataset.id }); break;
     case "key-pricing":
       e.preventDefault(); send("key_pricing", { provider: el.dataset.provider }); break;
-    case "switch": send("switch", { tool, email }); break;
+    case "switch":
+      if (switchNeedsConfirmation(state, tool, email)) {
+        pendingSwitch = { tool, email }; render();
+      } else {
+        pendingSwitch = null;
+        send("switch", { tool, email });
+      }
+      break;
+    case "switch-cancel": pendingSwitch = null; render(); break;
+    case "switch-confirm":
+      if (pendingSwitch?.tool === tool && pendingSwitch.email === email) {
+        pendingSwitch = null;
+        send("switch", { tool, email, confirmed_crossing: true }); render();
+      }
+      break;
     case "remove": if (confirm(`wave goodbye to ${email}?`)) send("remove", { tool, email }); break;
     // add-a-seat sub-view (spec §9). Header ＋ (no tool) → provider step; per-provider add-row and
     // the needs-login "log in" button carry a tool → deep-link straight to details, provider preset.
@@ -411,7 +478,16 @@ document.addEventListener("change", (e) => {
 
 // Esc pops a sub-view (spec §9): settings → main; add → one step back (like the chevron).
 document.addEventListener("keydown", (e) => {
+  if (openMenu && ["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) {
+    const menu = root.querySelector('.header-menu .menu:not([hidden])');
+    const buttons = [...(menu?.querySelectorAll("button") || [])];
+    const index = buttons.indexOf(document.activeElement);
+    const next = e.key === "Home" ? 0 : e.key === "End" ? buttons.length - 1
+      : (index + (e.key === "ArrowUp" ? -1 : 1) + buttons.length) % buttons.length;
+    e.preventDefault(); buttons[next]?.focus(); return;
+  }
   if (e.key !== "Escape") return;
+  if (pendingSwitch) { e.preventDefault(); pendingSwitch = null; render(); return; }
   const request = (state.pending_key_switches || []).find((r) =>
     r.status === "pending" && Date.parse(r.expires_at) > Date.now() && !answering.has(r.id));
   if (request) {
@@ -420,18 +496,10 @@ document.addEventListener("keydown", (e) => {
     send("answer_key_switch", { id: request.id, approved: false });
     return;
   }
-  const drawer = root.querySelector("details.guest-drawer[open]");
-  if (drawer) {
+  if (openMenu) {
     e.preventDefault();
-    if (!drawer.classList.contains("drawer-closing")) moveDrawer(drawer, false);
-    return;
-  }
-  const menu = root.querySelector("details.header-menu[open]");
-  if (menu) {
-    e.preventDefault();
-    menu.open = false;
-    menu.querySelector("summary")?.focus();   // keyboard users keep their place
-    return;
+    const trigger = root.querySelector(`[data-action="menu"][data-menu="${openMenu}"]`);
+    openMenu = null; paintMenus(); trigger?.focus(); return;
   }
   if (screen === "settings") { screen = "main"; render(); }
   else if (screen === "add") addBack();
@@ -443,6 +511,10 @@ document.addEventListener("keydown", (e) => {
 // explicitly so transient closes always clear the interval even on macOS versions that do not.
 document.addEventListener("visibilitychange", () => setPopoverVisible(!document.hidden));
 window.addEventListener("pagehide", () => setPopoverVisible(false));
+
+// Font loading can change intrinsic height without a state push.
+document.fonts?.ready.then(reportHeight);
+window.addEventListener("resize", reportHeight);
 
 // initial paint + ask the native side for fresh state
 render();

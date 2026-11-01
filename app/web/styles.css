@@ -1,5 +1,5 @@
-/* Shipping popover: rounded type, ambient state fields, and an open headroom roster.
-   Fixed to the native surface; task bodies and disclosure sheets scroll internally. */
+@font-face { font-family:"Hanken Grotesk"; src:url("fonts/hankengrotesk.woff2") format("woff2"); font-weight:100 900; font-display:swap; }
+/* Shared controls for the native popover and pushed task sheets. */
 :root {
   --codex:#46c2a8; --claude:#e0795a;
   --sans:ui-rounded,"SF Pro Rounded",-apple-system,BlinkMacSystemFont,system-ui,sans-serif;
@@ -42,10 +42,10 @@ button:disabled { cursor:wait; border-style:dashed; }
   outline:3px solid var(--focus); outline-offset:3px;
 }
 input::placeholder, textarea::placeholder { color:var(--support); opacity:1; }
-h1,h2,p,button,.seat-name,.key-model,.k-model,.support { overflow-wrap:anywhere; }
+h1,h2,p,button,.k-model,.support { overflow-wrap:anywhere; }
 h1 { font-size:2rem; line-height:1.13; font-weight:650; letter-spacing:-.035em; }
 h2 { font-size:1.15rem; line-height:1.3; font-weight:650; }
-.support, .add-hint, .add-foot, .set-s, .usage-reset, .set-ver,
+.support, .add-hint, .add-foot, .set-s, .set-ver,
 .add-prov-sub, .add-provcard-s, .add-sub, .key-price, .model-context, .model-count,
 .mono, code { font-family:inherit; }
 summary { cursor:pointer; list-style:none; }
@@ -82,22 +82,10 @@ summary::-webkit-details-marker { display:none; }
   --field-top:#272237; --field-mid:#403656; --field-base:#574575;
   --surface:#30273e; --sheet:#362b46; --support:#fff6df; --edge:#c7b3e5;
 }
-.ambient-art {
-  position:absolute; z-index:-1; pointer-events:none;
-  width:560px; height:560px; left:calc(50% - 280px); top:355px;
-  opacity:.38; mix-blend-mode:multiply; transform:rotate(-12deg);
-}
-.ambient-app.theme-dark .ambient-art { mix-blend-mode:screen; opacity:.08; }
-.mood-spending .ambient-art { opacity:.15; top:335px; }
-.ambient-app:has(.ambient-stage > .key-prompts:not(:empty)) .ambient-art { opacity:.18; top:335px; }
-.mood-resting .ambient-art { opacity:.3; }
-.mood-resting.theme-dark .ambient-art { opacity:.1; }
-.mood-empty .ambient-art { opacity:.35; }
 .top, .set-head {
   position:relative; z-index:5; display:flex; align-items:center; gap:10px;
   flex:0 0 64px; height:64px; padding:12px 24px;
 }
-.brand { flex:1; font-size:1.05rem; font-weight:650; letter-spacing:-.025em; }
 .top-actions { display:flex; gap:6px; }
 .ibtn, .set-back {
   width:36px; height:36px; display:flex; align-items:center; justify-content:center;
@@ -113,82 +101,22 @@ summary::-webkit-details-marker { display:none; }
 }
 .menu-panel button { min-height:44px; text-align:left; }
 .ambient-stage { flex:1; min-height:0; display:flex; flex-direction:column; }
-.availability { flex:1; min-height:0; display:flex; flex-direction:column; }
-.ambient-verdict {
-  display:flex; flex:1; min-height:0; flex-direction:column; align-items:center;
-  padding:24px 28px 18px; text-align:center; overflow-y:auto; scrollbar-width:thin;
-}
-.ambient-verdict h1 { max-width:300px; min-height:64px; display:flex; align-items:center; justify-content:center; }
 .reading { display:flex; flex-direction:column; align-items:center; }
 .reading-value {
   display:block; font-size:10.75rem; line-height:1.03; font-weight:250;
   font-variant-numeric:tabular-nums; letter-spacing:-.08em; padding-right:.08em;
 }
 .reading-unit { font-size:1rem; letter-spacing:-.015em; }
-.ambient-verdict .reading { margin-top:5px; }
-.hero-followup { width:100%; display:flex; flex-direction:column; gap:10px; margin-top:22px; }
-.hero-support { font-size:.93rem; color:var(--support); }
 .primary {
   background:var(--button); color:var(--button-ink); border:1px solid var(--button);
   padding:12px 18px; width:100%; min-height:46px;
 }
 .primary:hover { background:var(--button); filter:brightness(1.1); }
-.mood-resting .ambient-verdict { padding-top:15px; }
-.mood-resting .reading-value { font-size:7.8rem; }
-.mood-resting .hero-followup { margin-top:14px; }
 
-/* One quiet way down. On demand, a solid sheet covers the reading; the header stays pinned. */
-/* Closed, this is the same sheet as when it is open — just collapsed to its handle. It carries
-   the sheet's own surface, corners and lift so the roster visibly scrolls BEHIND a bar, instead
-   of disappearing under bare text floating on the field. */
-.guest-drawer {
-  --handle-height:60px; flex:none; margin:0; z-index:4;
-  background:var(--sheet); border-radius:26px 26px 0 0;
-  box-shadow:0 -10px 24px var(--shadow);
-}
-.drawer-handle { min-height:56px; padding:10px 24px; display:flex; align-items:center; gap:10px; font-weight:600; }
-.drawer-count { margin-left:auto; font-weight:400; font-size:.9rem; }
-.chevron { display:inline-flex; align-items:center; justify-content:center; width:24px; height:24px; flex:none; font-size:1.15rem; }
-.guest-drawer[open] {
-  display:flex; flex-direction:column;
-  position:absolute; inset:168px 0 0; margin:0; background:var(--sheet);
-  border-radius:30px 30px 0 0; box-shadow:0 -18px 40px var(--shadow); overflow:hidden;
-}
-.guest-drawer[open] > .drawer-handle { flex:none; height:var(--handle-height); padding:12px 24px; }
-.guest-drawer[open] > .drawer-handle:focus-visible { outline-offset:-6px; border-radius:30px 30px 0 0; }
-.guest-drawer[open] > .drawer-handle .chevron { transform:rotate(180deg); }
-/* Native details may insert a block box around its content. Establish our own bounded
-   flex parent without depending on ::details-content support or percentage heights. */
-.guest-drawer[open] > .drawer-content { position:absolute; inset:var(--handle-height) 0 0; display:flex; flex-direction:column; }
-/* min-height:0 lets the body shrink to the sheet; overflow belongs to this flex item. */
-.main-body { flex:1; min-height:0; overflow-y:auto; overflow-x:hidden; padding:0 24px 24px; scroll-padding:12px; scrollbar-width:thin; }
-.group + .group { margin-top:20px; }
-.g-head { display:flex; align-items:center; gap:9px; margin:12px 0 2px; font-size:.93rem; }
-.tool-marker { width:9px; height:9px; border:1px solid var(--ink); background:var(--codex); }
-.tool-marker--claude { background:var(--claude); border-radius:50%; }
-.seat { border-bottom:1px solid var(--line); }
-.seat-row { display:flex; align-items:center; gap:10px; min-height:53px; }
-.seat-name { flex:1; font-weight:650; }
-.seat-state { color:var(--support); font-size:.9rem; text-align:right; max-width:48%; }
-.seat-disclosure[open] > summary .chevron { transform:rotate(180deg); }
-.expand { padding:2px 0 18px; display:flex; flex-direction:column; gap:10px; }
-.seat-email { overflow-wrap:anywhere; }
-.chip { display:inline-block; margin-left:4px; }
 .seat-actions { display:flex; flex-wrap:wrap; gap:8px; }
-.window { display:flex; flex-direction:column; gap:4px; }
-.usage { display:flex; justify-content:space-between; gap:10px; font-size:.93rem; }
-.track { height:5px; border:1px solid var(--edge); border-radius:3px; overflow:hidden; position:relative; }
-.fill { display:block; height:100%; background:var(--ink); }
-.track.exhausted::after { content:""; position:absolute; left:0; top:0; width:3px; height:100%; background:var(--ink); }
 .usage-error, .key-check-status, .key-proof { font-size:.93rem; line-height:1.4; }
 .key-unproven { font-size:.93rem; font-weight:600; }
-.key-model, .k-model { font-size:.93rem; overflow-wrap:anywhere; }
-.supervision-banner { display:flex; flex-wrap:wrap; gap:10px; margin-bottom:14px; font-size:.93rem; }
-.supervision-banner > span { flex:1 1 180px; }
-.event { padding-top:22px; color:var(--support); font-size:.9rem; }
-.event h2 { font-size:.9rem; font-weight:650; margin-bottom:5px; }
-.empty { padding:12px 0; color:var(--support); }
-
+.k-model { font-size:.93rem; overflow-wrap:anywhere; }
 /* Real spending remains above disclosure. Each terminal appears once, with its end control. */
 .paid-use-control { display:flex; flex-direction:column; flex:1; min-height:0; padding:26px 28px 8px; align-items:stretch; }
 .paid-use-control h1 { text-align:center; flex:none; }
@@ -207,7 +135,6 @@ summary::-webkit-details-marker { display:none; }
 .key-prompts:empty { display:none; }
 .key-prompts { min-height:0; overflow-y:auto; scrollbar-width:thin; }
 .ambient-stage > .key-prompts:not(:empty) { flex:1; }
-.ambient-stage:has(> .key-prompts:not(:empty)) > .availability { display:none; }
 .key-confirm { display:flex; flex-direction:column; gap:18px; padding:26px 28px 16px; }
 .key-confirm h1 { font-size:2.25rem; max-width:310px; }
 .decision-facts { display:flex; flex-direction:column; gap:6px; }
@@ -261,7 +188,7 @@ input:focus-visible ~ .sw, .free-control:focus-within, .proof-gate:focus-within 
 .set-legend { display:flex; flex-direction:column; gap:10px; color:var(--support); font-size:.9rem; }
 .set-legend > div { display:flex; align-items:center; gap:10px; }
 .set-ver { padding-top:8px; }
-/* Original doorMark remains unchanged; its tiny menu-bar legend is secondary to the SVG field. */
+/* The settings legend mirrors the native menu-bar door states. */
 .avatar.door { width:26px; height:28px; display:inline-block; flex:none; position:relative; background:linear-gradient(145deg,#ffe6ad,#e7a23f); border-radius:7px; overflow:hidden; }
 .door-room { position:absolute; inset:4px 6px; background:#2f8a78; border-radius:8px 8px 0 0; }
 .door-leaf { position:absolute; inset:4px auto 3px 4px; width:5px; background:#f5eedd; transform:rotate(-7deg); }
@@ -330,16 +257,14 @@ input:focus-visible ~ .sw, .free-control:focus-within, .proof-gate:focus-within 
 .toast { position:fixed; bottom:20px; left:20px; right:20px; padding:14px 18px; border:1px solid var(--edge); border-radius:18px; background:var(--surface); color:var(--ink); box-shadow:0 10px 24px var(--shadow); font:400 1rem/1.4 var(--sans); z-index:30; }
 #overlay:empty { display:none; }
 @media (max-height:520px) {
-  .ambient-verdict { padding-top:6px; }
   .reading-value { font-size:7rem; }
-  .mood-resting .reading-value { font-size:5rem; }
   .paid-use-control { padding-top:6px; }
   .paid-use-control .reading-value { font-size:4rem; }
 }
 @container popover (max-width:22rem) {
   .top,.set-head { padding-left:18px; padding-right:18px; }
   .set-body { padding-left:18px; padding-right:18px; }
-  .ambient-verdict,.paid-use-control,.key-confirm { padding-left:20px; padding-right:20px; }
+  .paid-use-control,.key-confirm { padding-left:20px; padding-right:20px; }
   .model-columns,.key-model-option { grid-template-columns:minmax(0,1fr) 104px; gap:8px; }
   .set-toggle-row { flex-wrap:wrap; }
   .set-tx { flex-basis:65%; }
@@ -348,114 +273,259 @@ input:focus-visible ~ .sw, .free-control:focus-within, .proof-gate:focus-within 
   *,*::before,*::after { animation:none !important; transition:none !important; scroll-behavior:auto !important; }
 }
 
-/* The everyday roster uses shared headings and active-first rows. */
-.roster-glance {
-  flex:1; min-height:0; padding:22px 24px 12px;
-  overflow-y:auto; overflow-x:hidden; scrollbar-width:thin;
-}
-.roster-glance h1 { margin-bottom:25px; }
-/* Each seat rides an edge-to-edge band, as v13-band's did: a barely-there wash of the surface
-   over the field, full-bleed, unrounded. Cards would make the roster a stack of objects; this
-   keeps it one calm surface with the seats merely resting on it.
-   The table escapes the glance's 24px gutter so the band reaches both edges, and the cells put
-   that gutter back so the text stays aligned with the heading above. */
-.roster {
-  width:calc(100% + 48px); margin:0 -24px; table-layout:fixed;
-  border-collapse:separate; border-spacing:0 6px;
-}
-.roster th:first-child, .roster td:first-child { padding-left:24px; }
-.roster th:last-child, .roster td:last-child { padding-right:24px; }
-/* The tool heading stays on the open field; only seat cells take the wash. Selected per cell
-   rather than per row because :has() is not safe at the macOS 12 floor either. */
-.roster tbody > tr > :not(.roster-tool) { background:var(--row-panel); }
-.roster-seat-col { width:52%; }
-.roster-window-col { width:24%; }
-.roster th, .roster td { border:0; vertical-align:middle; }
-.roster thead th {
-  padding:0 0 8px; text-align:right; font-size:.85rem; font-weight:400;
-}
-.roster thead th:first-child { text-align:left; }
-.roster tbody th { padding:10px 10px 10px 0; text-align:left; font-weight:450; }
-.roster .roster-tool { padding:12px 0 2px; font-size:.85rem; font-weight:600; }
-.roster-identity { display:block; font-size:.98rem; line-height:1.3; }
-.roster-meta { display:block; margin-top:4px; font-size:.85rem; line-height:1.3; font-weight:400; }
-.roster-identity, .roster-meta { min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
-.roster-meta .chip { margin:0 5px 0 0; }
-.roster-value {
-  padding:10px 0; text-align:right; font-size:1.6rem; line-height:1.15;
-  font-weight:350; font-variant-numeric:tabular-nums; letter-spacing:-.04em;
-}
-.roster-active .roster-identity { font-weight:650; }
-.roster-active .roster-status { font-weight:650; }
-.roster-active .roster-value { font-size:2rem; font-weight:600; }
-.roster .roster-unknown { font-size:.92rem; font-weight:400; letter-spacing:0; }
-.roster-freshness { display:block; margin-top:4px; font-size:.78rem; font-weight:400; letter-spacing:0; }
-.roster-reset { display:block; margin-top:4px; font-size:.75rem; line-height:1.3; font-weight:400; letter-spacing:0; white-space:nowrap; }
-.roster-key-terms { text-align:right; font-size:.93rem; line-height:1.3; }
-.roster-app .drawer-handle .chevron { margin-left:auto; }
 
-/* The closed leaf occupies 314 × 440 px of the 500 px icon field. Normal compositing
-   bounds contrast even where words cross the leaf, tile or knob; no moving decoration. */
-.ambient-app .ambient-art.roster-door {
-  width:500px; height:500px; left:calc(50% - 250px); top:150px;
-  transform:none; mix-blend-mode:normal; opacity:.48;
-}
-.ambient-app.theme-dark .ambient-art.roster-door { opacity:.07; }
-@media (max-height:520px) {
-  .roster-glance { padding-top:8px; }
-  .roster-glance h1 { margin-bottom:16px; }
-  .roster tbody th, .roster-value { padding-top:9px; padding-bottom:9px; }
-}
+/* Now + next: values from v2-now-next.html. Native supplies the 376px surface. */
 
-/* Row actions sit beside identity/model text, leaving the figures and paid terms in their
-   columns. The shared underlined treatment is secondary, with a real 28px target and focus ring. */
-.key-terms { display:block; }
-.row-action {
-  display:inline-flex; align-items:center; justify-content:center; flex:none;
-  min-width:28px; min-height:28px; padding:3px 2px; border:0; border-radius:3px;
-  background:transparent; color:inherit; font-size:13px; font-weight:500;
-  white-space:nowrap; text-decoration:underline; text-underline-offset:3px;
-}
-.roster-inline { display:flex; align-items:center; gap:6px; min-width:0; }
-.roster-inline > .roster-identity, .roster-inline > .roster-meta { flex:1; }
-.roster-inline > .roster-meta { margin-top:0; }
-.roster-spending { flex:none; font-size:13px; font-weight:600; }
-.seat-actions { align-items:center; }
+@font-face { font-family:"Hanken Grotesk"; src:url("fonts/hankengrotesk.woff2") format("woff2"); font-weight:100 900; font-display:swap; }
+@font-face { font-family:"Outfit"; src:url("fonts/outfit-700.woff2") format("woff2"); font-weight:700; font-display:swap; }
 
-/* The verdict stays above a separately bounded roster. Long session lists can scroll inside
-   the paid hero; neither a long roster nor a long session list can push away the sheet handle. */
-.compact-roster-app .availability { flex:0 1 auto; max-height:290px; }
-.compact-roster-app .ambient-verdict { padding:10px 24px 14px; }
-.compact-roster-app .ambient-verdict h1 { min-height:0; }
-.compact-roster-app .reading { flex-direction:row; justify-content:center; gap:10px; margin:6px 0; }
-.compact-roster-app .reading-value { font-size:2.5rem; }
-.compact-roster-app .hero-followup { gap:8px; margin-top:4px; }
-.compact-roster-app .paid-use-control { flex:0 1 auto; max-height:290px; padding:10px 24px 14px; }
-.compact-roster-app .paid-session-list { margin-bottom:8px; }
-.compact-roster-app .billing-note { margin-top:6px; }
-.roster-compact {
-  flex:1; min-height:0; padding:4px 24px 12px;
-  overflow-y:auto; overflow-x:hidden; scrollbar-width:thin; scroll-padding:8px;
+:root {
+  --codex:#46c2a8; --claude:#e0795a;
+  --sans:"Hanken Grotesk",ui-rounded,"SF Pro Rounded",-apple-system,system-ui,sans-serif;
+  --figure:"Outfit",ui-rounded,"SF Pro Rounded",system-ui,sans-serif;
 }
-.roster-compact:focus-visible { outline-offset:-4px; }
-.roster-compact .roster { border-spacing:0 4px; }
-.roster-compact .roster tbody th, .roster-compact .roster-value { padding-top:6px; padding-bottom:6px; }
-.roster-compact .roster .roster-tool { padding-top:8px; padding-bottom:0; }
-.roster-compact .roster-value { font-size:1.35rem; }
-.roster-compact .roster-active .roster-value { font-size:1.6rem; }
-/* Compact body copy has a 13px floor, including countdowns, missing readings and provenance. */
-.roster-compact .roster-identity, .roster-compact .roster-meta,
-.roster-compact .roster thead th, .roster-compact .roster .roster-tool,
-.roster-compact .roster-reset, .roster-compact .roster-freshness,
-.roster-compact .roster-key-terms, .roster-compact .roster .roster-unknown { font-size:13px; }
+.theme-light {
+  color-scheme:light;
+  --desk:#cfd6d1; --desk-ink:#1d2b26; --menubar:rgba(246,250,247,.82);
+  --field-a:#e8f8ec; --field-b:#c4ebdf;
+  --sheet:#f6fbf8; --ink:#06231d; --muted:#365449; --line:rgba(6,35,29,.13);
+  --edge:#2a5244; --track:rgba(6,35,29,.13); --focus:#153d75;
+  --btn:#10382f; --btn-ink:#f2faf5; --hover:rgba(6,35,29,.07);
+  --hard-bg:#ffe3d6; --hard-ink:#3b1406; --hard-edge:#a4462a;
+  --soft-bg:rgba(255,236,186,.85); --soft-ink:#33260a; --soft-edge:#8a6a1f;
+  --menu:#fbfefc; --shadow:rgba(16,56,47,.26);
+}
+.theme-dark {
+  color-scheme:dark;
+  --desk:#151917; --desk-ink:#e7efe9; --menubar:rgba(30,36,33,.85);
+  --field-a:#123a32; --field-b:#1f5546;
+  --sheet:#14302a; --ink:#fff6df; --muted:#c3d8cc; --line:rgba(255,246,223,.13);
+  --edge:#a9c8b8; --track:rgba(255,246,223,.17); --focus:#ffe6ad;
+  --btn:#fff6df; --btn-ink:#10382f; --hover:rgba(255,246,223,.08);
+  --hard-bg:#4d2316; --hard-ink:#ffe6da; --hard-edge:#f0a184;
+  --soft-bg:rgba(84,64,26,.8); --soft-ink:#fff0c9; --soft-edge:#e6c378;
+  --menu:#1a3a33; --shadow:rgba(0,0,0,.5);
+}
+/* all limited: the field turns to the app's resting amber */
+.mood-resting.theme-light { --field-a:#fff6df; --field-b:#ffe2a6; --ink:#30220d; --muted:#4f3c1c; --edge:#6a5226; --line:rgba(48,34,13,.14); --track:rgba(48,34,13,.13); --sheet:#fffaf0; --btn:#443313; }
+.mood-resting.theme-dark { --field-a:#302b20; --field-b:#52412a; --sheet:#2c261c; --muted:#e8d9b9; --edge:#e6cf9f; }
 
-/* The action sits on its own line under the seat's meta, small and quiet, and the whole row is a
-   pointer target. The button is the keyboard path; the row is a convenience, so the row gets no
-   role or tabindex it could not honour. */
-.row-action { display:inline-flex; margin-top:6px; }
-.roster-actionable { cursor:pointer; }
-.roster-actionable:hover > * { background:var(--surface); }
-.roster-signedout .roster-status { font-weight:650; color:#b4443a; }
-.theme-dark .roster-signedout .roster-status { color:#e8877d; }
-.roster-signedout .roster-identity { font-weight:650; }
-.signin-expiry { display:block; margin-top:2px; font-size:.75rem; line-height:1.3; }
+/* ---------- popover chrome ---------- */
+.field { background:linear-gradient(180deg,var(--field-a) 0%,var(--field-b) 100%); }
+.top {
+  position:relative; z-index:3; display:flex; align-items:center; gap:6px;
+  height:44px; padding:0 8px 0 16px; background:var(--field-a);
+}
+.brand { font:700 15px/1 var(--figure); letter-spacing:-.01em; margin-right:auto; }
+.chip {
+  display:inline-flex; align-items:center; gap:5px; height:24px; padding:0 9px 0 7px; border-radius:999px;
+  font-size:12px; font-weight:650; border:1px solid var(--edge); white-space:nowrap;
+}
+.chip svg { width:12px; height:12px; flex:none; }
+.chip--hard { background:var(--hard-bg); color:var(--hard-ink); border-color:var(--hard-edge); }
+.chip--soft { background:var(--soft-bg); color:var(--soft-ink); border-color:var(--soft-edge); }
+.chip--calm { border-color:transparent; color:var(--muted); font-weight:550; }
+.ibtn { width:30px; height:30px; display:grid; place-items:center; border-radius:8px; }
+.ibtn:hover, .ibtn[aria-expanded="true"] { background:var(--hover); }
+.ibtn svg { width:16px; height:16px; }
+.menu-wrap { position:relative; }
+.menu {
+  position:absolute; right:0; top:36px; z-index:10; width:210px; padding:5px;
+  background:var(--menu); border:1px solid var(--line); border-radius:10px;
+  box-shadow:0 12px 28px var(--shadow); display:flex; flex-direction:column;
+}
+.menu button { display:flex; justify-content:space-between; align-items:center; gap:8px; text-align:left; padding:7px 9px; border-radius:6px; font-size:13px; }
+.menu button:hover { background:var(--hover); }
+.menu .sub { color:var(--muted); font-size:12px; }
+.menu hr { border:0; border-top:1px solid var(--line); margin:4px 6px; }
+
+.body { flex:1; min-height:0; overflow-y:auto; scrollbar-width:thin; }
+
+/* ---------- the answer: one block per tool ---------- */
+.tool { display:grid; grid-template-columns:58px 1fr; column-gap:6px; padding:9px 16px 11px; }
+.tool + .tool { border-top:1px solid var(--line); }
+.toolname { display:flex; align-items:center; gap:6px; height:28px; font-weight:650; font-size:12.5px; }
+.mark { width:8px; height:8px; flex:none; border:1px solid var(--ink); background:var(--codex); }
+.mark--claude { border-radius:50%; background:var(--claude); }
+.answer { min-width:0; }
+
+.now { display:flex; align-items:baseline; gap:7px; min-height:28px; }
+.seatname { font-weight:700; font-size:15px; letter-spacing:-.01em; border-radius:5px; padding:0 2px; margin:0 -2px; display:inline-flex; align-items:center; gap:4px; }
+.seatname:hover { background:var(--hover); }
+.seatname .chev { width:9px; height:9px; opacity:.6; transition:transform .15s; }
+.seatname[aria-expanded="true"] .chev { transform:rotate(180deg); }
+.tag { font-size:11px; font-weight:650; padding:1px 6px; border-radius:999px; border:1px solid var(--edge); line-height:1.3; white-space:nowrap; }
+.fig { margin-left:auto; font:700 28px/1 var(--figure); letter-spacing:-.02em; font-variant-numeric:tabular-nums; white-space:nowrap; }
+.fig small { font-size:15px; margin-left:1px; }
+.fig--time { font-size:25px; }
+.fig-l { font-size:12px; color:var(--muted); white-space:nowrap; }
+
+.bar { height:6px; margin:7px 0 5px; border-radius:3px; background:var(--track); overflow:hidden; }
+.bar i { display:block; height:100%; border-radius:3px; background:var(--ink); }
+.meta { display:flex; justify-content:space-between; gap:8px; font-size:12.5px; color:var(--muted); font-variant-numeric:tabular-nums; }
+
+.then { position:relative; margin-top:8px; padding-left:17px; font-size:13px; }
+.then::before {
+  content:""; position:absolute; left:3px; top:-4px; width:8px; height:12px;
+  border-left:1.5px solid var(--muted); border-bottom:1.5px solid var(--muted); border-bottom-left-radius:5px;
+}
+.then b { font-weight:700; }
+.then .muted { color:var(--muted); }
+
+.issue {
+  display:flex; align-items:center; gap:8px; margin-top:8px; padding:5px 5px 5px 8px; border-radius:9px;
+  font-size:12.5px; line-height:1.3; border:1px solid;
+}
+.tool > .issue, .tool > .details { grid-column:1 / -1; }
+.issue svg { width:14px; height:14px; flex:none; }
+.issue > div { flex:1; min-width:0; }
+.issue--hard { background:var(--hard-bg); color:var(--hard-ink); border-color:var(--hard-edge); }
+.issue--soft { background:var(--soft-bg); color:var(--soft-ink); border-color:var(--soft-edge); }
+.issue .seatname { font-size:12.5px; }
+.waiting { display:inline-flex; align-items:center; gap:6px; font-weight:600; padding:0 6px; white-space:nowrap; }
+.waiting::before { content:""; width:7px; height:7px; border-radius:50%; background:currentColor; animation:pulse 1s ease-in-out infinite alternate; }
+@keyframes pulse { from { opacity:.25 } to { opacity:1 } }
+
+.act {
+  height:26px; padding:0 10px; border-radius:999px; border:1px solid var(--edge);
+  font-size:12px; font-weight:650; white-space:nowrap; flex:none;
+}
+.act:hover { background:var(--hover); }
+.act--strong { background:var(--btn); color:var(--btn-ink); border-color:var(--btn); }
+.act--strong:hover { background:var(--btn); filter:brightness(1.15); }
+.issue--hard .act { border-color:var(--hard-edge); }
+.issue--hard .act--strong { background:var(--hard-ink); color:var(--hard-bg); border-color:var(--hard-ink); }
+.issue--soft .act { border-color:var(--soft-edge); }
+
+/* ---------- details on demand ---------- */
+.details { margin-top:8px; padding:10px; border:1px solid var(--line); border-radius:10px; background:color-mix(in srgb,var(--sheet) 65%,transparent); font-size:12px; font-variant-numeric:tabular-nums; }
+.detail-group + .detail-group { margin-top:10px; padding-top:8px; border-top:1px solid var(--line); }
+.detail-group h3, .detail-actions h3 { margin:0 0 4px; color:var(--muted); font-size:10.5px; font-weight:650; letter-spacing:.04em; }
+.detail-group dl { display:grid; grid-template-columns:max-content minmax(0,1fr); gap:3px 8px; }
+.details .detail-note { grid-column:1 / -1; }
+.detail-actions { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:6px; margin-top:10px; padding-top:8px; border-top:1px solid var(--line); }
+.detail-actions .seat-actions { justify-content:flex-end; }
+.details .destructive { color:var(--hard-edge); border-color:currentColor; }
+.details .destructive:hover { background:var(--hard-bg); }
+.details dt { color:var(--muted); }
+.details dd { min-width:0; }
+
+/* ---------- the rest: one line per seat ---------- */
+.sheet { padding:4px 0 2px; border-top:1px solid var(--line); }
+.sheet .seat { padding:0 16px; border-bottom:0; }
+.sheet .seat + .seat { border-top:1px solid var(--line); }
+.sheet .seat.first-of-tool:not(:first-child) { border-top-color:var(--edge); border-top-color:color-mix(in srgb,var(--ink) 30%,transparent); }
+.row { display:grid; grid-template-columns:58px minmax(0,auto) 1fr auto; column-gap:6px; align-items:center; min-height:38px; }
+.row .toolname { height:auto; color:var(--muted); font-weight:600; }
+.row .seatname { font-size:13px; font-weight:650; }
+.state { font-size:12.5px; color:var(--muted); min-width:0; padding-left:4px; }
+.state--strong { color:var(--ink); font-weight:600; }
+.sheet .seat .details { margin:0 0 9px 64px; }
+
+/* ---------- empty ---------- */
+.welcome { padding:22px 20px 22px; display:flex; flex-direction:column; align-items:flex-start; gap:8px; }
+.welcome-title { font:700 22px/1.1 var(--figure); letter-spacing:-.015em; }
+.welcome p { max-width:280px; }
+.welcome .act { height:32px; padding:0 14px; font-size:13px; margin-top:6px; }
+
+/* ---------- footer status line ---------- */
+.foot { display:flex; align-items:center; gap:7px; min-height:32px; padding:0 16px; border-top:1px solid var(--line); font-size:12px; color:var(--muted); background:var(--sheet); }
+.foot svg { width:12px; height:12px; flex:none; }
+.foot.flash { color:var(--ink); font-weight:600; }
+
+@media (prefers-reduced-motion:reduce) { *, *::before { animation:none !important; transition:none !important; } }
+
+/* Shared surfaces inherit the design palette and type. */
+.theme-light, .theme-dark { --support:var(--muted); --surface:var(--sheet); --button:var(--btn); --button-ink:var(--btn-ink); }
+html { font-size:13px; }
+html, body, #root { width:100%; height:auto; min-height:0; overflow:hidden; }
+body { margin:0; color:var(--ink); font:400 13px/1.38 var(--sans); -webkit-font-smoothing:antialiased; }
+.app { height:auto; min-height:220px; max-height:min(600px,100vh); font:400 13px/1.38 var(--sans); background:var(--sheet); }
+button { color:inherit; }
+[hidden] { display:none !important; }
+:where(button,a,input,select,textarea,summary,[tabindex]):focus-visible { outline:2px solid var(--focus); outline-offset:2px; border-radius:6px; }
+.sr-only { position:absolute !important; width:1px !important; height:1px !important; padding:0 !important; margin:-1px !important; overflow:hidden !important; clip-path:inset(50%); white-space:nowrap; border:0 !important; }
+.now-next { --support:var(--muted); --surface:var(--sheet); --button:var(--btn); --button-ink:var(--btn-ink); }
+.now-next .top { flex:0 0 44px; justify-content:initial; }
+.top-actions { display:flex; gap:6px; }
+.app-icon { display:block; width:20px; height:20px; flex:none; }
+.chip { margin-left:0; min-width:0; min-height:0; line-height:1.38; }
+.chip:hover { background:var(--hard-bg); }
+.ibtn { min-height:0; min-width:0; padding:0; border:0; }
+.header-menu { position:relative; }
+.menu button { min-height:0; border:0; background:none; font-weight:400; line-height:1.38; }
+.menu .sub { text-align:right; }
+.body { flex:0 1 auto; }
+.body:focus-visible { outline-offset:-3px; }
+.content { min-height:0; }
+.sheet { background:var(--sheet); }
+.now { display:grid; grid-template-columns:minmax(0,1fr) auto auto; }
+.now-seat { display:flex; align-items:baseline; flex-wrap:nowrap; gap:7px; min-width:0; }
+.now-seat > .seatname { flex:0 1 auto; }
+.now-seat > .tag { flex:none; }
+.seatname { min-height:0; min-width:0; border:0; background:none; text-align:left; line-height:1.38; }
+.seatname .chev { flex:none; }
+.seat-identity { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.seat-metadata { flex:none; font-size:12px; font-weight:400; color:var(--muted); white-space:nowrap; }
+.fig { margin-left:0; }
+.limited-meta { margin-top:5px; }
+.row { grid-template-columns:58px minmax(0,auto) minmax(0,1fr) auto; padding:5px 0; }
+.row > .seatname { max-width:200px; }
+.row .state { line-height:1.3; }
+.row > .state:last-child { grid-column:3 / -1; }
+.details { line-height:1.38; }
+.details dd { overflow-wrap:anywhere; }
+.row-action, .act { display:inline-flex; align-items:center; justify-content:center; min-height:0; min-width:0; height:26px; padding:0 10px; border-radius:999px; border:1px solid var(--edge); font-size:12px; font-weight:650; white-space:nowrap; flex:none; background:transparent; }
+.row-action:hover { background:var(--hover); }
+.issue .row-action { border-color:currentColor; }
+.issue--hard .row-action { background:var(--hard-ink); color:var(--hard-bg); border-color:var(--hard-ink); }
+.issue .signin-expiry { display:inline; font:inherit; }
+.issue b { font-weight:650; }
+.issue .state-glyph { flex:none; }
+.issue-text { flex:1; min-width:0; overflow-wrap:anywhere; }
+.crossing-confirm, .tier-confirm, .switch-confirm { flex-wrap:wrap; }
+.crossing-confirm .issue-text, .tier-confirm .issue-text, .switch-confirm .issue-text { flex-basis:calc(100% - 24px); }
+.crossing-acts { display:flex; flex-wrap:wrap; gap:6px; margin-left:22px; }
+.crossing-confirm .pricing-link { margin-left:22px; font-size:12px; min-height:0; padding:0; }
+.foot { flex:none; margin-top:auto; }
+.foot .footer-status { flex:1; min-width:0; padding:6px 0; }
+.app-problems { padding:0 16px 9px; background:var(--field-a); display:flow-root; }
+.app-problem { flex-wrap:wrap; }
+.key-management { display:flex; flex-direction:column; gap:8px; }
+.empty { padding:12px 16px; color:var(--support); }
+/* Empty, paid spending, and pending paid approval keep the established mood palettes. */
+.mood-empty.theme-light { --field-a:#fff6df; --field-b:#ffe2a6; }
+.mood-empty.theme-dark { --field-a:#302b20; --field-b:#52412a; }
+.mood-spending.theme-light { --field-a:#ffecd8; --field-b:#f4c9ae; --muted:#512e21; --edge:#512e21; --sheet:#fff0e6; --btn:#42251c; }
+.mood-spending.theme-dark { --field-a:#35231e; --field-b:#603a2c; --sheet:#432c23; --muted:#e6bba1; --edge:#e6bba1; }
+.now-next.theme-light:has(.key-prompts:not(:empty)) { --field-a:#f2ecff; --field-b:#ddd6ef; --ink:#302546; --muted:#59446e; --edge:#59446e; --sheet:#eee7f7; --btn:#302546; }
+.now-next.theme-dark:has(.key-prompts:not(:empty)) { --field-a:#272237; --field-b:#403656; --sheet:#362b46; --muted:#c7b3e5; --edge:#c7b3e5; }
+.now-next .key-confirm, .now-next .paid-use-control { padding:9px 16px 11px; gap:8px; background:linear-gradient(180deg,var(--field-a),var(--field-b)); border-bottom:1px solid var(--line); }
+.now-next .key-confirm h1 { font:700 18px/1.2 var(--figure); }
+.now-next .paid-use-control { flex:none; }
+.now-next .paid-use-control h1 { font-size:15px; text-align:left; }
+.now-next .paid-use-control .reading { flex-direction:row; gap:4px; margin:0; }
+.now-next .paid-use-control .reading-value, .now-next .paid-use-control .reading-unit { font-size:13px; font-weight:400; letter-spacing:0; }
+.now-next .paid-session-list { overflow:visible; margin-bottom:0; }
+.now-next .paid-session { padding:5px 0; }
+.now-next .paid-session h2 { font-size:13px; }
+.now-next .paid-session button, .now-next .stop-all { min-height:26px; padding:4px 10px; font-size:12px; }
+.now-next .billing-note { text-align:left; margin-top:0; }
+/* Pushed tasks use the same scale and controls as the popover. */
+.set-head { flex:0 0 44px; height:44px; padding:0 16px; gap:8px; background:var(--field-a); }
+.set-back { width:30px; height:30px; }
+.set-body { flex:0 1 auto; padding:12px 16px 16px; gap:18px; }
+.set-label { font:700 18px/1.2 var(--figure); }
+.set-s { font-size:12px; color:var(--muted); }
+.set-sec { gap:8px; }
+.set-toggle-row { min-height:38px; }
+.set-seg { gap:6px; }
+.set-app .sopt { min-height:30px; padding:5px 8px; font-size:12px; }
+.set-app .paid-settings { border-radius:9px; padding:12px; }
+.set-app .add-input, .set-app .add-token { border-radius:9px; }
+.set-app .add-center { padding:22px 0; }
+.set-app .add-h, .set-app .add-welcome { font:700 22px/1.1 var(--figure); }
+.picker-body { flex:1; height:510px; }
+@media (prefers-reduced-motion:reduce) { *, *::before, *::after { animation:none !important; transition:none !important; } }
+
+.now-next:has(.menu:not([hidden])) { min-height:min(300px,100vh); }

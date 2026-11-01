@@ -1,16 +1,4 @@
 [
-  {"label": "launch: unreadable home reads raise instead of allowing snapshot fallback",
-   "file": "acctsw/keychain.py",
-   "old": "            if strict and proc.returncode != ITEM_NOT_FOUND:\n",
-   "new": "            if proc.returncode != ITEM_NOT_FOUND:\n",
-   "test": ["tests/test_signin.py::test_launch_login_plan_uses_snapshot_when_home_item_is_unreadable"]},
-
-  {"label": "notify: an unknown sign-in verdict clears notification marks between convergence and a full poll",
-   "file": "acctsw/accounts.py",
-   "old": "            if not seat.get(\"signin\"):\n                continue  # credential convergence cleared the verdict, not the notification history\n",
-   "new": "",
-   "test": ["tests/test_signin.py::test_expiring_notice_survives_convergence_and_an_active_only_poll"]},
-
   {"label": "classifier: a Claude refresh token never expires (refreshTokenExpiresAt ignored)",
    "file": "acctsw/usage.py",
    "old": "_live_token(oauth.get(\"refreshToken\"), oauth.get(\"refreshTokenExpiresAt\"), at)",
@@ -129,8 +117,7 @@
    "file": "acctsw/selection.py",
    "old": "                and not (s.get(\"signin\") or {}).get(\"signed_out\")}",
    "new": "}",
-   "test": ["tests/test_signin.py::test_signed_out_seat_is_never_chosen",
-            "tests/test_signin.py::test_signed_out_active_seat_still_hops_to_a_usable_one"]},
+   "test": ["tests/test_signin.py::test_signed_out_seat_is_never_chosen", "tests/test_signin.py::test_signed_out_active_seat_still_hops_to_a_usable_one"]},
 
   {"label": "notify: signed out is announced on every poll (dedupe dropped)",
    "file": "acctsw/accounts.py",
@@ -161,6 +148,7 @@
    "old": "    return notices if state.settings().get(\"notify\", True) else []",
    "new": "    return notices",
    "test": ["tests/test_signin.py::test_bridge_poll_delivers_each_notice_once_and_honours_the_setting"]},
+
   {"label": "door: a signed-out seat that still reads ready/active holds the door open",
    "file": "acctsw/web_dot.py",
    "old": "s.get(\"status\") in (\"ready\", \"active\") and not s.get(\"signed_out\")",
@@ -172,6 +160,7 @@
    "old": "[\"ready\", \"active\"].includes(s.status) && !s.signed_out",
    "new": "[\"ready\", \"active\"].includes(s.status)",
    "cmd": ["node", "--test", "--test-name-pattern=doorKey golden parity", "app/web/render.test.mjs"]},
+
   {"label": "polling (launcher wait sweep): a signed-out seat is fetched anyway",
    "file": "acctsw/launcher.py",
    "old": "            u = (usage_mod.Usage(error=\"no_token\", fetched_at=iso(now())) if signin.signed_out\n                 else usage_mod._fetch_for(tool, login, get, ua))",
@@ -189,134 +178,142 @@
    "old": "    if tool == \"claude\" and ctx.claude_home(email).exists():\n",
    "new": "    if False:\n",
    "test": ["tests/test_signin.py::test_signed_in_means_a_launch_would_get_a_login"]},
+
   {"label": "launch login (B1): a wiped home takes back the snapshot Claude just proved dead",
    "file": "acctsw/usage.py",
    "old": "    elif wiped:\n        return None",
    "new": "    elif False:\n        return None",
    "test": ["tests/test_signin.py::test_signed_in_means_a_launch_would_get_a_login"]},
+
   {"label": "launch login (B1): the verdict never reads the snapshot a launch would restore",
    "file": "acctsw/usage.py",
    "old": "        launch = claude_launch_login(blob, snapshot, last, at)\n",
    "new": "        launch = claude_launch_login(blob, lambda: None, last, at)\n",
    "test": ["tests/test_signin.py::test_signed_in_means_a_launch_would_get_a_login"]},
+
   {"label": "launch login (B1): the poll fetches with the dead home item, not the login the verdict rests on",
    "file": "acctsw/usage.py",
    "old": "            tool=t, email=email, blob=login or \"\",",
    "new": "            tool=t, email=email, blob=blob or \"\",",
    "test": ["tests/test_signin.py::test_signed_in_means_a_launch_would_get_a_login"]},
+
   {"label": "launch login (B1): the verdict ignores refresh expiry on the login a launch would run on",
    "file": "acctsw/usage.py",
    "old": "        verdict = classify_signin(tool, [login], at)\n",
    "new": "        verdict = SignIn(login is None)\n",
    "test": ["tests/test_signin.py::test_launcher_capacity_check_classifies_and_gates_the_same_way"]},
+
   {"label": "keychain (W2): any failed read means 'no such item' (a locked keychain signs everyone out)",
    "file": "acctsw/keychain.py",
    "old": "            if strict and proc.returncode != ITEM_NOT_FOUND:\n",
    "new": "            if False:\n",
    "test": ["tests/test_signin.py::test_a_locked_keychain_signs_nobody_out"]},
+
   {"label": "keychain (W2): the app poll dies on an unreadable credential instead of keeping the verdict",
    "file": "acctsw/usage.py",
    "old": "            signin, digest, login = _signin_for(ctx, t, email, blob, at)\n        except UNREADABLE:\n            summary[t][email] = \"unreadable\"\n            continue\n",
    "new": "            signin, digest, login = _signin_for(ctx, t, email, blob, at)\n        except ZeroDivisionError:\n            summary[t][email] = \"unreadable\"\n            continue\n",
    "test": ["tests/test_signin.py::test_a_locked_keychain_signs_nobody_out"]},
+
   {"label": "keychain (W2): the launcher refresh takes an unreadable credential as signed out",
    "file": "acctsw/usage.py",
    "old": "            except UNREADABLE:\n                summary[t][email] = \"unreadable\"\n                continue\n",
    "new": "            except UNREADABLE:\n                blob, signin, digest, login = None, SignIn(True), None, None\n",
    "test": ["tests/test_signin.py::test_an_unreadable_snapshot_is_no_proof_of_logout"]},
+
   {"label": "keychain (W2): the launcher capacity check dies on an unreadable credential instead of keeping the verdict",
    "file": "acctsw/launcher.py",
    "old": "        except usage_mod.UNREADABLE:\n            continue   # proves nothing: the seat keeps its stored verdict\n",
    "new": "        except ZeroDivisionError:\n            continue   # proves nothing: the seat keeps its stored verdict\n",
    "test": ["tests/test_signin.py::test_a_locked_keychain_signs_nobody_out"]},
+
   {"label": "commit (W5a): the capacity check commits a verdict whose snapshot changed mid-fetch",
    "file": "acctsw/launcher.py",
    "old": "        return (digest == usage_mod._credential_digest(current)\n                or usage_mod._signin_for(ctx, tool, email, current, at)[1] == digest)",
    "new": "        return True",
    "test": ["tests/test_signin.py::test_launcher_capacity_check_drops_a_verdict_whose_snapshot_changed_mid_fetch"]},
+
   {"label": "commit (W5a): the app poll commits a verdict whose snapshot changed mid-fetch",
    "file": "acctsw/usage.py",
    "old": "                or current_signin != job.signin_digest):",
    "new": "                or False):",
    "test": ["tests/test_signin.py::test_app_poll_drops_a_verdict_whose_snapshot_changed_mid_fetch"]},
+
   {"label": "store (W5b): an authenticated 200 leaves a stored signed-out verdict in place",
    "file": "acctsw/usage.py",
    "old": "    if (u.ok and signin is None and seat is not None\n",
    "new": "    if (False and signin is None and seat is not None\n",
    "test": ["tests/test_signin.py::test_an_authenticated_answer_clears_a_stored_signed_out"]},
+
   {"label": "notify (S2): a moved expiry inside the window re-announces (keyed on the stamp again)",
    "file": "acctsw/accounts.py",
    "old": "            if expiring and not marks.get(\"expiring\"):",
    "new": "            if expiring and marks.get(\"expiring\") != iso(expires):",
    "test": ["tests/test_signin.py::test_expiring_is_announced_once_until_the_seat_leaves_the_window"]},
+
   {"label": "notify (S2): leaving the expiring window never re-arms the notice",
    "file": "acctsw/accounts.py",
    "old": "            elif not expiring:\n                marks.pop(\"expiring\", None)\n",
    "new": "",
    "test": ["tests/test_signin.py::test_expiring_is_announced_once_until_the_seat_leaves_the_window"]},
+
   {"label": "lock (S4): the capacity check reads the keychain under the state flock",
    "file": "acctsw/launcher.py",
    "old": "            blob = usage_mod._seat_blob(ctx, state, tool, email, strict=True)\n            # Same verdict",
    "new": "            with ctx.locked():\n                blob = usage_mod._seat_blob(ctx, state, tool, email, strict=True)\n            # Same verdict",
    "test": ["tests/test_signin.py::test_launcher_capacity_check_reads_credentials_outside_the_state_lock"]},
+
   {"label": "harness (S3): the mutant is written into the real tree",
    "file": "scripts/mutate.py",
    "old": "        (tree / entry[\"file\"]).write_text(",
    "new": "        (ROOT / entry[\"file\"]).write_text(",
    "test": ["tests/test_mutate.py"]},
+
   {"label": "harness (S3): a hung guard crashes the run instead of reading TIMEOUT",
    "file": "scripts/mutate.py",
    "old": "        except subprocess.TimeoutExpired:\n            return \"TIMEOUT\", f\"guard ran past {TIMEOUT_S}s\"\n",
    "new": "        except ZeroDivisionError:\n            return \"TIMEOUT\", f\"guard ran past {TIMEOUT_S}s\"\n",
    "test": ["tests/test_mutate.py::test_a_guard_that_hangs_is_a_timeout_not_a_verdict"]},
 
-  {
-    "label": "launch login: a usable partial home login is rejected",
-    "file": "acctsw/usage.py",
-    "old": "    if login_usable(\"claude\", current, at):",
-    "new": "    if claude_login_present(current):",
-    "test": [
-      "tests/test_signin.py::test_partial_home_login_matches_launch_and_signin"
-    ]
-  },
+  {"label": "launch: unreadable home reads raise instead of allowing snapshot fallback",
+   "file": "acctsw/keychain.py",
+   "old": "            if strict and proc.returncode != ITEM_NOT_FOUND:\n",
+   "new": "            if proc.returncode != ITEM_NOT_FOUND:\n",
+   "test": ["tests/test_signin.py::test_launch_login_plan_uses_snapshot_when_home_item_is_unreadable"]},
 
-  {
-    "label": "launch login: classifier clock is ignored",
-    "file": "acctsw/usage.py",
-    "old": "        launch = claude_launch_login(blob, snapshot, last, at)\n",
-    "new": "        launch = claude_launch_login(blob, snapshot, last)\n",
-    "test": [
-      "tests/test_signin.py::test_home_login_uses_the_classification_clock"
-    ]
-  },
+  {"label": "notify: an unknown sign-in verdict clears notification marks between convergence and a full poll",
+   "file": "acctsw/accounts.py",
+   "old": "            if not seat.get(\"signin\"):\n                continue  # credential convergence cleared the verdict, not the notification history\n",
+   "new": "",
+   "test": ["tests/test_signin.py::test_expiring_notice_survives_convergence_and_an_active_only_poll"]},
 
-  {
-    "label": "bridge: unreadable Claude preflight aborts the other seats",
-    "file": "acctsw/bridge.py",
-    "old": "                except usage_mod.UNREADABLE:\n                    # Locked/denied is unknown;",
-    "new": "                except ZeroDivisionError:\n                    # Locked/denied is unknown;",
-    "test": [
-      "tests/test_bridge.py::test_unreadable_claude_item_does_not_block_usage_or_codex_handoff"
-    ]
-  },
+  {"label": "launch login: a usable partial home login is rejected",
+   "file": "acctsw/usage.py",
+   "old": "    if login_usable(\"claude\", current, at):",
+   "new": "    if claude_login_present(current):",
+   "test": ["tests/test_signin.py::test_partial_home_login_matches_launch_and_signin"]},
 
-  {
-    "label": "bridge: unreadable handoff receipt aborts the request",
-    "file": "acctsw/bridge.py",
-    "old": "        except usage_mod.UNREADABLE:\n            continue  # unknown credentials cannot authorize a handoff",
-    "new": "        except ZeroDivisionError:\n            continue  # unknown credentials cannot authorize a handoff",
-    "test": [
-      "tests/test_bridge.py::test_unreadable_handoff_receipt_keeps_selection"
-    ]
-  },
+  {"label": "launch login: classifier clock is ignored",
+   "file": "acctsw/usage.py",
+   "old": "        launch = claude_launch_login(blob, snapshot, last, at)\n",
+   "new": "        launch = claude_launch_login(blob, snapshot, last)\n",
+   "test": ["tests/test_signin.py::test_home_login_uses_the_classification_clock"]},
 
-  {
-    "label": "bridge: a failed reconciliation probe still permits writes to that seat",
-    "file": "acctsw/usage.py",
-    "old": "            if unreadable and (t, email) in unreadable:",
-    "new": "            if False:",
-    "test": [
-      "tests/test_bridge.py::test_unreadable_claude_item_does_not_block_usage_or_codex_handoff"
-    ]
-  }
+  {"label": "bridge: unreadable Claude preflight aborts the other seats",
+   "file": "acctsw/bridge.py",
+   "old": "                except usage_mod.UNREADABLE:\n                    # Locked/denied is unknown;",
+   "new": "                except ZeroDivisionError:\n                    # Locked/denied is unknown;",
+   "test": ["tests/test_bridge.py::test_unreadable_claude_item_does_not_block_usage_or_codex_handoff"]},
+
+  {"label": "bridge: unreadable handoff receipt aborts the request",
+   "file": "acctsw/bridge.py",
+   "old": "        except usage_mod.UNREADABLE:\n            continue  # unknown credentials cannot authorize a handoff",
+   "new": "        except ZeroDivisionError:\n            continue  # unknown credentials cannot authorize a handoff",
+   "test": ["tests/test_bridge.py::test_unreadable_handoff_receipt_keeps_selection"]},
+
+  {"label": "bridge: a failed reconciliation probe still permits writes to that seat",
+   "file": "acctsw/usage.py",
+   "old": "            if unreadable and (t, email) in unreadable:",
+   "new": "            if False:",
+   "test": ["tests/test_bridge.py::test_unreadable_claude_item_does_not_block_usage_or_codex_handoff"]}
 ]
