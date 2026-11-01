@@ -273,5 +273,16 @@
    "--test",
    "app/web/render.test.mjs"
   ]
+ },
+ {
+  "label": "crossing automatic switching link missing",
+  "file": "app/web/render.mjs",
+  "old": "      <p class=\"support\"><button class=\"pricing-link\" data-action=\"crossing-auto\" data-scope=\"once\" ${data}>always switch automatically</button></p>\n",
+  "new": "",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
  }
 ]

@@ -531,6 +531,7 @@ export function buildSettings(state) {
       ${toggleRow("notify", "notify when switched", "show which seat is ready", s.notify)}
       ${toggleRow("restart_app", "restart the Codex app", "refresh its account after a switch", s.restart_app)}
       ${toggleRow("in_place_switch", "switch seats without restarting claude", "the conversation keeps running", s.in_place_switch !== false)}
+      ${toggleRow("crossing_auto", "switch automatically between business and personal seats", "skip the question when moving between work and personal", s.crossing_auto === true)}
       ${toggleRow("in_place_cross_tier", "switch without restarting across plan tiers", "models may differ between plans", s.in_place_cross_tier === true)}
       <p class="support">with supervision off, only cx/cl auto-switch. terminals switch without restarting the desktop app.</p>
     </section><section class="set-sec paid-settings"><h2 class="set-label">paid keys</h2>
@@ -853,7 +854,8 @@ export function crossingRequests(state) {
     return `<section class="crossing-confirm" aria-label="needs you"><p class="crossing-tag">needs you</p>
       <h2>${esc(r.from_name || r.from)} is out. continue on ${esc(r.to_name || r.to)} (${esc(KIND_WORD[r.to_kind] || KIND_WORD.unknown)})?</h2>
       <p class="crossing-why">${esc(r.from_name || r.from)} is ${esc(KIND_WORD[r.from_kind] || KIND_WORD.unknown)}; moving between work and personal seats needs your yes.</p>
-      <div class="crossing-acts"><button class="choice" data-action="crossing-answer" data-scope="once" ${data}>approve once</button><button class="choice" data-action="crossing-answer" data-scope="always" ${data}>always allow</button><button class="choice" data-action="crossing-answer" data-scope="deny" ${data}>no</button></div>
+      <div class="crossing-acts"><button class="choice" data-action="crossing-answer" data-scope="once" ${data}>switch now</button><button class="choice" data-action="crossing-answer" data-scope="deny" ${data}>not now</button></div>
+      <p class="support"><button class="pricing-link" data-action="crossing-auto" data-scope="once" ${data}>always switch automatically</button></p>
     </section>`;
   }).join("")}</div>`;
 }

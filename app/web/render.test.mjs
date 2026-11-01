@@ -2293,16 +2293,17 @@ test("settings offers the in-place switch toggle, on unless turned off", () => {
 const crossing = (over = {}) => ({ tool: "claude", from: "w@x", to: "p@x", at: "2026-10-31T10:00:00Z",
   from_name: "Work", to_name: "Home", from_kind: "business", to_kind: "personal", ...over });
 
-test("a pending crossing is a needs-you item with approve once, always allow and no", () => {
+test("a pending crossing offers switch now, not now and an automatic switching link", () => {
   const html = buildHTML(state({ pending_crossings: [crossing()] }));
   assert.match(html, /needs you/);
   assert.match(html, /Work is out\. continue on Home \(personal\)\?/);
-  for (const scope of ["once", "always", "deny"]) {
+  for (const scope of ["once", "deny"]) {
     assert.match(html, new RegExp(`data-action="crossing-answer" data-scope="${scope}" data-tool="claude" data-from="w@x" data-to="p@x"`));
   }
-  assert.match(html, />approve once</);
-  assert.match(html, />always allow</);
-  assert.match(html, />no</);
+  assert.match(html, />switch now</);
+  assert.match(html, />not now</);
+  assert.match(html, /data-action="crossing-auto" data-scope="once" data-tool="claude" data-from="w@x" data-to="p@x">always switch automatically<\/button>/);
+  assert.doesNotMatch(html, /always allow|data-scope="always"/);
   assert.equal(crossingRequests(state({})), "");
   assert.doesNotMatch(buildHTML(state({})), /crossing-answer/);
 });
@@ -2315,14 +2316,37 @@ test("an unknown kind is said plainly and names are escaped", () => {
 test("crossing answers reach the bridge as approve_crossing / deny_crossing", () => {
   const html = crossingRequests({ pending_crossings: [crossing()] });
   const buttons = [...html.matchAll(/data-action="crossing-answer" data-scope="(\w+)" data-tool="([^"]+)" data-from="([^"]+)" data-to="([^"]+)"/g)];
-  assert.equal(buttons.length, 3);
+  assert.equal(buttons.length, 2);
   const app = keyApp();
   for (const [, scope, tool, from, to] of buttons) app.click({ action: "crossing-answer", scope, tool, from, to });
-  assert.deepEqual(JSON.parse(JSON.stringify(app.sent.slice(-3))), [
+  assert.deepEqual(JSON.parse(JSON.stringify(app.sent.slice(-2))), [
     { action: "approve_crossing", tool: "claude", from: "w@x", to: "p@x", scope: "once" },
-    { action: "approve_crossing", tool: "claude", from: "w@x", to: "p@x", scope: "always" },
     { action: "deny_crossing", tool: "claude", from: "w@x", to: "p@x", scope: "deny" },
   ]);
+});
+
+test("the automatic switching link enables the setting then approves this crossing once", () => {
+  const html = crossingRequests({ pending_crossings: [crossing()] });
+  const [, action, scope, tool, from, to] = html.match(/data-action="(crossing-auto)" data-scope="(once)" data-tool="([^"]+)" data-from="([^"]+)" data-to="([^"]+)"/);
+  const app = keyApp();
+  app.click({ action, scope, tool, from, to });
+  assert.deepEqual(JSON.parse(JSON.stringify(app.sent.slice(-2))), [
+    { action: "toggle", key: "crossing_auto", value: true },
+    { action: "approve_crossing", tool: "claude", from: "w@x", to: "p@x", scope: "once" },
+  ]);
+});
+
+test("settings offers automatic business/personal switching, off by default", () => {
+  const off = buildSettings({ settings: {} });
+  assert.match(off, /switch automatically between business and personal seats/);
+  assert.match(off, /data-action="toggle" data-key="crossing_auto" >/);
+  assert.match(buildSettings({ settings: { crossing_auto: true } }), /data-key="crossing_auto" checked/);
+  assert.match(buildSettings({ settings: { crossing_auto: false } }), /data-key="crossing_auto" >/);
+  const app = keyApp();
+  for (const checked of [true, false]) {
+    app.handlers.change({ target: { closest: () => ({ dataset: { key: "crossing_auto" }, checked }) } });
+    assert.deepEqual(JSON.parse(JSON.stringify(app.sent.at(-1))), { action: "toggle", key: "crossing_auto", value: checked });
+  }
 });
 
 // --- plan tiers ---------------------------------------------------------------------------------

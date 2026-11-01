@@ -291,8 +291,10 @@ document.addEventListener("click", (e) => {
       if (answering.has(el.dataset.id)) break;
       answering.add(el.dataset.id); refreshKeyPrompts();
       send("answer_key_switch", { id: el.dataset.id, approved: el.dataset.approved === "true" }); break;
+    case "crossing-auto":
     case "crossing-answer": {
       const { tool, from, to, scope } = el.dataset;
+      if (el.dataset.action === "crossing-auto") send("toggle", { key: "crossing_auto", value: true });
       send(scope === "deny" ? "deny_crossing" : "approve_crossing", { tool, from, to, scope });
       break;
     }

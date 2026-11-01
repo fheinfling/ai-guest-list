@@ -53,6 +53,19 @@ def test_crosses_on_kind_change_or_any_unknown(ctx):
     assert not seatkind.crosses(state, T, None, "p@x")
 
 
+def test_crossing_auto_is_a_default_off_toggle(ctx):
+    state = seats(ctx, {"w@x": "Team", "p@x": "Max"})
+    assert state.settings()["crossing_auto"] is False
+    for enabled in (False, True, False):
+        result = bridge.handle(ctx, {"action": "toggle", "key": "crossing_auto", "value": enabled})
+        assert result["ok"]
+        state = ctx.load_state()
+        assert state.settings()["crossing_auto"] is enabled
+        for a, b in (("w@x", "p@x"), ("p@x", "w@x")):
+            assert seatkind.approved(state, T, a, b) is enabled
+            assert seatkind.consume(state, T, a, b) is enabled
+
+
 def test_approval_is_directional(ctx):
     state = seats(ctx, {"w@x": "Team", "p@x": "Max"})
     seatkind.approve(state, T, "w@x", "p@x", "always")

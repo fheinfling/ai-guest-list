@@ -211,9 +211,9 @@
   ]
  },
  {
-  "label": "UI approve-once button missing",
+  "label": "UI switch-now button missing",
   "file": "app/web/render.mjs",
-  "old": "<button class=\"choice\" data-action=\"crossing-answer\" data-scope=\"once\" ${data}>approve once</button>",
+  "old": "<button class=\"choice\" data-action=\"crossing-answer\" data-scope=\"once\" ${data}>switch now</button>",
   "new": "",
   "cmd": [
    "node",
@@ -1404,6 +1404,24 @@
    "node",
    "--test",
    "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "crossing auto setting ignored by approved",
+  "file": "acctsw/seatkind.py",
+  "old": "    if state.settings()[\"crossing_auto\"] or not crosses(state, tool, a, b, home=home):\n        return True\n    at = at or now()\n    return _live",
+  "new": "    if False or not crosses(state, tool, a, b, home=home):\n        return True\n    at = at or now()\n    return _live",
+  "test": [
+   "tests/test_seatkind.py::test_crossing_auto_is_a_default_off_toggle"
+  ]
+ },
+ {
+  "label": "crossing auto True treated as False by consume",
+  "file": "acctsw/seatkind.py",
+  "old": "    if state.settings()[\"crossing_auto\"] or not crosses(state, tool, a, b, home=home):\n        return True\n    at = at or now()\n    store = _peek",
+  "new": "    if False or not crosses(state, tool, a, b, home=home):\n        return True\n    at = at or now()\n    store = _peek",
+  "test": [
+   "tests/test_seatkind.py::test_crossing_auto_is_a_default_off_toggle"
   ]
  }
 ]

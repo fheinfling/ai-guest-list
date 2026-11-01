@@ -99,7 +99,7 @@ def _live(record, at: datetime) -> bool:
 def approved(state, tool: str, a: str | None, b: str | None, at: datetime | None = None, *,
              home: str | None = None) -> bool:
     """True when ``a``→``b`` needs no question: not a crossing, or approved in this direction."""
-    if not crosses(state, tool, a, b, home=home):
+    if state.settings()["crossing_auto"] or not crosses(state, tool, a, b, home=home):
         return True
     at = at or now()
     return _live((_peek(state, tool).get("approvals") or {}).get(_key(a, b)), at)
@@ -149,7 +149,7 @@ def consume(state, tool: str, a: str | None, b: str | None, at: datetime | None 
     """Spend the approval a switch ``a``→``b`` is about to use. Call it in the same locked write
     that commits the switch. Returns whether the switch may proceed: True for a non-crossing or a
     live approval ("once" is removed here, "always" stays), False when there is nothing to spend."""
-    if not crosses(state, tool, a, b, home=home):
+    if state.settings()["crossing_auto"] or not crosses(state, tool, a, b, home=home):
         return True
     at = at or now()
     store = _peek(state, tool)

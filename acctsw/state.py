@@ -113,6 +113,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "confirm_key_switch": True,  # consent for each hop onto metered API usage
     "key_fallback": False,    # metered seats must be explicitly opted into
     "in_place_switch": True,  # move a running claude between seats without restarting it
+    "crossing_auto": False,   # business<->personal switches happen without asking each time
     "in_place_cross_tier": False,  # ...also between plan tiers (Max/Pro/Team): models may differ
 }
 
