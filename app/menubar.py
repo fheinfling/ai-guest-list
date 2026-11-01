@@ -10,6 +10,7 @@ Run (dev):  bash scripts/run-app.sh
 from __future__ import annotations
 
 import json
+import math
 import importlib
 import importlib.util
 import subprocess
@@ -78,6 +79,22 @@ def _log_exception(exc: BaseException, secret: str = "") -> None:
         if exc is not None:
             lines.append("Caused by / during handling of:\n")
     print(bridge._redact_key("".join(lines), secret), file=sys.stderr, end="")
+
+def popover_height(value):
+    """Validate the web content height; keep native geometry finite and bounded."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value):
+        return None
+    return max(220, min(600, math.ceil(value)))
+
+
+def resize_popover(popover, value, make_size):
+    """Handle only geometry here, on the script-message (main) thread."""
+    height = popover_height(value)
+    if height is not None:
+        popover.setContentSize_(make_size(376, height))
+
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 # The open popover is the one place where a person is actively making a decision from the
@@ -414,7 +431,7 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
             ucc = WKUserContentController.alloc().init()
             ucc.addScriptMessageHandler_name_(self, "agl")
             cfg.setUserContentController_(ucc)
-            self.webview = WKWebView.alloc().initWithFrame_configuration_(NSMakeRect(0, 0, 376, 600), cfg)
+            self.webview = WKWebView.alloc().initWithFrame_configuration_(NSMakeRect(0, 0, 376, 220), cfg)
             self.webview.loadFileURL_allowingReadAccessToURL_(
                 NSURL.fileURLWithPath_(str(WEB_DIR / "index.html")),
                 NSURL.fileURLWithPath_(str(WEB_DIR)))
@@ -423,7 +440,7 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
             self.popover = NSPopover.alloc().init()
             self.popover.setDelegate_(self)
             self.popover.setContentViewController_(vc)
-            self.popover.setContentSize_(NSMakeSize(376, 600))  # match the 376px popover width
+            self.popover.setContentSize_(NSMakeSize(376, 220))  # match the 376px popover width
             self.popover.setBehavior_(1)  # NSPopoverBehaviorTransient
 
         @objc.python_method
@@ -800,6 +817,9 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
                 _log_exception(exc)
                 return
             action = msg.get("action")
+            if action == "resize":
+                resize_popover(self.popover, msg.get("height"), NSMakeSize)
+                return
             if action == "quit":
                 NSApplication.sharedApplication().terminate_(self)
                 return

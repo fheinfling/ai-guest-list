@@ -7,6 +7,8 @@ const overlay = document.createElement("div");   // toast surface only (siblings
 overlay.id = "overlay";
 document.body.appendChild(overlay);
 let state = { settings: { theme: "dark" }, tools: {} };
+let openMenu = null;
+let flashMessage = null, flashTimer = null;
 let lastRev = -1;   // highest state.rev applied; a lower one is a stale snapshot and is ignored
 
 // --- bridge -----------------------------------------------------------------------------------
@@ -32,9 +34,10 @@ window.AGL = {
     if (inKeyFlow || screen === "paid-key") out.screen = screen; // keep the current input/confirmation
     screen = out.screen; add = out.add; lastRev = out.lastRev; state = out.state;
     const keyChanged = reduceKeyReply(keyFlow, res);
-    let paidChanged = false, paidHandled = false;
+    let paidChanged = false, paidHandled = false, confirmation = null;
     if (paidTerminal && res.key_action === "key_terminal" && res.key_target_id === paidTerminal.id) {
       paidTerminal.pending = false;
+      if (res.ok) confirmation = `opened a new terminal on ${paidTerminal.label}`;
       if (res.code === "paid_use_disabled") {
         screen = "paid-key"; paidTerminal.error = null;
         paidHandled = true; paidChanged = true;
@@ -51,7 +54,11 @@ window.AGL = {
     if (out.flash && !res.key_request_id && !paidHandled) flash(out.flash);
     if (res.key_action === "key_validate" && res.ok) flash(res.validation?.operation_permitted
       ? "key check passed — this checks account access only" : "key check wasn't permitted — check access with your provider");
-    if (out.celebrate) celebrate();
+    if (confirmation) flash(confirmation);
+    if (out.celebrate) {
+      celebrate();
+      if (!out.flash) flash(state.moved_note || "seat switched");
+    }
     if (out.closeFlow) setTimeout(() => {      // auto-close this flow's "done" screen; scoped by
       if (screen === "add" && add === out.closeFlow && add.step === "done") {   // object identity so
         screen = "main"; add = null; render();  // a stale timer can't close a later add.
@@ -70,10 +77,74 @@ function celebrate() {
   root.firstElementChild?.classList.add("celebrate");
   setTimeout(() => root.firstElementChild?.classList.remove("celebrate"), 600);
 }
+function paintFlash() {
+  const status = root.querySelector(".footer-status");
+  if (status && flashMessage) {
+    status.textContent = flashMessage;
+    root.querySelector(".foot")?.classList.add("flash");
+  }
+}
 function flash(text) {
-  overlay.innerHTML = '<div class="toast" role="status"></div>';
-  overlay.firstElementChild.textContent = text;
-  setTimeout(() => { if (overlay.querySelector(".toast")) overlay.innerHTML = ""; }, 3000);
+  flashMessage = text;
+  if (flashTimer !== null) clearTimeout(flashTimer);
+  if (root.querySelector(".footer-status")) paintFlash();
+  else {
+    overlay.innerHTML = '<div class="toast" role="status"></div>';
+    overlay.firstElementChild.textContent = text;
+  }
+  reportHeight();
+  flashTimer = setTimeout(() => {
+    flashMessage = null; flashTimer = null;
+    overlay.innerHTML = "";
+    if (screen === "main") render();
+  }, 3000);
+}
+
+// Measure intrinsic content, not the current native viewport (which would prevent shrinking).
+// The body alone scrolls above 600; native is the final authority on the size limits.
+function contentHeight() {
+  const app = root.firstElementChild;
+  if (!app) return 0;
+  if (root.querySelector("details.guest-drawer[open]")) return 600;
+  const body = root.querySelector(".body, .set-body");
+  if (!body) return app.scrollHeight;
+  const content = root.querySelector(".content");
+  let height = (root.querySelector(".top, .set-head")?.offsetHeight || 0)
+    + (content?.scrollHeight || body.scrollHeight) + (root.querySelector(".foot")?.offsetHeight || 0);
+  // Pushed screens pin live paid consent above their body.
+  if (screen !== "main") height += root.querySelector(".key-prompts")?.scrollHeight || 0;
+  for (const menu of root.querySelectorAll('.header-menu .menu:not([hidden])')) {
+    height = Math.max(height, menu.getBoundingClientRect().bottom - app.getBoundingClientRect().top + 8);
+  }
+  return Math.ceil(height);
+}
+let heightFrame = null, lastHeight = 0;
+function reportHeight() {
+  if (heightFrame !== null || !window.requestAnimationFrame) return;
+  heightFrame = window.requestAnimationFrame(() => {
+    heightFrame = null;
+    const height = contentHeight();
+    if (Number.isFinite(height) && height > 0 && height !== lastHeight) {
+      lastHeight = height;
+      send("resize", { height });
+    }
+  });
+}
+const sizeObserver = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(reportHeight);
+function observeSize() {
+  sizeObserver?.disconnect();
+  for (const node of root.querySelectorAll(".app, .content, .set-body, .key-prompts, .model-list")) sizeObserver?.observe(node);
+  reportHeight();
+}
+function paintMenus(focus = false) {
+  for (const button of root.querySelectorAll('[data-action="menu"]')) {
+    const open = button.dataset.menu === openMenu;
+    button.setAttribute("aria-expanded", String(open));
+    const menu = button.parentElement.querySelector(".menu");
+    menu.hidden = !open;
+    if (open && focus) menu.querySelector("button")?.focus();
+  }
+  reportHeight();
 }
 
 // which screen occupies the popover: "main", the settings sub-view, or the add-seat sub-view
@@ -106,6 +177,7 @@ function moveDrawer(drawer, open, startedAt = Date.now()) {
   }
   root.querySelector('[data-action="seat-options"]')?.setAttribute("aria-expanded", String(open));
   drawer.open = true;
+  reportHeight();
   drawer.classList.toggle("drawer-closing", !open);
   body.inert = !open;
   const finish = () => {
@@ -113,6 +185,7 @@ function moveDrawer(drawer, open, startedAt = Date.now()) {
     drawer.classList.remove("drawer-closing");
     body.inert = false;
     drawerMotion = null;
+    reportHeight();
   };
   if (reducedMotion.matches) { finish(); return; }
   const frames = [{ opacity: 0, transform: "translateY(12px)" }, { opacity: 1, transform: "translateY(0)" }];
@@ -139,6 +212,7 @@ function setPopoverVisible(visible) {
       updateClockText(root);
       // Expired consent is never left looking actionable, even without a state revision.
       refreshKeyPrompts();
+      reportHeight();
     }, 1000);
   } else if (!visible && clockTimer !== null) {
     clearInterval(clockTimer);
@@ -147,6 +221,7 @@ function setPopoverVisible(visible) {
 }
 
 function render() {
+  if (screen !== renderedScreen) openMenu = null;
   if (screen !== "main" || (pendingSwitch &&
       !switchNeedsConfirmation(state, pendingSwitch.tool, pendingSwitch.email))) pendingSwitch = null;
   // A background state push (the usage poll) re-renders whatever screen is up; carry the current
@@ -154,19 +229,19 @@ function render() {
   // Only when the screen is unchanged — navigating must start the new screen at the top.
   const focusData = screen === renderedScreen && root.contains?.(document.activeElement)
     && document.activeElement?.dataset?.action ? { ...document.activeElement.dataset } : null;
-  const prevRoster = root.querySelector(".roster-glance, .roster-compact");
-  const rosterScroll = screen === renderedScreen ? prevRoster?.scrollTop || 0 : 0;
+  const prevMain = root.querySelector(".body");
+  const mainScroll = screen === renderedScreen ? prevMain?.scrollTop || 0 : 0;
   const prevBody = root.querySelector(".main-body, .set-body");
   const scrollTop = screen === renderedScreen && prevBody ? prevBody.scrollTop : 0;
   // Polls must keep native disclosures open, including the enclosing drawer. Identity follows
-  // the seat or the menu's action, never its position in a reordered list.
+  // the seat, never its position in a reordered list.
   const disclosureKey = (details) => {
     const card = details.closest("[data-card]");
     if (card) return JSON.stringify(["seat", card.dataset.tool, card.dataset.email]);
     if (details.classList.contains("guest-drawer")) return "guest-drawer";
-    return JSON.stringify(["menu", details.querySelector("[data-action]")?.dataset.action]);
+    return "guest-drawer";
   };
-  const disclosures = "details.seat-disclosure, details.guest-drawer, details.header-menu";
+  const disclosures = "details.seat-disclosure, details.guest-drawer";
   const openDisclosures = new Set(screen === renderedScreen
     ? [...root.querySelectorAll(disclosures)].filter((node) => node.open && !node.classList.contains("drawer-closing")).map(disclosureKey)
     : []);
@@ -205,8 +280,9 @@ function render() {
     const nextBody = root.querySelector(".main-body, .set-body");
     if (nextBody) nextBody.scrollTop = scrollTop;
   }
-  const nextRoster = root.querySelector(".roster-glance, .roster-compact");
-  if (nextRoster) nextRoster.scrollTop = rosterScroll;
+  const nextMain = root.querySelector(".body");
+  if (nextMain) nextMain.scrollTop = mainScroll;
+  paintMenus(); // Reveal the preserved menu before restoring focus to one of its items.
   if (focusData) {
     const control = [...root.querySelectorAll("button[data-action], input[data-action]")]
       .find((node) => Object.entries(focusData).every(([key, value]) => node.dataset[key] === value));
@@ -215,6 +291,8 @@ function render() {
   // mirror the theme onto <body> so overlays (siblings of #root) get the same CSS vars
   const theme = (state.settings && state.settings.theme === "dark") ? "dark" : "light";
   document.body.className = "theme-" + theme;
+  paintFlash();
+  observeSize();
 }
 
 function liveKeyRequests() {
@@ -223,9 +301,8 @@ function liveKeyRequests() {
 
 function refreshKeyPrompts() {
   const pending = liveKeyRequests();
-  // The ledger is absent during paid consent. When its last request expires, restore the
-  // roster and remove the approval fact immediately, even before the next engine poll.
-  // Pushed views keep their inputs and focus; only the main ledger changes its layout.
+  // Expiring consent updates the header verdict even before the next engine poll.
+  // Pushed views keep their inputs and focus.
   if (screen === "main" && pending.length !== mainKeyPromptCount) {
     render();
     return;
@@ -274,16 +351,23 @@ document.addEventListener("click", (e) => {
   const drawer = root.querySelector("details.guest-drawer[open]");
   if (drawer && e.target.closest("[data-action]")?.dataset.action !== "seat-options"
       && !drawer.contains(e.target) && !drawer.classList.contains("drawer-closing")) moveDrawer(drawer, false);
-  // The + and ⋯ menus are native <details>, which stay open until their own summary is clicked
-  // again. Dismiss on any click outside, and never leave both open at once.
-  for (const menu of root.querySelectorAll("details.header-menu[open]")) {
-    if (!menu.contains(e.target)) menu.open = false;
-  }
+  if (openMenu && !e.target.closest(".header-menu")) { openMenu = null; paintMenus(); }
   const el = e.target.closest("[data-action]");
   if (!el) return; // Other summaries retain native disclosure toggling.
   const { action, tool, email, value } = el.dataset;
   if (el.disabled) return;
+  if (action !== "menu" && openMenu) { openMenu = null; paintMenus(); }
   switch (action) {
+    case "menu":
+      openMenu = openMenu === el.dataset.menu ? null : el.dataset.menu;
+      paintMenus(true); break;
+    case "attention": {
+      const target = root.querySelector('.issue button, .key-confirm button');
+      target?.scrollIntoView({ block: "nearest" }); target?.focus(); break;
+    }
+    case "toggle":
+      if (el.tagName === "BUTTON") send("toggle", { key: el.dataset.key, value: !state.settings?.[el.dataset.key] });
+      break;
     case "seat-options": {
       const drawer = root.querySelector("details.guest-drawer");
       if (drawer) {
@@ -300,6 +384,7 @@ document.addEventListener("click", (e) => {
       el.setAttribute("aria-expanded", String(open));
       const detail = document.getElementById(el.getAttribute("aria-controls"));
       if (detail) detail.hidden = !open;
+      reportHeight();
       break;
     }
     case "key-start":
@@ -486,6 +571,14 @@ document.addEventListener("change", (e) => {
 
 // Esc pops a sub-view (spec §9): settings → main; add → one step back (like the chevron).
 document.addEventListener("keydown", (e) => {
+  if (openMenu && ["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) {
+    const menu = root.querySelector('.header-menu .menu:not([hidden])');
+    const buttons = [...(menu?.querySelectorAll("button") || [])];
+    const index = buttons.indexOf(document.activeElement);
+    const next = e.key === "Home" ? 0 : e.key === "End" ? buttons.length - 1
+      : (index + (e.key === "ArrowUp" ? -1 : 1) + buttons.length) % buttons.length;
+    e.preventDefault(); buttons[next]?.focus(); return;
+  }
   if (e.key !== "Escape") return;
   if (pendingSwitch) { e.preventDefault(); pendingSwitch = null; render(); return; }
   const request = (state.pending_key_switches || []).find((r) =>
@@ -502,12 +595,10 @@ document.addEventListener("keydown", (e) => {
     if (!drawer.classList.contains("drawer-closing")) moveDrawer(drawer, false);
     return;
   }
-  const menu = root.querySelector("details.header-menu[open]");
-  if (menu) {
+  if (openMenu) {
     e.preventDefault();
-    menu.open = false;
-    menu.querySelector("summary")?.focus();   // keyboard users keep their place
-    return;
+    const trigger = root.querySelector(`[data-action="menu"][data-menu="${openMenu}"]`);
+    openMenu = null; paintMenus(); trigger?.focus(); return;
   }
   if (screen === "settings") { screen = "main"; render(); }
   else if (screen === "add") addBack();
@@ -519,6 +610,11 @@ document.addEventListener("keydown", (e) => {
 // explicitly so transient closes always clear the interval even on macOS versions that do not.
 document.addEventListener("visibilitychange", () => setPopoverVisible(!document.hidden));
 window.addEventListener("pagehide", () => setPopoverVisible(false));
+
+// Native disclosures and font loading also change intrinsic height without a state push.
+document.addEventListener("toggle", reportHeight, true);
+document.fonts?.ready.then(reportHeight);
+window.addEventListener("resize", reportHeight);
 
 // initial paint + ask the native side for fresh state
 render();

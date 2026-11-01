@@ -1,4 +1,4 @@
-// Shipping popover and pushed views: a compact seat ledger and native disclosures.
+// Shipping popover: now + next on the warm field, other seats on a solid sheet.
 // Pure state-to-markup rendering and bridge reducers; clock updates only change existing text.
 
 export const TOOL_META = {
@@ -112,11 +112,11 @@ export function fmtCountdown(iso, now = Date.now()) {
   if (isNaN(ms) || ms <= 0) return "now";
   const mins = Math.round(ms / 60000);
   if (mins < 60) return `${mins}m`;
-  if (mins > 24 * 60) {
+  if (mins >= 24 * 60) {
     const totalHours = Math.floor(mins / 60);
     const days = Math.floor(totalHours / 24);
     const hours = totalHours % 24;
-    return `${days}d${hours ? `${hours}h` : ""}`;
+    return `${days}d${hours ? ` ${hours}h` : ""}`;
   }
   const hrs = Math.floor(mins / 60);
   return `${hrs}h${mins % 60 ? ` ${mins % 60}m` : ""}`;
@@ -151,7 +151,7 @@ export function updateClockText(root, now = Date.now()) {
   }
   for (const node of root.querySelectorAll("[data-reset-at]")) {
     node.textContent = node.dataset.pastText && resetIsPast(node.dataset.resetAt, now) ? node.dataset.pastText
-      : `${node.dataset.clockPrefix ?? "resets in"}${node.dataset.clockPrefix === "" ? "" : " "}${fmtCountdown(node.dataset.resetAt, now)}`;
+      : `${node.dataset.clockPrefix ?? "resets in"}${node.dataset.clockPrefix === "" ? "" : " "}${node.dataset.clockApprox === "true" ? "~" : ""}${fmtCountdown(node.dataset.resetAt, now)}`;
   }
   for (const node of root.querySelectorAll("[data-session-at]")) {
     node.textContent = fmtSessionAge(node.dataset.sessionAt, now).replace(" · ", "; ");
@@ -217,7 +217,7 @@ function seatAction(tool, seat, placement = "all") {
 
 function signinExpiryLine(seat, tag, compact = false) {
   const at = seat.signin_expires_at;
-  const prefix = compact ? "expires in" : "sign-in expires in";
+  const prefix = compact ? "ends in" : "sign-in ends in";
   return `<${tag} class="signin-expiry" data-reset-at="${esc(at)}" data-clock-prefix="${prefix}" title="${esc(new Date(at).toLocaleString())}">${prefix} ${fmtCountdown(at)}</${tag}>`;
 }
 
@@ -237,10 +237,10 @@ function switchConfirmation(tool, seat, pending) {
   if (pending?.tool !== tool || pending.email !== seat.email) return "";
   const kind = seat.kind === "business" ? "work seat" : seat.kind === "personal" ? "personal seat" : "unknown seat kind";
   const data = `data-tool="${esc(tool)}" data-email="${esc(seat.email)}"`;
-  return `<div class="issue-line switch-confirm" role="group" aria-label="confirm seat switch"><span class="issue-text">switch ${esc(tool)} to ${esc(seat.name || seat.email)} (${kind})? running sessions move too</span><button class="row-action" data-action="switch-confirm" ${data}>switch</button><button class="row-action" data-action="switch-cancel" ${data}>cancel</button></div>`;
+  return `<div class="issue issue--soft switch-confirm" role="group" aria-label="confirm seat switch"><span class="issue-text">switch ${esc(tool)} to ${esc(seat.name || seat.email)} (${kind})? running sessions move too</span><button class="row-action" data-action="switch-confirm" ${data}>switch</button><button class="row-action" data-action="switch-cancel" ${data}>cancel</button></div>`;
 }
 
-function seatCard(tool, seat, pending) {
+function seatCard(tool, seat, pending, peers = []) {
   const fetched = seat.usage_fetched_at || seat.usage?.fetched_at || "";
   const reported = seat?.usage?.reported_windows;
   const weeklyOnly = tool === "codex" && Array.isArray(reported) && reported.includes("weekly") && !reported.includes("5h");
@@ -255,7 +255,7 @@ function seatCard(tool, seat, pending) {
   const issue = usageIssue(tool, seat);
   const action = seatAction(tool, seat);
   return `<article class="seat seat--${esc(seat.status)}${out ? " seat--signedout" : ""}" data-card data-tool="${tool}" data-email="${esc(seat.email)}">
-    <details class="seat-disclosure"><summary class="seat-row"><span class="seat-name">${esc(seat.name)}</span><span class="seat-state">${stateText}</span><span class="chevron" aria-hidden="true">⌄</span></summary>
+    <details class="seat-disclosure"><summary class="seat-row"><span class="seat-name">${esc(seatIdentity(seat, peers))}</span><span class="seat-state">${stateText}</span><span class="chevron" aria-hidden="true">⌄</span></summary>
     <div class="expand"><p class="seat-email">${esc(seat.email)} ${planChip(seat.plan)}</p>
     ${out ? `<p class="usage-error" role="status">signed out; sign in to see usage</p>` : `${weeklyOnly ? "" : bar(seat, "5h", "5h")}${bar(seat, "weekly", "7d")}
     <p class="support"><span data-usage-at="${esc(fetched)}">${fmtUsageAge(fetched)}</span>${seat.usage_stale || seat.usage_unknown ? "; last known reading" : ""}</p>`}
@@ -272,7 +272,7 @@ function toolGroup(tool, t, keys = [], pending = null) {
   const seats = t?.seats || [];
   if (!seats.length && !keys.length) return "";
   return `<section class="group" style="--accent:${TOOL_META[tool].accent}"><h2 class="g-head"><span class="tool-marker tool-marker--${tool}" aria-hidden="true"></span>${TOOL_META[tool].label}</h2>
-    ${seats.map((seat) => seatCard(tool, seat, pending)).join("")}${keys.map(keySeatCard).join("")}</section>`;
+    ${seats.map((seat) => seatCard(tool, seat, pending, seats)).join("")}${keys.map(keySeatCard).join("")}</section>`;
 }
 
 
@@ -646,7 +646,7 @@ function paidCount(state) {
   const pinned = state?.pinned_sessions || [];
   return pinned.length + (state?.running_key_seats || []).filter((id) => !pinned.some((s) => (s.key_seat?.id || s.email) === id)).length;
 }
-// Distinct shapes and written states keep the ledger readable without colour.
+// Distinct shapes and written states keep approvals readable without colour.
 function stateGlyph(kind) {
   const paths = {
     active: '<circle cx="6" cy="6" r="5.2" stroke-width="1.2"/><circle cx="6" cy="6" r="2.8" fill="currentColor" stroke="none"/>',
@@ -669,170 +669,213 @@ function returnTime(seat, prefix = "back in") {
   return `<span data-reset-at="${esc(at)}" data-clock-prefix="${prefix}" data-past-text="resetting…" title="${esc(new Date(at).toLocaleString())}">${resetIsPast(at) ? "resetting…" : `${prefix} ${fmtCountdown(at)}`}</span>`;
 }
 
-function ledgerFacts(state) {
-  const seats = subscriptionSeats(state);
-  const ready = seats.filter(usable);
-  const facts = [];
-  const crossings = state?.pending_crossings || [];
-  const tiers = state?.pending_tier_requests || [];
-  const keys = (state?.pending_key_switches || []).filter((r) => r.status === "pending" && Date.parse(r.expires_at) > Date.now());
-  const approvals = crossings.length + tiers.length + keys.length;
-  if (approvals) {
-    const request = crossings[0];
-    const question = request ? `switch ${esc(request.tool)} to ${esc(request.to_name || request.to)}?`
-      : tiers.length ? "switch across plan tiers?" : "use a paid key?";
-    facts.push(`${approvals} ${approvals === 1 ? "approval" : "approvals"}: ${question}`);
-  } else {
-    for (const tool of ["codex", "claude"]) {
-      const problems = [];
-      for (const seat of seats.filter((seat) => seat.tool === tool)) {
-        const name = esc(seat.name || seat.email);
-        if (entitlementRevoked(seat)) problems.push(`${name}: check your subscription to refresh usage`);
-        else if (signedOut(seat)) problems.push(`${name} signed out`);
-        else if (signinNeeded(seat)) problems.push(`${name}: sign-in needed`);
-        else if (signinExpiring(seat)) problems.push(`${name} ${signinExpiryLine(seat, "span", true)}`);
-      }
-      if (problems.length) facts.push(`${tool}: ${problems.join(", ")}`);
-    }
-    if (seats.length && !ready.length) {
-      const first = seats.filter((s) => limitedSeat(s) && Number.isFinite(Date.parse(s.limited_until)))
-        .sort((a, b) => Date.parse(a.limited_until) - Date.parse(b.limited_until))[0];
-      facts.unshift(seats.every(limitedSeat) ? `all seats limited${first ? `; ${esc(first.tool)} ${esc(first.name || first.email)}: ${returnTime(first)}` : ""}` : "no subscription seat ready");
-      const key = (state?.keys || [])[0];
-      if (key) facts.push(`${esc(key.label)} ${key.responses_verified === false || key.last_proof?.outcome === "incompatible" ? "may help with paid use; endpoint unproven" : "available for paid use"}`);
-    }
-  }
-  return facts.length ? `<div class="ledger-facts" role="status">${stateGlyph("warn")}<span>${facts.join("; ")}</span></div>` : "";
-}
-
-function groupNext(tool, seats, state) {
-  const ready = seats.filter((seat) => usable(seat) && !isActive(seat));
-  const selection = state?.tools?.[tool]?.selection;
-  // Prefer the engine's selection when it names another usable seat. Otherwise retain its
-  // saved-seat order; the UI must not invent a different selection strategy.
-  const next = ready.find((seat) => selection?.available && seat.email === selection.email) || ready[0];
-  if (next) {
-    const pending = (state?.pending_crossings || []).some((r) => r.tool === tool && r.to === next.email);
-    return `${pending ? "needs approval" : "next"}: <b>${esc(next.name || next.email)}</b>`;
-  }
-  const back = seats.filter((seat) => limitedSeat(seat) && Number.isFinite(Date.parse(seat.limited_until)))
-    .sort((a, b) => Date.parse(a.limited_until) - Date.parse(b.limited_until))[0];
-  if (back) return `<b>${esc(back.name || back.email)}</b> ${returnTime(back)}`;
-  return seats.length ? "no other seat ready" : "paid per token";
-}
-
 function usageIssue(tool, seat) {
   const error = seat.usage?.error;
   return entitlementRevoked(seat) ? "check your subscription to refresh usage" : ({ rate_limited: "updates throttled; retrying automatically", network: "connection unavailable; retrying automatically",
     token_expired: `open ${TOOL_META[tool].label} to refresh usage`, unauthorized: "sign in to refresh usage", forbidden: "check your subscription to refresh usage", no_token: "sign in to refresh usage" })[error] || (error ? "usage update failed; retrying automatically" : "");
 }
 
-function nextReset(seat, resets) {
-  if (limitedSeat(seat) && Number.isFinite(Date.parse(seat.limited_until))) return seat.limited_until;
-  return resets.sort((a, b) => (b.used ?? -1) - (a.used ?? -1) || Date.parse(a.at) - Date.parse(b.at))[0]?.at;
+// Identity stays legible in the block, sheet and management drawer. Only known plan
+// labels are public copy; provider-internal enums must not leak into the interface.
+export function seatIdentity(seat, peers = [], includeMetadata = true) {
+  const name = String(seat.name || seat.email || "seat");
+  const duplicate = peers.filter((s) => String(s.name || s.email || "seat").toLowerCase() === name.toLowerCase());
+  const short = (email) => {
+    const [local, domain = ""] = String(email || "").split("@");
+    return local.includes("+") ? local.slice(local.lastIndexOf("+") + 1) : domain.replace(/\.[^.]+$/, "") || local;
+  };
+  let suffix = duplicate.length > 1 ? short(seat.email) : "";
+  if (suffix && duplicate.some((s) => s.email !== seat.email && short(s.email) === suffix)) suffix = String(seat.email).split("@")[0];
+  if (suffix && duplicate.some((s) => s.email !== seat.email && String(s.email).split("@")[0] === suffix)) suffix = seat.email;
+  const kind = ["business", "personal"].includes(seat.kind) ? seat.kind : "kind unknown";
+  const raw = typeof seat.plan === "string" ? seat.plan.trim().toLowerCase() : "";
+  const plan = Object.prototype.hasOwnProperty.call(PLAN_CHIPS, raw) ? raw : "plan unknown";
+  const parts = [name, kind, plan].filter((part, i, all) => !all.slice(0, i).some((prior) => prior.toLowerCase() === part.toLowerCase()));
+  return (includeMetadata ? parts.join(" · ") : name) + (suffix ? ` · ${suffix}` : "");
 }
 
-function rowDetails(tool, seat, id, open) {
-  const action = limitedSeat(seat) ? seatAction(tool, seat, "switch") : "";
-  const fetched = seat.usage_fetched_at || seat.usage?.fetched_at || "";
-  const resets = signedOut(seat) ? "" : ["5h", "weekly"].map((win) => {
-    const reported = seat.usage?.reported_windows;
-    const at = seat.usage?.windows?.[win]?.resets_at;
-    if ((Array.isArray(reported) && !reported.includes(win)) || !Number.isFinite(Date.parse(at))) return "";
-    return `<div><dt>${win === "5h" ? "5h" : "week"} resets</dt><dd><time datetime="${esc(at)}">${esc(new Date(at).toLocaleString())}</time> (<span data-reset-at="${esc(at)}" data-clock-prefix="in" data-past-text="resetting…">${resetIsPast(at) ? "resetting…" : `in ${fmtCountdown(at)}`}</span>)</dd></div>`;
-  }).join("");
-  return `<tr class="roster-detail" id="${id}"${open ? "" : " hidden"}><td colspan="5"><dl class="ledger-detail"><div><dt>seat</dt><dd>${esc(seat.email)} ${planChip(seat.plan)}</dd></div><div><dt>updated</dt><dd data-usage-at="${esc(fetched)}">${fmtUsageAge(fetched)}</dd></div>${resets}${action ? `<div><dt>action</dt><dd>${action}</dd></div>` : ""}</dl></td></tr>`;
+function seatMetadata(seat) {
+  const kind = ["business", "personal"].includes(seat.kind) ? seat.kind : "kind unknown";
+  const raw = typeof seat.plan === "string" ? seat.plan.trim().toLowerCase() : "";
+  const plan = Object.prototype.hasOwnProperty.call(PLAN_CHIPS, raw) ? raw : "plan unknown";
+  return [...new Set([kind, plan])].join(" · ");
 }
 
-// Tier requests carry a plan pair, not an email. Attach once to the matching target plan.
-function tierTarget(request, seats) {
-  return seats.find((s) => String(s.plan).toLowerCase() === String(request.b).toLowerCase())
-    || seats.find(isActive) || seats[0];
+const ICON = {
+  alert: '<svg viewBox="0 0 14 14" aria-hidden="true"><circle cx="7" cy="7" r="6.2" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M7 3.6v4.1" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="7" cy="10.2" r=".95" fill="currentColor"/></svg>',
+  clock: '<svg viewBox="0 0 14 14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="7" cy="7" r="6.2"/><path d="M7 3.8V7l2.2 1.4" stroke-linecap="round"/></svg>',
+  check: '<svg viewBox="0 0 12 12" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2.5 6.2l2.3 2.3 4.7-5" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  rest: '<svg viewBox="0 0 12 12" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M9.5 7.6A4.2 4.2 0 0 1 4.4 2.5a4.2 4.2 0 1 0 5.1 5.1z"/></svg>',
+  plus: '<svg viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M8 3v10M3 8h10"/></svg>',
+  more: '<svg viewBox="0 0 16 16" aria-hidden="true" fill="currentColor"><circle cx="3.2" cy="8" r="1.4"/><circle cx="8" cy="8" r="1.4"/><circle cx="12.8" cy="8" r="1.4"/></svg>',
+  chev: '<svg class="chev" viewBox="0 0 10 10" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2 3.6l3 3 3-3"/></svg>',
+  switch: '<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="M2 4h7l-2-2M10 8H3l2 2"/></svg>',
+};
+const mark = (tool) => `<span class="mark${tool === "claude" ? " mark--claude" : ""}" aria-hidden="true"></span>`;
+const detailId = (tool, email) => `seat-detail-${encodeURIComponent(tool)}-${encodeURIComponent(email)}`;
+function nameButton(tool, seat, peers, openDetails, showMetadata = false) {
+  const label = tool === "key" ? seat.label : seatIdentity(seat, peers);
+  const name = tool === "key" ? seat.label : seatIdentity(seat, peers, false);
+  const metadata = showMetadata && tool !== "key" ? `<span class="seat-metadata">${esc(seatMetadata(seat))}</span>` : "";
+  const email = tool === "key" ? seat.id : seat.email;
+  return `<button class="seatname" data-action="seat-details" data-tool="${esc(tool)}" data-email="${esc(email)}" aria-expanded="${openDetails.has(JSON.stringify([tool, email]))}" aria-controls="${detailId(tool, email)}" aria-label="${esc(label)}, details"><span class="seat-identity" title="${esc(label)}">${esc(name)}</span>${metadata}${ICON.chev}</button>`;
 }
 
-function rosterTable(state, pending, openDetails) {
+export function seatWindows(seat) {
+  const out = signedOut(seat);
+  return ["5h", "weekly"].filter((win) => !Array.isArray(seat.usage?.reported_windows) || seat.usage.reported_windows.includes(win)).map((win) => {
+    const used = out || seat.usage_unknown ? null : pct(seat, win);
+    const reset = out ? null : seat.usage?.windows?.[win]?.resets_at;
+    return { key: win, label: win === "5h" ? "5h" : "week", left: used === null ? null : Math.round(100 - used),
+      reset: Number.isFinite(Date.parse(reset)) ? reset : null };
+  });
+}
+function tighter(seat) {
+  return seatWindows(seat).sort((a, b) => (a.left ?? 101) - (b.left ?? 101))[0];
+}
+const leftText = (seat) => {
+  const left = tighter(seat)?.left;
+  return left == null ? "usage unknown" : `${seat.usage_stale ? "~" : ""}${left === 100 ? "full" : `${left}% left`}`;
+};
+function timed(at, prefix = "", past = "resetting…", approximate = false) {
+  if (!Number.isFinite(Date.parse(at))) return "reset time unknown";
+  return `<span data-reset-at="${esc(at)}" data-clock-prefix="${esc(prefix)}" data-past-text="${esc(past)}"${approximate ? ' data-clock-approx="true"' : ""} title="${esc(new Date(at).toLocaleString())}">${resetIsPast(at) ? past : `${prefix}${prefix ? " " : ""}${approximate ? "~" : ""}${fmtCountdown(at)}`}</span>`;
+}
+function refillClock(iso, now = Date.now()) {
+  const date = new Date(iso), today = new Date(now);
+  if (!Number.isFinite(date.getTime())) return "";
+  const hm = `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+  const days = Math.round((new Date(date).setHours(0, 0, 0, 0) - new Date(today).setHours(0, 0, 0, 0)) / 864e5);
+  return days === 0 ? hm : days === 1 ? `tomorrow ${hm}`
+    : `${["sun", "mon", "tue", "wed", "thu", "fri", "sat"][date.getDay()]} ${date.getDate()} ${["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"][date.getMonth()]}, ${hm}`;
+}
+function backAt(seat) {
+  if (Number.isFinite(Date.parse(seat.limited_until))) return seat.limited_until;
+  // Both exhausted windows must refill before this seat is usable again.
+  return seatWindows(seat).filter((w) => w.left === 0 && w.reset).sort((a, b) => Date.parse(b.reset) - Date.parse(a.reset))[0]?.reset;
+}
+function backText(seat, prefix = "back in") {
+  return `${seat.usage_stale ? '<span class="sr-only">approximate, last known reading: </span>' : ""}${timed(backAt(seat), prefix, "resetting…", seat.usage_stale)}`;
+}
+function rowDetails(tool, seat, peers, openDetails) {
+  const key = tool === "key", email = key ? seat.id : seat.email;
+  const open = openDetails.has(JSON.stringify([tool, email]));
+  let rows;
+  if (key) rows = `<dt>model</dt><dd>${esc(seat.model)}</dd><dt>billing</dt><dd>paid per token; no app spend cap</dd><dt>use</dt><dd>opens a new terminal, never switches one</dd>${keyProofStatus(seat) ? `<dt>endpoint</dt><dd>${keyProofStatus(seat)}</dd>` : ""}`;
+  else {
+    const fetched = seat.usage_fetched_at || seat.usage?.fetched_at || "";
+    rows = `<dt>seat</dt><dd>${esc(seat.email)}</dd><dt>plan</dt><dd>${esc(seatIdentity(seat, peers))}</dd>`;
+    if (signedOut(seat)) rows += '<dt>usage</dt><dd>signed out; sign in to see usage</dd>';
+    else rows += seatWindows(seat).map((w) => `<dt>${w.label}</dt><dd>${w.left == null ? "usage unknown" : `${seat.usage_stale ? "~" : ""}${w.left}% left`}${w.reset ? `, <time datetime="${esc(w.reset)}">${esc(new Date(w.reset).toLocaleString())}</time> (${timed(w.reset, "in")})` : ""}</dd>`).join("");
+    rows += `<dt>updated</dt><dd>${seat.usage_stale ? "last known reading; " : ""}<span data-usage-at="${esc(fetched)}">${fmtUsageAge(fetched)}</span></dd>`;
+    if (limitedSeat(seat) || (!isActive(seat) && !signedOut(seat) && !usable(seat))) rows += `<dt>action</dt><dd>${seatAction(tool, seat, "switch")}</dd>`;
+  }
+  return `<dl class="details" id="${detailId(tool, email)}"${open ? "" : " hidden"}>${rows}</dl>`;
+}
+function toolPlan(tool, state) {
+  const seats = state?.tools?.[tool]?.seats || [];
+  const keys = (state?.keys || []).filter((s) => (s.harness || "codex") === tool);
+  const ready = seats.filter((s) => usable(s) && !isActive(s));
+  const selection = state?.tools?.[tool]?.selection;
+  const next = ready.find((s) => selection?.available && selection.email === s.email) || ready[0];
+  const limited = seats.filter(limitedSeat).sort((a, b) => (Date.parse(backAt(a)) || Infinity) - (Date.parse(backAt(b)) || Infinity));
+  const lead = seats.find(isActive) || limited[0] || null;
+  return { tool, seats, keys, ready, limited, next, lead };
+}
+
+export function headerVerdict(state) {
   const seats = subscriptionSeats(state);
-  const spending = new Set([...(state?.running_key_seats || []),
-    ...(state?.pinned_sessions || []).map((session) => session.key_seat?.id || session.email)]);
-  return `<table class="roster" aria-label="seats and remaining headroom">
-      <colgroup><col class="roster-state-col"><col class="roster-seat-col"><col class="roster-window-col"><col class="roster-window-col"><col class="roster-action-col"></colgroup>
-      <thead><tr><th scope="col">state</th><th scope="col">seat</th><th scope="col" aria-label="5-hour left">5h left</th><th scope="col" aria-label="weekly left">week</th><th scope="col">resets</th></tr></thead>
-      ${[...new Set(["codex", "claude", ...(state?.keys || []).map((key) => key.harness)])].map((tool) => {
-        const subscriptions = seats.filter((seat) => seat.tool === tool);
-        const keys = (state?.keys || []).filter((key) => key.harness === tool);
-        if (!subscriptions.length && !keys.length) return "";
-        const accent = TOOL_META[tool]?.accent || "var(--support)";
-        const edge = tool === "codex" ? "var(--codex-edge)" : tool === "claude" ? "var(--claude-edge)" : "var(--line)";
-        return `<tbody style="--accent:${accent};--group-edge:${edge}"><tr><th class="roster-tool" scope="rowgroup" colspan="5"><span class="group-rule"><span>${esc(tool || "api key")}</span><span class="group-next">${groupNext(tool, subscriptions, state)}</span></span></th></tr>${subscriptions.sort((a, b) => Number(isActive(b)) - Number(isActive(a))).map((seat) => {
-        const active = isActive(seat);
-        const out = signedOut(seat);
-        const limited = limitedSeat(seat);
-        const attention = signinNeeded(seat) || entitlementRevoked(seat);
-        const status = entitlementRevoked(seat) ? "check your subscription to refresh usage" : !out && signinNeeded(seat) ? "sign-in needed" : out ? (active ? "on now · signed out" : "signed out") : limited ? "limited" : active ? "on now" : "ready";
-        const resets = [];
-        const windows = ["5h", "weekly"].map((win) => {
-          const reported = seat.usage?.reported_windows;
-          const absent = Array.isArray(reported) && !reported.includes(win);
-          const used = out || seat.usage_unknown || absent ? null : pct(seat, win);
-          const left = Number.isFinite(used) ? Math.round(100 - used) : null;
-          const why = out ? "signed out; usage unknown" : absent ? `no ${win === "5h" ? "5-hour" : "weekly"} window on this plan`
-                             : "usage reading unavailable";
-          const missing = left === null;
-          const reset = absent || out ? null : seat.usage?.windows?.[win]?.resets_at;
-          if (reset && Number.isFinite(Date.parse(reset))) resets.push({ at: reset, used });
-          return `<td class="roster-value${missing ? " roster-unknown" : left === 0 ? " roster-zero" : left <= 20 ? " roster-low" : ""}"${missing ? ` title="${esc(why)}" aria-label="${esc(why)}"` : ` aria-label="${seat.usage_stale ? "last known: " : ""}${left}% left"`}>${missing ? "—" : `${seat.usage_stale ? "~" : ""}${left}%<span class="ledger-bar${seat.usage_stale ? " stale" : ""}" aria-hidden="true"><i style="width:${left}%"></i></span>`}</td>`;
-        }).join("");
-        const action = seatAction(tool, seat, "switch");
-        const signin = seatAction(tool, seat, "signin");
-        const detailKey = JSON.stringify([tool, seat.email]);
-        const detailId = `seat-detail-${encodeURIComponent(tool)}-${encodeURIComponent(seat.email)}`;
-        const identity = `<button class="roster-details" data-action="seat-details" data-tool="${esc(tool)}" data-email="${esc(seat.email)}" aria-expanded="${openDetails.has(detailKey)}" aria-controls="${detailId}" aria-label="${esc(`${seat.name || seat.email}, details`)}"><span class="roster-identity" title="${esc(seat.name || seat.email)}">${esc(seat.name || seat.email)}</span><svg class="row-chevron" viewBox="0 0 8 8" aria-hidden="true"><path d="M2.5 1l3 3-3 3"/></svg></button><span class="roster-meta sr-only">${planChip(seat.plan)}</span>`;
-        const reset = out ? null : nextReset(seat, resets);
-        const resetPrefix = limited ? "back" : "";
-        const resetHTML = reset ? `<span class="roster-reset" data-reset-at="${esc(reset)}" data-clock-prefix="${resetPrefix}" data-past-text="resetting…" title="window resets at ${esc(new Date(reset).toLocaleString())}">${resetIsPast(reset) ? "resetting…" : `${resetPrefix}${resetPrefix ? " " : ""}${fmtCountdown(reset)}`}</span>` : "";
-        const rowAction = action && !active && !out && !limited
-          ? ` data-action="switch" data-tool="${esc(tool)}" data-email="${esc(seat.email)}"` : "";
-        const issues = [];
-        if (out) issues.push("signed out; sign in to see usage");
-        if (!out && signinNeeded(seat)) issues.push("sign-in needed");
-        if (!out && signinExpiring(seat)) issues.push(signinExpiryLine(seat, "span"));
-        const error = usageIssue(tool, seat);
-        if (!out && error) issues.push(esc(error));
-        if (!out && (seat.usage_stale || seat.usage_unknown)) issues.push(`${seat.usage_unknown ? "usage unknown" : "last known reading"}; <span data-usage-at="${esc(seat.usage_fetched_at || seat.usage?.fetched_at || "")}">${fmtUsageAge(seat.usage_fetched_at || seat.usage?.fetched_at)}</span>`);
-        const confirmation = switchConfirmation(tool, seat, pending);
-        const approvals = crossingRequests({ pending_crossings: (state.pending_crossings || []).filter((r) => r.tool === tool && r.to === seat.email) })
-          + tierRequests({ pending_tier_requests: (state.pending_tier_requests || []).filter((r) => r.tool === tool && tierTarget(r, subscriptions) === seat) });
-        return `<tr class="${active && !out && !attention ? "roster-active" : ""}${out ? " roster-signedout" : ""}${limited ? " roster-limited" : ""}${rowAction ? " roster-actionable" : ""}"${rowAction} data-seat-email="${esc(seat.email)}"><td class="roster-state">${stateGlyph(out ? "out" : attention ? "warn" : limited ? "limited" : active ? "active" : "ready")}<span class="roster-status">${status}</span></td><th scope="row">${identity}</th>${windows}<td class="roster-last">${action && !limited ? action : ""}${action && !limited ? "" : resetHTML}</td></tr>${approvals ? `<tr class="roster-issue roster-approval"><td colspan="5">${approvals}</td></tr>` : ""}${confirmation ? `<tr class="roster-issue"><td colspan="5">${confirmation}</td></tr>` : ""}${issues.length ? `<tr class="roster-issue${out ? " issue-danger" : ""}" data-tool="${esc(tool)}" data-email="${esc(seat.email)}"><td colspan="5"><div class="issue-line" role="group" aria-label="${esc(TOOL_META[tool].label)} ${esc(seat.name || seat.email)} attention">${stateGlyph(out ? "out" : "warn")}<span class="issue-text">${issues.join("; ")}</span>${signin}</div></td></tr>` : ""}${rowDetails(tool, seat, detailId, openDetails.has(detailKey))}`;
-      }).join("")}${keys.map((key) => {
-        const detailKey = JSON.stringify(["key", key.id]);
-        const detailId = `key-detail-${encodeURIComponent(key.id)}`;
-        const open = openDetails.has(detailKey);
-        return `<tr class="roster-key roster-actionable" data-action="key-terminal" data-id="${esc(key.id)}"><td class="roster-state">${stateGlyph("key")}<span class="roster-status">${spending.has(key.id) ? "spending now" : "api key"}</span></td><th scope="row"><button class="roster-details key-identity" data-action="seat-details" data-tool="key" data-email="${esc(key.id)}" aria-expanded="${open}" aria-controls="${detailId}" aria-label="${esc(`${key.label}, details`)}"><span class="roster-identity" title="${esc(key.label)}">${esc(key.label)}</span><svg class="row-chevron" viewBox="0 0 8 8" aria-hidden="true"><path d="M2.5 1l3 3-3 3"/></svg></button></th><td class="roster-key-terms" colspan="2"><span class="key-terms">paid per token<span class="sr-only">; no app spend cap</span></span></td><td class="roster-last"><button class="row-action key-use" data-action="key-terminal" data-id="${esc(key.id)}" aria-label="${esc(`use ${key.label} in a new paid terminal`)}" title="use in a new paid terminal">new terminal</button></td></tr><tr class="roster-detail" id="${detailId}"${open ? "" : " hidden"}><td colspan="5"><dl class="ledger-detail"><div><dt>model</dt><dd>${esc(key.model)}</dd></div></dl></td></tr>`;
-      }).join("")}</tbody>`;
-      }).join("")}
-    </table>`;
+  const ready = seats.filter(usable);
+  const hard = seats.filter((s) => signedOut(s) || signinNeeded(s) || entitlementRevoked(s)).length
+    + (state?.pending_crossings || []).length + (state?.pending_tier_requests || []).length
+    + (state?.pending_key_switches || []).filter((r) => r.status === "pending" && Date.parse(r.expires_at) > Date.now()).length;
+  if (hard) return `<button class="chip chip--hard" data-action="attention">${ICON.alert}${hard} needs you</button>`;
+  if (seats.length && !ready.length && seats.every(limitedSeat)) return `<span class="chip chip--soft">${ICON.rest}all limited</span>`;
+  if (seats.some((s) => signinExpiring(s))) return `<span class="chip chip--soft">${ICON.clock}renew soon</span>`;
+  if (seats.some((s) => s.usage_unknown || s.usage_stale || s.usage?.error)) return `<span class="chip chip--soft">${ICON.clock}checking usage</span>`;
+  return seats.length || state?.keys?.length ? `<span class="chip chip--calm">${ICON.check}all good</span>` : "";
+}
+function thenLine(p, state) {
+  const label = (s) => esc(seatIdentity(s, p.seats));
+  const next = p.next;
+  let text;
+  if (next) {
+    const approval = switchNeedsConfirmation(state, p.tool, next.email)
+      || (state.pending_crossings || []).some((r) => r.tool === p.tool && r.to === next.email);
+    text = `${label(next)}, ${leftText(next)}${approval ? ' <span class="muted">(needs approval)</span>' : ""}`;
+  } else {
+    const back = p.limited.find((s) => s !== p.lead);
+    const key = p.keys[0];
+    text = back ? `${usable(p.lead) ? "nothing ready. " : ""}${label(back)} ${backText(back, usable(p.lead) ? "back in" : "in")}` : '<span class="muted">nothing ready</span>';
+    if (key) text = `${back ? `${text}, or ` : ""}${esc(key.label)} now, paid${key.responses_verified === false || key.last_proof?.outcome === "incompatible" ? "; endpoint unproven" : ""}`;
+  }
+  return `<p class="then"><b>then</b> ${text}</p>`;
+}
+function seatIssues(p, openDetails) {
+  return p.seats.map((seat) => {
+    const out = signedOut(seat), revoked = entitlementRevoked(seat);
+    const hard = out || signinNeeded(seat) || revoked;
+    const issues = [];
+    if (revoked) issues.push("check your subscription to refresh usage");
+    else if (out) issues.push(isActive(seat) ? "on now · signed out" : "signed out");
+    else if (signinNeeded(seat)) issues.push("sign-in needed");
+    if (!out && signinExpiring(seat)) issues.push(signinExpiryLine(seat, "span"));
+    const error = usageIssue(p.tool, seat);
+    if (!out && !hard && error) issues.push(esc(error));
+    if (!out && !hard && (seat.usage_unknown || (seat.usage_stale && error))) issues.push(`${seat.usage_unknown ? "usage unknown" : "last known reading"}; <span data-usage-at="${esc(seat.usage_fetched_at || seat.usage?.fetched_at || "")}">${fmtUsageAge(seat.usage_fetched_at || seat.usage?.fetched_at)}</span>`);
+    if (!issues.length) return "";
+    const representedHere = seat !== p.lead && hard;
+    return `<div class="issue issue--${hard ? "hard" : "soft"}" data-tool="${esc(p.tool)}" data-email="${esc(seat.email)}" role="group" aria-label="${esc(p.tool)} ${esc(seat.name || seat.email)} attention">${hard ? ICON.alert : ICON.clock}<div>${representedHere ? nameButton(p.tool, seat, p.seats, openDetails) : `<b>${esc(seatIdentity(seat, p.seats))}</b>`} ${issues.join("; ")}</div>${seatAction(p.tool, seat, "signin")}</div>${representedHere ? rowDetails(p.tool, seat, p.seats, openDetails) : ""}`;
+  }).join("");
+}
+function toolBlock(p, state, pending, openDetails) {
+  const s = p.lead;
+  let head = '<div class="now"><span class="tag">nothing on</span></div>';
+  if (s) {
+    const out = signedOut(s), attention = out || signinNeeded(s) || entitlementRevoked(s);
+    const limited = limitedSeat(s), t = tighter(s), other = seatWindows(s).find((w) => w.key !== t?.key);
+    const active = isActive(s) && !out && !signinNeeded(s) && !entitlementRevoked(s) && !limited;
+    const name = `<div class="now-seat">${nameButton(p.tool, s, p.seats, openDetails)}${active ? '<span class="tag">on now</span>' : ""}</div>`;
+    if (attention) head = `<div class="now">${name}</div>`;
+    else if (limited) head = `<div class="now">${name}<span class="fig fig--time">${backText(s, "")}</span><span class="fig-l">until back</span></div><div class="meta limited-meta"><span>${esc(seatMetadata(s))} · limited${t && backAt(s) && !resetIsPast(backAt(s)) ? `, ${t.label} refills ${refillClock(backAt(s))}` : ""}</span>${other ? `<span>${other.label} ${other.left == null ? "unknown" : `${s.usage_stale ? "~" : ""}${other.left}%`}</span>` : ""}</div>`;
+    else head = `<div class="now">${name}<span class="fig">${t?.left == null ? "—" : `${s.usage_stale ? "~" : ""}${t.left}<small>%</small>`}</span><span class="fig-l">${t?.left == null ? "usage unknown" : `of ${t.label} left`}</span></div>
+      ${t?.left != null ? `<div class="bar" role="img" aria-label="${s.usage_stale ? "last known: " : ""}${t.left}% of the ${t.label} window left"><i style="width:${t.left}%"></i></div>` : ""}
+      <div class="meta"><span>${esc(seatMetadata(s))} · ${t?.reset ? timed(t.reset, `${t.label} resets in`) : "reset time unknown"}</span>${other ? `<span aria-label="${s.usage_stale ? "last known: " : ""}${other.label} ${other.left == null ? "unknown" : `${other.left}% left`}">${other.label} ${other.left == null ? "unknown" : `${s.usage_stale ? "~" : ""}${other.left}%`}</span>` : ""}</div>`;
+    head += rowDetails(p.tool, s, p.seats, openDetails);
+  }
+  const crossings = crossingRequests({ pending_crossings: (state.pending_crossings || []).filter((r) => r.tool === p.tool) });
+  const tiers = tierRequests({ pending_tier_requests: (state.pending_tier_requests || []).filter((r) => r.tool === p.tool) });
+  const target = p.seats.find((s) => pending?.tool === p.tool && pending.email === s.email);
+  return `<section class="tool" data-tool="${esc(p.tool)}" aria-label="${esc(p.tool)}"><div class="toolname">${mark(p.tool)}${esc(p.tool)}</div><div class="answer">${head}${thenLine(p, state)}</div>${seatIssues(p, openDetails)}${crossings}${tiers}${target ? switchConfirmation(p.tool, target, pending) : ""}</section>`;
+}
+function listRows(p, state, openDetails) {
+  const rest = [...p.ready, ...p.keys, ...p.seats.filter((s) => !p.ready.includes(s))]
+    .filter((s) => s !== p.lead && (s.id || (!signedOut(s) && !signinNeeded(s) && !entitlementRevoked(s))));
+  const spending = new Set([...(state.running_key_seats || []), ...(state.pinned_sessions || []).map((s) => s.key_seat?.id || s.email)]);
+  return rest.map((s, i) => {
+    const key = p.keys.includes(s), limited = !key && limitedSeat(s);
+    const text = key ? `${spending.has(s.id) ? "spending now, " : ""}paid per token<span class="sr-only">; no app spend cap</span>` : limited ? `limited, ${backText(s)}` : `${p.next === s ? '<span class="state--strong">next</span>, ' : ""}${leftText(s)}`;
+    const action = key ? `<button class="row-action" data-action="key-terminal" data-id="${esc(s.id)}" aria-label="${esc(`use ${s.label} in a new paid terminal`)}">new terminal</button>` : limited ? "" : seatAction(p.tool, s, "switch");
+    return `<div class="seat${i === 0 ? " first-of-tool" : ""}${key ? " key-seat" : ""}" data-seat-email="${esc(key ? s.id : s.email)}"><div class="row"><span class="toolname">${i === 0 ? `${mark(p.tool)}${esc(p.tool)}` : `<span class="sr-only">${esc(p.tool)}</span>`}</span>${nameButton(key ? "key" : p.tool, s, p.seats, openDetails, true)}<span class="state">${text}</span>${action}</div>${rowDetails(key ? "key" : p.tool, s, p.seats, openDetails)}</div>`;
+  }).join("");
 }
 
 // --- popover ----------------------------------------------------------------------------------
-
 export function buildHTML(state, pendingSwitch = null, openDetails = new Set()) {
   const theme = state?.settings?.theme === "dark" ? "dark" : "light";
-  const seats = subscriptionSeats(state);
-  const paid = paidCount(state);
-  const ready = seats.some(usable);
-  const mood = paid ? "spending" : ready ? "ready" : seats.length ? "resting" : "empty";
+  const seats = subscriptionSeats(state), paid = paidCount(state);
+  const mood = paid ? "spending" : seats.some(usable) ? "ready" : seats.length ? "resting" : "empty";
   const moved = state?.moved_note ? `<section class="event"><h2>last switch</h2><p>${esc(state.moved_note.replaceAll(" · ", ", "))}</p></section>` : "";
-  const prompts = keyConfirmations(state);
-  const asking = prompts.includes('class="key-confirm"');
-  // Paid approval remains focused; its accessible choices and session stop controls stay pinned.
-  const glance = ready && !paid && !asking;
-  const compact = !asking && !glance && (paid > 0 || seats.length > 0 || state?.keys?.length);
-  return `<div class="app ambient-app ledger-app${glance ? " roster-app" : ""}${compact ? " compact-roster-app" : ""} theme-${theme} mood-${mood}">
-    <header class="top">${appIcon()}<div class="top-actions"><details class="header-menu"><summary class="ibtn" aria-label="add a subscription seat or API key" title="add a seat or key">＋</summary><nav class="menu-panel"><button data-action="add">a subscription seat</button><button data-action="key-start">an API key</button></nav></details>
-    <details class="header-menu"><summary class="ibtn" aria-label="app menu" title="app menu">⋯</summary><nav class="menu-panel"><button data-action="settings">settings</button><button data-action="quit">quit ai guest list</button></nav></details></div></header>
-    ${ledgerFacts(state)}
-    <div class="ambient-stage">${prompts}${orphanRequests(state, asking)}${paid ? paidUseControl(state) : ""}${!asking && (seats.length || state?.keys?.length) ? `<section class="${glance ? "roster-glance" : "roster-compact"}" aria-label="seat availability" tabindex="0">${rosterTable(state, pendingSwitch, openDetails)}</section>` : !asking ? `<div class="ledger-empty"><p>no seats yet. add one to start switching.</p><button data-action="add">add your first seat</button><button data-action="key-start">add an API key</button></div>` : ""}</div>
-    <footer class="ledger-footer"><label class="footer-auto"><input type="checkbox" data-action="toggle" data-key="auto_switch" ${state?.settings?.auto_switch ? "checked" : ""}><span class="sw" aria-hidden="true"></span><span>auto-switch <span class="when-on">on</span><span class="when-off">off</span></span></label><button class="footer-options" data-action="seat-options" aria-controls="seat-options" aria-expanded="false">seat options</button><span class="footer-strategy">strategy: <b>${state?.settings?.strategy === "most_headroom" ? "most headroom" : "soonest back"}</b></span></footer>
+  const prompts = keyConfirmations(state), asking = prompts.includes('class="key-confirm"');
+  const tools = [...new Set(["codex", "claude", ...(state.keys || []).map((k) => k.harness || "codex"), ...(state.pending_crossings || []).map((r) => r.tool), ...(state.pending_tier_requests || []).map((r) => r.tool)])];
+  const plans = tools.map((tool) => toolPlan(tool, state)).filter((p) => p.seats.length || p.keys.length || (state.pending_crossings || []).some((r) => r.tool === p.tool) || (state.pending_tier_requests || []).some((r) => r.tool === p.tool));
+  const strategy = state?.settings?.strategy === "most_headroom" ? "most headroom first" : "soonest back first";
+  return `<div class="app ambient-app now-next theme-${theme} mood-${mood}">
+    <header class="top"><span class="brand">${appIcon()}</span>${headerVerdict(state)}<div class="top-actions">
+      <div class="header-menu"><button class="ibtn" data-action="menu" data-menu="add" aria-label="add a subscription seat or API key" aria-haspopup="menu" aria-expanded="false">${ICON.plus}</button><nav class="menu" role="menu" aria-label="add" hidden><button role="menuitem" data-action="add" data-tool="codex">codex seat <span class="sub">sign in</span></button><button role="menuitem" data-action="add" data-tool="claude">claude seat <span class="sub">sign in</span></button><hr><button role="menuitem" data-action="key-start">api key <span class="sub">paid</span></button><button role="menuitem" data-action="add">a subscription seat</button></nav></div>
+      <div class="header-menu"><button class="ibtn" data-action="menu" data-menu="more" aria-label="app menu" aria-haspopup="menu" aria-expanded="false">${ICON.more}</button><nav class="menu" role="menu" aria-label="more" hidden><button role="menuitemcheckbox" aria-checked="${!!state?.settings?.auto_switch}" data-action="toggle" data-key="auto_switch">auto-switch <span class="sub">${state?.settings?.auto_switch ? "on" : "off"}</span></button><button role="menuitem" data-action="set_strategy" data-value="${state?.settings?.strategy === "most_headroom" ? "soonest_back" : "most_headroom"}">next seat <span class="sub">${strategy.replace(" first", "")}</span></button><hr><button role="menuitem" data-action="settings">settings…</button><button role="menuitem" data-action="quit">quit</button></nav></div></div></header>
+    <div class="body" aria-label="seat availability" tabindex="0"><div class="content">${prompts}${paid ? paidUseControl(state) : ""}${plans.length ? `<div class="field">${plans.map((p) => toolBlock(p, state, pendingSwitch, openDetails)).join("")}</div><div class="sheet">${plans.map((p) => listRows(p, state, openDetails)).join("")}</div>` : !asking ? `<div class="field welcome"><p class="welcome-title">no seats yet</p><p>add your codex or claude sign-ins. when one runs out, work moves to the next.</p><button class="act act--strong" data-action="add">add a seat</button></div>` : ""}</div></div>
+    <footer class="foot">${ICON.switch}<span class="footer-status" role="status" aria-live="polite">${state?.settings?.auto_switch ? `auto-switch on, ${strategy}` : "auto-switch off, you switch by hand"}</span><button class="footer-options" data-action="seat-options" aria-controls="seat-options" aria-expanded="false" aria-label="seat options" title="seat options">${ICON.more}</button></footer>
     <details class="guest-drawer" id="seat-options"><summary class="drawer-handle"><span>seat options</span><span class="drawer-count">${seats.length + (state?.keys?.length || 0)} seats</span><span class="chevron" aria-hidden="true">⌃</span></summary>
       <div class="drawer-content"><div class="main-body">${engineBanner(state)}${supervisionBanner(state)}${toolGroup("codex", state?.tools?.codex, (state?.keys || []).filter((k) => k.harness === "codex"), pendingSwitch)}${toolGroup("claude", state?.tools?.claude, (state?.keys || []).filter((k) => k.harness === "claude"), pendingSwitch)}
       ${!seats.length && !state?.keys?.length ? `<p class="empty">use ＋ above to add a subscription or API key.</p>` : ""}${moved}
@@ -958,7 +1001,7 @@ export function crossingRequests(state) {
     const prompt = r.reason === "switch"
       ? `you switched ${esc(r.tool || "claude")} to ${to}. move the other running session too? (${esc(fromKind)} → ${esc(toKind)})`
       : `${from} is out. continue this session on ${to}${namedKind ? "" : ` (${esc(toKind)})`}?`;
-    return `<div class="issue-line crossing-confirm" role="group" aria-label="seat crossing approval">${stateGlyph("warn")}<span class="issue-text">${prompt}</span><span class="crossing-acts"><button class="row-action" data-action="crossing-answer" data-scope="once" ${data}>switch now</button><button class="row-action" data-action="crossing-answer" data-scope="deny" ${data}>not now</button></span>
+    return `<div class="issue issue--soft crossing-confirm" role="group" aria-label="seat crossing approval">${stateGlyph("warn")}<span class="issue-text">${prompt}</span><span class="crossing-acts"><button class="row-action" data-action="crossing-answer" data-scope="once" ${data}>switch now</button><button class="row-action" data-action="crossing-answer" data-scope="deny" ${data}>not now</button></span>
       <button class="pricing-link" data-action="crossing-auto" data-scope="once" ${data}>always switch automatically</button>
     </div>`;
   }).join("");
@@ -971,18 +1014,10 @@ export function tierRequests(state) {
   return requests.map((r) => {
     const data = `data-tool="${esc(r.tool)}" data-a="${esc(r.a)}" data-b="${esc(r.b)}"`;
     const pair = `${esc(r.a)}\u2194${esc(r.b)}`;
-    return `<div class="issue-line tier-confirm" role="group" aria-label="plan tier approval">${stateGlyph("warn")}<span class="issue-text">switch without restarting across plan tiers? ${esc(r.a)} and ${esc(r.b)} are different plans; models may differ. until you say yes, these moves restart the session.</span>
+    return `<div class="issue issue--soft tier-confirm" role="group" aria-label="plan tier approval">${stateGlyph("warn")}<span class="issue-text">switch without restarting across plan tiers? ${esc(r.a)} and ${esc(r.b)} are different plans; models may differ. until you say yes, these moves restart the session.</span>
       <span class="crossing-acts"><button class="row-action" data-action="tier-answer" data-scope="pair" ${data}>always for ${pair}</button><button class="row-action" data-action="tier-answer" data-scope="all" ${data}>always for all tiers</button><button class="row-action" data-action="tier-answer" data-scope="deny" ${data}>no</button></span>
     </div>`;
   }).join("");
-}
-
-function orphanRequests(state, asking) {
-  const seats = subscriptionSeats(state);
-  const crossings = (state.pending_crossings || []).filter((r) => asking || !seats.some((s) => s.tool === r.tool && s.email === r.to));
-  const tiers = (state.pending_tier_requests || []).filter((r) => asking || !seats.some((s) => s.tool === r.tool));
-  const issues = crossingRequests({ pending_crossings: crossings }) + tierRequests({ pending_tier_requests: tiers });
-  return issues ? `<div class="orphan-issues">${issues}</div>` : "";
 }
 
 export function keyConfirmations(state, answering = new Set(), now = Date.now()) {
