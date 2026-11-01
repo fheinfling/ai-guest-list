@@ -342,5 +342,16 @@
    "--test-name-pattern=a switch crossing",
    "app/web/render.test.mjs"
   ]
+ },
+ {
+  "label": "crossing click switches immediately without inline confirmation",
+  "file": "app/web/render.mjs",
+  "old": "  if (state?.settings?.crossing_auto === true) return false;",
+  "new": "  if (true) return false;",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
  }
 ]

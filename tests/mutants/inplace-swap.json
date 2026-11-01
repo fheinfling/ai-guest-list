@@ -454,8 +454,8 @@
  {
   "label": "N8 crossing session not asked",
   "file": "acctsw/switch.py",
-  "old": "        for origin, sid, home in asks:   # after chosen(), which closes a direction's requests\n            seatkind.request(state, tool, origin, email, sid, home=home)\n",
-  "new": "",
+  "old": "            for origin, sid, home in asks:\n                seatkind.request(state, tool, origin, email, sid, home=home, reason=\"switch\")\n",
+  "new": "            pass\n",
   "test": [
    "tests/test_seatkind.py::test_a_manual_switch_moves_whom_it_does_not_cross_and_asks_the_rest"
   ]
@@ -1676,6 +1676,15 @@
   "new": "return claudehome.load(ctx, email)",
   "test": [
    "tests/test_seatswap.py::test_failed_security_read_preserves_the_borrowed_binding"
+  ]
+ },
+ {
+  "label": "confirmed_crossing ignored by manual switch",
+  "file": "acctsw/switch.py",
+  "old": "        if confirmed_crossing:\n",
+  "new": "        if False:\n",
+  "test": [
+   "tests/test_seatkind.py::test_confirmed_manual_switch_approves_each_live_crossing"
   ]
  }
 ]

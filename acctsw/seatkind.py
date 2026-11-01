@@ -12,17 +12,19 @@ Every AUTOMATIC switch — in place or by restart — that moves a session betwe
 an unknown kind, is a crossing. Two unknown seats cross too: unknown is never proof of sameness.
 A crossing is only taken with an approval for exactly that direction (``a>b`` never approves
 ``b>a``). A move back to the session's own home seat (the one it was launched on, whose login it
-holds) is never a crossing: pass ``home=`` and ``b == home`` is exempt. A manual switch in the app
-is the user's own choice: it answers the open questions onto its target (``chosen``) and leaves no
-approval behind that could later authorize an automatic crossing.
+holds) is never a crossing: pass ``home=`` and ``b == home`` is exempt. A manual switch answers
+non-crossing moves with ``chosen`` and asks about crossing sessions. When the user confirms the
+crossing before switching, each live session's crossing gets a one-time approval instead.
 
 State lives in ``tools.<tool>.crossings``::
 
-    {"approvals": {"a>b": {"scope": "once"|"always", "at": iso, "via": "user"|"manual"}},
+    {"approvals": {"a>b": {"scope": "once"|"always", "at": iso, "via": "user"|"manual",
+                            "uses": int}},
      "requests":  [{"from": a, "to": b, "session_id": str|None, "at": iso,
                     "reason": "limit"|"switch"}]}
 
-A "once" approval is consumed by the switch that uses it (``consume``) and lapses after
+A "once" approval is consumed by the switch that uses it (``consume``); a confirmed manual switch
+can carry a ``uses`` count for multiple live sessions (omitted means one). The approval lapses after
 ``ONCE_TTL`` if no switch does: a yes given for one stuck session must not quietly authorize a
 crossing hours later. "always" stays until ``deny`` revokes it.
 """
@@ -128,14 +130,17 @@ def _drop_requests(store: dict, a: str, b: str) -> None:
 
 
 def approve(state, tool: str, a: str, b: str, scope: str, at: datetime | None = None, *,
-            via: str = "user") -> None:
-    """Approve ``a``→``b`` only (directional). Answers every open request for that direction."""
+            via: str = "user", uses: int = 1) -> None:
+    """Approve ``a``→``b`` only (directional). Answers every open request for that direction.
+    A confirmed manual switch can grant one use for each live session moving this direction."""
     if scope not in SCOPES:
         raise ValueError(f"bad crossing scope: {scope}")
     store = _store(state, tool)
     current = store["approvals"].get(_key(a, b))
     if not (scope == "once" and isinstance(current, dict) and current.get("scope") == "always"):
         store["approvals"][_key(a, b)] = {"scope": scope, "at": iso(at or now()), "via": via}
+        if scope == "once" and uses > 1:
+            store["approvals"][_key(a, b)]["uses"] = uses
     _drop_requests(store, a, b)
 
 
@@ -158,6 +163,9 @@ def consume(state, tool: str, a: str | None, b: str | None, at: datetime | None 
     record = (store.get("approvals") or {}).get(_key(a, b))
     if not _live(record, at):
         return False
+    if record["scope"] == "once" and record.get("uses", 1) > 1:
+        record["uses"] -= 1
+        return True
     if record["scope"] == "once":
         del store["approvals"][_key(a, b)]
     return True

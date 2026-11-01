@@ -3,11 +3,11 @@ from datetime import timedelta
 
 import pytest
 
-from acctsw import bridge, seatkind, session
+from acctsw import accounts, bridge, seatkind, session
 from acctsw.selection import choose, crossing_candidate
 from acctsw.switch import switch
 from acctsw.util import iso, now
-from tests.conftest import make_claude_blob
+from tests.conftest import make_claude_blob, make_codex_blob
 
 pytestmark = pytest.mark.crossings
 
@@ -218,11 +218,63 @@ def test_a_manual_move_home_keeps_an_always_approval(ctx, monkeypatch):
     assert seatkind.approved(ctx.load_state(), T, "p@x", "w@x")
 
 
+@pytest.mark.parametrize("via_bridge", [False, True])
+@pytest.mark.parametrize("confirmed", [False, True])
+def test_confirmed_manual_switch_approves_each_live_crossing(ctx, monkeypatch, via_bridge, confirmed):
+    tool, target = "codex", "work@x"
+    plans = {target: "Business", "personal@x": "Plus", "unknown@x": None,
+             "work2@x": "Team", "idle@x": "Pro"}
+    state = ctx.load_state()
+    for email, plan in plans.items():
+        state.upsert_seat(tool, email, plan=plan)
+        ctx.snapshot_set(tool, email, make_codex_blob(email))
+    state.set_active(tool, "personal@x")
+    seatkind.request(state, tool, "personal@x", target, 11, reason="switch")
+    state.save()
+    monkeypatch.setattr(session, "active_sessions", lambda *_a, **_k: [
+        {"email": "personal@x", "pid": 11, "started_at": iso(now())},
+        {"email": "personal@x", "pid": 12, "started_at": iso(now())},  # both sessions must be able to spend a use
+        {"email": "unknown@x", "pid": 13, "started_at": iso(now())},
+        {"email": "personal@x", "pid": 14, "home": target, "started_at": iso(now())},
+        {"email": "work2@x", "pid": 15, "started_at": iso(now())},
+    ])
+    if via_bridge:
+        reply = bridge.handle(ctx, {"action": "switch", "tool": tool, "email": target,
+                                    **({"confirmed_crossing": True} if confirmed else {})})
+        assert reply["ok"], reply
+    else:
+        switch(ctx, state, tool, target, sync=False, mirror=False, manual=True,
+               confirmed_crossing=confirmed)
+    state = ctx.load_state()
+    assert state.active(tool) == target
+    store = state.data["tools"][tool]["crossings"]
+    if confirmed:
+        assert store["requests"] == []
+        assert seatkind.pending(state, tool) == []
+        for origin, uses in (("personal@x", 2), ("unknown@x", 1)):
+            assert store["approvals"][f"{origin}>{target}"]["scope"] == "once"
+            for _ in range(uses):
+                assert seatkind.consume(state, tool, origin, target)
+            assert not seatkind.consume(state, tool, origin, target)
+        assert not seatkind.approved(state, tool, "idle@x", target)
+        assert not seatkind.approved(state, tool, target, "personal@x")
+    else:
+        assert {(r["from"], r["session_id"]) for r in store["requests"]} == {
+            ("personal@x", "11"), ("personal@x", "12"), ("unknown@x", "13")}
+        assert not store["approvals"]
+
+
+def test_seat_view_exposes_kind_from_plan(ctx):
+    state = seats(ctx, {"work@x": "Team", "personal@x": "Max", "unknown@x": None})
+    assert {s["email"]: s["kind"] for s in accounts.list_seats(state, T)} == {
+        "work@x": "business", "personal@x": "personal", "unknown@x": "unknown"}
+
+
 def test_an_automatic_switch_approves_nothing(ctx, monkeypatch):
     for email, plan in (("w@x", "Team"), ("p@x", "Max")):
         _claude_seat(ctx, email, plan)
     state = seats(ctx, {"w@x": "Team", "p@x": "Max"}, active="w@x")
-    switch(ctx, state, T, "p@x", sync=False, mirror=False)
+    switch(ctx, state, T, "p@x", sync=False, mirror=False, confirmed_crossing=True)
     state = ctx.load_state()
     assert not seatkind.approved(state, T, "w@x", "p@x")
     assert "manual_switch" not in state.data["tools"][T]

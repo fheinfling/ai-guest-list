@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   buildHTML, dotState, dotKey, doorKey, doorMark, creditLeft, pct, fmtCountdown, needsHello,
-  signedOut, isActive, signinExpiring, usable, resetIsPast,
+  signedOut, isActive, signinExpiring, usable, resetIsPast, switchNeedsConfirmation,
   buildSettings, buildAddSeat, reduceReply, supervisionBanner, engineBanner, fmtUsageAge, fmtSessionAge, updateClockText,
 } from "./render.mjs";
 
@@ -2598,4 +2598,57 @@ for (const revoked of [{ entitlement_revoked: true }, { usage: { error: "forbidd
       assert.doesNotMatch(part, /sign-in needed|signed out|data-action="add"|data-action="switch"/);
     }
   });
+}
+
+// A click may ask locally, but cannot change credentials or the active marker before consent.
+for (const tool of ["codex", "claude"]) {
+  for (const [fromKind, toKind, crossingAuto, asks] of [
+    ["business", "personal", false, true], ["personal", "business", false, true],
+    ["business", "business", false, false], ["personal", "personal", false, false],
+    ["business", "personal", true, false], ["unknown", "personal", false, true],
+    ["business", "unknown", false, true], ["unknown", "unknown", false, true],
+    [undefined, "business", false, true], ["personal", undefined, false, true],
+  ]) {
+    test(`${tool} crossing click ${fromKind} -> ${toKind}, automatic=${crossingAuto}`, () => {
+      const app = keyApp();
+      const snapshot = state({ settings: { crossing_auto: crossingAuto }, tools: { [tool]: {
+        active: "current@x", seats: [
+          seat({ email: "current@x", name: "Current", active: true, status: "active", kind: fromKind }),
+          seat({ email: "target@x", name: "Target <&>", kind: toKind }),
+        ],
+      } } });
+      assert.equal(switchNeedsConfirmation(snapshot, tool, "target@x"), asks);
+      app.window.AGL.update(snapshot);
+      const before = app.sent.length;
+      const roster = rosterHTML(snapshot);
+      const row = rowOf(roster, "target@x");
+      assert.match(row, /^<tr[^>]*data-action="switch"/, "row and button use the same action");
+      assert.match(row, /<button[^>]*data-action="switch"/);
+      app.click({ action: "switch", tool, email: "target@x" });
+      assert.equal(snapshot.tools[tool].active, "current@x");
+      if (!asks) {
+        assert.doesNotMatch(app.root.innerHTML, /class="issue-line switch-confirm"/);
+        assert.deepEqual(JSON.parse(JSON.stringify(app.sent.slice(before))), [{ action: "switch", tool, email: "target@x" }]);
+        return;
+      }
+      assert.equal(app.sent.length, before);
+      const kind = toKind === "business" ? "work seat" : toKind === "personal" ? "personal seat" : "unknown seat kind";
+      assert.ok(app.root.innerHTML.includes(`switch ${tool} to Target &lt;&amp;&gt; (${kind})? running sessions move too`));
+      assert.match(app.root.innerHTML, /<tr class="roster-issue"><td colspan="5"><div class="issue-line switch-confirm"/);
+      assert.match(rowOf(app.root.innerHTML, "current@x"), /on now/);
+      app.window.AGL.update(snapshot); // a background push keeps the local question open
+      assert.match(app.root.innerHTML, /data-action="switch-cancel"/);
+      app.click({ action: "switch-cancel", tool, email: "target@x" });
+      assert.equal(app.sent.length, before);
+      assert.doesNotMatch(app.root.innerHTML, /data-action="switch-confirm"/);
+      app.click({ action: "switch-confirm", tool, email: "target@x" }); // dismissed controls are inert
+      assert.equal(app.sent.length, before);
+      app.click({ action: "switch", tool, email: "target@x" });
+      app.click({ action: "switch-confirm", tool, email: "target@x" });
+      assert.deepEqual(JSON.parse(JSON.stringify(app.sent.slice(before))), [
+        { action: "switch", tool, email: "target@x", confirmed_crossing: true },
+      ]);
+      assert.doesNotMatch(app.root.innerHTML, /data-action="switch-confirm"/);
+    });
+  }
 }

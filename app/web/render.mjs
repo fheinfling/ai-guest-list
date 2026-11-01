@@ -220,7 +220,26 @@ function signinExpiryLine(seat, tag) {
   return `<${tag} class="signin-expiry" data-reset-at="${esc(at)}" data-clock-prefix="sign-in expires in" title="${esc(new Date(at).toLocaleString())}">sign-in expires in ${fmtCountdown(at)}</${tag}>`;
 }
 
-function seatCard(tool, seat) {
+export function switchNeedsConfirmation(state, tool, email) {
+  if (state?.settings?.crossing_auto === true) return false;
+  const group = state?.tools?.[tool];
+  const seats = group?.seats || [];
+  const target = seats.find((seat) => seat.email === email);
+  const active = group?.active || seats.find(isActive)?.email;
+  if (!target || !active || active === email) return false;
+  const current = seats.find((seat) => seat.email === active);
+  const known = (kind) => kind === "business" || kind === "personal";
+  return !known(current?.kind) || !known(target.kind) || current.kind !== target.kind;
+}
+
+function switchConfirmation(tool, seat, pending) {
+  if (pending?.tool !== tool || pending.email !== seat.email) return "";
+  const kind = seat.kind === "business" ? "work seat" : seat.kind === "personal" ? "personal seat" : "unknown seat kind";
+  const data = `data-tool="${esc(tool)}" data-email="${esc(seat.email)}"`;
+  return `<div class="issue-line switch-confirm" role="group" aria-label="confirm seat switch"><span class="issue-text">switch ${esc(tool)} to ${esc(seat.name || seat.email)} (${kind})? running sessions move too</span><button class="row-action" data-action="switch-confirm" ${data}>switch</button><button class="row-action" data-action="switch-cancel" ${data}>cancel</button></div>`;
+}
+
+function seatCard(tool, seat, pending) {
   const fetched = seat.usage_fetched_at || seat.usage?.fetched_at || "";
   const reported = seat?.usage?.reported_windows;
   const weeklyOnly = tool === "codex" && Array.isArray(reported) && reported.includes("weekly") && !reported.includes("5h");
@@ -244,14 +263,15 @@ function seatCard(tool, seat) {
     ${seat.in_session ? `<p class="support">terminal attached<span data-session-at="${esc(seat.session_started_at)}">${fmtSessionAge(seat.session_started_at).replace(" · ", "; ")}</span></p>` : ""}
     ${seat.last_on_floor ? `<p class="support">last on the floor ${esc(fmtClock(seat.last_on_floor))}</p>` : ""}
     <div class="seat-actions">${action}<button class="logout" data-action="remove" data-tool="${tool}" data-email="${esc(seat.email)}">log out</button></div>
+    ${switchConfirmation(tool, seat, pending)}
     </div></details></article>`;
 }
 
-function toolGroup(tool, t, keys = []) {
+function toolGroup(tool, t, keys = [], pending = null) {
   const seats = t?.seats || [];
   if (!seats.length && !keys.length) return "";
   return `<section class="group" style="--accent:${TOOL_META[tool].accent}"><h2 class="g-head"><span class="tool-marker tool-marker--${tool}" aria-hidden="true"></span>${TOOL_META[tool].label}</h2>
-    ${seats.map((seat) => seatCard(tool, seat)).join("")}${keys.map(keySeatCard).join("")}</section>`;
+    ${seats.map((seat) => seatCard(tool, seat, pending)).join("")}${keys.map(keySeatCard).join("")}</section>`;
 }
 
 
@@ -695,7 +715,7 @@ function usageIssue(tool, seat) {
     token_expired: `open ${TOOL_META[tool].label} to refresh usage`, unauthorized: "sign in to refresh usage", forbidden: "check your subscription to refresh usage", no_token: "sign in to refresh usage" })[error] || (error ? "usage update failed; retrying automatically" : "");
 }
 
-function rosterTable(state) {
+function rosterTable(state, pending) {
   const seats = subscriptionSeats(state);
   const spending = new Set([...(state?.running_key_seats || []),
     ...(state?.pinned_sessions || []).map((session) => session.key_seat?.id || session.email)]);
@@ -739,7 +759,8 @@ function rosterTable(state) {
         const error = usageIssue(tool, seat);
         if (!out && error) issues.push(esc(error));
         if (!out && (seat.usage_stale || seat.usage_unknown)) issues.push(`${seat.usage_unknown ? "usage unknown" : "last known reading"}; <span data-usage-at="${esc(seat.usage_fetched_at || seat.usage?.fetched_at || "")}">${fmtUsageAge(seat.usage_fetched_at || seat.usage?.fetched_at)}</span>`);
-        return `<tr class="${active && !out && !attention ? "roster-active" : ""}${out ? " roster-signedout" : ""}${limited ? " roster-limited" : ""}${rowAction ? " roster-actionable" : ""}"${rowAction} data-seat-email="${esc(seat.email)}"><td class="roster-state">${stateGlyph(out ? "out" : attention ? "warn" : limited ? "limited" : active ? "active" : "ready")}<span class="roster-status">${status}</span></td><th scope="row">${identity}</th>${windows}<td class="roster-last">${action && !limited ? action : ""}${resets.length ? `<span class="roster-resets${action && !limited ? " sr-only" : ""}">${resets.join("")}</span>` : ""}</td></tr>${issues.length ? `<tr class="roster-issue${out ? " issue-danger" : ""}" data-tool="${esc(tool)}" data-email="${esc(seat.email)}"><td colspan="5"><div class="issue-line" role="group" aria-label="${esc(TOOL_META[tool].label)} ${esc(seat.name || seat.email)} attention">${stateGlyph(out ? "out" : "warn")}<span class="issue-text">${issues.join("; ")}</span>${signin}${limited ? action : ""}</div></td></tr>` : ""}`;
+        const confirmation = switchConfirmation(tool, seat, pending);
+        return `<tr class="${active && !out && !attention ? "roster-active" : ""}${out ? " roster-signedout" : ""}${limited ? " roster-limited" : ""}${rowAction ? " roster-actionable" : ""}"${rowAction} data-seat-email="${esc(seat.email)}"><td class="roster-state">${stateGlyph(out ? "out" : attention ? "warn" : limited ? "limited" : active ? "active" : "ready")}<span class="roster-status">${status}</span></td><th scope="row">${identity}</th>${windows}<td class="roster-last">${action && !limited ? action : ""}${resets.length ? `<span class="roster-resets${action && !limited ? " sr-only" : ""}">${resets.join("")}</span>` : ""}</td></tr>${confirmation ? `<tr class="roster-issue"><td colspan="5">${confirmation}</td></tr>` : ""}${issues.length ? `<tr class="roster-issue${out ? " issue-danger" : ""}" data-tool="${esc(tool)}" data-email="${esc(seat.email)}"><td colspan="5"><div class="issue-line" role="group" aria-label="${esc(TOOL_META[tool].label)} ${esc(seat.name || seat.email)} attention">${stateGlyph(out ? "out" : "warn")}<span class="issue-text">${issues.join("; ")}</span>${signin}${limited ? action : ""}</div></td></tr>` : ""}`;
       }).join("")}${keys.map((key) => `<tr class="roster-key roster-actionable" data-action="key-terminal" data-id="${esc(key.id)}"><td class="roster-state">${stateGlyph("key")}<span class="roster-status">${spending.has(key.id) ? "spending now" : "api key"}</span></td><th scope="row"><span class="roster-identity" title="${esc(key.label)}">${esc(key.label)}</span>${key.model ? `<span class="roster-meta" title="${esc(key.model)}">${esc(key.model)}</span>` : ""}</th><td class="roster-key-terms" colspan="2"><span class="key-terms">paid per token<span class="sr-only">; no app spend cap</span></span></td><td class="roster-last"><button class="row-action key-use" data-action="key-terminal" data-id="${esc(key.id)}" aria-label="${esc(`use ${key.label} in a new paid terminal`)}" title="use in a new paid terminal">new terminal</button></td></tr>`).join("")}</tbody>`;
       }).join("")}
     </table>`;
@@ -747,7 +768,7 @@ function rosterTable(state) {
 
 // --- popover ----------------------------------------------------------------------------------
 
-export function buildHTML(state) {
+export function buildHTML(state, pendingSwitch = null) {
   const theme = state?.settings?.theme === "dark" ? "dark" : "light";
   const seats = subscriptionSeats(state);
   const paid = paidCount(state);
@@ -763,9 +784,9 @@ export function buildHTML(state) {
     <header class="top">${appIcon()}<div class="top-actions"><details class="header-menu"><summary class="ibtn" aria-label="add a subscription seat or API key" title="add a seat or key">＋</summary><nav class="menu-panel"><button data-action="add">a subscription seat</button><button data-action="key-start">an API key</button></nav></details>
     <details class="header-menu"><summary class="ibtn" aria-label="app menu" title="app menu">⋯</summary><nav class="menu-panel"><button data-action="settings">settings</button><button data-action="quit">quit ai guest list</button></nav></details></div></header>
     ${ledgerFacts(state)}
-    <div class="ambient-stage">${prompts}${crossingRequests(state)}${tierRequests(state)}${paid ? paidUseControl(state) : ""}${!asking && (seats.length || state?.keys?.length) ? `<section class="${glance ? "roster-glance" : "roster-compact"}" aria-label="seat availability" tabindex="0">${rosterTable(state)}</section>` : !asking ? `<div class="ledger-empty"><p>no seats yet. add one to start switching.</p><button data-action="add">add your first seat</button><button data-action="key-start">add an API key</button></div>` : ""}</div>
+    <div class="ambient-stage">${prompts}${crossingRequests(state)}${tierRequests(state)}${paid ? paidUseControl(state) : ""}${!asking && (seats.length || state?.keys?.length) ? `<section class="${glance ? "roster-glance" : "roster-compact"}" aria-label="seat availability" tabindex="0">${rosterTable(state, pendingSwitch)}</section>` : !asking ? `<div class="ledger-empty"><p>no seats yet. add one to start switching.</p><button data-action="add">add your first seat</button><button data-action="key-start">add an API key</button></div>` : ""}</div>
     <details class="guest-drawer"><summary class="drawer-handle"><span>seat options</span><span class="drawer-count">${seats.length + (state?.keys?.length || 0)} seats</span><span class="chevron" aria-hidden="true">⌃</span></summary>
-      <div class="drawer-content"><div class="main-body">${engineBanner(state)}${supervisionBanner(state)}${toolGroup("codex", state?.tools?.codex, (state?.keys || []).filter((k) => k.harness === "codex"))}${toolGroup("claude", state?.tools?.claude, (state?.keys || []).filter((k) => k.harness === "claude"))}
+      <div class="drawer-content"><div class="main-body">${engineBanner(state)}${supervisionBanner(state)}${toolGroup("codex", state?.tools?.codex, (state?.keys || []).filter((k) => k.harness === "codex"), pendingSwitch)}${toolGroup("claude", state?.tools?.claude, (state?.keys || []).filter((k) => k.harness === "claude"), pendingSwitch)}
       ${!seats.length && !state?.keys?.length ? `<p class="empty">use ＋ above to add a subscription or API key.</p>` : ""}${moved}
       </div></div></details></div>`;
 }

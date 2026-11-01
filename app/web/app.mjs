@@ -1,6 +1,6 @@
 // Live glue: render state into the DOM and forward user actions to the Python bridge.
 // All rendering logic lives in render.mjs (pure, unit-tested); this file is the thin wiring.
-import { buildHTML, buildSettings, buildAddSeat, addUsesPaste, reduceReply, updateClockText, buildAddKey, KEY_PROVIDERS, keyRequest, reduceKeyReply, keyConfirmations, buildPaidKeyGate, buildModelResults } from "./render.mjs";
+import { buildHTML, switchNeedsConfirmation, buildSettings, buildAddSeat, addUsesPaste, reduceReply, updateClockText, buildAddKey, KEY_PROVIDERS, keyRequest, reduceKeyReply, keyConfirmations, buildPaidKeyGate, buildModelResults } from "./render.mjs";
 
 const root = document.getElementById("root");
 const overlay = document.createElement("div");   // toast surface only (siblings of #root)
@@ -85,6 +85,7 @@ let renderedScreen = null;  // what the last render() actually drew — gates sc
 let add = null;
 let keyFlow = null;
 let paidTerminal = null;
+let pendingSwitch = null;
 let keySequence = 0;
 const answering = new Set();
 const proving = new Set();
@@ -144,6 +145,8 @@ function setPopoverVisible(visible) {
 }
 
 function render() {
+  if (screen !== "main" || (pendingSwitch &&
+      !switchNeedsConfirmation(state, pendingSwitch.tool, pendingSwitch.email))) pendingSwitch = null;
   // A background state push (the usage poll) re-renders whatever screen is up; carry the current
   // screen's body scroll position across the innerHTML swap so a poll doesn't snap it to the top.
   // Only when the screen is unchanged — navigating must start the new screen at the top.
@@ -168,7 +171,7 @@ function render() {
     : screen === "add" ? buildAddSeat(state, add)
     : screen === "add-key" ? buildAddKey(state, keyFlow)
     : screen === "paid-key" ? buildPaidKeyGate(state, paidTerminal)
-    : buildHTML(state);
+    : buildHTML(state, pendingSwitch);
   if (!root.querySelector(".key-prompts")) {
     root.querySelector(".set-head")?.insertAdjacentHTML("afterend", keyConfirmations(state, answering));
   }
@@ -342,7 +345,21 @@ document.addEventListener("click", (e) => {
     case "key-remove-confirm": send("key_remove", { id: el.dataset.id }); break;
     case "key-pricing":
       e.preventDefault(); send("key_pricing", { provider: el.dataset.provider }); break;
-    case "switch": send("switch", { tool, email }); break;
+    case "switch":
+      if (switchNeedsConfirmation(state, tool, email)) {
+        pendingSwitch = { tool, email }; render();
+      } else {
+        pendingSwitch = null;
+        send("switch", { tool, email });
+      }
+      break;
+    case "switch-cancel": pendingSwitch = null; render(); break;
+    case "switch-confirm":
+      if (pendingSwitch?.tool === tool && pendingSwitch.email === email) {
+        pendingSwitch = null;
+        send("switch", { tool, email, confirmed_crossing: true }); render();
+      }
+      break;
     case "remove": if (confirm(`wave goodbye to ${email}?`)) send("remove", { tool, email }); break;
     // add-a-seat sub-view (spec §9). Header ＋ (no tool) → provider step; per-provider add-row and
     // the needs-login "log in" button carry a tool → deep-link straight to details, provider preset.
@@ -437,6 +454,7 @@ document.addEventListener("change", (e) => {
 // Esc pops a sub-view (spec §9): settings → main; add → one step back (like the chevron).
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
+  if (pendingSwitch) { e.preventDefault(); pendingSwitch = null; render(); return; }
   const request = (state.pending_key_switches || []).find((r) =>
     r.status === "pending" && Date.parse(r.expires_at) > Date.now() && !answering.has(r.id));
   if (request) {

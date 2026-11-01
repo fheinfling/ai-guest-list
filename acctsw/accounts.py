@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from . import identity, session
+from . import identity, seatkind, session
 from .context import Context
 from .errors import CannotIdentify, NoLiveCreds
 from .selection import choose
@@ -244,6 +244,7 @@ def _seat_view(seat: dict, *, active: bool, at: datetime,
         "email": seat["email"],
         "name": seat.get("name") or seat["email"].split("@")[0],
         "plan": seat.get("plan"),
+        "kind": seatkind.kind(seat),
         "active": active,
         "limited": limited,
         "limited_until": seat.get("limited_until") if limited else None,
