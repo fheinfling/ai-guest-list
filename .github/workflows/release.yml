@@ -180,8 +180,10 @@ jobs:
             echo "::error::notarization $STATUS"
             exit 1
           fi
-          xcrun stapler staple "$RUNNER_TEMP/app/AI Guest List.app"
-          xcrun stapler validate "$RUNNER_TEMP/app/AI Guest List.app"
+          # stapler asks Apple's CloudKit for the ticket; that lookup sometimes drops the connection.
+          retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "::warning::attempt $i failed: $*"; sleep $((i * 15)); done; return 1; }
+          retry xcrun stapler staple "$RUNNER_TEMP/app/AI Guest List.app"
+          retry xcrun stapler validate "$RUNNER_TEMP/app/AI Guest List.app"
 
       - name: Check the zip users will download
         run: |
@@ -201,7 +203,9 @@ jobs:
           ditto -x -k "$ASSET" "$RUNNER_TEMP/final-check"
           requirement="$(cat scripts/update-requirement.txt)"
           codesign --verify --deep --strict -R "=$requirement" "$RUNNER_TEMP/final-check/AI Guest List.app"
-          xcrun stapler validate "$RUNNER_TEMP/final-check/AI Guest List.app"
+          # stapler asks Apple's CloudKit for the ticket; that lookup sometimes drops the connection.
+          retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "::warning::attempt $i failed: $*"; sleep $((i * 15)); done; return 1; }
+          retry xcrun stapler validate "$RUNNER_TEMP/final-check/AI Guest List.app"
           python scripts/update-manifest.py --zip "$ASSET" --app "$APP" --tag "$GITHUB_REF_NAME" --out latest.json
           shasum -a 256 "$ASSET"
 
