@@ -1,4 +1,4 @@
-// Shipping popover and pushed views: a verdict, an open seat roster, and native disclosures.
+// Shipping popover and pushed views: a compact seat ledger and native disclosures.
 // Pure state-to-markup rendering and bridge reducers; clock updates only change existing text.
 
 export const TOOL_META = {
@@ -77,7 +77,7 @@ export function signinExpiring(seat, now = Date.now()) {
 
 // A seat that can actually take work: ready or on now, and signed in.
 export function usable(seat) {
-  return ["ready", "active"].includes(seat?.status) && !signedOut(seat);
+  return !seat?.limited && ["ready", "active"].includes(seat?.status) && !signedOut(seat);
 }
 
 // A window whose reset time already passed is mid-refresh, not "in now": say so neutrally.
@@ -194,11 +194,12 @@ function bar(seat, win, label) {
 // "switch anyway" rather than "switch limited": the latter reads as a noun phrase, or as
 // "switching is limited", and a real user asked what it meant. The row already shows resting,
 // 0% and the reset countdown, so the label only has to carry "despite that".
-function seatAction(tool, seat) {
-  const add = (label) => `<button class="row-action" data-action="add" data-tool="${tool}" data-email="${esc(seat.email)}">${label}</button>`;
+function seatAction(tool, seat, placement = "all") {
+  const add = (label) => placement === "switch" ? "" : `<button class="row-action" data-action="add" data-tool="${tool}" data-email="${esc(seat.email)}">${label}</button>`;
   if (signedOut(seat)) return add("sign in");
   const again = signinExpiring(seat) ? add("sign in again") : "";
   if (isActive(seat)) return again;
+  if (placement === "signin") return again;
   const limited = seat.limited || ["resting", "queued"].includes(seat.status);
   const label = `switch to ${seat.name || seat.email}${limited ? "; this seat's limit applies immediately" : ""}`;
   return `<button class="row-action" data-action="switch" data-tool="${tool}" data-email="${esc(seat.email)}" aria-label="${esc(label)}" title="${esc(label)}">${limited ? "switch anyway" : "switch"}</button>${again}`;
@@ -219,9 +220,7 @@ function seatCard(tool, seat) {
     ? `<span data-reset-at="${esc(seat.limited_until)}" data-clock-prefix="back in" title="${esc(fmtClock(seat.limited_until))}">back in ${fmtCountdown(seat.limited_until)}</span>`
     : isActive(seat) ? (seat.in_session ? "on the floor" : "selected")
     : seat.status === "queued" ? "up next" : "ready";
-  const error = seat.usage?.error;
-  const issue = ({ rate_limited: "updates throttled; retrying automatically", network: "connection unavailable; retrying automatically",
-    token_expired: `open ${TOOL_META[tool].label} to refresh usage`, unauthorized: "sign in to refresh usage", forbidden: "check your subscription to refresh usage", no_token: "sign in to refresh usage" })[error] || (error ? "usage update failed; retrying automatically" : "");
+  const issue = usageIssue(tool, seat);
   const action = seatAction(tool, seat);
   return `<article class="seat seat--${esc(seat.status)}${out ? " seat--signedout" : ""}" data-card data-tool="${tool}" data-email="${esc(seat.email)}">
     <details class="seat-disclosure"><summary class="seat-row"><span class="seat-name">${esc(seat.name)}</span><span class="seat-state">${stateText}</span><span class="chevron" aria-hidden="true">⌄</span></summary>
@@ -547,46 +546,47 @@ export function buildSettings(state) {
 }
 
 
-function ambientArt() { return `<svg xmlns="http://www.w3.org/2000/svg" class="ambient-art" viewBox="265 252 500 500" aria-hidden="true" focusable="false">
+// Inline app/icon.svg: the header keeps the complete app mark at native icon size.
+function appIcon() { return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" class="app-icon" width="20" height="20" role="img" aria-label="ai guest list" focusable="false">
   <defs>
-    <linearGradient id="ambient-tile" x1="0" y1="0" x2="0" y2="1">
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%" stop-color="#ffe6ad"/>
       <stop offset="55%" stop-color="#f7c668"/>
       <stop offset="100%" stop-color="#e7a23f"/>
     </linearGradient>
-    <radialGradient id="ambient-glow" cx="50%" cy="40%" r="62%">
+    <radialGradient id="glow" cx="50%" cy="40%" r="62%">
       <stop offset="0%" stop-color="#fff6df" stop-opacity=".95"/>
       <stop offset="100%" stop-color="#fff6df" stop-opacity="0"/>
     </radialGradient>
-    <radialGradient id="ambient-ball" cx="38%" cy="30%" r="78%">
+    <radialGradient id="ball" cx="38%" cy="30%" r="78%">
       <stop offset="0%" stop-color="#ffffff"/>
       <stop offset="40%" stop-color="#bfe9df"/>
       <stop offset="100%" stop-color="#2f8a78"/>
     </radialGradient>
-    <linearGradient id="ambient-leaf" x1="0" y1="0" x2="1" y2="0">
+    <linearGradient id="leaf" x1="0" y1="0" x2="1" y2="0">
       <stop offset="0%" stop-color="#f5eedd"/>
       <stop offset="100%" stop-color="#d8c8a8"/>
     </linearGradient>
-    <clipPath id="ambient-ballClip"><circle cx="512" cy="470" r="172"/></clipPath>
-    <clipPath id="ambient-tileClip"><rect x="92" y="92" width="840" height="840" rx="200"/></clipPath>
+    <clipPath id="ballClip"><circle cx="512" cy="470" r="172"/></clipPath>
+    <clipPath id="tileClip"><rect x="92" y="92" width="840" height="840" rx="200"/></clipPath>
   </defs>
 
   <!-- squircle tile (macOS-style) -->
-  <rect x="92" y="92" width="840" height="840" rx="200" fill="url(#ambient-tile)"/>
-  <g clip-path="url(#ambient-tileClip)">
-    <rect x="92" y="92" width="840" height="840" fill="url(#ambient-glow)"/>
+  <rect x="92" y="92" width="840" height="840" rx="200" fill="url(#tile)"/>
+  <g clip-path="url(#tileClip)">
+    <rect x="92" y="92" width="840" height="840" fill="url(#glow)"/>
 
     <!-- door swung open on the left -->
     <g transform="rotate(-7 250 520)">
-      <rect x="150" y="150" width="120" height="740" rx="26" fill="url(#ambient-leaf)"/>
+      <rect x="150" y="150" width="120" height="740" rx="26" fill="url(#leaf)"/>
       <circle cx="244" cy="540" r="13" fill="#cf9b2e"/>
     </g>
 
     <!-- disco ball: string, glow, body, facets, highlight -->
     <line x1="512" y1="120" x2="512" y2="300" stroke="#b5905a" stroke-width="9"/>
     <circle cx="512" cy="470" r="200" fill="#fff2cf" opacity=".5"/>
-    <circle cx="512" cy="470" r="172" fill="url(#ambient-ball)"/>
-    <g clip-path="url(#ambient-ballClip)" stroke="#2c7e6d" stroke-width="7" opacity=".5" fill="none">
+    <circle cx="512" cy="470" r="172" fill="url(#ball)"/>
+    <g clip-path="url(#ballClip)" stroke="#2c7e6d" stroke-width="7" opacity=".5" fill="none">
       <line x1="392" y1="470" x2="632" y2="470"/>
       <path d="M360 388 q152 70 304 0"/>
       <path d="M360 552 q152 -70 304 0"/>
@@ -612,84 +612,118 @@ function paidCount(state) {
   const pinned = state?.pinned_sessions || [];
   return pinned.length + (state?.running_key_seats || []).filter((id) => !pinned.some((s) => (s.key_seat?.id || s.email) === id)).length;
 }
-// Never claim all is fine while a seat is signed out; the sentence still says work can continue
-// when another seat is usable.
-function glanceHeadline(state) {
-  const seats = subscriptionSeats(state);
-  const out = seats.filter(signedOut).length;
-  return out ? `you can keep working, but ${out === 1 ? "a seat is" : `${out} seats are`} signed out.` : "you can keep working.";
-}
-function ambientVerdict(state) {
-  const seats = subscriptionSeats(state);
-  const ready = seats.filter(usable);
-  let headline = glanceHeadline(state);
-  let action = "", detail = "";
-  if (!seats.length) {
-    headline = "add a seat to get started.";
-    action = `<button class="primary" data-action="add">add your first seat</button>`;
-  } else if (!ready.length) {
-    headline = seats.every((seat) => ["resting", "queued"].includes(seat.status)) ? "every subscription is resting." : "your seats need attention.";
-    const key = (state?.keys || [])[0];
-    const login = seats.find(signedOut);
-    const reset = seats.map((seat) => seat.limited_until).filter((iso) => iso && Number.isFinite(Date.parse(iso))).sort((a,b) => Date.parse(a)-Date.parse(b))[0];
-    if (key) {
-      detail = `<p class="hero-support">${esc(key.label)} ${key.responses_verified === false || key.last_proof?.outcome === "incompatible" ? "may help with paid use; endpoint unproven." : "can keep you going with paid use."}</p>`;
-      action = `<button class="primary" data-action="key-terminal" data-id="${esc(key.id)}">use ${esc(key.label)} in a terminal</button>`;
-    } else if (login) {
-      action = `<button class="primary" data-action="add" data-tool="${esc(login.tool)}" data-email="${esc(login.email)}">sign in to ${esc(login.name)}</button>`;
-    }
-    if (reset) detail += `<p class="hero-support" title="${esc(new Date(reset).toLocaleString())}"><span data-reset-at="${esc(reset)}" data-clock-prefix="next seat back in">next seat back in ${fmtCountdown(reset)}</span></p>`;
-  }
-  return `<section class="ambient-verdict" aria-label="current availability"><h1 role="status">${headline}</h1>
-    <div class="reading" role="status"><span class="reading-value">${ready.length}</span><span class="reading-unit">subscription ${ready.length === 1 ? "seat" : "seats"} ready</span></div>
-    <div class="hero-followup">${detail}${action}</div></section>`;
+// Distinct shapes and written states keep the ledger readable without colour.
+function stateGlyph(kind) {
+  const paths = {
+    active: '<circle cx="6" cy="6" r="4.7"/><circle cx="6" cy="6" r="2.4" fill="currentColor" stroke="none"/>',
+    ready: '<circle cx="6" cy="6" r="4.7"/>',
+    limited: '<circle cx="6" cy="6" r="4.7"/><path d="M3.5 6h5"/>',
+    out: '<circle cx="6" cy="6" r="4.7"/><path d="m2.7 9.3 6.6-6.6"/>',
+    key: '<rect x="2" y="2" width="8" height="8" rx="1.5"/>',
+    warn: '<path d="M6 1 11 10.5H1Z M6 4v3 M6 8.5v.1"/>',
+  };
+  return `<svg class="state-glyph" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[kind] || paths.ready}</svg>`;
 }
 
-function rosterTable(state, compact = false) {
+function limitedSeat(seat) {
+  return !signedOut(seat) && (seat.limited || ["resting", "queued"].includes(seat.status));
+}
+
+function returnTime(seat, prefix = "back in") {
+  const at = seat.limited_until;
+  if (!at || !Number.isFinite(Date.parse(at))) return "reset time unknown";
+  return `<span data-reset-at="${esc(at)}" data-clock-prefix="${prefix}" data-past-text="resetting…" title="${esc(new Date(at).toLocaleString())}">${resetIsPast(at) ? "resetting…" : `${prefix} ${fmtCountdown(at)}`}</span>`;
+}
+
+function ledgerFacts(state) {
+  const seats = subscriptionSeats(state);
+  const ready = seats.filter(usable);
+  const facts = [];
+  const approvals = (state?.pending_crossings || []).length + (state?.pending_tier_requests || []).length
+    + (state?.pending_key_switches || []).filter((r) => r.status === "pending" && Date.parse(r.expires_at) > Date.now()).length;
+  if (approvals) facts.push(`${approvals} ${approvals === 1 ? "approval needs" : "approvals need"} you`);
+  if (seats.length && !ready.length) {
+    facts.push(seats.every(limitedSeat) ? "all seats limited" : "no subscription seat ready");
+    const first = seats.filter((s) => limitedSeat(s) && Number.isFinite(Date.parse(s.limited_until)))
+      .sort((a, b) => Date.parse(a.limited_until) - Date.parse(b.limited_until))[0];
+    if (first) facts.push(`${esc(TOOL_META[first.tool].label)} ${esc(first.name || first.email)}: ${returnTime(first)}`);
+    const key = (state?.keys || [])[0];
+    if (key) facts.push(`${esc(key.label)} ${key.responses_verified === false || key.last_proof?.outcome === "incompatible" ? "may help with paid use; endpoint unproven" : "available for paid use"}`);
+  }
+  for (const seat of seats) {
+    const name = `${esc(TOOL_META[seat.tool].label)} ${esc(seat.name || seat.email)}`;
+    if (signedOut(seat)) facts.push(`${name} signed out`);
+    else if (signinExpiring(seat)) facts.push(`${name}: ${signinExpiryLine(seat, "span")}`);
+  }
+  return facts.length ? `<div class="ledger-facts" role="status">${stateGlyph("warn")}<span>${facts.join("; ")}</span></div>` : "";
+}
+
+function groupNext(tool, seats, state) {
+  const ready = seats.filter((seat) => usable(seat) && !isActive(seat));
+  const selection = state?.tools?.[tool]?.selection;
+  // Prefer the engine's selection when it names another usable seat. Otherwise retain its
+  // saved-seat order; the UI must not invent a different selection strategy.
+  const next = ready.find((seat) => selection?.available && seat.email === selection.email) || ready[0];
+  if (next) {
+    const pending = (state?.pending_crossings || []).some((r) => r.tool === tool && r.to === next.email);
+    return `${pending ? "needs approval" : "next"}: <b>${esc(next.name || next.email)}</b>`;
+  }
+  const back = seats.filter((seat) => limitedSeat(seat) && Number.isFinite(Date.parse(seat.limited_until)))
+    .sort((a, b) => Date.parse(a.limited_until) - Date.parse(b.limited_until))[0];
+  if (back) return `<b>${esc(back.name || back.email)}</b> ${returnTime(back)}`;
+  return seats.length ? "no other seat ready" : "paid per token";
+}
+
+function usageIssue(tool, seat) {
+  const error = seat.usage?.error;
+  return ({ rate_limited: "updates throttled; retrying automatically", network: "connection unavailable; retrying automatically",
+    token_expired: `open ${TOOL_META[tool].label} to refresh usage`, unauthorized: "sign in to refresh usage", forbidden: "check your subscription to refresh usage", no_token: "sign in to refresh usage" })[error] || (error ? "usage update failed; retrying automatically" : "");
+}
+
+function rosterTable(state) {
   const seats = subscriptionSeats(state);
   const spending = new Set([...(state?.running_key_seats || []),
     ...(state?.pinned_sessions || []).map((session) => session.key_seat?.id || session.email)]);
   return `<table class="roster" aria-label="seats and remaining headroom">
-      <colgroup><col class="roster-seat-col"><col class="roster-window-col"><col class="roster-window-col"></colgroup>
-      <thead><tr><th scope="col">${compact ? "seat availability" : "your seats"}</th><th scope="col">5-hour left</th><th scope="col">weekly left</th></tr></thead>
+      <colgroup><col class="roster-state-col"><col class="roster-seat-col"><col class="roster-window-col"><col class="roster-window-col"><col class="roster-action-col"></colgroup>
+      <thead><tr><th scope="col">state</th><th scope="col">seat</th><th scope="col" aria-label="5-hour left">5h left</th><th scope="col" aria-label="weekly left">week left</th><th scope="col">resets / action</th></tr></thead>
       ${[...new Set(["codex", "claude", ...(state?.keys || []).map((key) => key.harness)])].map((tool) => {
         const subscriptions = seats.filter((seat) => seat.tool === tool);
         const keys = (state?.keys || []).filter((key) => key.harness === tool);
         if (!subscriptions.length && !keys.length) return "";
-        return `<tbody><tr><th class="roster-tool" scope="rowgroup" colspan="3">${esc(TOOL_META[tool]?.label || tool || "API key")} /</th></tr>${subscriptions.sort((a, b) => Number(isActive(b)) - Number(isActive(a))).map((seat) => {
+        const accent = TOOL_META[tool]?.accent || "var(--support)";
+        return `<tbody style="--accent:${accent}"><tr><th class="roster-tool" scope="rowgroup" colspan="5"><span class="group-rule"><span>${esc(TOOL_META[tool]?.label || tool || "API key")}</span><span class="group-next">${groupNext(tool, subscriptions, state)}</span></span></th></tr>${subscriptions.sort((a, b) => Number(isActive(b)) - Number(isActive(a))).map((seat) => {
         const active = isActive(seat);
         const out = signedOut(seat);
-        const status = out ? (active ? "on now · signed out" : "signed out") : active ? "active" : seat.status === "resting" ? "resting" : seat.status === "queued" ? "up next" : "ready";
+        const limited = limitedSeat(seat);
+        const status = out ? (active ? "on now · signed out" : "signed out") : limited ? "limited" : active ? "on now" : "ready";
+        const resets = [];
         const windows = ["5h", "weekly"].map((win) => {
           const reported = seat.usage?.reported_windows;
           const absent = Array.isArray(reported) && !reported.includes(win);
           const used = out || seat.usage_unknown || absent ? null : pct(seat, win);
           const left = Number.isFinite(used) ? Math.round(100 - used) : null;
-          // A dash rather than a word. Under a heading that reads "5-hour left", "none" and
-          // "unknown" both invite the reading "no headroom left" — which is what 0% means, and
-          // the opposite of what an absent window means. The reason still reaches hover and
-          // assistive tech, so nothing is lost by the cell being quiet.
           const why = out ? "signed out; usage unknown" : absent ? `no ${win === "5h" ? "5-hour" : "weekly"} window on this plan`
                              : "usage reading unavailable";
           const missing = left === null;
           const reset = absent || out ? null : seat.usage?.windows?.[win]?.resets_at;
-          const resetText = reset && Number.isFinite(Date.parse(reset))
-            ? `<span class="roster-reset" data-reset-at="${esc(reset)}" data-clock-prefix="in" data-past-text="resetting…" title="window resets at ${esc(new Date(reset).toLocaleString())}">${resetIsPast(reset) ? "resetting…" : `in ${fmtCountdown(reset)}`}</span>` : "";
-          return `<td class="roster-value${missing ? " roster-unknown" : ""}"${
-            missing ? ` title="${esc(why)}" aria-label="${esc(why)}"` : ""}>${
-            missing ? "—" : `${left}%`}${seat.usage_stale && !missing ? `<span class="roster-freshness">last known</span>` : ""}${resetText}</td>`;
+          if (reset && Number.isFinite(Date.parse(reset))) resets.push(`<span class="reset-window">${win === "5h" ? "5h" : "week"} <span class="roster-reset" data-reset-at="${esc(reset)}" data-clock-prefix="in" data-past-text="resetting…" title="window resets at ${esc(new Date(reset).toLocaleString())}">${resetIsPast(reset) ? "resetting…" : `in ${fmtCountdown(reset)}`}</span></span>`);
+          return `<td class="roster-value${missing ? " roster-unknown" : left === 0 ? " roster-zero" : left <= 20 ? " roster-low" : ""}"${missing ? ` title="${esc(why)}" aria-label="${esc(why)}"` : ` aria-label="${seat.usage_stale ? "last known: " : ""}${left}% left"`}>${missing ? "—" : `${seat.usage_stale ? "~" : ""}${left}%<span class="ledger-bar${seat.usage_stale ? " stale" : ""}" aria-hidden="true"><i style="width:${left}%"></i></span>`}</td>`;
         }).join("");
-        const action = seatAction(tool, seat);
-        const identity = `<span class="roster-identity" title="${esc(seat.name || seat.email)}">${esc(seat.name || seat.email)}</span>`;
-        // The row itself carries the action for the pointer — a 344px target instead of a 90px
-        // label. The button stays in the markup as the keyboard and screen-reader path, and
-        // because it is the innermost [data-action], a click on it dispatches once, not twice.
-        // Only a switch becomes a row target. A seat needing sign-in offers "sign in again", and
-        // turning the whole row into a switch would fire the wrong action entirely.
+        const action = seatAction(tool, seat, "switch");
+        const signin = seatAction(tool, seat, "signin");
+        const identity = `<span class="roster-identity" title="${esc(seat.name || seat.email)}">${esc(seat.name || seat.email)}</span><span class="roster-meta sr-only">${planChip(seat.plan)}</span>`;
         const rowAction = action && !active && !out
           ? ` data-action="switch" data-tool="${esc(tool)}" data-email="${esc(seat.email)}"` : "";
-        return `<tr class="${active && !out ? "roster-active" : ""}${out ? " roster-signedout" : ""}${rowAction ? " roster-actionable" : ""}"${rowAction}><th scope="row">${identity}<span class="roster-meta">${planChip(seat.plan)}<span class="roster-status">${status}</span></span>${!out && signinExpiring(seat) ? signinExpiryLine(seat, "span").replace('class="signin-expiry"', 'class="signin-expiry roster-meta"') : ""}${action}</th>${windows}</tr>`;
-      }).join("")}${keys.map((key) => `<tr class="roster-key roster-actionable" data-action="key-terminal" data-id="${esc(key.id)}"><th scope="row"><span class="roster-inline"><span class="roster-identity" title="${esc(key.label)}">${esc(key.label)}</span>${spending.has(key.id) ? `<span class="roster-spending">spending now</span>` : ""}</span>${key.model ? `<span class="roster-meta" title="${esc(key.model)}">${esc(key.model)}</span>` : ""}<button class="row-action key-use" data-action="key-terminal" data-id="${esc(key.id)}" aria-label="${esc(`use ${key.label} in a new paid terminal`)}" title="use in a new paid terminal">new terminal</button></th><td class="roster-key-terms" colspan="2"><span class="key-terms">paid per token<span class="roster-meta">no app spend cap</span></span></td></tr>`).join("")}</tbody>`;
+        const issues = [];
+        if (out) issues.push("signed out; sign in to see usage");
+        if (!out && signinExpiring(seat)) issues.push(signinExpiryLine(seat, "span"));
+        if (limited) issues.push(`limited; ${returnTime(seat)}`);
+        const error = usageIssue(tool, seat);
+        if (!out && error) issues.push(esc(error));
+        if (!out && (seat.usage_stale || seat.usage_unknown)) issues.push(`${seat.usage_unknown ? "usage unknown" : "last known reading"}; <span data-usage-at="${esc(seat.usage_fetched_at || seat.usage?.fetched_at || "")}">${fmtUsageAge(seat.usage_fetched_at || seat.usage?.fetched_at)}</span>`);
+        return `<tr class="${active && !out ? "roster-active" : ""}${out ? " roster-signedout" : ""}${limited ? " roster-limited" : ""}${rowAction ? " roster-actionable" : ""}"${rowAction} data-seat-email="${esc(seat.email)}"><td class="roster-state">${stateGlyph(out ? "out" : limited ? "limited" : active ? "active" : "ready")}<span class="roster-status">${status}</span></td><th scope="row">${identity}</th>${windows}<td class="roster-last">${action && !limited ? action : ""}${resets.length ? `<span class="roster-resets${action && !limited ? " sr-only" : ""}">${resets.join("")}</span>` : ""}</td></tr>${issues.length ? `<tr class="roster-issue${out ? " issue-danger" : ""}" data-tool="${esc(tool)}" data-email="${esc(seat.email)}"><td colspan="5"><div class="issue-line" role="group" aria-label="${esc(TOOL_META[tool].label)} ${esc(seat.name || seat.email)} attention">${stateGlyph(out ? "out" : "warn")}<span class="issue-text">${issues.join("; ")}</span>${signin}${limited ? action : ""}</div></td></tr>` : ""}`;
+      }).join("")}${keys.map((key) => `<tr class="roster-key roster-actionable" data-action="key-terminal" data-id="${esc(key.id)}"><td class="roster-state">${stateGlyph("key")}<span class="roster-status">${spending.has(key.id) ? "spending now" : "api key"}</span></td><th scope="row"><span class="roster-identity" title="${esc(key.label)}">${esc(key.label)}</span>${key.model ? `<span class="roster-meta" title="${esc(key.model)}">${esc(key.model)}</span>` : ""}</th><td class="roster-key-terms" colspan="2"><span class="key-terms">paid per token<span class="sr-only">; no app spend cap</span></span></td><td class="roster-last"><button class="row-action key-use" data-action="key-terminal" data-id="${esc(key.id)}" aria-label="${esc(`use ${key.label} in a new paid terminal`)}" title="use in a new paid terminal">new terminal</button></td></tr>`).join("")}</tbody>`;
       }).join("")}
     </table>`;
 }
@@ -705,36 +739,15 @@ export function buildHTML(state) {
   const moved = state?.moved_note ? `<section class="event"><h2>last switch</h2><p>${esc(state.moved_note.replaceAll(" · ", ", "))}</p></section>` : "";
   const prompts = keyConfirmations(state);
   const asking = prompts.includes('class="key-confirm"');
-  // Consent is deliberately focused: asking permission to spend real money must never gain
-  // a roster, even while another key is spending. Keep both priced and unpriced consent clear.
-  // Multiple active tools are real; never choose one on the user's behalf.
+  // Paid approval remains focused; its accessible choices and session stop controls stay pinned.
   const glance = ready && !paid && !asking;
-  const compact = !asking && !glance && (paid > 0 || seats.length > 0);
-  const roster = glance ? `<section class="roster-glance" aria-label="current availability">
-    <h1 role="status">${glanceHeadline(state)}</h1>
-    ${rosterTable(state)}
-  </section>` : "";
-  // app/icon.svg's tile, glow and cream leaf, closed across the room. The knob keeps its
-  // original radius and colour; only the open leaf's width/position changes to close the door.
-  // doorKey and doorMark remain the sole, unchanged availability/mark helpers.
-  const art = !paid && !asking && doorKey(state) === "shut" ? `<svg xmlns="http://www.w3.org/2000/svg" class="ambient-art roster-door" viewBox="92 92 840 840" aria-hidden="true" focusable="false">
-    <defs>
-      <linearGradient id="roster-tile" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#ffe6ad"/><stop offset="55%" stop-color="#f7c668"/><stop offset="100%" stop-color="#e7a23f"/></linearGradient>
-      <radialGradient id="roster-glow" cx="50%" cy="40%" r="62%"><stop offset="0%" stop-color="#fff6df" stop-opacity=".95"/><stop offset="100%" stop-color="#fff6df" stop-opacity="0"/></radialGradient>
-      <linearGradient id="roster-leaf" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#f5eedd"/><stop offset="100%" stop-color="#d8c8a8"/></linearGradient>
-      <clipPath id="roster-tile-clip"><rect x="92" y="92" width="840" height="840" rx="200"/></clipPath>
-    </defs>
-    <rect x="92" y="92" width="840" height="840" rx="200" fill="url(#roster-tile)"/>
-    <g clip-path="url(#roster-tile-clip)"><rect x="92" y="92" width="840" height="840" fill="url(#roster-glow)"/>
-      <rect x="248" y="150" width="528" height="740" rx="26" fill="url(#roster-leaf)"/>
-      <circle cx="716" cy="540" r="13" fill="#cf9b2e"/>
-    </g>
-  </svg>` : ambientArt();
-  return `<div class="app ambient-app${glance ? " roster-app" : ""}${compact ? " compact-roster-app" : ""} theme-${theme} mood-${mood}">${art}
-    <header class="top"><span class="brand">ai guest list</span><div class="top-actions"><details class="header-menu"><summary class="ibtn" aria-label="add a subscription seat or API key" title="add a seat or key">＋</summary><nav class="menu-panel"><button data-action="add">a subscription seat</button><button data-action="key-start">an API key</button></nav></details>
+  const compact = !asking && !glance && (paid > 0 || seats.length > 0 || state?.keys?.length);
+  return `<div class="app ambient-app ledger-app${glance ? " roster-app" : ""}${compact ? " compact-roster-app" : ""} theme-${theme} mood-${mood}">
+    <header class="top">${appIcon()}<div class="top-actions"><details class="header-menu"><summary class="ibtn" aria-label="add a subscription seat or API key" title="add a seat or key">＋</summary><nav class="menu-panel"><button data-action="add">a subscription seat</button><button data-action="key-start">an API key</button></nav></details>
     <details class="header-menu"><summary class="ibtn" aria-label="app menu" title="app menu">⋯</summary><nav class="menu-panel"><button data-action="settings">settings</button><button data-action="quit">quit ai guest list</button></nav></details></div></header>
-    <div class="ambient-stage">${prompts}${crossingRequests(state)}${tierRequests(state)}${paid ? paidUseControl(state) : `<div class="availability">${glance ? roster : ambientVerdict(state)}</div>`}${compact ? `<section class="roster-compact" aria-label="seat availability" tabindex="0">${rosterTable(state, true)}</section>` : ""}</div>
-    <details class="guest-drawer"><summary class="drawer-handle"><span>${glance ? "seat options" : "guest list"}</span>${glance ? "" : `<span class="drawer-count">${seats.length + (state?.keys?.length || 0)} seats</span>`}<span class="chevron" aria-hidden="true">⌃</span></summary>
+    ${ledgerFacts(state)}
+    <div class="ambient-stage">${prompts}${crossingRequests(state)}${tierRequests(state)}${paid ? paidUseControl(state) : ""}${!asking && (seats.length || state?.keys?.length) ? `<section class="${glance ? "roster-glance" : "roster-compact"}" aria-label="seat availability" tabindex="0">${rosterTable(state)}</section>` : !asking ? `<div class="ledger-empty"><p>no seats yet. add one to start switching.</p><button data-action="add">add your first seat</button><button data-action="key-start">add an API key</button></div>` : ""}</div>
+    <details class="guest-drawer"><summary class="drawer-handle"><span>seat options</span><span class="drawer-count">${seats.length + (state?.keys?.length || 0)} seats</span><span class="chevron" aria-hidden="true">⌃</span></summary>
       <div class="drawer-content"><div class="main-body">${engineBanner(state)}${supervisionBanner(state)}${toolGroup("codex", state?.tools?.codex, (state?.keys || []).filter((k) => k.harness === "codex"))}${toolGroup("claude", state?.tools?.claude, (state?.keys || []).filter((k) => k.harness === "claude"))}
       ${!seats.length && !state?.keys?.length ? `<p class="empty">use ＋ above to add a subscription or API key.</p>` : ""}${moved}
       </div></div></details></div>`;

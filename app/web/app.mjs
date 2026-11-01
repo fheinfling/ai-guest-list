@@ -89,6 +89,7 @@ let keySequence = 0;
 const answering = new Set();
 const proving = new Set();
 let clockTimer = null;
+let mainKeyPromptCount = 0;
 let drawerMotion = null;
 const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 
@@ -171,6 +172,7 @@ function render() {
   if (!root.querySelector(".key-prompts")) {
     root.querySelector(".set-head")?.insertAdjacentHTML("afterend", keyConfirmations(state, answering));
   }
+  mainKeyPromptCount = screen === "main" ? liveKeyRequests().length : 0;
   refreshKeyPrompts();
   for (const button of root.querySelectorAll('[data-action="key-prove"]')) {
     if (proving.has(button.dataset.id)) {
@@ -198,10 +200,21 @@ function render() {
   document.body.className = "theme-" + theme;
 }
 
+function liveKeyRequests() {
+  return (state.pending_key_switches || []).filter((r) => r.status === "pending" && Date.parse(r.expires_at) > Date.now());
+}
+
 function refreshKeyPrompts() {
+  const pending = liveKeyRequests();
+  // The ledger is absent during paid consent. When its last request expires, restore the
+  // roster and remove the approval fact immediately, even before the next engine poll.
+  // Pushed views keep their inputs and focus; only the main ledger changes its layout.
+  if (screen === "main" && pending.length !== mainKeyPromptCount) {
+    render();
+    return;
+  }
   const prompts = root.querySelector(".key-prompts");
   if (!prompts) return;
-  const pending = (state.pending_key_switches || []).filter((r) => r.status === "pending" && Date.parse(r.expires_at) > Date.now());
   const signature = JSON.stringify([pending, [...answering]]);
   // Time passing must not rebuild focused approval buttons just to update a price's age.
   if (prompts.dataset.signature !== signature) {

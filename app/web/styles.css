@@ -1,4 +1,4 @@
-/* Shipping popover: rounded type, ambient state fields, and an open headroom roster.
+/* Shipping popover: a compact ledger with shared columns and native disclosure sheets.
    Fixed to the native surface; task bodies and disclosure sheets scroll internally. */
 :root {
   --codex:#46c2a8; --claude:#e0795a;
@@ -82,22 +82,10 @@ summary::-webkit-details-marker { display:none; }
   --field-top:#272237; --field-mid:#403656; --field-base:#574575;
   --surface:#30273e; --sheet:#362b46; --support:#fff6df; --edge:#c7b3e5;
 }
-.ambient-art {
-  position:absolute; z-index:-1; pointer-events:none;
-  width:560px; height:560px; left:calc(50% - 280px); top:355px;
-  opacity:.38; mix-blend-mode:multiply; transform:rotate(-12deg);
-}
-.ambient-app.theme-dark .ambient-art { mix-blend-mode:screen; opacity:.08; }
-.mood-spending .ambient-art { opacity:.15; top:335px; }
-.ambient-app:has(.ambient-stage > .key-prompts:not(:empty)) .ambient-art { opacity:.18; top:335px; }
-.mood-resting .ambient-art { opacity:.3; }
-.mood-resting.theme-dark .ambient-art { opacity:.1; }
-.mood-empty .ambient-art { opacity:.35; }
 .top, .set-head {
   position:relative; z-index:5; display:flex; align-items:center; gap:10px;
   flex:0 0 64px; height:64px; padding:12px 24px;
 }
-.brand { flex:1; font-size:1.05rem; font-weight:650; letter-spacing:-.025em; }
 .top-actions { display:flex; gap:6px; }
 .ibtn, .set-back {
   width:36px; height:36px; display:flex; align-items:center; justify-content:center;
@@ -113,29 +101,17 @@ summary::-webkit-details-marker { display:none; }
 }
 .menu-panel button { min-height:44px; text-align:left; }
 .ambient-stage { flex:1; min-height:0; display:flex; flex-direction:column; }
-.availability { flex:1; min-height:0; display:flex; flex-direction:column; }
-.ambient-verdict {
-  display:flex; flex:1; min-height:0; flex-direction:column; align-items:center;
-  padding:24px 28px 18px; text-align:center; overflow-y:auto; scrollbar-width:thin;
-}
-.ambient-verdict h1 { max-width:300px; min-height:64px; display:flex; align-items:center; justify-content:center; }
 .reading { display:flex; flex-direction:column; align-items:center; }
 .reading-value {
   display:block; font-size:10.75rem; line-height:1.03; font-weight:250;
   font-variant-numeric:tabular-nums; letter-spacing:-.08em; padding-right:.08em;
 }
 .reading-unit { font-size:1rem; letter-spacing:-.015em; }
-.ambient-verdict .reading { margin-top:5px; }
-.hero-followup { width:100%; display:flex; flex-direction:column; gap:10px; margin-top:22px; }
-.hero-support { font-size:.93rem; color:var(--support); }
 .primary {
   background:var(--button); color:var(--button-ink); border:1px solid var(--button);
   padding:12px 18px; width:100%; min-height:46px;
 }
 .primary:hover { background:var(--button); filter:brightness(1.1); }
-.mood-resting .ambient-verdict { padding-top:15px; }
-.mood-resting .reading-value { font-size:7.8rem; }
-.mood-resting .hero-followup { margin-top:14px; }
 
 /* One quiet way down. On demand, a solid sheet covers the reading; the header stays pinned. */
 /* Closed, this is the same sheet as when it is open — just collapsed to its handle. It carries
@@ -207,7 +183,6 @@ summary::-webkit-details-marker { display:none; }
 .key-prompts:empty { display:none; }
 .key-prompts { min-height:0; overflow-y:auto; scrollbar-width:thin; }
 .ambient-stage > .key-prompts:not(:empty) { flex:1; }
-.ambient-stage:has(> .key-prompts:not(:empty)) > .availability { display:none; }
 .key-confirm { display:flex; flex-direction:column; gap:18px; padding:26px 28px 16px; }
 .key-confirm h1 { font-size:2.25rem; max-width:310px; }
 .decision-facts { display:flex; flex-direction:column; gap:6px; }
@@ -261,7 +236,7 @@ input:focus-visible ~ .sw, .free-control:focus-within, .proof-gate:focus-within 
 .set-legend { display:flex; flex-direction:column; gap:10px; color:var(--support); font-size:.9rem; }
 .set-legend > div { display:flex; align-items:center; gap:10px; }
 .set-ver { padding-top:8px; }
-/* Original doorMark remains unchanged; its tiny menu-bar legend is secondary to the SVG field. */
+/* The settings legend mirrors the native menu-bar door states. */
 .avatar.door { width:26px; height:28px; display:inline-block; flex:none; position:relative; background:linear-gradient(145deg,#ffe6ad,#e7a23f); border-radius:7px; overflow:hidden; }
 .door-room { position:absolute; inset:4px 6px; background:#2f8a78; border-radius:8px 8px 0 0; }
 .door-leaf { position:absolute; inset:4px auto 3px 4px; width:5px; background:#f5eedd; transform:rotate(-7deg); }
@@ -330,16 +305,14 @@ input:focus-visible ~ .sw, .free-control:focus-within, .proof-gate:focus-within 
 .toast { position:fixed; bottom:20px; left:20px; right:20px; padding:14px 18px; border:1px solid var(--edge); border-radius:18px; background:var(--surface); color:var(--ink); box-shadow:0 10px 24px var(--shadow); font:400 1rem/1.4 var(--sans); z-index:30; }
 #overlay:empty { display:none; }
 @media (max-height:520px) {
-  .ambient-verdict { padding-top:6px; }
   .reading-value { font-size:7rem; }
-  .mood-resting .reading-value { font-size:5rem; }
   .paid-use-control { padding-top:6px; }
   .paid-use-control .reading-value { font-size:4rem; }
 }
 @container popover (max-width:22rem) {
   .top,.set-head { padding-left:18px; padding-right:18px; }
   .set-body { padding-left:18px; padding-right:18px; }
-  .ambient-verdict,.paid-use-control,.key-confirm { padding-left:20px; padding-right:20px; }
+  .paid-use-control,.key-confirm { padding-left:20px; padding-right:20px; }
   .model-columns,.key-model-option { grid-template-columns:minmax(0,1fr) 104px; gap:8px; }
   .set-toggle-row { flex-wrap:wrap; }
   .set-tx { flex-basis:65%; }
@@ -348,117 +321,122 @@ input:focus-visible ~ .sw, .free-control:focus-within, .proof-gate:focus-within 
   *,*::before,*::after { animation:none !important; transition:none !important; scroll-behavior:auto !important; }
 }
 
-/* The everyday roster uses shared headings and active-first rows. */
-.roster-glance {
-  flex:1; min-height:0; padding:22px 24px 12px;
-  overflow-y:auto; overflow-x:hidden; scrollbar-width:thin;
+/* Ledger: one ruled table; sheet and pushed settings retain their existing controls. */
+.ledger-app {
+  --ink:#16201c; --support:#55625c; --edge:#63736a; --line:#d3dad6;
+  --surface:#f4f6f4; --sheet:#e8edea; --row-panel:#e8edea;
+  --codex:#0d7561; --claude:#b03f22; --danger:#a8231b; --danger-bg:#fbe9e6;
+  --warn:#7a4e00; --warn-bg:#fbf0d6; --button:#16201c; --button-ink:#f4f6f4;
+  background:var(--surface); font-size:13px; font-variant-numeric:tabular-nums;
 }
-.roster-glance h1 { margin-bottom:25px; }
-/* Each seat rides an edge-to-edge band, as v13-band's did: a barely-there wash of the surface
-   over the field, full-bleed, unrounded. Cards would make the roster a stack of objects; this
-   keeps it one calm surface with the seats merely resting on it.
-   The table escapes the glance's 24px gutter so the band reaches both edges, and the cells put
-   that gutter back so the text stays aligned with the heading above. */
-.roster {
-  width:calc(100% + 48px); margin:0 -24px; table-layout:fixed;
-  border-collapse:separate; border-spacing:0 6px;
+.ledger-app.theme-dark {
+  --ink:#e9efeb; --support:#9eaca5; --edge:#9eaca5; --line:#2d3631;
+  --surface:#171d1a; --sheet:#212925; --row-panel:#212925;
+  --codex:#62d6bc; --claude:#f29473; --danger:#ff9a90; --danger-bg:#3a1f1c;
+  --warn:#f2c35f; --warn-bg:#3a2f14; --button:#e9efeb; --button-ink:#171d1a;
 }
-.roster th:first-child, .roster td:first-child { padding-left:24px; }
-.roster th:last-child, .roster td:last-child { padding-right:24px; }
-/* The tool heading stays on the open field; only seat cells take the wash. Selected per cell
-   rather than per row because :has() is not safe at the macOS 12 floor either. */
-.roster tbody > tr > :not(.roster-tool) { background:var(--row-panel); }
-.roster-seat-col { width:52%; }
-.roster-window-col { width:24%; }
-.roster th, .roster td { border:0; vertical-align:middle; }
-.roster thead th {
-  padding:0 0 8px; text-align:right; font-size:.85rem; font-weight:400;
-}
-.roster thead th:first-child { text-align:left; }
-.roster tbody th { padding:10px 10px 10px 0; text-align:left; font-weight:450; }
-.roster .roster-tool { padding:12px 0 2px; font-size:.85rem; font-weight:600; }
-.roster-identity { display:block; font-size:.98rem; line-height:1.3; }
-.roster-meta { display:block; margin-top:4px; font-size:.85rem; line-height:1.3; font-weight:400; }
+/* Keep the existing mood palette, as quiet surfaces rather than decorative artwork. */
+.ledger-app.mood-resting.theme-light, .ledger-app.mood-empty.theme-light { --surface:#faf6ec; --sheet:#f1e9d8; --row-panel:#f1e9d8; --line:#dfd6c3; }
+.ledger-app.mood-resting.theme-dark, .ledger-app.mood-empty.theme-dark { --surface:#24231d; --sheet:#302e24; --row-panel:#302e24; --line:#454032; }
+.ledger-app.mood-spending.theme-light { --surface:#fbf2ec; --sheet:#f2e5da; --row-panel:#f2e5da; --line:#e2d0c4; }
+.ledger-app.mood-spending.theme-dark { --surface:#2b211d; --sheet:#372a23; --row-panel:#372a23; --line:#49392e; }
+.ledger-app.theme-light:has(.ambient-stage > .key-prompts:not(:empty)) { --surface:#f4effb; --sheet:#eee7f7; --line:#d9cfe6; }
+.ledger-app.theme-dark:has(.ambient-stage > .key-prompts:not(:empty)) { --surface:#272237; --sheet:#362b46; --line:#514360; }
+.ledger-app .top { flex:0 0 34px; height:34px; padding:4px 6px 2px 12px; justify-content:space-between; }
+.app-icon { display:block; width:20px; height:20px; flex:none; }
+.ledger-app .top-actions { gap:2px; }
+.ledger-app .ibtn { width:26px; height:26px; border-radius:6px; font-size:20px; }
+.ledger-app .ibtn:hover, .ledger-app .header-menu[open] > summary { background:var(--sheet); }
+.ledger-app .menu-panel { top:30px; width:190px; padding:4px; gap:2px; border:1px solid var(--line); border-radius:8px; }
+.ledger-app .menu-panel button { min-height:30px; padding:5px 8px; border:0; border-radius:5px; font-size:12px; }
+.ledger-app .menu-panel button:hover { background:var(--sheet); }
+.sr-only { position:absolute !important; width:1px !important; height:1px !important; padding:0 !important; margin:-1px !important; overflow:hidden !important; clip:rect(0,0,0,0); white-space:nowrap; border:0 !important; }
+.ledger-facts { display:flex; align-items:flex-start; gap:6px; flex:0 1 auto; max-height:110px; overflow-y:auto; margin:2px 10px 6px; padding:5px 8px; border-radius:5px; color:var(--danger); background:var(--danger-bg); font-size:12px; line-height:1.35; font-weight:600; }
+.ledger-facts > span { min-width:0; overflow-wrap:anywhere; }
+.ledger-facts .state-glyph { margin-top:2px; }
+.ledger-facts .signin-expiry { display:inline; font:inherit; }
+.ledger-app .ambient-stage { overflow-y:auto; scrollbar-width:thin; }
+.roster-glance, .roster-compact { flex:1; min-height:0; padding:0 10px 8px; overflow-y:auto; overflow-x:hidden; scrollbar-width:thin; scroll-padding:6px; }
+.roster-glance:focus-visible, .roster-compact:focus-visible { outline-offset:-3px; }
+.roster { width:100%; table-layout:fixed; border-collapse:collapse; border-spacing:0; }
+.roster-state-col { width:78px; }
+.roster-window-col { width:44px; }
+.roster-action-col { width:84px; }
+.roster th, .roster td { padding:3px; vertical-align:middle; text-align:left; }
+.roster thead th { padding-top:2px; padding-bottom:2px; font-size:11px; color:var(--support); font-weight:400; white-space:nowrap; }
+.roster thead th:nth-child(n+3) { text-align:right; }
+.roster tbody > tr > td, .roster tbody > tr > th[scope="row"] { height:30px; border-bottom:1px solid var(--line); }
+.roster tbody th[scope="row"] { font-weight:400; min-width:0; }
+.roster .roster-tool { padding:6px 3px 3px; border-bottom:2px solid var(--accent); font-size:12px; color:var(--accent); }
+.group-rule { display:flex; justify-content:space-between; align-items:baseline; gap:8px; }
+.group-next { color:var(--support); text-align:right; font-size:11px; font-weight:400; min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+.group-next b { font-weight:600; color:var(--ink); }
+.state-glyph { display:inline-block; width:12px; height:12px; flex:none; vertical-align:middle; }
+.roster-state { font-size:11px; color:var(--support); }
+.roster-state .state-glyph { margin-right:4px; }
+.roster-status { vertical-align:middle; }
+.roster-identity { display:block; font-size:13px; line-height:1.3; }
+.roster-meta { display:block; margin-top:1px; font-size:10px; line-height:1.3; color:var(--support); }
 .roster-identity, .roster-meta { min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
-.roster-meta .chip { margin:0 5px 0 0; }
-.roster-value {
-  padding:10px 0; text-align:right; font-size:1.6rem; line-height:1.15;
-  font-weight:350; font-variant-numeric:tabular-nums; letter-spacing:-.04em;
-}
-.roster-active .roster-identity { font-weight:650; }
-.roster-active .roster-status { font-weight:650; }
-.roster-active .roster-value { font-size:2rem; font-weight:600; }
-.roster .roster-unknown { font-size:.92rem; font-weight:400; letter-spacing:0; }
-.roster-freshness { display:block; margin-top:4px; font-size:.78rem; font-weight:400; letter-spacing:0; }
-.roster-reset { display:block; margin-top:4px; font-size:.75rem; line-height:1.3; font-weight:400; letter-spacing:0; white-space:nowrap; }
-.roster-key-terms { text-align:right; font-size:.93rem; line-height:1.3; }
-.roster-app .drawer-handle .chevron { margin-left:auto; }
-
-/* The closed leaf occupies 314 × 440 px of the 500 px icon field. Normal compositing
-   bounds contrast even where words cross the leaf, tile or knob; no moving decoration. */
-.ambient-app .ambient-art.roster-door {
-  width:500px; height:500px; left:calc(50% - 250px); top:150px;
-  transform:none; mix-blend-mode:normal; opacity:.48;
-}
-.ambient-app.theme-dark .ambient-art.roster-door { opacity:.07; }
-@media (max-height:520px) {
-  .roster-glance { padding-top:8px; }
-  .roster-glance h1 { margin-bottom:16px; }
-  .roster tbody th, .roster-value { padding-top:9px; padding-bottom:9px; }
-}
-
-/* Row actions sit beside identity/model text, leaving the figures and paid terms in their
-   columns. The shared underlined treatment is secondary, with a real 28px target and focus ring. */
+.roster-active > * { background:var(--row-panel); }
+.roster-active > td:first-child { box-shadow:inset 3px 0 0 var(--accent); padding-left:6px; }
+.roster-active .roster-identity { font-weight:750; }
+.roster-active .roster-state { color:var(--accent); font-weight:650; }
+.roster-signedout > * { background:var(--danger-bg); }
+.roster-signedout .roster-state { color:var(--danger); font-weight:650; }
+.roster-signedout > td:first-child { box-shadow:inset 3px 0 0 var(--danger); padding-left:6px; }
+.roster .roster-value { text-align:right; font-size:12px; font-weight:600; line-height:1.1; }
+.roster .roster-unknown { color:var(--support); font-weight:400; }
+.roster .roster-low { color:var(--warn); }
+.roster .roster-zero { color:var(--danger); font-weight:750; }
+.ledger-bar { display:block; height:3px; background:var(--line); border-radius:2px; margin-top:3px; overflow:hidden; }
+.ledger-bar i { display:block; height:100%; background:currentColor; }
+.ledger-bar.stale { background:repeating-linear-gradient(90deg,var(--line) 0 3px,transparent 3px 5px); }
+.ledger-bar.stale i { opacity:.55; }
+.roster .roster-last { text-align:right; font-size:11px; line-height:1.25; color:var(--support); }
+.roster-resets, .reset-window { display:block; }
+.reset-window { white-space:nowrap; }
+.roster-reset { color:var(--ink); }
+.roster .roster-key-terms { text-align:right; font-size:11px; color:var(--support); }
 .key-terms { display:block; }
-.row-action {
-  display:inline-flex; align-items:center; justify-content:center; flex:none;
-  min-width:28px; min-height:28px; padding:3px 2px; border:0; border-radius:3px;
-  background:transparent; color:inherit; font-size:13px; font-weight:500;
-  white-space:nowrap; text-decoration:underline; text-underline-offset:3px;
-}
-.roster-inline { display:flex; align-items:center; gap:6px; min-width:0; }
-.roster-inline > .roster-identity, .roster-inline > .roster-meta { flex:1; }
-.roster-inline > .roster-meta { margin-top:0; }
-.roster-spending { flex:none; font-size:13px; font-weight:600; }
-.seat-actions { align-items:center; }
-
-/* The verdict stays above a separately bounded roster. Long session lists can scroll inside
-   the paid hero; neither a long roster nor a long session list can push away the sheet handle. */
-.compact-roster-app .availability { flex:0 1 auto; max-height:290px; }
-.compact-roster-app .ambient-verdict { padding:10px 24px 14px; }
-.compact-roster-app .ambient-verdict h1 { min-height:0; }
-.compact-roster-app .reading { flex-direction:row; justify-content:center; gap:10px; margin:6px 0; }
-.compact-roster-app .reading-value { font-size:2.5rem; }
-.compact-roster-app .hero-followup { gap:8px; margin-top:4px; }
-.compact-roster-app .paid-use-control { flex:0 1 auto; max-height:290px; padding:10px 24px 14px; }
-.compact-roster-app .paid-session-list { margin-bottom:8px; }
-.compact-roster-app .billing-note { margin-top:6px; }
-.roster-compact {
-  flex:1; min-height:0; padding:4px 24px 12px;
-  overflow-y:auto; overflow-x:hidden; scrollbar-width:thin; scroll-padding:8px;
-}
-.roster-compact:focus-visible { outline-offset:-4px; }
-.roster-compact .roster { border-spacing:0 4px; }
-.roster-compact .roster tbody th, .roster-compact .roster-value { padding-top:6px; padding-bottom:6px; }
-.roster-compact .roster .roster-tool { padding-top:8px; padding-bottom:0; }
-.roster-compact .roster-value { font-size:1.35rem; }
-.roster-compact .roster-active .roster-value { font-size:1.6rem; }
-/* Compact body copy has a 13px floor, including countdowns, missing readings and provenance. */
-.roster-compact .roster-identity, .roster-compact .roster-meta,
-.roster-compact .roster thead th, .roster-compact .roster .roster-tool,
-.roster-compact .roster-reset, .roster-compact .roster-freshness,
-.roster-compact .roster-key-terms, .roster-compact .roster .roster-unknown { font-size:13px; }
-
-/* The action sits on its own line under the seat's meta, small and quiet, and the whole row is a
-   pointer target. The button is the keyboard path; the row is a convenience, so the row gets no
-   role or tabindex it could not honour. */
-.row-action { display:inline-flex; margin-top:6px; }
+.row-action { display:inline-flex; align-items:center; justify-content:center; flex:none; min-width:28px; min-height:24px; padding:3px 5px; border:1px solid var(--edge); border-radius:5px; background:transparent; color:var(--ink); font-size:11px; line-height:1.2; font-weight:600; white-space:nowrap; }
+.row-action:hover { background:var(--ink); color:var(--surface); }
 .roster-actionable { cursor:pointer; }
-.roster-actionable:hover > * { background:var(--surface); }
-.roster-signedout .roster-status { font-weight:650; color:#b4443a; }
-.theme-dark .roster-signedout .roster-status { color:#e8877d; }
-.roster-signedout .roster-identity { font-weight:650; }
-.signin-expiry { display:block; margin-top:2px; font-size:.75rem; line-height:1.3; }
+.roster-actionable:hover > * { background:var(--sheet); }
+.roster .roster-issue > td { height:auto; padding:0; }
+.issue-line { display:flex; align-items:center; gap:6px; padding:3px 4px 5px 6px; font-size:11px; line-height:1.3; color:var(--warn); }
+.issue-text { flex:1; min-width:0; overflow-wrap:anywhere; }
+.issue-danger { background:var(--danger-bg); }
+.issue-danger .issue-line { color:var(--danger); }
+.issue-line .signin-expiry { display:inline; font:inherit; }
+.signin-expiry { display:block; margin-top:2px; font-size:12px; line-height:1.3; }
+.ledger-app .guest-drawer { --handle-height:36px; border-radius:0; box-shadow:none; border-top:1px solid var(--line); }
+.ledger-app .drawer-handle { min-height:36px; padding:6px 12px; font-size:12px; }
+.ledger-app .drawer-count { font-size:11px; color:var(--support); }
+.ledger-app .guest-drawer[open] { inset:100px 0 0; border-radius:12px 12px 0 0; box-shadow:0 -8px 30px var(--shadow); }
+.ledger-app .guest-drawer[open] > .drawer-handle { padding:6px 12px; }
+.ledger-app .main-body { padding:0 12px 12px; }
+.ledger-app .seat-row { min-height:36px; }
+.ledger-empty { padding:8px 12px; color:var(--support); }
+.ledger-empty p { margin-bottom:8px; }
+.ledger-empty button { display:block; width:100%; padding:8px 0; border:0; border-bottom:1px solid var(--line); border-radius:0; text-align:left; font-size:12px; }
+/* Approval and paid-session content stays visible and scrollable above the ledger. */
+.ledger-app .key-confirm { padding:8px 12px 12px; gap:10px; }
+.ledger-app .key-confirm h1 { font-size:20px; }
+.ledger-app .crossing-prompts { flex:0 1 auto; min-height:0; overflow-y:auto; padding:0 12px 8px; }
+.ledger-app .crossing-confirm { padding:8px 0; border:0; border-bottom:1px solid var(--line); border-radius:0; }
+.ledger-app .crossing-acts { display:flex; flex-wrap:wrap; gap:6px; }
+.ledger-app .crossing-acts .choice { flex:1; min-width:90px; min-height:32px; padding:6px; border-radius:5px; font-size:11px; }
+.ledger-app .paid-use-control { flex:0 1 auto; max-height:260px; padding:8px 12px; border-bottom:1px solid var(--line); }
+.ledger-app .paid-use-control h1 { text-align:left; font-size:14px; letter-spacing:0; }
+.ledger-app .paid-use-control .reading { flex-direction:row; gap:5px; margin:3px 0; }
+.ledger-app .paid-use-control .reading-value, .ledger-app .paid-use-control .reading-unit { font-size:12px; font-weight:400; letter-spacing:0; }
+.ledger-app .paid-session-list { margin-bottom:6px; }
+.ledger-app .paid-session { padding:4px 0; }
+.ledger-app .paid-session h2 { font-size:12px; }
+.ledger-app .paid-session p, .ledger-app .billing-note { font-size:11px; }
+.ledger-app .paid-session button, .ledger-app .stop-all { min-height:28px; padding:4px 8px; border-radius:5px; font-size:11px; }
+.ledger-app .billing-note { margin-top:4px; text-align:left; }
 
 /* business <-> personal crossing questions ("needs you") */
 .crossing-prompts { display:flex; flex-direction:column; gap:10px; padding:0 28px 12px; }

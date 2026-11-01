@@ -57,8 +57,8 @@
  {
   "label": "signed-out active seat loses 'on now' honesty",
   "file": "app/web/render.mjs",
-  "old": "out ? (active ? \"on now \u00b7 signed out\" : \"signed out\") : active ? \"active\"",
-  "new": "out ? \"signed out\" : active ? \"active\"",
+  "old": "out ? (active ? \"on now \u00b7 signed out\" : \"signed out\") : limited ? \"limited\"",
+  "new": "out ? \"signed out\" : limited ? \"limited\"",
   "cmd": [
    "node",
    "--test",
@@ -178,8 +178,8 @@
  {
   "label": "expiring line dropped from the roster row",
   "file": "app/web/render.mjs",
-  "old": "${!out && signinExpiring(seat) ? signinExpiryLine",
-  "new": "${false ? signinExpiryLine",
+  "old": "if (!out && signinExpiring(seat)) issues.push(signinExpiryLine(seat, \"span\"));",
+  "new": "if (false) issues.push(signinExpiryLine(seat, \"span\"));",
   "cmd": [
    "node",
    "--test",
@@ -187,10 +187,10 @@
   ]
  },
  {
-  "label": "headline claims all is fine with a signed-out seat",
+  "label": "fact line claims all is fine with a signed-out seat",
   "file": "app/web/render.mjs",
-  "old": "return out ? `you can keep working, but",
-  "new": "return false ? `you can keep working, but",
+  "old": "if (signedOut(seat)) facts.push(`${name} signed out`);",
+  "new": "if (false) facts.push(`${name} signed out`);",
   "cmd": [
    "node",
    "--test",
@@ -198,10 +198,10 @@
   ]
  },
  {
-  "label": "verdict counts signed-out seats as ready",
+  "label": "fact line counts signed-out seats as ready",
   "file": "app/web/render.mjs",
-  "old": "const ready = seats.filter(usable);\n  let headline",
-  "new": "const ready = seats.filter((s) => [\"ready\", \"active\"].includes(s.status));\n  let headline",
+  "old": "const ready = seats.filter(usable);\n  const facts",
+  "new": "const ready = seats.filter((s) => [\"ready\", \"active\"].includes(s.status));\n  const facts",
   "cmd": [
    "node",
    "--test",
