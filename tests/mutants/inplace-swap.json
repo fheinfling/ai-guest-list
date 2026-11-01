@@ -1423,5 +1423,250 @@
   "test": [
    "tests/test_seatkind.py::test_crossing_auto_is_a_default_off_toggle"
   ]
+ },
+ {
+  "label": "keep warm: default disabled",
+  "file": "acctsw/state.py",
+  "old": "\"keep_warm\": True,",
+  "new": "\"keep_warm\": False,",
+  "test": [
+   "tests/test_keep_warm.py::test_setting_defaults_on_and_bridge_toggle_persists"
+  ]
+ },
+ {
+  "label": "keep warm: toggle not whitelisted",
+  "file": "acctsw/bridge.py",
+  "old": "    \"keep_warm\",\n",
+  "new": "",
+  "test": [
+   "tests/test_keep_warm.py::test_setting_defaults_on_and_bridge_toggle_persists"
+  ]
+ },
+ {
+  "label": "keep warm: setting ignored",
+  "file": "acctsw/claudehome.py",
+  "old": "if not state.settings()[\"keep_warm\"]:",
+  "new": "if False:",
+  "test": [
+   "tests/test_keep_warm.py::test_skips_ineligible_seat[setting_off]"
+  ]
+ },
+ {
+  "label": "keep warm: active seat warmed",
+  "file": "acctsw/claudehome.py",
+  "old": "if email == state.active(\"claude\") or email_key(email) in busy:",
+  "new": "if email_key(email) in busy:",
+  "test": [
+   "tests/test_keep_warm.py::test_skips_ineligible_seat[active]"
+  ]
+ },
+ {
+  "label": "keep warm: billed seat warmed",
+  "file": "acctsw/claudehome.py",
+  "old": "for key in (\"email\", \"home\")}",
+  "new": "for key in (\"home\",)}",
+  "test": [
+   "tests/test_keep_warm.py::test_skips_ineligible_seat[billed]"
+  ]
+ },
+ {
+  "label": "keep warm: home seat warmed",
+  "file": "acctsw/claudehome.py",
+  "old": "for key in (\"email\", \"home\")}",
+  "new": "for key in (\"email\",)}",
+  "test": [
+   "tests/test_keep_warm.py::test_skips_ineligible_seat[homed]"
+  ]
+ },
+ {
+  "label": "keep warm: unseeded home warmed",
+  "file": "acctsw/claudehome.py",
+  "old": "not home.is_dir() or not (home / \".acctsw-seeded\").is_file()",
+  "new": "not home.is_dir()",
+  "test": [
+   "tests/test_keep_warm.py::test_skips_ineligible_seat[unseeded]"
+  ]
+ },
+ {
+  "label": "keep warm: quarantine ignored",
+  "file": "acctsw/claudehome.py",
+  "old": "or (home / \".acctsw-quarantined\").exists()):",
+  "new": "or False):",
+  "test": [
+   "tests/test_keep_warm.py::test_skips_ineligible_seat[quarantined]"
+  ]
+ },
+ {
+  "label": "keep warm: signed-out seat warmed",
+  "file": "acctsw/claudehome.py",
+  "old": "if (seat.get(\"signin\") or {}).get(\"signed_out\"):",
+  "new": "if False:",
+  "test": [
+   "tests/test_keep_warm.py::test_skips_ineligible_seat[signed_out]"
+  ]
+ },
+ {
+  "label": "keep warm: expiry window widened",
+  "file": "acctsw/claudehome.py",
+  "old": "before > (at + timedelta(minutes=30)).timestamp() * 1000",
+  "new": "before > (at + timedelta(minutes=60)).timestamp() * 1000",
+  "test": [
+   "tests/test_keep_warm.py::test_skips_ineligible_seat[non_expiring]"
+  ]
+ },
+ {
+  "label": "keep warm: refresh token not required",
+  "file": "acctsw/claudehome.py",
+  "old": "for k in (\"accessToken\", \"refreshToken\")):",
+  "new": "for k in (\"accessToken\",)):",
+  "test": [
+   "tests/test_keep_warm.py::test_skips_ineligible_seat[no_refresh]"
+  ]
+ },
+ {
+  "label": "keep warm: access token not required",
+  "file": "acctsw/claudehome.py",
+  "old": "for k in (\"accessToken\", \"refreshToken\")):",
+  "new": "for k in (\"refreshToken\",)):",
+  "test": [
+   "tests/test_keep_warm.py::test_skips_ineligible_seat[no_access]"
+  ]
+ },
+ {
+  "label": "keep warm: three-hour cooldown dropped",
+  "file": "acctsw/claudehome.py",
+  "old": "timedelta(hours=24 if warm.get(\"fails\", 0) >= 2 else 3)",
+  "new": "timedelta(hours=24 if warm.get(\"fails\", 0) >= 2 else 0)",
+  "test": [
+   "tests/test_keep_warm.py::test_failure_backoff_and_success_reset"
+  ]
+ },
+ {
+  "label": "keep warm: failure backoff dropped",
+  "file": "acctsw/claudehome.py",
+  "old": "timedelta(hours=24 if warm.get(\"fails\", 0) >= 2 else 3)",
+  "new": "timedelta(hours=3)",
+  "test": [
+   "tests/test_keep_warm.py::test_failure_backoff_and_success_reset"
+  ]
+ },
+ {
+  "label": "keep warm: backoff boundary widened",
+  "file": "acctsw/claudehome.py",
+  "old": "at - last <= cooldown:",
+  "new": "at - last < cooldown:",
+  "test": [
+   "tests/test_keep_warm.py::test_failure_backoff_and_success_reset"
+  ]
+ },
+ {
+  "label": "keep warm: unchanged expiry counted as renewed",
+  "file": "acctsw/claudehome.py",
+  "old": "ok = after is not None and after > before",
+  "new": "ok = after is not None and after >= before",
+  "test": [
+   "tests/test_keep_warm.py::test_failure_backoff_and_success_reset"
+  ]
+ },
+ {
+  "label": "keep warm: earlier expiry counted as renewed",
+  "file": "acctsw/claudehome.py",
+  "old": "ok = after is not None and after > before",
+  "new": "ok = after is not None and after != before",
+  "test": [
+   "tests/test_keep_warm.py::test_earlier_expiry_is_not_success"
+  ]
+ },
+ {
+  "label": "keep warm: success does not reset fails",
+  "file": "acctsw/claudehome.py",
+  "old": "\"fails\": 0 if ok else fails + 1",
+  "new": "\"fails\": fails + 1",
+  "test": [
+   "tests/test_keep_warm.py::test_failure_backoff_and_success_reset"
+  ]
+ },
+ {
+  "label": "keep warm: failure not counted",
+  "file": "acctsw/claudehome.py",
+  "old": "\"fails\": 0 if ok else fails + 1",
+  "new": "\"fails\": 0 if ok else fails",
+  "test": [
+   "tests/test_keep_warm.py::test_failure_backoff_and_success_reset"
+  ]
+ },
+ {
+  "label": "keep warm: one-seat limit dropped",
+  "file": "acctsw/claudehome.py",
+  "old": "            return email\n    except Exception as exc:",
+  "new": "            continue\n    except Exception as exc:",
+  "test": [
+   "tests/test_keep_warm.py::test_only_one_seat_per_call"
+  ]
+ },
+ {
+  "label": "keep warm: wrong config dir passed",
+  "file": "acctsw/claudehome.py",
+  "old": "env[\"CLAUDE_CONFIG_DIR\"] = str(home)",
+  "new": "env[\"CLAUDE_CONFIG_DIR\"] = str(ctx._claude_real)",
+  "test": [
+   "tests/test_keep_warm.py::test_picks_only_parked_idle_expiring_seat_and_records_success"
+  ]
+ },
+ {
+  "label": "keep warm: timeout not bounded to sixty seconds",
+  "file": "acctsw/claudehome.py",
+  "old": "stderr=subprocess.DEVNULL, timeout=60,",
+  "new": "stderr=subprocess.DEVNULL, timeout=None,",
+  "test": [
+   "tests/test_keep_warm.py::test_picks_only_parked_idle_expiring_seat_and_records_success"
+  ]
+ },
+ {
+  "label": "keep warm: poll warmer never started",
+  "file": "acctsw/bridge.py",
+  "old": "            if want_claude:\n                _start_keep_warm(ctx)",
+  "new": "            if False:\n                _start_keep_warm(ctx)",
+  "test": [
+   "tests/test_keep_warm.py::test_bridge_poll_does_not_wait_and_prevents_overlap"
+  ]
+ },
+ {
+  "label": "keep warm: poll runs warmer synchronously",
+  "file": "acctsw/bridge.py",
+  "old": "threading.Thread(target=worker, name=\"claude-keep-warm\", daemon=True).start()",
+  "new": "worker()",
+  "test": [
+   "tests/test_keep_warm.py::test_bridge_poll_does_not_wait_and_prevents_overlap"
+  ]
+ },
+ {
+  "label": "keep warm: worker overlap lock skipped",
+  "file": "acctsw/bridge.py",
+  "old": "if not _KEEP_WARM_LOCK.acquire(blocking=False):",
+  "new": "if False:",
+  "test": [
+   "tests/test_keep_warm.py::test_bridge_poll_does_not_wait_and_prevents_overlap"
+  ]
+ },
+ {
+  "label": "keep warm: worker is not a daemon",
+  "file": "acctsw/bridge.py",
+  "old": "threading.Thread(target=worker, name=\"claude-keep-warm\", daemon=True).start()",
+  "new": "threading.Thread(target=worker, name=\"claude-keep-warm\", daemon=False).start()",
+  "test": [
+   "tests/test_keep_warm.py::test_bridge_poll_does_not_wait_and_prevents_overlap"
+  ]
+ },
+ {
+  "label": "keep warm: UI defaults off",
+  "file": "app/web/render.mjs",
+  "old": "s.keep_warm !== false",
+  "new": "s.keep_warm === true",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
  }
 ]

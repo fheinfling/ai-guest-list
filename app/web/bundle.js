@@ -534,6 +534,7 @@ function buildSettings(state) {
       ${toggleRow("notify", "notify when switched", "show which seat is ready", s.notify)}
       ${toggleRow("restart_app", "restart the Codex app", "refresh its account after a switch", s.restart_app)}
       ${toggleRow("in_place_switch", "switch seats without restarting claude", "the conversation keeps running", s.in_place_switch !== false)}
+      ${toggleRow("keep_warm", "keep parked claude seats signed in", "renew idle seats before their access expires", s.keep_warm !== false)}
       ${toggleRow("crossing_auto", "switch automatically between business and personal seats", "skip the question when moving between work and personal", s.crossing_auto === true)}
       ${toggleRow("in_place_cross_tier", "switch without restarting across plan tiers", "models may differ between plans", s.in_place_cross_tier === true)}
       <p class="support">with supervision off, only cx/cl auto-switch. terminals switch without restarting the desktop app.</p>

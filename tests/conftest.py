@@ -112,6 +112,17 @@ def _in_place_switch_off(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_background_keep_warm(request, monkeypatch):
+    """Only dedicated poll tests start maintenance workers, always with a fake warmer.
+
+    In particular an ordinary usage test must never launch the installed Claude binary.
+    """
+    if not request.node.get_closest_marker("keep_warm_poll"):
+        from acctsw import bridge
+        monkeypatch.setattr(bridge, "_start_keep_warm", lambda _ctx: None)
+
+
+@pytest.fixture(autouse=True)
 def _no_network(monkeypatch):
     """HTTP tests inject transports or urllib handlers; no test may open a real connection."""
     def offline(*_args, **_kwargs):
