@@ -44,7 +44,7 @@ The app talks directly to providers for sign-in, usage and model information; yo
 connect through the official tools.
 
 <p align="center">
-  <img src="docs/assets/screenshot.png" width="340" alt="The ai guest list popover: the verdict 'you can keep working', then one row per seat giving the tool, the account and how much 5-hour and weekly headroom is left — active seats first, a resting one at 0%, and an API-key seat priced per token." />
+  <img src="docs/assets/screenshot.png" width="340" alt="The ai guest list popover: a status chip, then one block per tool with the seat on now, how much of its tighter window is left, when it resets and where work goes next; below, one line per other seat with its kind and plan, a resting seat with its return time, and an API-key seat priced per token." />
   &nbsp;
   <img src="docs/assets/screenshot-settings.png" width="340" alt="The settings view in three sections: switching, paid keys set apart on gold, and appearance with the theme picker and the menu-bar icon legend." />
   <br><sub><i>The shipping popover and settings, with fictional accounts. Views are expanded to show all content.</i></sub>
@@ -58,6 +58,19 @@ connect through the official tools.
   resume the conversation on that seat. A resting seat can be chosen too; its limit applies at
   once, and the row says when it resets. Manual switching works even with auto-switch off. After updating,
   restart existing terminal launchers once so they load the new switching behavior.
+- **Claude keeps running while it switches.** A supervised Claude session moves to the next seat
+  *in place* — no restart, no resume — when its seat hits a limit or you pick another seat. A small
+  per-session local proxy (with a per-session certificate trusted only by that session) swaps the
+  seat behind the conversation; Claude Code keeps talking to `api.anthropic.com`, so admin policies
+  and features work as before. If anything about it doesn't work, it falls back to the restart
+  switch. Turn it off in settings with **switch seats without restarting claude**.
+- **Work and personal stay apart unless you say so.** Moving a session between a business seat
+  (Team/Enterprise) and a personal one (Pro/Max/Plus) asks first — **switch now** or **not now** —
+  every time, unless you turn on **switch automatically between business and personal seats**.
+  Switching in place across plan tiers (e.g. Max ↔ Team) is opt-in too.
+- **Parked seats stay ready.** Shortly before a parked Claude seat's sign-in token lapses, the app
+  lets Claude Code renew it (`claude mcp list` in that seat's home — no model call), so the seat can
+  take over in place at any time. Setting: **keep parked claude seats signed in**.
 - **Pick the smartest seat.** All seats resting? It chooses the one that unlocks soonest (or the one
   with the most headroom, your call).
 - **Non-destructive & reversible.** A factory-image backup makes uninstall a clean restore.
