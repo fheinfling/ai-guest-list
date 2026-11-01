@@ -9,10 +9,13 @@ from __future__ import annotations
 from .util import email_key
 
 import hashlib
+import logging
+import threading
 from typing import Any
 
 from . import TOOLS, __version__, build_number
 from . import accounts as acct
+from . import claudehome as claudehome_mod
 from . import engine as engine_mod
 from . import identity as identity_mod
 from . import install as install_mod
@@ -38,7 +41,33 @@ from .web_dot import dot_for, door_for
 TOGGLE_KEYS = {
     "auto_switch", "notify", "restart_app", "celebrations", "same_tool_only", "supervise_shell",
     "confirm_key_switch", "key_fallback", "in_place_switch", "in_place_cross_tier", "crossing_auto",
+    "keep_warm",
 }
+
+_KEEP_WARM_LOCK = threading.Lock()
+
+
+def _start_keep_warm(ctx: Context) -> None:
+    """Reserve the worker before starting it: overlapping polls never queue more children."""
+    if not _KEEP_WARM_LOCK.acquire(blocking=False):
+        return
+
+    def worker():
+        try:
+            claudehome_mod.keep_warm(ctx)
+        except Exception as exc:
+            logging.getLogger(__name__).warning("Claude keep-warm worker failed (%s)",
+                                                type(exc).__name__)
+        finally:
+            _KEEP_WARM_LOCK.release()
+
+    try:
+        threading.Thread(target=worker, name="claude-keep-warm", daemon=True).start()
+    except Exception as exc:
+        _KEEP_WARM_LOCK.release()
+        logging.getLogger(__name__).warning("Claude keep-warm thread failed (%s)",
+                                            type(exc).__name__)
+
 
 KEY_ACTIONS = {"key_add", "key_remove", "key_validate", "key_prove", "models_list", "answer_key_switch",
                "key_terminal", "end_pinned_session"}
@@ -724,6 +753,8 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
                 active_only=(scope == "active"), force=bool(message.get("force", False)),
                 user_agent=claude_ua,
             )
+            if want_claude:
+                _start_keep_warm(ctx)
             handoff = _auto_switch_after_usage(ctx, summary)
             return {"ok": True, "refresh": summary, "auto_switch": handoff,
                     "signin_notices": _take_signin_notices(ctx), "state": snapshot_state(ctx)}

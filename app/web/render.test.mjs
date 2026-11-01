@@ -2299,6 +2299,19 @@ test("settings offers the in-place switch toggle, on unless turned off", () => {
   assert.match(off, /data-key="in_place_switch" >/);
 });
 
+test("settings keeps parked claude seats signed in by default and dispatches its toggle", () => {
+  const on = buildSettings({ settings: {} });
+  assert.match(on, /keep parked claude seats signed in/);
+  assert.match(on, /data-action="toggle" data-key="keep_warm" checked/);
+  assert.match(buildSettings({ settings: { keep_warm: false } }), /data-key="keep_warm" >/);
+  for (const checked of [false, true]) {
+    const app = keyApp();
+    app.handlers.change({ target: { closest: () => ({ dataset: { key: "keep_warm" }, checked }) } });
+    assert.deepEqual(JSON.parse(JSON.stringify(app.sent.at(-1))),
+      { action: "toggle", key: "keep_warm", value: checked });
+  }
+});
+
 const crossing = (over = {}) => ({ tool: "claude", from: "w@x", to: "p@x", at: "2026-10-31T10:00:00Z",
   from_name: "Work", to_name: "Home", from_kind: "business", to_kind: "personal", ...over });
 

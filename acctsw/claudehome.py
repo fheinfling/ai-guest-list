@@ -35,16 +35,20 @@ from .util import email_key
 
 import hashlib
 from contextlib import contextmanager
+from datetime import timedelta
 import json
+import logging
 import os
 from pathlib import Path
+import subprocess
+import tempfile
 import threading
 import time
 import unicodedata
 
 from . import codexhome
 from .errors import AcctswError, CredentialIdentityMismatch, MissingSnapshot
-from .util import atomic_write_text
+from .util import atomic_write_text, iso, now, parse_iso
 
 PRIVATE = frozenset({
     ".claude.json", ".config.json", ".claude.json.backup", ".credentials.json",
@@ -360,6 +364,79 @@ def load(ctx, email: str) -> str | None:
     if (home / ".acctsw-quarantined").exists():
         return None
     return ctx.claude_cred(email).get_live()
+
+
+def keep_warm(ctx, at=None, *, run=None) -> str | None:
+    """Ask Claude Code to renew at most one idle parked home's expiring access token.
+
+    Never seed a home or spend a refresh token ourselves. The slow child runs without the store
+    lock; only its attempt record is written under the lock, onto freshly loaded state.
+    """
+    from . import session
+    from .claudesync import expiry
+
+    log = logging.getLogger(__name__)
+    try:
+        at = at or now()
+        state = ctx.load_state()
+        if not state.settings()["keep_warm"]:
+            return None
+        busy = {email_key(record.get(key, ""))
+                for record in session.active_sessions(ctx.data_dir, "claude")
+                for key in ("email", "home")}
+        for email, seat in state.accounts("claude").items():
+            if email == state.active("claude") or email_key(email) in busy:
+                continue
+            home = ctx.claude_home(email)
+            if (not home.is_dir() or not (home / ".acctsw-seeded").is_file()
+                    or (home / ".acctsw-quarantined").exists()):
+                continue
+            if (seat.get("signin") or {}).get("signed_out"):
+                continue
+            warm = seat.get("warm") or {}
+            last = parse_iso(warm.get("at"))
+            cooldown = timedelta(hours=24 if warm.get("fails", 0) >= 2 else 3)
+            if last is not None and at - last <= cooldown:
+                continue
+            item = ctx.claude_cred(email)
+            blob = item.get_live()  # tolerant home read, never a migration snapshot
+            before = expiry(blob)
+            if before is None or before > (at + timedelta(minutes=30)).timestamp() * 1000:
+                continue
+            oauth = json.loads(blob).get("claudeAiOauth") or {}
+            if not all(isinstance(oauth.get(k), str) and oauth[k]
+                       for k in ("accessToken", "refreshToken")):
+                continue
+
+            ok = False
+            try:
+                env = os.environ.copy()
+                env["CLAUDE_CONFIG_DIR"] = str(home)
+                with tempfile.TemporaryDirectory(prefix="acctsw-warm-") as cwd:
+                    (run or subprocess.run)(
+                        [ctx.claude_bin or "claude", "mcp", "list"], env=env, cwd=cwd,
+                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL, timeout=60,
+                    )
+            except Exception as exc:
+                log.warning("Claude keep-warm runner failed (%s)", type(exc).__name__)
+            try:
+                after = expiry(item.get_live())
+                ok = after is not None and after > before
+            except Exception as exc:
+                log.warning("Claude keep-warm credential read failed (%s)", type(exc).__name__)
+            with ctx.locked():
+                current = ctx.load_state()
+                seat = current.get_seat("claude", email)
+                if seat is not None:
+                    fails = (seat.get("warm") or {}).get("fails", 0)
+                    seat["warm"] = {"at": iso(at), "ok": ok, "fails": 0 if ok else fails + 1}
+                    current.save()
+            return email
+    except Exception as exc:
+        # Background maintenance must never break a usage poll or log credential bytes.
+        log.warning("Claude keep-warm failed (%s)", type(exc).__name__)
+    return None
 
 
 def sync_back(ctx, state, email: str, *, live_identity=None) -> bool:
