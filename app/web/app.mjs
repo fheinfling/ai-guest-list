@@ -105,7 +105,6 @@ function flash(text) {
 function contentHeight() {
   const app = root.firstElementChild;
   if (!app) return 0;
-  if (root.querySelector("details.guest-drawer[open]")) return 600;
   const body = root.querySelector(".body, .set-body");
   if (!body) return app.scrollHeight;
   const content = root.querySelector(".content");
@@ -163,48 +162,6 @@ const proving = new Set();
 const openSeatDetails = new Set();
 let clockTimer = null;
 let mainKeyPromptCount = 0;
-let drawerMotion = null;
-const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
-
-// Animate our content wrapper without depending on WKWebView's ::details-content support.
-// `open` stays true until an exit finishes, but drawer-closing is logically dismissed.
-function moveDrawer(drawer, open, startedAt = Date.now()) {
-  drawerMotion?.animation.cancel();
-  drawerMotion = null;
-  const body = drawer.querySelector(".main-body");
-  if (!open && drawer.contains(document.activeElement)) {
-    (root.querySelector('[data-action="seat-options"]') || drawer.querySelector(".drawer-handle")).focus({ preventScroll: true });
-  }
-  root.querySelector('[data-action="seat-options"]')?.setAttribute("aria-expanded", String(open));
-  drawer.open = true;
-  reportHeight();
-  drawer.classList.toggle("drawer-closing", !open);
-  body.inert = !open;
-  const finish = () => {
-    drawer.open = open;
-    drawer.classList.remove("drawer-closing");
-    body.inert = false;
-    drawerMotion = null;
-    reportHeight();
-  };
-  if (reducedMotion.matches) { finish(); return; }
-  const frames = [{ opacity: 0, transform: "translateY(12px)" }, { opacity: 1, transform: "translateY(0)" }];
-  const animation = drawer.querySelector(".drawer-content").animate(open ? frames : [...frames].reverse(), {
-    duration: 200, easing: "cubic-bezier(.2,.7,.2,1)", fill: "both",
-  });
-  drawerMotion = { animation, open, startedAt };
-  animation.onfinish = () => {
-    if (drawerMotion?.animation !== animation) return;
-    finish(); animation.cancel();
-  };
-  // A poll replaces the wrapper; resume its remaining time instead of replaying the motion.
-  animation.currentTime = Math.min(200, Math.max(0, Date.now() - startedAt));
-}
-
-reducedMotion.addEventListener("change", () => {
-  if (reducedMotion.matches && drawerMotion) drawerMotion.animation.finish();
-});
-
 function setPopoverVisible(visible) {
   if (visible && clockTimer === null) {
     clockTimer = setInterval(() => {
@@ -229,25 +186,8 @@ function render() {
   // Only when the screen is unchanged — navigating must start the new screen at the top.
   const focusData = screen === renderedScreen && root.contains?.(document.activeElement)
     && document.activeElement?.dataset?.action ? { ...document.activeElement.dataset } : null;
-  const prevMain = root.querySelector(".body");
-  const mainScroll = screen === renderedScreen ? prevMain?.scrollTop || 0 : 0;
-  const prevBody = root.querySelector(".main-body, .set-body");
-  const scrollTop = screen === renderedScreen && prevBody ? prevBody.scrollTop : 0;
-  // Polls must keep native disclosures open, including the enclosing drawer. Identity follows
-  // the seat, never its position in a reordered list.
-  const disclosureKey = (details) => {
-    const card = details.closest("[data-card]");
-    if (card) return JSON.stringify(["seat", card.dataset.tool, card.dataset.email]);
-    if (details.classList.contains("guest-drawer")) return "guest-drawer";
-    return "guest-drawer";
-  };
-  const disclosures = "details.seat-disclosure, details.guest-drawer";
-  const openDisclosures = new Set(screen === renderedScreen
-    ? [...root.querySelectorAll(disclosures)].filter((node) => node.open && !node.classList.contains("drawer-closing")).map(disclosureKey)
-    : []);
-  const motion = screen === renderedScreen ? drawerMotion : null;
-  drawerMotion?.animation.cancel();
-  drawerMotion = null;
+  const prevBody = root.querySelector(".body, .set-body");
+  const scrollTop = screen === renderedScreen ? prevBody?.scrollTop || 0 : 0;
   root.innerHTML = screen === "settings" ? buildSettings(state)
     : screen === "add" ? buildAddSeat(state, add)
     : screen === "add-key" ? buildAddKey(state, keyFlow)
@@ -267,21 +207,8 @@ function render() {
     }
   }
   renderedScreen = screen;
-  // Restore before scrolling: a closed drawer has no scrollable height.
-  for (const details of root.querySelectorAll(disclosures)) {
-    details.open = openDisclosures.has(disclosureKey(details));
-  }
-  root.querySelector('[data-action="seat-options"]')?.setAttribute("aria-expanded", String(root.querySelector("details.guest-drawer")?.open || false));
-  if (motion) {
-    const drawer = root.querySelector("details.guest-drawer");
-    if (drawer) moveDrawer(drawer, motion.open, motion.startedAt);
-  }
-  if (scrollTop) {
-    const nextBody = root.querySelector(".main-body, .set-body");
-    if (nextBody) nextBody.scrollTop = scrollTop;
-  }
-  const nextMain = root.querySelector(".body");
-  if (nextMain) nextMain.scrollTop = mainScroll;
+  const nextBody = root.querySelector(".body, .set-body");
+  if (nextBody) nextBody.scrollTop = scrollTop;
   paintMenus(); // Reveal the preserved menu before restoring focus to one of its items.
   if (focusData) {
     const control = [...root.querySelectorAll("button[data-action], input[data-action]")]
@@ -340,20 +267,9 @@ function sendKeyFlow(action, extra = {}) {
 
 // --- event delegation (whole document, so overlay buttons work too) ---------------------------
 document.addEventListener("click", (e) => {
-  // Decide containment before a delegated action can replace the clicked DOM.
-  const handle = e.target.closest(".guest-drawer > summary");
-  if (handle) {
-    e.preventDefault();
-    const drawer = handle.parentElement;
-    moveDrawer(drawer, !drawer.open || drawer.classList.contains("drawer-closing"));
-    return;
-  }
-  const drawer = root.querySelector("details.guest-drawer[open]");
-  if (drawer && e.target.closest("[data-action]")?.dataset.action !== "seat-options"
-      && !drawer.contains(e.target) && !drawer.classList.contains("drawer-closing")) moveDrawer(drawer, false);
   if (openMenu && !e.target.closest(".header-menu")) { openMenu = null; paintMenus(); }
   const el = e.target.closest("[data-action]");
-  if (!el) return; // Other summaries retain native disclosure toggling.
+  if (!el) return;
   const { action, tool, email, value } = el.dataset;
   if (el.disabled) return;
   if (action !== "menu" && openMenu) { openMenu = null; paintMenus(); }
@@ -368,15 +284,6 @@ document.addEventListener("click", (e) => {
     case "toggle":
       if (el.tagName === "BUTTON") send("toggle", { key: el.dataset.key, value: !state.settings?.[el.dataset.key] });
       break;
-    case "seat-options": {
-      const drawer = root.querySelector("details.guest-drawer");
-      if (drawer) {
-        const open = !drawer.open || drawer.classList.contains("drawer-closing");
-        moveDrawer(drawer, open);
-        if (open) drawer.querySelector(".drawer-handle").focus({ preventScroll: true });
-      }
-      break;
-    }
     case "seat-details": {
       const key = JSON.stringify([tool, email]);
       const open = !openSeatDetails.has(key);
@@ -589,12 +496,6 @@ document.addEventListener("keydown", (e) => {
     send("answer_key_switch", { id: request.id, approved: false });
     return;
   }
-  const drawer = root.querySelector("details.guest-drawer[open]");
-  if (drawer) {
-    e.preventDefault();
-    if (!drawer.classList.contains("drawer-closing")) moveDrawer(drawer, false);
-    return;
-  }
   if (openMenu) {
     e.preventDefault();
     const trigger = root.querySelector(`[data-action="menu"][data-menu="${openMenu}"]`);
@@ -611,8 +512,7 @@ document.addEventListener("keydown", (e) => {
 document.addEventListener("visibilitychange", () => setPopoverVisible(!document.hidden));
 window.addEventListener("pagehide", () => setPopoverVisible(false));
 
-// Native disclosures and font loading also change intrinsic height without a state push.
-document.addEventListener("toggle", reportHeight, true);
+// Font loading can change intrinsic height without a state push.
 document.fonts?.ready.then(reportHeight);
 window.addEventListener("resize", reportHeight);
 

@@ -57,7 +57,7 @@
   {
     "label": "signed-out active seat loses 'on now' honesty",
     "file": "app/web/render.mjs",
-    "old": "else if (out) issues.push(isActive(seat) ? \"on now \u00b7 signed out\" : \"signed out\");",
+    "old": "else if (out) issues.push(isActive(seat) ? \"on now · signed out\" : \"signed out\");",
     "new": "else if (out) issues.push(\"signed out\");",
     "cmd": [
       "node",
@@ -88,10 +88,10 @@
     ]
   },
   {
-    "label": "signed-out seat card keeps the usage bars",
+    "label": "signed-out inline details lose their sign-in explanation",
     "file": "app/web/render.mjs",
-    "old": "${out ? `<p class=\"usage-error\" role=\"status\">signed out; sign in to see usage</p>` : `",
-    "new": "${false ? `<p class=\"usage-error\" role=\"status\">signed out; sign in to see usage</p>` : `",
+    "old": "if (signedOut(seat)) rows +=",
+    "new": "if (false) rows +=",
     "cmd": [
       "node",
       "--test",
@@ -110,10 +110,10 @@
     ]
   },
   {
-    "label": "past window bar reset renders 'resets in now'",
+    "label": "inline window details lose the past-reset wording",
     "file": "app/web/render.mjs",
-    "old": "${resetIsPast(reset) ? \"resetting\u2026\" : `window resets in ${fmtCountdown(reset)}`}",
-    "new": "${`window resets in ${fmtCountdown(reset)}`}",
+    "old": "timed(w.reset, \"in\")",
+    "new": "fmtCountdown(w.reset)",
     "cmd": [
       "node",
       "--test",
@@ -244,8 +244,8 @@
   {
     "label": "expiring seat loses its switch action",
     "file": "app/web/render.mjs",
-    "old": "if (isActive(seat)) return again;",
-    "new": "if (isActive(seat) || again) return again;",
+    "old": "if (placement === \"signin\") return again;",
+    "new": "if (placement === \"signin\" || signinExpiring(seat)) return again;",
     "cmd": [
       "node",
       "--test",
@@ -264,10 +264,10 @@
     ]
   },
   {
-    "label": "sign in again dropped beside switch",
+    "label": "sign in again dropped from the inline problem",
     "file": "app/web/render.mjs",
-    "old": "${limited ? \"switch anyway\" : \"switch\"}</button>${again}`",
-    "new": "${limited ? \"switch anyway\" : \"switch\"}</button>`",
+    "old": "${seatAction(p.tool, seat, \"signin\")}</div>",
+    "new": "</div>",
     "cmd": [
       "node",
       "--test",
@@ -288,8 +288,8 @@
   {
     "label": "tool block omits the signed-out problem",
     "file": "app/web/render.mjs",
-    "old": "else if (out) issues.push(isActive(seat) ? \"on now \u00b7 signed out\" : \"signed out\");",
-    "new": "else if (false) issues.push(isActive(seat) ? \"on now \u00b7 signed out\" : \"signed out\");",
+    "old": "else if (out) issues.push(isActive(seat) ? \"on now · signed out\" : \"signed out\");",
+    "new": "else if (false) issues.push(isActive(seat) ? \"on now · signed out\" : \"signed out\");",
     "cmd": [
       "node",
       "--test",
@@ -438,6 +438,150 @@
       "node",
       "--test",
       "--test-name-pattern=block heading keeps only",
+      "app/web/render.test.mjs"
+    ]
+  },
+  {
+    "label": "remove seat disappears from inline details",
+    "file": "app/web/render.mjs",
+    "old": "<dt>manage</dt><dd><button class=\"row-action\" data-action=\"remove\"",
+    "new": "<dt>manage</dt><dd><button class=\"row-action\" data-action=\"missing-remove\"",
+    "cmd": [
+      "node",
+      "--test",
+      "--test-name-pattern=remove seat lives",
+      "app/web/render.test.mjs"
+    ]
+  },
+  {
+    "label": "key management disappears from inline details",
+    "file": "app/web/render.mjs",
+    "old": "if (key) rows = keySeatDetails(seat);",
+    "new": "if (key) rows = \"\";",
+    "cmd": [
+      "node",
+      "--test",
+      "--test-name-pattern=paid key management lives",
+      "app/web/render.test.mjs"
+    ]
+  },
+  {
+    "label": "key validation disappears from inline details",
+    "file": "app/web/render.mjs",
+    "old": "data-action=\"key-validate\"",
+    "new": "data-action=\"missing-key-validate\"",
+    "cmd": [
+      "node",
+      "--test",
+      "--test-name-pattern=paid key management lives",
+      "app/web/render.test.mjs"
+    ]
+  },
+  {
+    "label": "key endpoint proof disappears from inline details",
+    "file": "app/web/render.mjs",
+    "old": "data-action=\"key-prove\"",
+    "new": "data-action=\"missing-key-prove\"",
+    "cmd": [
+      "node",
+      "--test",
+      "--test-name-pattern=paid key management lives",
+      "app/web/render.test.mjs"
+    ]
+  },
+  {
+    "label": "key removal disappears from inline details",
+    "file": "app/web/render.mjs",
+    "old": "data-action=\"key-remove\"",
+    "new": "data-action=\"missing-key-remove\"",
+    "cmd": [
+      "node",
+      "--test",
+      "--test-name-pattern=paid key management lives",
+      "app/web/render.test.mjs"
+    ]
+  },
+  {
+    "label": "engine problem disappears from the main view",
+    "file": "app/web/render.mjs",
+    "old": "const problems = engineBanner(state) + supervisionBanner(state);",
+    "new": "const problems = supervisionBanner(state);",
+    "cmd": [
+      "node",
+      "--test",
+      "--test-name-pattern=engine and supervision problem lines",
+      "app/web/render.test.mjs"
+    ]
+  },
+  {
+    "label": "supervision problem disappears from the main view",
+    "file": "app/web/render.mjs",
+    "old": "const problems = engineBanner(state) + supervisionBanner(state);",
+    "new": "const problems = engineBanner(state);",
+    "cmd": [
+      "node",
+      "--test",
+      "--test-name-pattern=engine and supervision problem lines",
+      "app/web/render.test.mjs"
+    ]
+  },
+  {
+    "label": "engine adoption action disappears from the problem",
+    "file": "app/web/render.mjs",
+    "old": "data-action=\"engine-adopt\"",
+    "new": "data-action=\"missing-engine-adopt\"",
+    "cmd": [
+      "node",
+      "--test",
+      "--test-name-pattern=engine and supervision problem lines",
+      "app/web/render.test.mjs"
+    ]
+  },
+  {
+    "label": "supervision repair action disappears from the problem",
+    "file": "app/web/render.mjs",
+    "old": "data-action=\"supervision-on\"",
+    "new": "data-action=\"missing-supervision-on\"",
+    "cmd": [
+      "node",
+      "--test",
+      "--test-name-pattern=engine and supervision problem lines",
+      "app/web/render.test.mjs"
+    ]
+  },
+  {
+    "label": "engine problems no longer count in the chip",
+    "file": "app/web/render.mjs",
+    "old": "+ engineWarnings(state).length + Number(Boolean(supervisionProblem(state)))",
+    "new": "+ 0 + Number(Boolean(supervisionProblem(state)))",
+    "cmd": [
+      "node",
+      "--test",
+      "--test-name-pattern=engine and supervision problem lines",
+      "app/web/render.test.mjs"
+    ]
+  },
+  {
+    "label": "supervision problems no longer count in the chip",
+    "file": "app/web/render.mjs",
+    "old": "+ engineWarnings(state).length + Number(Boolean(supervisionProblem(state)))",
+    "new": "+ engineWarnings(state).length + 0",
+    "cmd": [
+      "node",
+      "--test",
+      "--test-name-pattern=engine and supervision problem lines",
+      "app/web/render.test.mjs"
+    ]
+  },
+  {
+    "label": "empty-state guidance disappears from the main view",
+    "file": "app/web/render.mjs",
+    "old": "<p>use ＋ above to add a subscription or API key.</p>",
+    "new": "<p></p>",
+    "cmd": [
+      "node",
+      "--test",
+      "--test-name-pattern=empty state guidance",
       "app/web/render.test.mjs"
     ]
   }

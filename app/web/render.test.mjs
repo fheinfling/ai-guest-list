@@ -80,8 +80,8 @@ test("fmtCountdown", () => {
 test("local clickdummy type and tabular readings require no remote resources", () => {
   const html = buildHTML(state({ tools: { codex: { seats: [seat()] } } }));
   assert.match(html, /class="app-icon"[^>]*aria-label="ai guest list"/);
-  assert.match(html, /class="seat-email">work@x\.com/);
-  assert.match(html, /class="seat-name">Work · business</);
+  assert.match(html, /<dt>seat<\/dt><dd>work@x\.com/);
+  assert.match(html, /class="seat-identity" title="Work · business">Work</);
   const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
   assert.match(css, /--sans:"Hanken Grotesk",ui-rounded,/);
   assert.match(css, /font-variant-numeric:tabular-nums/);
@@ -92,21 +92,20 @@ test("local clickdummy type and tabular readings require no remote resources", (
 test("seat summaries retain status, countdown, switch and sign-in actions", () => {
   const mk = (status, extra) => buildHTML(state({ tools: {
     codex: { seats: [seat({ status, ...extra })] } } }));
-  assert.match(mk("active"), /class="seat-state">selected/);
+  assert.match(mk("active"), /class="tag">on now/);
   assert.match(mk("ready"), /data-action="switch" data-tool="codex" data-email="work@x.com"/);
-  assert.match(mk("resting", { limited_until: new Date(Date.now() + 6e6).toISOString() }), /data-clock-prefix="back in"/);
-  assert.match(mk("queued"), /class="seat-state">up next/);
+  assert.match(mk("resting", { limited_until: new Date(Date.now() + 6e6).toISOString() }), /until back/);
+  assert.match(mk("queued"), /limited/);
   assert.match(mk("needs-login"), /data-action="add" data-tool="codex" data-email="work@x.com">sign in/);
 });
 
 for (const kind of ["seat", "roster"]) {
   test(`hostile status cannot forge markup in the ${kind} surface`, () => {
     const status = 'ready"><button data-action="remove" data-email="forged">& remove</button><i class="';
-    const escaped = 'ready&quot;&gt;&lt;button data-action=&quot;remove&quot; data-email=&quot;forged&quot;&gt;&amp; remove&lt;/button&gt;&lt;i class=&quot;';
     const html = buildHTML(state({ tools: {
       codex: { seats: [seat({ status })] }, claude: { seats: [] },
     } }));
-    if (kind === "seat") assert.ok(html.includes(`class="seat seat--${escaped}"`));
+    if (kind === "seat") assert.match(html, /data-action="remove" data-tool="codex" data-email="work@x.com"/);
     else {
       const roster = buildHTML(state({ tools: { codex: { seats: [seat({ status }), seat({ email: "active@x", status: "active" })] } } }));
       assert.doesNotMatch(roster, /<button data-action="remove" data-email="forged"/);
@@ -131,10 +130,10 @@ test("resting disclosures show one return countdown and retain reading provenanc
     limited_until: "2026-09-13T18:57:00Z", usage_stale: true,
     usage_fetched_at: "2026-09-13T18:25:00Z", usage: { error: "network" },
   })] } } }));
-  const card = html.match(/<article class="seat[\s\S]*?<\/article>/)[0];
-  assert.equal((card.match(/data-clock-prefix="back in"/g) || []).length, 1);
+  const card = detailsOf(html, "codex", "work@x.com");
+  assert.equal((rosterOf(html).match(/data-clock-prefix=""/g) || []).length, 1);
   assert.match(card, /last known reading/);
-  assert.match(card, /connection unavailable; retrying automatically/);
+  assert.match(html, /connection unavailable; retrying automatically/);
   assert.match(card, /data-usage-at="2026-09-13T18:25:00Z"/);
   assert.doesNotMatch(card, /taking a breather/);
 });
@@ -146,8 +145,8 @@ const main = rosterOf(html);
 assert.match(main, /usage unknown/);
 assert.doesNotMatch(main, /\d+%|class="bar"/);
 assert.match(main, /data-usage-at="2026-09-13T12:00:00Z"/);
-assert.match(html, /last known reading/);
-assert.match(html, /25% left/); // Cached detail remains available in management, never in the summary.
+assert.match(detailsOf(html, "codex", "work@x.com"), /usage unknown/);
+assert.doesNotMatch(html, /25% left/); // Unknown readings stay unknown in the inline details too.
 });
 
 test("missing usage is explicitly unknown in the roster and disclosures", () => {
@@ -156,7 +155,7 @@ const html = buildHTML(state({ tools: { codex: { seats: [seat({ status: "active"
 assert.match(rosterOf(html), /class="fig">—</);
 assert.match(rosterOf(html), /usage unknown/);
 assert.doesNotMatch(rosterOf(html), /class="bar"|0%/);
-assert.equal((html.match(/style="width:0%"/g) || []).length, 2); // management's unknown tracks
+assert.doesNotMatch(html, /style="width:0%"/);
 assert.doesNotMatch(html, />0%<|>0% left</);
 });
 
@@ -170,13 +169,13 @@ test("active seats distinguish a live session from loaded-but-idle credentials",
     session_started_at: "2026-06-28T12:12:00Z",
     last_on_floor: "2026-06-28T11:45:00Z",
   });
-  assert.match(live, /class="seat-state">on the floor/);
+  assert.match(live, /class="tag">on now/);
   assert.match(live, /terminal attached/);
   assert.match(live, /last on the floor/);
   assert.match(live, /data-session-at="2026-06-28T12:12:00Z"/);
 
   const idle = mk({ in_session: false });
-  assert.match(idle, /class="seat-state">selected/);
+  assert.match(idle, /class="tag">on now/);
   assert.doesNotMatch(idle, /terminal attached|data-session-at=/);
 });
 
@@ -185,17 +184,18 @@ test("only the credential holder is on the floor; a parked terminal keeps its sw
     seat({ email: "live@x.com", status: "active", active: true, in_session: true }),
     seat({ email: "parked@x.com", in_session: true, session_started_at: "2026-09-14T08:47:00Z" }),
   ] }, claude: { seats: [] } } }));
-  assert.equal((html.match(/on the floor/g) || []).length, 1);
-  const parked = html.slice(html.indexOf('class="seat seat--ready"'));
-  const row = parked.slice(0, parked.indexOf('</article>'));
-  assert.match(row, /terminal attached/);
-  assert.match(row, /data-session-at="2026-09-14T08:47:00Z"/);
+  assert.equal((html.match(/class="tag">on now/g) || []).length, 1);
+  const parked = rowOf(html, "parked@x.com");
+  const row = parked;
+  const detail = detailsOf(html, "codex", "parked@x.com");
+  assert.match(detail, /terminal attached/);
+  assert.match(detail, /data-session-at="2026-09-14T08:47:00Z"/);
   assert.match(row, /data-action="switch" data-tool="codex" data-email="parked@x.com"/);
   assert.doesNotMatch(parked, /floor--live/);
 });
 
 test("parked terminals retain resting, queued, and sign-in signals beside the chip", () => {
-  for (const [status, signal] of [["resting", /back in/], ["queued", /up next/],
+  for (const [status, signal] of [["resting", /until back/], ["queued", /limited/],
     ["needs-login", /data-action="add"/]]) {
     const html = buildHTML(state({ tools: { codex: { seats: [seat({ status, in_session: true })] } } }));
     assert.match(html, /terminal attached/);
@@ -245,23 +245,23 @@ for (const tool of ["codex", "claude"]) {
 }
 });
 
-test("Codex hides 5h only when durations confirm a weekly-only quota", () => {
+test("inline details respect reported windows and retain both for legacy engines", () => {
   const renderSeat = (tool, usage) => buildHTML(state({ tools: {
     [tool]: { seats: [seat({ usage })] },
     [tool === "codex" ? "claude" : "codex"]: { seats: [] },
   } }));
 
   const weeklyOnly = renderSeat("codex", { reported_windows: ["weekly"] });
-  assert.doesNotMatch(weeklyOnly, />5h window</);
-  assert.match(weeklyOnly, />7d window</);
+  assert.doesNotMatch(weeklyOnly, /<dt>5h<\/dt>/);
+  assert.match(weeklyOnly, /<dt>week<\/dt>/);
 
   const legacy = renderSeat("codex", { windows: { weekly: { used_pct: 10 } } });
-  assert.match(legacy, />5h window</);
-  assert.match(legacy, />7d window</);
+  assert.match(legacy, /<dt>5h<\/dt>/);
+  assert.match(legacy, /<dt>week<\/dt>/);
 
   const claude = renderSeat("claude", { reported_windows: ["weekly"] });
-  assert.match(claude, />5h window</);
-  assert.match(claude, />7d window</);
+  assert.doesNotMatch(claude, /<dt>5h<\/dt>/);
+  assert.match(claude, /<dt>week<\/dt>/);
 });
 
 test("usage ages handle fresh, old, missing, and future timestamps", () => {
@@ -314,7 +314,7 @@ test("expired Claude token asks for an app refresh without implying logout", () 
     claude: { seats: [seat({ status: "resting", active: true, limited: true, usage5h: 100,
       limited_until: "2026-09-13T18:57:00Z", usage: { error: "token_expired" } })] },
   } }));
-  assert.match(resting, /data-clock-prefix="back in"/);
+  assert.match(resting, /until back/);
   assert.doesNotMatch(resting, />log in<|usage refresh pending|sign in to refresh/);
 });
 
@@ -337,13 +337,13 @@ assert.match(html, /limited/); assert.match(html, /until back/);
 assert.doesNotMatch(html, /🟢|🟡|🌸|🌿|💚/);
 });
 
-test("ledger has no headline and management remains in seat options", () => {
+test("ledger has no headline and management lives in inline details", () => {
 const html = buildHTML(state({ tools: { codex: { seats: [seat({ plan: "Business" })] } } }));
 assert.doesNotMatch(html, /<h1|you can keep working|<table/);
 assert.match(html, /class="tool" data-tool="codex"/);
 assert.match(html, /class="seat-identity" title="Work · business">Work<\/span>/);
-assert.match(html, /class="mono chip">Business/);
-assert.match(html, /data-action="seat-options"/);
+assert.match(detailsOf(html, "codex", "work@x.com"), /<dt>plan<\/dt><dd>Work · business/);
+assert.doesNotMatch(html, /guest-drawer|seat-options/);
 });
 
 test("seat cards hide internal provider plan enums but retain known plan chips", () => {
@@ -354,11 +354,9 @@ test("seat cards hide internal provider plan enums but retain known plan chips",
     ] },
     claude: { seats: [seat({ email: "max@x.com", name: "Max seat", plan: "Max" })] },
   } }));
-  const drawer = html.slice(html.indexOf('<details class="guest-drawer"'));
-  assert.doesNotMatch(drawer, /SELF_SERVE_BUSINESS_PROLITE|Self_Serve_Business_Prolite/);
   assert.doesNotMatch(html, /SELF_SERVE_BUSINESS_PROLITE|Self_Serve_Business_Prolite/);
-  assert.match(html, /class="mono chip">Team<\/span>/);
-  assert.match(html, /class="mono chip">Max<\/span>/);
+  assert.match(detailsOf(html, "codex", "team@x.com"), /Team seat · business · team/);
+  assert.match(detailsOf(html, "claude", "max@x.com"), /Max seat · business · max/);
 });
 
 test("buildHTML escapes user content", () => {
@@ -380,7 +378,7 @@ test("inactive supervision shows a repair banner", () => {
   assert.match(banner, /codex\/claude/);
   assert.match(banner, /won't auto-switch/);
   assert.match(banner, /data-action="supervision-on"/);
-  assert.match(buildHTML(st), /supervision-banner--error/);
+  assert.match(buildHTML(st), /issue--hard app-problem supervision-problem/);
 });
 
 test("supervision read errors name the file and reason without offering installation", () => {
@@ -401,7 +399,7 @@ test("wired supervision outside the current PATH asks for a new terminal", () =>
   });
   const banner = supervisionBanner(st);
   assert.match(banner, /open a new terminal to finish setup/);
-  assert.match(banner, /supervision-banner--info/);
+  assert.match(banner, /issue--soft app-problem supervision-problem/);
   assert.doesNotMatch(banner, /turn it on/);
 });
 
@@ -410,7 +408,7 @@ test("supervision banner is absent when active or explicitly opted out", () => {
     supervision: { wrappers: true, block: true, on_path: true, active: true },
   });
   assert.equal(supervisionBanner(active), "");
-  assert.doesNotMatch(buildHTML(active), /supervision-banner/);
+  assert.doesNotMatch(buildHTML(active), /supervision-problem/);
 
   const optedOut = state({
     settings: { theme: "light", supervise_shell: false },
@@ -712,7 +710,7 @@ test("reduceReply: a tool-less add-op error falls back to the current flow", () 
 });
 
 // Milestone 6: bridge-shaped key metadata/catalogs; all earlier tests above remain unchanged.
-import { buildAddKey, buildModelPicker, keySeatCard, keyConfirmations, keyRequest, reduceKeyReply, KEY_PROVIDERS, formatPrice } from "./render.mjs";
+import { buildAddKey, buildModelPicker, keySeatDetails, keyConfirmations, keyRequest, reduceKeyReply, KEY_PROVIDERS, formatPrice } from "./render.mjs";
 
 test("Langdock routes visibly distinguish model families and harnesses, sharing one key", () => {
   const html = buildAddKey({ settings: {} }, { step: "provider" });
@@ -770,21 +768,21 @@ const keyPrompt = (over = {}) => ({ id: "prompt-1", status: "pending", tool: "co
 
 test("key seat card sits in its harness group, with model instead of usage bars", () => {
   const h = buildHTML(state({ keys: [keySeat()] }));
-  assert.match(h, /seat--key/); assert.match(h, /late-night/); assert.match(h, /vendor\/model/);
-  assert.match(h, /<p>openrouter<\/p>/);
+  assert.match(h, /class="seat first-of-tool key-seat"/); assert.match(h, /late-night/); assert.match(h, /vendor\/model/);
+  assert.match(h, /<dt>provider<\/dt><dd>openrouter<\/dd>/);
   assert.doesNotMatch(h, /class="track"|\$0|USD 0/);
-  assert.match(h, /data-tool="codex" data-email="key:key-1"/);
+  assert.match(h, /data-action="seat-details" data-tool="key" data-email="key-1"/);
   // No running cost is shown at all: a money figure needs a price, and the providers most likely
   // to be used as key seats publish none. Supplied spend metadata must not resurrect the display.
-  assert.doesNotMatch(keySeatCard(keySeat({ spend: { amount: "0.000012", currency: "USD" } })),
+  assert.doesNotMatch(keySeatDetails(keySeat({ spend: { amount: "0.000012", currency: "USD" } })),
     /0\.000012|running cost/);
 });
 
 test("unproven responses seats say so plainly; anthropic uses messages with claude", () => {
-  assert.match(keySeatCard(keySeat({ responses_verified: false })), /responses support unproven.*may not work/);
-  assert.doesNotMatch(keySeatCard(keySeat()), /key-unproven/);
-  const h = keySeatCard(keySeat({ provider: "anthropic", harness: "claude", responses_verified: false }));
-  assert.match(h, /<p>anthropic<\/p>/); assert.doesNotMatch(h, /responses support unproven/);
+  assert.match(keySeatDetails(keySeat({ responses_verified: false })), /responses support unproven.*may not work/);
+  assert.doesNotMatch(keySeatDetails(keySeat()), /key-unproven/);
+  const h = keySeatDetails(keySeat({ provider: "anthropic", harness: "claude", responses_verified: false }));
+  assert.match(h, /<dt>provider<\/dt><dd>anthropic<\/dd>/); assert.doesNotMatch(h, /responses support unproven/);
 });
 
 test("endpoint proof renders four distinct outcomes and success removes the warning", () => {
@@ -795,7 +793,7 @@ test("endpoint proof renders four distinct outcomes and success removes the warn
     ["inconclusive", "timeout", /inconclusive.*timed out.*Responses support is undetermined/],
   ];
   for (const [outcome, error, expected] of cases) {
-    const h = keySeatCard(keySeat({ responses_verified: outcome === "proven", last_proof: {
+    const h = keySeatDetails(keySeat({ responses_verified: outcome === "proven", last_proof: {
       outcome, error, model: "checked-model", checked_at: "2026-09-26T12:00:00Z",
     } }));
     assert.match(h, expected);
@@ -809,9 +807,9 @@ test("endpoint proof renders four distinct outcomes and success removes the warn
     if (outcome === "refused" || outcome === "inconclusive") assert.doesNotMatch(h, /does not support|will not work/);
   }
   // A fresh negative verdict beats an old registry-derived positive flag.
-  const negative = keySeatCard(keySeat({ last_proof: { outcome: "incompatible" } }));
+  const negative = keySeatDetails(keySeat({ last_proof: { outcome: "incompatible" } }));
   assert.match(negative, /will not work/); assert.match(negative, /data-action="key-prove"/);
-  const proven = keySeatCard(keySeat({ last_validation: { operation_permitted: false },
+  const proven = keySeatDetails(keySeat({ last_validation: { operation_permitted: false },
     last_proof: { outcome: "proven" } }));
   assert.doesNotMatch(proven, /unproven/);
 });
@@ -819,14 +817,14 @@ test("endpoint proof renders four distinct outcomes and success removes the warn
 test("proof rendering uses fixed refusal copy and escapes stored metadata", () => {
   for (const [error, reason] of [["insufficient_quota", "quota"], ["rate_limited", "rate limit"],
                                  ["<script>secret</script>", "access or billing"]]) {
-    const h = keySeatCard(keySeat({ responses_verified: false, last_proof: {
+    const h = keySeatDetails(keySeat({ responses_verified: false, last_proof: {
       outcome: "refused", error, model: "<img>", checked_at: "<script>",
     } }));
     assert.ok(h.includes(`(${reason})`));
     assert.doesNotMatch(h, /<img>|<script>|secret/);
     assert.match(h, /&lt;img&gt;/);
   }
-  assert.doesNotMatch(keySeatCard(keySeat({ harness: "claude", responses_verified: false })), /key-prove/);
+  assert.doesNotMatch(keySeatDetails(keySeat({ harness: "claude", responses_verified: false })), /key-prove/);
 });
 
 test("priced picker orders by named input $/Mtok, retains both rates and cached age", () => {
@@ -1002,7 +1000,7 @@ function keyApp(options = {}) {
     requestAnimationFrame: options.requestAnimationFrame, matchMedia: () => options.motion || { matches: true, addEventListener() {} } };
   runInNewContext(readFileSync(new URL("./bundle.js", import.meta.url), "utf8"),
     { document, window, console, setTimeout: options.setTimeout || setTimeout,
-      setInterval: options.setInterval || setInterval, clearInterval, clearTimeout, URL, ResizeObserver: options.ResizeObserver });
+      setInterval: options.setInterval || setInterval, clearInterval, clearTimeout, URL, confirm: options.confirm || (() => true), ResizeObserver: options.ResizeObserver });
   const click = (dataset) => handlers.click({ target: { closest: (selector) => selector === "[data-action]" ? { dataset } : null }, preventDefault() {} });
   const input = (id, value) => handlers.input({ target: { id, value } });
   return { window, root, sent, click, input, handlers, document };
@@ -1065,7 +1063,7 @@ test("key glue cannot discover an unverified endpoint without an explicit acknow
 test("key confirmation is pinned above the scrolling list and escapes provider-controlled strings", () => {
   const request = keyPrompt({ key_seat: keySeat({ label: '<img src=x onerror="bad">', model: '<script>bad</script>' }) });
   const h = buildHTML(state({ pending_key_switches: [request] }));
-  assert.ok(h.indexOf('class="key-prompts"') < h.indexOf('class="main-body"'));
+  assert.ok(rosterOf(h).includes(keyConfirmations({ pending_key_switches: [request] })));
   assert.doesNotMatch(h, /<img|<script>/);
   assert.match(h, /&lt;script&gt;/);
 });
@@ -1093,7 +1091,7 @@ test("a running paid seat offers a pinned one-tap stop that sends the kill switc
   assert.match(h, /<h1 role="status">your keys are spending\.<\/h1>/);
   assert.match(paidStrip(h), /late-night[\s\S]*vendor\/model/);
   assert.match(h, /data-action="key-stop">stop all paid use<\/button>/);
-  assert.ok(h.indexOf('data-action="key-stop"') < h.indexOf('class="main-body"'));
+  assert.ok(h.indexOf('data-action="key-stop"') < h.indexOf('class="field"'));
   assert.match(h, /stops sessions and new paid requests/);
   assert.match(h, /sent turns may still bill/);
   app.click({ action: "key-stop" });
@@ -1125,7 +1123,7 @@ test("paid-use strip names and escapes the running pin's seat and model even aft
   assert.match(strip, /late &lt;shift&gt;[\s\S]*codex terminal 202[\s\S]*guest\/&lt;model&gt;/);
   assert.doesNotMatch(strip, /<shift>|<model>/);
   assert.match(strip, /aria-label="paid sessions"/);
-  assert.ok(html.indexOf(strip) < html.indexOf('class="main-body"'));
+  assert.ok(rosterOf(html).includes(strip));
 });
 
 test("paid-use strip names both running sessions and makes its global stop explicit", () => {
@@ -1210,7 +1208,7 @@ test("each key seat offers use in new terminal with its exact id", () => {
   ];
   const html = buildHTML(state({ keys }));
   for (const key of keys) {
-    assert.ok(html.includes(`data-action="key-terminal" data-id="${key.id}">use in new terminal</button>`));
+    assert.match(html, new RegExp(`data-action="key-terminal" data-id="${key.id}"[^>]*>new terminal</button>`));
   }
   const app = readFileSync(new URL('./app.mjs', import.meta.url), 'utf8');
   assert.match(app, /send\("key_terminal", \{ id: el.dataset.id \}\)/);
@@ -1523,8 +1521,7 @@ for (const tool of ["codex", "claude"]) {
       const email = `seat+${status}@${tool}.example`;
       const html = buildHTML(state({ tools: { [tool]: { seats: [seat({ status, email, name: "My seat" })] } } }));
       const roster = rosterOf(html);
-      const card = html.match(/<article class="seat[^"]*"[\s\S]*?<\/article>/)[0];
-      for (const surface of [roster, card]) {
+      for (const surface of [roster]) {
         if (status === "active") {
           assert.doesNotMatch(surface, /data-action="switch"/);
         } else if (status === "needs-login") {
@@ -1543,9 +1540,9 @@ for (const tool of ["codex", "claude"]) {
   }
 }
 
-test("unauthorized usage takes precedence over switch on both subscription surfaces", () => {
+test("unauthorized usage takes precedence over switch in the main view", () => {
   const html = buildHTML(state({ tools: { codex: { seats: [seat({ usage: { error: "unauthorized" } })] } } }));
-  assert.equal((html.match(/>sign in<\/button>/g) || []).length, 2);
+  assert.equal((html.match(/>sign in<\/button>/g) || []).length, 1);
   assert.doesNotMatch(html, /data-action="switch"/);
 });
 
@@ -1706,105 +1703,32 @@ test("free model visibility is reversible and catalog provenance is outside resu
   assert.match(css, /\.model-picker:not\(:has\(#show-free-models:checked\)\) \.is-free \{ display:none; \}/);
 });
 
-// A DOM boundary for the dispatcher, built from the actual emitted disclosure markup.
-// It deliberately models closed-drawer scroll clamping so restoring scroll before open fails.
-// Layout and browser-native keyboard operation still require browser QA.
-function disclosureDOM(animations = []) {
-  const decode = (s) => s.replace(/&quot;/g, '"').replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
-  const data = (tag) => Object.fromEntries([...tag.matchAll(/data-([\w-]+)="([^"]*)"/g)].map((m) => [m[1], decode(m[2])]));
-  let html = "", nodes = [], body = null;
-  const root = {
+// Minimal scroll boxes recreated on each render, as with root.innerHTML in the app.
+function scrollDOM() {
+  let html = "", body;
+  return {
     get innerHTML() { return html; },
-    set innerHTML(value) {
-      html = value; nodes = []; let card = null;
-      for (const m of html.matchAll(/<article\b[^>]*>|<\/article>|<details\b[^>]*>/g)) {
-        if (m[0] === "</article>") { card = null; continue; }
-        if (m[0].startsWith("<article")) { card = { dataset: data(m[0]) }; continue; }
-        const classes = m[0].match(/class="([^"]*)"/)[1].split(" ");
-        const owner = card;
-        const content = html.slice(m.index, html.indexOf("</details>", m.index));
-        const action = content.match(/data-action="([^"]+)"/)?.[1];
-        const changeClass = (name, enabled) => {
-          if (enabled && !classes.includes(name)) classes.push(name);
-          if (!enabled && classes.includes(name)) classes.splice(classes.indexOf(name), 1);
-        };
-        const node = { open: / open(?:>| )/.test(m[0]), classes, owner,
-          classList: { contains: (name) => classes.includes(name),
-            toggle: changeClass, remove: (name) => changeClass(name, false) },
-          closest: (selector) => selector === "[data-card]" ? owner : null,
-          contains: (target) => target?.drawer === node,
-          querySelector: (selector) => [".main-body", ".drawer-content"].includes(selector) ? body
-            : selector === ".drawer-handle" ? node.handle
-            : selector === "[data-action]" && action ? { dataset: { action } } : null,
-        };
-        node.handle = { parentElement: node, drawer: node, focused: false,
-          focus() { this.focused = true; },
-          closest: (selector) => selector === ".guest-drawer > summary" ? node.handle : null };
-        nodes.push(node);
-      }
-      let scrollTop = 0;
-      body = /class="(?:main-body|set-body)"/.test(html) ? {
-        animate(frames, options) {
-          const animation = { frames, options, currentTime: 0, cancelled: false,
-            cancel() { this.cancelled = true; }, finish() { this.onfinish?.(); } };
-          animations.push(animation);
-          return animation;
-        },
-        get scrollTop() { return scrollTop; },
-        set scrollTop(value) {
-          const drawer = nodes.find((n) => n.classes.includes("guest-drawer"));
-          scrollTop = drawer && !drawer.open ? 0 : value;
-        },
-      } : null;
-    },
-    querySelector: (selector) => selector === ".main-body, .set-body" ? body
-      : selector === "details.guest-drawer" ? nodes.find((n) => n.classes.includes("guest-drawer"))
-      : selector === "details.guest-drawer[open]" ? nodes.find((n) => n.classes.includes("guest-drawer") && n.open) : null,
-    querySelectorAll: (selector) => selector.includes("details.") ? nodes.filter((node) => selector.split(",").some((part) =>
-      node.classes.includes(part.match(/details\.([\w-]+)/)?.[1]) && (!part.includes("[open]") || node.open))) : [],
-    get nodes() { return nodes; },
+    set innerHTML(value) { html = value; body = { scrollTop: 0 }; },
+    querySelector: (selector) => selector === ".body, .set-body" ? body : null,
+    querySelectorAll: () => [],
     get body() { return body; },
   };
-  return root;
 }
 
-test("polls preserve nested disclosures by tool/email and menu purpose through seat reordering", () => {
-  const root = disclosureDOM(), app = keyApp({ root });
-  const snapshot = state({ rev: 1, keys: [keySeat({ id: 'key"<&' })], tools: {
-    codex: { seats: [seat({ email: 'same"<&', status: "active" }), seat({ email: "closed" })] },
-    claude: { seats: [seat({ email: 'same"<&' })] },
-  } });
+test("polls preserve main and settings scroll while navigation starts at the top", () => {
+  const root = scrollDOM(), app = keyApp({ root });
+  const snapshot = state({ rev: 1, keys: [keySeat()], tools: { codex: { seats: [seat()] } } });
   app.window.AGL.update(snapshot);
-  const match = (classes, email, tool) => root.nodes.find((n) => n.classes.includes(classes) &&
-    (!email || n.owner?.dataset.email === email) && (!tool || n.owner?.dataset.tool === tool));
-  match("guest-drawer").open = true;
-  match("seat-disclosure", 'same"<&', "codex").open = true;
-  match("seat-disclosure", 'key:key"<&').open = true;
-  root.nodes.reverse(); // DOM order is not identity, even for the two header menus.
   root.body.scrollTop = 180;
-  app.window.AGL.update({ ...snapshot, rev: 2, tools: {
-    ...snapshot.tools, codex: { seats: [seat({ email: "new" }), ...snapshot.tools.codex.seats.toReversed()] },
-  } });
-  assert.equal(match("guest-drawer").open, true);
-  assert.equal(match("seat-disclosure", 'same"<&', "codex").open, true);
-  assert.equal(match("seat-disclosure", 'same"<&', "claude").open, false);
-  assert.equal(match("seat-disclosure", 'key:key"<&').open, true);
-  assert.equal(match("seat-disclosure", "new").open, false);
-  assert.equal(match("seat-disclosure", "closed").open, false);
-  assert.match(root.innerHTML, /data-action="menu" data-menu="more"/);
-  assert.equal(root.body.scrollTop, 180, "drawer must open before restoring scroll");
-  match("seat-disclosure", 'same"<&', "codex").open = false;
-  app.window.AGL.update({ ...snapshot, rev: 3 });
-  assert.equal(match("seat-disclosure", 'same"<&', "codex").open, false);
+  app.window.AGL.update({ ...snapshot, rev: 2 });
+  assert.equal(root.body.scrollTop, 180);
   app.click({ action: "settings" });
   assert.equal(root.body.scrollTop, 0);
   root.body.scrollTop = 250;
-  app.window.AGL.update({ ...snapshot, rev: 4 });
-  assert.equal(root.body.scrollTop, 250, "settings preserves its own scroll");
+  app.window.AGL.update({ ...snapshot, rev: 3 });
+  assert.equal(root.body.scrollTop, 250);
   app.click({ action: "settings-back" });
-  assert.ok(root.nodes.every((n) => !n.open), "navigation starts with closed disclosures");
   assert.equal(root.body.scrollTop, 0);
-  assert.doesNotMatch(readFileSync(new URL("./app.mjs", import.meta.url), "utf8"), /\.expanded|toggle\("expanded"\)/);
 });
 
 test("settings inserts consent immediately after its pinned header", () => {
@@ -1819,127 +1743,6 @@ test("settings inserts consent immediately after its pinned header", () => {
   assert.equal(inserted.position, "afterend");
   assert.match(inserted.html, /data-action="key-answer"/);
   assert.match(app.root.innerHTML, /<header class="set-head">[\s\S]*<div class="set-body">/);
-});
-
-function drawerApp(reduce = false) {
-  const animations = [], root = disclosureDOM(animations);
-  const motion = { matches: reduce, addEventListener: (_, fn) => { motion.change = fn; } };
-  const app = keyApp({ root, motion });
-  app.window.AGL.update(state({ rev: 1, keys: [keySeat()], tools: { codex: { seats: [seat()] } } }));
-  const drawer = () => root.querySelector("details.guest-drawer");
-  const click = (target) => app.handlers.click({ target, preventDefault() {} });
-  return { ...app, animations, motion, drawer, clickTarget: click,
-    toggle: () => click(drawer().handle),
-    outside: () => click({ closest: () => null }) };
-}
-
-test("sheet content rises and fades on open; closing holds details open until the reverse finishes", () => {
-  const app = drawerApp();
-  app.toggle();
-  assert.equal(app.drawer().open, true);
-  assert.equal(app.animations.length, 1);
-  const entry = app.animations[0];
-  assert.equal(entry.options.duration, 200);
-  assert.equal(entry.frames[0].opacity, 0);
-  assert.equal(entry.frames[1].opacity, 1);
-  entry.finish();
-  app.document.activeElement = { drawer: app.drawer() };
-  app.toggle();
-  assert.equal(app.drawer().open, true, "native content remains available to the exit animation");
-  assert.equal(app.drawer().classList.contains("drawer-closing"), true);
-  assert.equal(app.root.body.inert, true);
-  assert.equal(app.drawer().handle.focused, true);
-  const exit = app.animations[1];
-  assert.equal(exit.frames[0].opacity, 1);
-  assert.equal(exit.frames[1].opacity, 0);
-  exit.finish();
-  assert.equal(app.drawer().open, false);
-  assert.equal(app.root.body.inert, false);
-});
-
-test("outside clicks dismiss the sheet; inside controls still dispatch across synchronous rerenders", () => {
-  const app = drawerApp(true);
-  app.toggle();
-  app.clickTarget({ drawer: app.drawer(), closest: () => null });
-  assert.equal(app.drawer().open, true);
-  app.clickTarget({ drawer: app.drawer(), closest: (selector) => selector === "[data-action]"
-    ? { dataset: { action: "key-prove", id: "key-1" } } : null });
-  assert.equal(app.sent.at(-1).action, "key_prove");
-  assert.equal(app.drawer().open, true, "the clicked element was replaced by render()");
-  app.outside();
-  assert.equal(app.drawer().open, false);
-  app.window.AGL.update(state({ rev: 2 }));
-  assert.equal(app.drawer().open, false, "a poll cannot reopen a dismissed drawer");
-  app.toggle();
-  app.click({ action: "settings" });
-  assert.match(app.root.innerHTML, /class="set-title">settings/);
-});
-
-test("polls resume a closing sheet without logically reopening it or replaying its full exit", () => {
-  const app = drawerApp();
-  app.toggle(); app.animations.at(-1).finish();
-  app.outside();
-  const old = app.animations.at(-1);
-  app.window.AGL.update(state({ rev: 2 }));
-  assert.equal(old.cancelled, true);
-  assert.equal(app.drawer().classList.contains("drawer-closing"), true);
-  assert.equal(app.drawer().open, true);
-  old.finish();
-  assert.equal(app.drawer().open, true, "a detached animation cannot end the replacement");
-  app.animations.at(-1).finish();
-  assert.equal(app.drawer().open, false);
-  app.window.AGL.update(state({ rev: 3 }));
-  assert.equal(app.drawer().open, false);
-});
-
-test("summary can reopen during exit and navigation cancels a detached sheet animation", () => {
-  const app = drawerApp();
-  app.toggle(); app.animations.at(-1).finish();
-  app.outside();
-  const exit = app.animations.at(-1);
-  app.toggle();
-  assert.equal(exit.cancelled, true);
-  assert.equal(app.drawer().classList.contains("drawer-closing"), false);
-  assert.equal(app.root.body.inert, false);
-  app.animations.at(-1).finish();
-  exit.finish();
-  assert.equal(app.drawer().open, true);
-  app.outside();
-  const leaving = app.animations.at(-1);
-  app.click({ action: "settings" });
-  assert.equal(leaving.cancelled, true);
-  leaving.finish();
-  assert.match(app.root.innerHTML, /class="set-title">settings/);
-});
-
-test("reduced motion opens and closes synchronously and changing the preference ends active motion", () => {
-  const app = drawerApp(true);
-  app.toggle();
-  assert.equal(app.drawer().open, true);
-  app.outside();
-  assert.equal(app.drawer().open, false);
-  assert.equal(app.animations.length, 0);
-  app.motion.matches = false;
-  app.toggle(); app.animations.at(-1).finish(); app.outside();
-  app.motion.matches = true;
-  app.motion.change();
-  assert.equal(app.drawer().open, false);
-});
-
-test("Escape declines pending consent before dismissing an open sheet", () => {
-  const app = drawerApp(true);
-  app.window.AGL.update(state({ rev: 2, pending_key_switches: [keyPrompt()] }));
-  app.toggle();
-  let prevented = 0;
-  const escape = () => app.handlers.keydown({ key: "Escape", preventDefault() { prevented++; } });
-  escape();
-  assert.equal(app.sent.at(-1).action, "answer_key_switch");
-  assert.equal(app.sent.at(-1).approved, false);
-  assert.equal(app.drawer().open, true);
-  escape();
-  assert.equal(app.drawer().open, false);
-  assert.equal(prevented, 2);
-  assert.equal(app.sent.filter((m) => m.action === "answer_key_switch").length, 1);
 });
 
 test("pending endpoint proof stays visible and disabled after a rerender", () => {
@@ -1993,8 +1796,8 @@ test("clock hooks in actual seat markup update usage, resets, session age and co
   const root = { querySelectorAll: (selector) => nodes.filter((n) => selector.slice(1, -1).slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase()) in n.dataset) };
   updateClockText(root, Date.parse("2099-01-01T00:00:00Z"));
   assert.ok(nodes.some((n) => n.textContent === "updated 30s ago"));
-  assert.ok(nodes.some((n) => n.textContent === "back in 1h"));
-  assert.ok(nodes.some((n) => n.textContent === "window resets in 1d"));
+  assert.ok(nodes.some((n) => n.textContent === "1h"));
+  assert.ok(nodes.some((n) => n.textContent === "in 1d"));
   assert.ok(nodes.some((n) => n.textContent === "; 2h"));
   assert.ok(nodes.some((n) => n.textContent === "0s"));
 });
@@ -2079,13 +1882,13 @@ test("account-specific sign-in carries the seat to the engine; plus stays unrest
   }
 });
 
-test("sign-in buttons carry escaped seat identity on the inline problem and sheet", () => {
+test("sign-in buttons carry escaped seat identity on the inline problem", () => {
   const email = 'alpha"<&@example.test';
   for (const tool of ["codex", "claude"]) {
     const html = buildHTML(state({ tools: { [tool]: { seats: [seat({ email, status: "needs-login" })] } } }));
     const target = `data-action="add" data-tool="${tool}" data-email="alpha&quot;&lt;&amp;@example.test"`;
     assert.ok(html.includes(`${target}>sign in`));
-    assert.equal(html.split(`${target}>sign in`).length - 1, 2);
+    assert.equal(html.split(`${target}>sign in`).length - 1, 1);
     assert.match(html, /class="issue issue--hard"/);
   }
 });
@@ -2144,9 +1947,9 @@ test("signed-out parked seat reads signed out with a sign in action and no numbe
   assert.doesNotMatch(mine, /data-action="switch"/);
 });
 
-test("signed-out seat card in the drawer hides bars and offers sign in", () => {
+test("signed-out main view hides bars and offers sign in", () => {
   const html = buildHTML(claudeState(seat({ status: "needs-login", active: true, signed_out: true, usage: { error: "no_token" } })));
-  const card = html.slice(html.indexOf("<article"), html.indexOf("</article>"));
+  const card = rosterOf(html);
   assert.match(card, /on now · signed out/);
   assert.doesNotMatch(card, /% left|usage unknown|class="window"/);
   assert.match(card, />sign in<\/button>/);
@@ -2194,7 +1997,7 @@ test("a window reset in the past never renders 'in now'", () => {
   assert.equal(resetIsPast(inHours(-1)), true);
   assert.equal(resetIsPast(inHours(1)), false);
   assert.equal(resetIsPast("garbage"), false);
-  assert.match(html, /usage-reset[^>]*>resetting…</);
+  assert.match(detailsOf(html, "claude", "work@x.com"), /data-past-text="resetting…"[^>]*>resetting…</);
 });
 
 test("clock tick turns a reset that has just passed into resetting…", () => {
@@ -2240,7 +2043,7 @@ test("revoked subscription is not signed out: keeps check your subscription, no 
   const s = seat({ status: "ready", signed_out: false, needs_login: true, usage: { error: "forbidden" } });
   assert.equal(signedOut(s), false);
   const html = buildHTML(claudeState(s));
-  const card = html.slice(html.indexOf("<article"), html.indexOf("</article>"));
+  const card = rosterOf(html);
   assert.match(card, /check your subscription to refresh usage/);
   assert.doesNotMatch(card, />sign in<\/button>/);
   assert.doesNotMatch(card, /signed out/);
@@ -2536,9 +2339,9 @@ test("stale, throttled and unknown problems stay inline; limited resets stay in 
 });
 
 for (const tool of ["codex", "claude"]) {
-  test(`${tool} expiring seat keeps both switch and renewal in the seat-options sheet`, () => {
+  test(`${tool} expiring seat keeps both switch and renewal in the main view`, () => {
     const html = buildHTML(state({ tools: { [tool]: { seats: [seat({ signin_expiring: true, signin_expires_at: inHours(50) })] } } }));
-    const card = html.match(/<article class="seat[^\"]*"[\s\S]*?<\/article>/)[0];
+    const card = rosterOf(html);
     assert.match(card, /data-action="switch"[^>]*>switch<\/button>/);
     assert.match(card, /data-action="add"[^>]*>sign in again<\/button>/);
     assert.match(card, /sign-in ends in/);
@@ -2574,7 +2377,7 @@ for (const auth of [
   const html = buildHTML(state({ tools: { codex: { seats: [s] }, claude: { seats: [] } } }));
   assert.equal(signedOut(s), false);
   assert.equal(usable(s), false);
-  for (const part of [rosterOf(html), html.slice(html.indexOf("<article"), html.indexOf("</article>"))]) {
+  for (const part of [rosterOf(html)]) {
     assert.match(part, /sign-in needed/);
     assert.match(part, /data-action="add"[^>]*>sign in<\/button>/);
     assert.doesNotMatch(part, /signed out|data-action="switch"|class="roster-active"/);
@@ -2586,7 +2389,7 @@ for (const revoked of [{ entitlement_revoked: true }, { usage: { error: "forbidd
     const s = seat({ signed_out: false, needs_login: true, signin_expiring: true,
       signin_expires_at: inHours(1), ...revoked });
     const html = buildHTML(claudeState(s));
-    for (const part of [rosterOf(html), html.slice(html.indexOf("<article"), html.indexOf("</article>"))]) {
+    for (const part of [rosterOf(html)]) {
       assert.match(part, /check your subscription to refresh usage/);
       assert.doesNotMatch(part, /sign-in needed|signed out|data-action="add"|data-action="switch"/);
     }
@@ -2708,20 +2511,17 @@ assert.match(toolOf(html, "claude"), /continue this session/);
 assert.match(factsOf(buildHTML(claudeState(seat({ status: "active" })))), /all good/);
 });
 
-test("footer seat-options link opens, closes and preserves the existing management drawer", () => {
+test("footer keeps only the live status line and the main view has no drawer", () => {
   const snapshot = state({ tools: { codex: { seats: [seat()] } } });
   const html = buildHTML(snapshot), footer = html.match(/<footer class="foot">[\s\S]*?<\/footer>/)[0];
   assert.match(html, /role="menuitemcheckbox" aria-checked="true" data-action="toggle" data-key="auto_switch"/);
-  assert.match(footer, /<button class="footer-options" data-action="seat-options" aria-controls="seat-options" aria-expanded="false" aria-label="seat options"/);
+  assert.doesNotMatch(footer, /<button|data-action/);
+  assert.doesNotMatch(html, /guest-drawer|seat-options/);
+  assert.doesNotMatch(css, /guest-drawer|drawer-handle|drawer-content|footer-options/);
+  assert.doesNotMatch(readFileSync(new URL("./app.mjs", import.meta.url), "utf8"), /guest-drawer|seat-options|moveDrawer|drawerMotion/);
   assert.match(footer, /auto-switch on, soonest back first/);
   assert.match(buildHTML({ ...snapshot, settings: { auto_switch: true, strategy: "most_headroom" } }), /auto-switch on, most headroom first/);
-  const app = drawerApp(true);
-  app.window.AGL.update(snapshot);
-  app.click({ action: "seat-options" });
-  assert.equal(app.drawer().open, true);
-  assert.match(app.root.innerHTML, /data-action="remove" data-tool="codex"/);
-  app.click({ action: "seat-options" });
-  assert.equal(app.drawer().open, false);
+  const app = keyApp();
   for (const checked of [false, true]) {
     app.handlers.change({ target: { closest: () => ({ dataset: { key: "auto_switch" }, checked }) } });
     assert.deepEqual(JSON.parse(JSON.stringify(app.sent.at(-1))), { action: "toggle", key: "auto_switch", value: checked });
@@ -2870,10 +2670,9 @@ test("signed-out windows suppress cached percentages and resets, including an ac
 
 test("content height reports intrinsic size through agl and shrinks after disclosures close", () => {
   const frames = [], observed = [], observer = {};
-  const sizes = { content: 240, top: 44, foot: 32, menu: 0, drawer: false };
+  const sizes = { content: 240, top: 44, foot: 32, menu: 0 };
   const root = { innerHTML: "", firstElementChild: { scrollHeight: 600, getBoundingClientRect: () => ({ top: 0 }) },
     querySelector(q) {
-      if (q === "details.guest-drawer[open]") return sizes.drawer ? {} : null;
       if (q === ".body, .set-body") return { scrollHeight: 600 }; // bounded scrollbox, not the intrinsic reading
       if (q === ".content") return { scrollHeight: sizes.content };
       if (q === ".top, .set-head") return { offsetHeight: sizes.top };
@@ -2897,12 +2696,10 @@ test("content height reports intrinsic size through agl and shrinks after disclo
   sizes.content = 710; observer.change(); flush(); assert.equal(heights().at(-1), 786, "native applies the 600px clamp");
   sizes.content = 100; observer.change(); flush(); assert.equal(heights().at(-1), 176, "native applies the 220px minimum");
   sizes.menu = 285; observer.change(); flush(); assert.equal(heights().at(-1), 293);
-  sizes.menu = 0; sizes.drawer = true; observer.change(); flush(); assert.equal(heights().at(-1), 600);
-  sizes.drawer = false; app.handlers.toggle(); flush(); assert.equal(heights().at(-1), 176);
+  sizes.menu = 0; observer.change(); flush(); assert.equal(heights().at(-1), 176);
   sizes.content = 241.3; app.window.AGL.update(state()); flush(); assert.equal(heights().at(-1), 318);
   assert.match(css, /max-height:min\(600px,100vh\)/);
   assert.match(css, /\.body \{[^}]*overflow-y:auto/);
-  assert.match(css, /\.now-next:has\(\.guest-drawer\[open\]\) \{ height:600px/);
 });
 
 test("button menus retain their purpose through polls, close on Escape and navigate by keyboard", () => {
@@ -2948,4 +2745,114 @@ test("footer confirmations use text, survive a poll and restore the live status"
   assert.match(app.root.innerHTML, /role="status" aria-live="polite">auto-switch on, soonest back first/);
   app.window.AGL.result({ ok: true, celebrate: true, state: { ...snapshot, rev: 3, moved_note: "codex is on personal now" } });
   assert.equal(status.textContent, "codex is on personal now");
+});
+
+test("remove seat lives in every subscription's inline details with its original confirmation", () => {
+  for (const tool of ["codex", "claude"]) {
+    for (const status of ["active", "ready", "resting", "queued", "needs-login"]) {
+      const email = 'seat"<&@example.test', s = seat({ email, status });
+      const snapshot = state({ tools: { [tool]: { seats: [s] } } });
+      const html = buildHTML(snapshot), detail = detailsOf(html, tool, email);
+      assert.match(detail, /^<dl class="details"[^>]* hidden>/);
+      assert.ok(detail.includes(`data-action="remove" data-tool="${tool}" data-email="seat&quot;&lt;&amp;@example.test">remove seat</button>`));
+      assert.equal((html.match(/data-action="remove"/g) || []).length, 1);
+      assert.doesNotMatch(visibleMarkup(html), /data-action="remove"/);
+      const opened = buildHTML(snapshot, null, new Set([JSON.stringify([tool, email])]));
+      assert.match(visibleMarkup(opened), /data-action="remove"/);
+      const confirmations = [];
+      let approved = false;
+      const app = keyApp({ confirm: (text) => { confirmations.push(text); return approved; } });
+      const sentBefore = app.sent.length;
+      app.click({ action: "remove", tool, email });
+      assert.equal(app.sent.length, sentBefore);
+      approved = true;
+      app.click({ action: "remove", tool, email });
+      assert.deepEqual(confirmations, [`wave goodbye to ${email}?`, `wave goodbye to ${email}?`]);
+      assert.deepEqual(JSON.parse(JSON.stringify(app.sent.at(-1))), { action: "remove", tool, email });
+    }
+  }
+});
+
+test("paid key management lives in the key row's details and preserves each action", () => {
+  for (const harness of ["codex", "claude"]) {
+    const key = keySeat({ harness, responses_verified: false,
+      last_validation: { operation_permitted: true } });
+    const snapshot = state({ keys: [key] }), html = buildHTML(snapshot);
+    const detail = detailsOf(html, "key", key.id);
+    assert.match(detail, /^<dl class="details"[^>]* hidden>/);
+    assert.match(detail, /key check passed; account access confirmed/);
+    for (const action of ["key-validate", "key-remove", ...(harness === "codex" ? ["key-prove"] : [])]) {
+      assert.ok(detail.includes(`data-action="${action}" data-id="key-1"`));
+      assert.equal((html.match(new RegExp(`data-action="${action}"`, "g")) || []).length, 1);
+      assert.ok(!visibleMarkup(html).includes(`data-action="${action}"`));
+      const opened = buildHTML(snapshot, null, new Set([JSON.stringify(["key", key.id])]));
+      assert.ok(visibleMarkup(opened).includes(`data-action="${action}"`));
+    }
+    assert.match(visibleMarkup(html), /data-action="key-terminal" data-id="key-1"/);
+    if (harness === "codex") assert.match(detail, /this sends a paid request[\s\S]*not now[\s\S]*send paid check/);
+    const app = keyApp();
+    app.click({ action: "key-validate", id: key.id });
+    assert.deepEqual(JSON.parse(JSON.stringify(app.sent.at(-1))), { action: "key_validate", id: key.id });
+    const remove = { dataset: { action: "key-remove", id: key.id }, textContent: "remove key" };
+    const sentBefore = app.sent.length;
+    app.handlers.click({ target: { closest: (q) => q === "[data-action]" ? remove : null } });
+    assert.equal(app.sent.length, sentBefore);
+    assert.equal(remove.dataset.action, "key-remove-confirm");
+    assert.equal(remove.textContent, "remove this key from the list?");
+    app.click(remove.dataset);
+    assert.deepEqual(JSON.parse(JSON.stringify(app.sent.at(-1))), { action: "key_remove", id: key.id });
+  }
+});
+
+test("engine and supervision problem lines lead the main view and count in the header chip", () => {
+  const warning = { text: "older terminal sessions <old>", action: "adopt_engine" };
+  const supervision = { active: false, on_path: false };
+  const base = state({ tools: { codex: { seats: [seat({ status: "active" })] } } });
+  for (const [extra, count] of [
+    [{ engine_warnings: [warning] }, 1],
+    [{ supervision }, 1],
+    [{ engine_warnings: [warning, { text: "2 older sessions" }], supervision }, 3],
+    [{ supervision: { error: "can't read .zshrc", active: false } }, 1],
+    [{ supervision: { active: true, on_path: false } }, 1],
+  ]) {
+    const snapshot = { ...base, ...extra, pending_key_switches: [keyPrompt()] };
+    const html = buildHTML(snapshot), main = rosterOf(html);
+    assert.match(headerVerdict({ ...base, ...extra }), new RegExp(`${count} needs you`));
+    assert.match(headerVerdict(snapshot), new RegExp(`${count + 1} needs you`));
+    assert.match(main, /^<div class="content"><div class="app-problems">/);
+    const problems = elements(main, "div", (tag) => tag.includes('class="app-problems"'))[0];
+    assert.equal(elements(problems, "div", (tag) => tag.includes("app-problem ")).length, count);
+    assert.ok(main.indexOf(problems) < main.indexOf('class="key-prompts"'));
+    assert.ok(main.indexOf(problems) < main.indexOf('class="field"'));
+    assert.ok(!problems.includes("<old>"));
+    assert.match(problems, /class="issue issue--(?:hard|soft) app-problem/);
+  }
+  const html = buildHTML({ ...base, engine_warnings: [warning], supervision });
+  assert.match(rosterOf(html), /data-action="engine-adopt"/);
+  assert.match(rosterOf(html), /data-action="supervision-on"/);
+  assert.match(headerVerdict({ ...base, engine_warnings: [null, {}, { text: "" }] }), /all good/);
+  assert.match(headerVerdict({ ...base, supervision: { active: true, on_path: true } }), /all good/);
+  assert.match(headerVerdict({ ...base, settings: { supervise_shell: false }, supervision }), /all good/);
+  assert.match(headerVerdict(state({ engine_warnings: [warning] })), /1 needs you/);
+  assert.match(headerVerdict({ ...claudeState(seat({ signed_out: true })), engine_warnings: [warning], supervision }), /3 needs you/);
+  const app = keyApp();
+  app.click({ action: "engine-adopt" });
+  assert.deepEqual(JSON.parse(JSON.stringify(app.sent.at(-1))), { action: "adopt_engine" });
+  app.click({ action: "supervision-on" });
+  assert.deepEqual(JSON.parse(JSON.stringify(app.sent.at(-1))), { action: "toggle", key: "supervise_shell", value: true });
+  let focused = false, scrolled = false;
+  app.root.querySelector = (q) => q === '.issue button, .key-confirm button'
+    ? { focus() { focused = true; }, scrollIntoView() { scrolled = true; } } : null;
+  app.click({ action: "attention" });
+  assert.ok(focused && scrolled);
+});
+
+test("empty state guidance is in the main view, including with a pending paid approval", () => {
+  for (const extra of [{}, { pending_key_switches: [keyPrompt()] }, { pending_crossings: [crossing()] }]) {
+    const html = buildHTML(state(extra));
+    assert.match(rosterOf(html), /use ＋ above to add a subscription or API key\./);
+    assert.equal((html.match(/use ＋ above to add/g) || []).length, 1);
+    assert.doesNotMatch(html, /guest-drawer|seat-options/);
+  }
+  assert.doesNotMatch(rosterHTML(state({ keys: [keySeat()] })), /use ＋ above to add/);
 });

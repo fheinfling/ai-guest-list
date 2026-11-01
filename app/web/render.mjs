@@ -176,33 +176,12 @@ const PLAN_CHIPS = {
   plus: "Plus", max: "Max", free: "Free",
 };
 
-function planChip(plan) {
-  const key = typeof plan === "string" ? plan.trim().toLowerCase() : "";
-  const label = Object.prototype.hasOwnProperty.call(PLAN_CHIPS, key) ? PLAN_CHIPS[key] : null;
-  return label ? `<span class="mono chip">${label}</span>` : "";
-}
-
-// --- seat card --------------------------------------------------------------------------------
-
-
-function bar(seat, win, label) {
-  const used = pct(seat, win);
-  const reset = seat?.usage?.windows?.[win]?.resets_at;
-  const other = seat?.usage?.windows?.[win === "5h" ? "weekly" : "5h"]?.resets_at;
-  // The seat's return is the authoritative countdown. Window resets appear only when distinct.
-  const showReset = reset && reset !== seat.limited_until && reset !== other && Number.isFinite(Date.parse(reset));
-  const left = used === null ? null : Math.round(100 - used);
-  return `<div class="window"><div class="usage"><span>${label} window</span><span>${left === null ? "usage unknown" : left === 0 ? "exhausted" : `${left}% left`}</span></div>
-    <div class="track${left === 0 ? " exhausted" : ""}" aria-hidden="true"><span class="fill" style="width:${left ?? 0}%"></span></div>
-    ${showReset ? `<span class="usage-reset" data-reset-at="${esc(reset)}" data-clock-prefix="window resets in" data-past-text="resetting…" title="${esc(new Date(reset).toLocaleString())}">${resetIsPast(reset) ? "resetting…" : `window resets in ${fmtCountdown(reset)}`}</span>` : ""}</div>`;
-}
-
 // The engine can switch to any saved subscription, including a capped one. Say what that
 // means at the action instead of silently withholding it; sign-in always takes precedence.
 // "switch anyway" rather than "switch limited": the latter reads as a noun phrase, or as
 // "switching is limited", and a real user asked what it meant. The row already shows resting,
 // 0% and the reset countdown, so the label only has to carry "despite that".
-function seatAction(tool, seat, placement = "all") {
+function seatAction(tool, seat, placement) {
   const add = (label) => placement === "switch" ? "" : `<button class="row-action" data-action="add" data-tool="${tool}" data-email="${esc(seat.email)}">${label}</button>`;
   if (entitlementRevoked(seat)) return "";
   if (signinNeeded(seat)) return add("sign in");
@@ -212,7 +191,7 @@ function seatAction(tool, seat, placement = "all") {
   if (placement === "signin") return again;
   const limited = seat.limited || ["resting", "queued"].includes(seat.status);
   const label = `switch to ${seat.name || seat.email}${limited ? "; this seat's limit applies immediately" : ""}`;
-  return `<button class="row-action" data-action="switch" data-tool="${tool}" data-email="${esc(seat.email)}" aria-label="${esc(label)}" title="${esc(label)}">${limited ? "switch anyway" : "switch"}</button>${again}`;
+  return `<button class="row-action" data-action="switch" data-tool="${tool}" data-email="${esc(seat.email)}" aria-label="${esc(label)}" title="${esc(label)}">${limited ? "switch anyway" : "switch"}</button>`;
 }
 
 function signinExpiryLine(seat, tag, compact = false) {
@@ -240,78 +219,28 @@ function switchConfirmation(tool, seat, pending) {
   return `<div class="issue issue--soft switch-confirm" role="group" aria-label="confirm seat switch"><span class="issue-text">switch ${esc(tool)} to ${esc(seat.name || seat.email)} (${kind})? running sessions move too</span><button class="row-action" data-action="switch-confirm" ${data}>switch</button><button class="row-action" data-action="switch-cancel" ${data}>cancel</button></div>`;
 }
 
-function seatCard(tool, seat, pending, peers = []) {
-  const fetched = seat.usage_fetched_at || seat.usage?.fetched_at || "";
-  const reported = seat?.usage?.reported_windows;
-  const weeklyOnly = tool === "codex" && Array.isArray(reported) && reported.includes("weekly") && !reported.includes("5h");
-  const out = signedOut(seat);
-  const stateText = entitlementRevoked(seat) ? "check your subscription to refresh usage"
-    : !out && signinNeeded(seat) ? "sign-in needed"
-    : out ? (isActive(seat) ? "on now · signed out" : "signed out")
-    : seat.status === "resting"
-    ? `<span data-reset-at="${esc(seat.limited_until)}" data-clock-prefix="back in" title="${esc(fmtClock(seat.limited_until))}">back in ${fmtCountdown(seat.limited_until)}</span>`
-    : isActive(seat) ? (seat.in_session ? "on the floor" : "selected")
-    : seat.status === "queued" ? "up next" : "ready";
-  const issue = usageIssue(tool, seat);
-  const action = seatAction(tool, seat);
-  return `<article class="seat seat--${esc(seat.status)}${out ? " seat--signedout" : ""}" data-card data-tool="${tool}" data-email="${esc(seat.email)}">
-    <details class="seat-disclosure"><summary class="seat-row"><span class="seat-name">${esc(seatIdentity(seat, peers))}</span><span class="seat-state">${stateText}</span><span class="chevron" aria-hidden="true">⌄</span></summary>
-    <div class="expand"><p class="seat-email">${esc(seat.email)} ${planChip(seat.plan)}</p>
-    ${out ? `<p class="usage-error" role="status">signed out; sign in to see usage</p>` : `${weeklyOnly ? "" : bar(seat, "5h", "5h")}${bar(seat, "weekly", "7d")}
-    <p class="support"><span data-usage-at="${esc(fetched)}">${fmtUsageAge(fetched)}</span>${seat.usage_stale || seat.usage_unknown ? "; last known reading" : ""}</p>`}
-    ${signinExpiring(seat) ? signinExpiryLine(seat, "p") : ""}
-    ${issue && !out ? `<p class="usage-error" role="status">${issue}</p>` : ""}
-    ${seat.in_session ? `<p class="support">terminal attached<span data-session-at="${esc(seat.session_started_at)}">${fmtSessionAge(seat.session_started_at).replace(" · ", "; ")}</span></p>` : ""}
-    ${seat.last_on_floor ? `<p class="support">last on the floor ${esc(fmtClock(seat.last_on_floor))}</p>` : ""}
-    <div class="seat-actions">${action}<button class="logout" data-action="remove" data-tool="${tool}" data-email="${esc(seat.email)}">log out</button></div>
-    ${switchConfirmation(tool, seat, pending)}
-    </div></details></article>`;
+// Infrastructure problems share the main view's problem lines and header count.
+function supervisionProblem(state) {
+  if (state?.settings?.supervise_shell === false || !state?.supervision) return null;
+  if (state.supervision.error) return "error";
+  if (!state.supervision.active) return "off";
+  return !state.supervision.on_path ? "path" : null;
 }
-
-function toolGroup(tool, t, keys = [], pending = null) {
-  const seats = t?.seats || [];
-  if (!seats.length && !keys.length) return "";
-  return `<section class="group" style="--accent:${TOOL_META[tool].accent}"><h2 class="g-head"><span class="tool-marker tool-marker--${tool}" aria-hidden="true"></span>${TOOL_META[tool].label}</h2>
-    ${seats.map((seat) => seatCard(tool, seat, pending, seats)).join("")}${keys.map(keySeatCard).join("")}</section>`;
+function engineWarnings(state) {
+  return (Array.isArray(state?.engine_warnings) ? state.engine_warnings : []).filter((w) => w && w.text);
 }
-
-
-
-// Terminal supervision is infrastructure, not a seat-health signal. Keep this decision pure so a
-// missing rc block/wrapper can never be hidden by an otherwise healthy usage snapshot.
 export function supervisionBanner(state) {
-  if (state?.settings?.supervise_shell === false || !state?.supervision) return "";
-  const supervision = state.supervision;
-  // A failed read leaves the block unknown. Reinstalling cannot fix unreadable settings;
-  // show the path/reason from the probe so we don't claim their existing setup is off.
-  if (supervision.error) {
-    return `<div class="supervision-banner supervision-banner--error" role="alert">
-      <span>${esc(supervision.error)}</span>
-    </div>`;
-  }
-  if (!supervision.active) {
-    return `<div class="supervision-banner supervision-banner--error" role="alert">
-      <span>terminal supervision is off — <span class="mono">codex/claude</span> won't auto-switch</span>
-      <button data-action="supervision-on">turn it on</button>
-    </div>`;
-  }
-  if (!supervision.on_path) {
-    return `<div class="supervision-banner supervision-banner--info" role="status">
-      open a new terminal to finish setup
-    </div>`;
-  }
-  return "";
+  const problem = supervisionProblem(state);
+  if (!problem) return "";
+  const text = problem === "error" ? esc(state.supervision.error)
+    : problem === "off" ? `terminal supervision is off — <span class="mono">codex/claude</span> won't auto-switch`
+    : "open a new terminal to finish setup";
+  return `<div class="issue issue--${problem === "path" ? "soft" : "hard"} app-problem supervision-problem" role="${problem === "path" ? "status" : "alert"}">${ICON.alert}<div>${text}</div>${problem === "off" ? '<button class="row-action" data-action="supervision-on">turn it on</button>' : ""}</div>`;
 }
 
-// App/engine drift: a terminal on an older engine shares this app's store and can sign every
-// session out. Shown whatever the supervision setting — `cx`/`cl` run the same wrapper either way.
-// The wrapper warning offers its consented fix; the others name theirs in the text.
+// Older terminal engines share this app's store, regardless of supervision preferences.
 export function engineBanner(state) {
-  const warnings = Array.isArray(state?.engine_warnings) ? state.engine_warnings : [];
-  return warnings.filter((w) => w && w.text).map((w) => `<div class="supervision-banner supervision-banner--error" role="alert">
-      <span>${esc(w.text)}</span>${w.action === "adopt_engine" ? `
-      <button data-action="engine-adopt">use this app's engine</button>` : ""}
-    </div>`).join("");
+  return engineWarnings(state).map((w) => `<div class="issue issue--hard app-problem engine-problem" role="alert">${ICON.alert}<div>${esc(w.text)}</div>${w.action === "adopt_engine" ? `<button class="row-action" data-action="engine-adopt">use this app's engine</button>` : ""}</div>`).join("");
 }
 
 // --- add-a-seat sub-view (spec §9) — a pushed screen like settings, NOT a modal ----------------
@@ -675,7 +604,7 @@ function usageIssue(tool, seat) {
     token_expired: `open ${TOOL_META[tool].label} to refresh usage`, unauthorized: "sign in to refresh usage", forbidden: "check your subscription to refresh usage", no_token: "sign in to refresh usage" })[error] || (error ? "usage update failed; retrying automatically" : "");
 }
 
-// Identity stays legible in the block, sheet and management drawer. Only known plan
+// Identity stays legible in the block, sheet and inline details. Only known plan
 // labels are public copy; provider-internal enums must not leak into the interface.
 export function seatIdentity(seat, peers = [], includeMetadata = true) {
   const name = String(seat.name || seat.email || "seat");
@@ -761,7 +690,7 @@ function rowDetails(tool, seat, peers, openDetails) {
   const key = tool === "key", email = key ? seat.id : seat.email;
   const open = openDetails.has(JSON.stringify([tool, email]));
   let rows;
-  if (key) rows = `<dt>model</dt><dd>${esc(seat.model)}</dd><dt>billing</dt><dd>paid per token; no app spend cap</dd><dt>use</dt><dd>opens a new terminal, never switches one</dd>${keyProofStatus(seat) ? `<dt>endpoint</dt><dd>${keyProofStatus(seat)}</dd>` : ""}`;
+  if (key) rows = keySeatDetails(seat);
   else {
     const fetched = seat.usage_fetched_at || seat.usage?.fetched_at || "";
     rows = `<dt>seat</dt><dd>${esc(seat.email)}</dd><dt>plan</dt><dd>${esc(seatIdentity(seat, peers))}</dd>`;
@@ -769,6 +698,9 @@ function rowDetails(tool, seat, peers, openDetails) {
     else rows += seatWindows(seat).map((w) => `<dt>${w.label}</dt><dd>${w.left == null ? "usage unknown" : `${seat.usage_stale ? "~" : ""}${w.left}% left`}${w.reset ? `, <time datetime="${esc(w.reset)}">${esc(new Date(w.reset).toLocaleString())}</time> (${timed(w.reset, "in")})` : ""}</dd>`).join("");
     rows += `<dt>updated</dt><dd>${seat.usage_stale ? "last known reading; " : ""}<span data-usage-at="${esc(fetched)}">${fmtUsageAge(fetched)}</span></dd>`;
     if (limitedSeat(seat) || (!isActive(seat) && !signedOut(seat) && !usable(seat))) rows += `<dt>action</dt><dd>${seatAction(tool, seat, "switch")}</dd>`;
+    if (seat.in_session) rows += `<dt>terminal</dt><dd>terminal attached<span data-session-at="${esc(seat.session_started_at)}">${fmtSessionAge(seat.session_started_at).replace(" · ", "; ")}</span></dd>`;
+    if (seat.last_on_floor) rows += `<dt>last used</dt><dd>last on the floor ${esc(fmtClock(seat.last_on_floor))}</dd>`;
+    rows += `<dt>manage</dt><dd><button class="row-action" data-action="remove" data-tool="${esc(tool)}" data-email="${esc(seat.email)}">remove seat</button></dd>`;
   }
   return `<dl class="details" id="${detailId(tool, email)}"${open ? "" : " hidden"}>${rows}</dl>`;
 }
@@ -788,7 +720,8 @@ export function headerVerdict(state) {
   const ready = seats.filter(usable);
   const hard = seats.filter((s) => signedOut(s) || signinNeeded(s) || entitlementRevoked(s)).length
     + (state?.pending_crossings || []).length + (state?.pending_tier_requests || []).length
-    + (state?.pending_key_switches || []).filter((r) => r.status === "pending" && Date.parse(r.expires_at) > Date.now()).length;
+    + (state?.pending_key_switches || []).filter((r) => r.status === "pending" && Date.parse(r.expires_at) > Date.now()).length
+    + engineWarnings(state).length + Number(Boolean(supervisionProblem(state)));
   if (hard) return `<button class="chip chip--hard" data-action="attention">${ICON.alert}${hard} needs you</button>`;
   if (seats.length && !ready.length && seats.every(limitedSeat)) return `<span class="chip chip--soft">${ICON.rest}all limited</span>`;
   if (seats.some((s) => signinExpiring(s))) return `<span class="chip chip--soft">${ICON.clock}renew soon</span>`;
@@ -865,21 +798,18 @@ export function buildHTML(state, pendingSwitch = null, openDetails = new Set()) 
   const theme = state?.settings?.theme === "dark" ? "dark" : "light";
   const seats = subscriptionSeats(state), paid = paidCount(state);
   const mood = paid ? "spending" : seats.some(usable) ? "ready" : seats.length ? "resting" : "empty";
-  const moved = state?.moved_note ? `<section class="event"><h2>last switch</h2><p>${esc(state.moved_note.replaceAll(" · ", ", "))}</p></section>` : "";
+  const problems = engineBanner(state) + supervisionBanner(state);
   const prompts = keyConfirmations(state), asking = prompts.includes('class="key-confirm"');
   const tools = [...new Set(["codex", "claude", ...(state.keys || []).map((k) => k.harness || "codex"), ...(state.pending_crossings || []).map((r) => r.tool), ...(state.pending_tier_requests || []).map((r) => r.tool)])];
   const plans = tools.map((tool) => toolPlan(tool, state)).filter((p) => p.seats.length || p.keys.length || (state.pending_crossings || []).some((r) => r.tool === p.tool) || (state.pending_tier_requests || []).some((r) => r.tool === p.tool));
+  const emptyWithoutWelcome = !seats.length && !state?.keys?.length && (plans.length || asking);
   const strategy = state?.settings?.strategy === "most_headroom" ? "most headroom first" : "soonest back first";
   return `<div class="app ambient-app now-next theme-${theme} mood-${mood}">
     <header class="top"><span class="brand">${appIcon()}</span>${headerVerdict(state)}<div class="top-actions">
       <div class="header-menu"><button class="ibtn" data-action="menu" data-menu="add" aria-label="add a subscription seat or API key" aria-haspopup="menu" aria-expanded="false">${ICON.plus}</button><nav class="menu" role="menu" aria-label="add" hidden><button role="menuitem" data-action="add" data-tool="codex">codex seat <span class="sub">sign in</span></button><button role="menuitem" data-action="add" data-tool="claude">claude seat <span class="sub">sign in</span></button><hr><button role="menuitem" data-action="key-start">api key <span class="sub">paid</span></button><button role="menuitem" data-action="add">a subscription seat</button></nav></div>
       <div class="header-menu"><button class="ibtn" data-action="menu" data-menu="more" aria-label="app menu" aria-haspopup="menu" aria-expanded="false">${ICON.more}</button><nav class="menu" role="menu" aria-label="more" hidden><button role="menuitemcheckbox" aria-checked="${!!state?.settings?.auto_switch}" data-action="toggle" data-key="auto_switch">auto-switch <span class="sub">${state?.settings?.auto_switch ? "on" : "off"}</span></button><button role="menuitem" data-action="set_strategy" data-value="${state?.settings?.strategy === "most_headroom" ? "soonest_back" : "most_headroom"}">next seat <span class="sub">${strategy.replace(" first", "")}</span></button><hr><button role="menuitem" data-action="settings">settings…</button><button role="menuitem" data-action="quit">quit</button></nav></div></div></header>
-    <div class="body" aria-label="seat availability" tabindex="0"><div class="content">${prompts}${paid ? paidUseControl(state) : ""}${plans.length ? `<div class="field">${plans.map((p) => toolBlock(p, state, pendingSwitch, openDetails)).join("")}</div><div class="sheet">${plans.map((p) => listRows(p, state, openDetails)).join("")}</div>` : !asking ? `<div class="field welcome"><p class="welcome-title">no seats yet</p><p>add your codex or claude sign-ins. when one runs out, work moves to the next.</p><button class="act act--strong" data-action="add">add a seat</button></div>` : ""}</div></div>
-    <footer class="foot">${ICON.switch}<span class="footer-status" role="status" aria-live="polite">${state?.settings?.auto_switch ? `auto-switch on, ${strategy}` : "auto-switch off, you switch by hand"}</span><button class="footer-options" data-action="seat-options" aria-controls="seat-options" aria-expanded="false" aria-label="seat options" title="seat options">${ICON.more}</button></footer>
-    <details class="guest-drawer" id="seat-options"><summary class="drawer-handle"><span>seat options</span><span class="drawer-count">${seats.length + (state?.keys?.length || 0)} seats</span><span class="chevron" aria-hidden="true">⌃</span></summary>
-      <div class="drawer-content"><div class="main-body">${engineBanner(state)}${supervisionBanner(state)}${toolGroup("codex", state?.tools?.codex, (state?.keys || []).filter((k) => k.harness === "codex"), pendingSwitch)}${toolGroup("claude", state?.tools?.claude, (state?.keys || []).filter((k) => k.harness === "claude"), pendingSwitch)}
-      ${!seats.length && !state?.keys?.length ? `<p class="empty">use ＋ above to add a subscription or API key.</p>` : ""}${moved}
-      </div></div></details></div>`;
+    <div class="body" aria-label="seat availability" tabindex="0"><div class="content">${problems ? `<div class="app-problems">${problems}</div>` : ""}${prompts}${paid ? paidUseControl(state) : ""}${plans.length ? `<div class="field">${plans.map((p) => toolBlock(p, state, pendingSwitch, openDetails)).join("")}</div><div class="sheet">${plans.map((p) => listRows(p, state, openDetails)).join("")}</div>` : !asking ? `<div class="field welcome"><p class="welcome-title">no seats yet</p><p>use ＋ above to add a subscription or API key.</p><button class="act act--strong" data-action="add">add a seat</button></div>` : ""}${emptyWithoutWelcome ? `<p class="empty">use ＋ above to add a subscription or API key.</p>` : ""}</div></div>
+    <footer class="foot">${ICON.switch}<span class="footer-status" role="status" aria-live="polite">${state?.settings?.auto_switch ? `auto-switch on, ${strategy}` : "auto-switch off, you switch by hand"}</span></footer></div>`;
 }
 
 function paidUseControl(state) {
@@ -974,15 +904,15 @@ export function keyProofStatus(seat) {
     ${seat.responses_verified === false && proof?.outcome !== "incompatible" && proof?.outcome !== "proven" ? `<div class="key-unproven">responses support unproven — this endpoint may not work</div>` : ""}`;
 }
 
-export function keySeatCard(seat) {
+export function keySeatDetails(seat) {
   const unproven = (seat.responses_verified === false || seat.last_proof?.outcome === "incompatible") && seat.harness !== "claude";
   const checked = seat.last_validation;
-  return `<article class="seat seat--key" data-card data-tool="${esc(seat.harness)}" data-email="key:${esc(seat.id)}"><details class="seat-disclosure"><summary class="seat-row"><span class="seat-name">${esc(seat.label)}</span><span class="seat-state">paid key</span><span class="chevron" aria-hidden="true">⌄</span></summary>
-    <div class="expand"><p>${esc(providerName(seat))}</p><p class="key-model">${esc(seat.model)}</p><p class="support">paid per token; this app does not cap spend.</p>
-    <button data-action="key-terminal" data-id="${esc(seat.id)}">use in new terminal</button>${keyProofStatus(seat)}
+  return `<dt>provider</dt><dd>${esc(providerName(seat))}</dd><dt>model</dt><dd>${esc(seat.model)}</dd><dt>billing</dt><dd>paid per token; no app spend cap</dd><dt>use</dt><dd>opens a new terminal, never switches one</dd>
+    ${keyProofStatus(seat) ? `<dt>endpoint</dt><dd>${keyProofStatus(seat)}</dd>` : ""}
+    <dt>manage</dt><dd class="key-management">
     ${checked ? `<p class="key-check-status" role="status">${checked.operation_permitted ? "key check passed; account access confirmed" : "key check was not permitted; check access with your provider"}</p>` : ""}
     ${unproven ? `<div class="proof-gate"><input class="local-check" type="checkbox" id="proof-${esc(seat.id)}"><label class="proof-open" for="proof-${esc(seat.id)}">check this endpoint</label><div class="proof-choice"><p>this sends a paid request. price unavailable here; check provider pricing. this app does not cap spend.</p><div class="equal-choices"><label class="choice" for="proof-${esc(seat.id)}">not now</label><button class="choice" data-action="key-prove" data-id="${esc(seat.id)}">send paid check</button></div></div></div>` : ""}
-    <div class="seat-actions"><button data-action="key-validate" data-id="${esc(seat.id)}">check key</button><button class="logout" data-action="key-remove" data-id="${esc(seat.id)}">remove key</button></div></div></details></article>`;
+    <div class="seat-actions"><button class="row-action" data-action="key-validate" data-id="${esc(seat.id)}">check key</button><button class="row-action" data-action="key-remove" data-id="${esc(seat.id)}">remove key</button></div></dd>`;
 }
 
 // A session waits on a move between a business and a personal seat (or one whose kind is
