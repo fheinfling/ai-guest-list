@@ -330,5 +330,17 @@
    "--test-name-pattern=revoked subscription",
    "app/web/render.test.mjs"
   ]
+ },
+ {
+  "label": "switch crossing shows the limit copy",
+  "file": "app/web/render.mjs",
+  "old": "const prompt = r.reason === \"switch\"",
+  "new": "const prompt = false",
+  "cmd": [
+   "node",
+   "--test",
+   "--test-name-pattern=a switch crossing",
+   "app/web/render.test.mjs"
+  ]
  }
 ]

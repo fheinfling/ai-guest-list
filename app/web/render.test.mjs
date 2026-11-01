@@ -2317,10 +2317,10 @@ test("settings keeps parked claude seats signed in by default and dispatches its
 const crossing = (over = {}) => ({ tool: "claude", from: "w@x", to: "p@x", at: "2026-10-31T10:00:00Z",
   from_name: "Work", to_name: "Home", from_kind: "business", to_kind: "personal", ...over });
 
-test("a pending crossing offers switch now, not now and an automatic switching link", () => {
-  const html = buildHTML(state({ pending_crossings: [crossing()] }));
+test("a limit crossing offers switch now, not now and an automatic switching link", () => {
+  const html = buildHTML(state({ pending_crossings: [crossing({ reason: "limit" })] }));
   assert.match(html, /needs you/);
-  assert.match(html, /Work is out\. continue on Home \(personal\)\?/);
+  assert.match(html, /Work is out\. continue this session on Home \(personal seat\)\?/);
   for (const scope of ["once", "deny"]) {
     assert.match(html, new RegExp(`data-action="crossing-answer" data-scope="${scope}" data-tool="claude" data-from="w@x" data-to="p@x"`));
   }
@@ -2332,9 +2332,22 @@ test("a pending crossing offers switch now, not now and an automatic switching l
   assert.doesNotMatch(buildHTML(state({})), /crossing-answer/);
 });
 
+test("a switch crossing asks about the other running session", () => {
+  const html = crossingRequests({ pending_crossings: [crossing({ reason: "switch" })] });
+  assert.match(html, /you switched claude to Home\. move the other running session too\? \(work seat → personal seat\)/);
+  assert.doesNotMatch(html, /is out|continue this session/);
+});
+
+test("limit crossings omit a kind already present in the seat name", () => {
+  for (const [to_name, to_kind] of [["Business", "business"], ["my personal", "personal"]]) {
+    const html = crossingRequests({ pending_crossings: [crossing({ to_name, to_kind })] });
+    assert.ok(html.includes(`<h2>Work is out. continue this session on ${to_name}?</h2>`));
+  }
+});
+
 test("an unknown kind is said plainly and names are escaped", () => {
   const html = crossingRequests({ pending_crossings: [crossing({ to_name: "<b>x</b>", to_kind: "unknown" })] });
-  assert.match(html, /continue on &lt;b&gt;x&lt;\/b&gt; \(plan unknown\)/);
+  assert.match(html, /continue this session on &lt;b&gt;x&lt;\/b&gt; \(plan unknown\)/);
 });
 
 test("crossing answers reach the bridge as approve_crossing / deny_crossing", () => {

@@ -875,14 +875,22 @@ export function keySeatCard(seat) {
 
 // A session waits on a move between a business and a personal seat (or one whose kind is
 // unknown): never taken automatically, so the user answers here. "no" closes the question.
-const KIND_WORD = { business: "business", personal: "personal", unknown: "plan unknown" };
+const KIND_WORD = { business: "work seat", personal: "personal seat", unknown: "plan unknown" };
 export function crossingRequests(state) {
   const requests = state?.pending_crossings || [];
   if (!requests.length) return "";
   return `<div class="crossing-prompts">${requests.map((r) => {
     const data = `data-tool="${esc(r.tool)}" data-from="${esc(r.from)}" data-to="${esc(r.to)}"`;
+    const from = esc(r.from_name || r.from), to = esc(r.to_name || r.to);
+    const fromKind = KIND_WORD[r.from_kind] || KIND_WORD.unknown;
+    const toKind = KIND_WORD[r.to_kind] || KIND_WORD.unknown;
+    const namedKind = ["business", "personal"].includes(r.to_kind)
+      && new RegExp(`\\b${r.to_kind}\\b`, "i").test(r.to_name || r.to);
+    const prompt = r.reason === "switch"
+      ? `you switched ${esc(r.tool || "claude")} to ${to}. move the other running session too? (${esc(fromKind)} → ${esc(toKind)})`
+      : `${from} is out. continue this session on ${to}${namedKind ? "" : ` (${esc(toKind)})`}?`;
     return `<section class="crossing-confirm" aria-label="needs you"><p class="crossing-tag">needs you</p>
-      <h2>${esc(r.from_name || r.from)} is out. continue on ${esc(r.to_name || r.to)} (${esc(KIND_WORD[r.to_kind] || KIND_WORD.unknown)})?</h2>
+      <h2>${prompt}</h2>
       <p class="crossing-why">${esc(r.from_name || r.from)} is ${esc(KIND_WORD[r.from_kind] || KIND_WORD.unknown)}; moving between work and personal seats needs your yes.</p>
       <div class="crossing-acts"><button class="choice" data-action="crossing-answer" data-scope="once" ${data}>switch now</button><button class="choice" data-action="crossing-answer" data-scope="deny" ${data}>not now</button></div>
       <p class="support"><button class="pricing-link" data-action="crossing-auto" data-scope="once" ${data}>always switch automatically</button></p>

@@ -112,6 +112,8 @@ def test_requests_are_per_session_and_answered_by_direction(ctx):
     assert seatkind.request(state, T, "w@x", "p@x", session_id=12)
     assert seatkind.request(state, T, "p@x", "w@x", session_id=13)
     shown = seatkind.pending(state, T)
+    assert all(r["reason"] == "limit" for r in shown)
+    assert all(r["reason"] == "limit" for r in state.data["tools"][T]["crossings"]["requests"])
     assert [(r["from"], r["to"]) for r in shown] == [("w@x", "p@x"), ("p@x", "w@x")]
     seatkind.approve(state, T, "w@x", "p@x", "once")
     assert [(r["from"], r["to"]) for r in seatkind.pending(state, T)] == [("p@x", "w@x")]
@@ -196,6 +198,8 @@ def test_a_manual_switch_moves_whom_it_does_not_cross_and_asks_the_rest(ctx, mon
     store = state.data["tools"][T]["crossings"]
     assert [(r["from"], r["to"], r["session_id"]) for r in store["requests"]] == [
         ("p@x", "w@x", "2")]
+    assert store["requests"][0]["reason"] == "switch"
+    assert bridge.snapshot_state(ctx)["pending_crossings"][0]["reason"] == "switch"
     assert [(r["from"], r["to"]) for r in seatkind.pending(state, T)] == [("p@x", "w@x")]
     assert not seatkind.approved(state, T, "p@x", "w@x")
     assert not seatkind.approved(state, T, "p2@x", "w@x"), "the move home spent no new grant"
@@ -225,14 +229,15 @@ def test_an_automatic_switch_approves_nothing(ctx, monkeypatch):
 
 
 @pytest.mark.parametrize("scope", ["once", "always"])
-def test_bridge_approve_crossing(ctx, scope):
+@pytest.mark.parametrize("reason", ["limit", "switch"])
+def test_bridge_approve_crossing(ctx, scope, reason):
     state = seats(ctx, {"w@x": "Team", "p@x": "Max"})
-    seatkind.request(state, T, "w@x", "p@x", 7)
+    seatkind.request(state, T, "w@x", "p@x", 7, reason=reason)
     state.save()
     shown = bridge.snapshot_state(ctx)["pending_crossings"]
     assert shown == [{"from": "w@x", "to": "p@x", "at": shown[0]["at"], "tool": T,
                       "from_name": "W", "to_name": "P", "from_kind": "business",
-                      "to_kind": "personal"}]
+                      "to_kind": "personal", "reason": reason}]
     res = bridge.handle(ctx, {"action": "approve_crossing", "tool": T, "from": "w@x", "to": "p@x",
                               "scope": scope})
     assert res["ok"] and res["state"]["pending_crossings"] == []

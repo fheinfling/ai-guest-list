@@ -19,7 +19,8 @@ approval behind that could later authorize an automatic crossing.
 State lives in ``tools.<tool>.crossings``::
 
     {"approvals": {"a>b": {"scope": "once"|"always", "at": iso, "via": "user"|"manual"}},
-     "requests":  [{"from": a, "to": b, "session_id": str|None, "at": iso}]}
+     "requests":  [{"from": a, "to": b, "session_id": str|None, "at": iso,
+                    "reason": "limit"|"switch"}]}
 
 A "once" approval is consumed by the switch that uses it (``consume``) and lapses after
 ``ONCE_TTL`` if no switch does: a yes given for one stuck session must not quietly authorize a
@@ -106,7 +107,7 @@ def approved(state, tool: str, a: str | None, b: str | None, at: datetime | None
 
 
 def request(state, tool: str, a: str, b: str, session_id=None, at: datetime | None = None, *,
-            home: str | None = None) -> bool:
+            home: str | None = None, reason: str = "limit") -> bool:
     """Ask the user about ``a``→``b`` for one session. False when that exact question is open,
     or when there is nothing to ask (not a crossing)."""
     if not crosses(state, tool, a, b, home=home):
@@ -116,7 +117,8 @@ def request(state, tool: str, a: str, b: str, session_id=None, at: datetime | No
     for r in store["requests"]:
         if r.get("from") == a and r.get("to") == b and r.get("session_id") == sid:
             return False
-    store["requests"].append({"from": a, "to": b, "session_id": sid, "at": iso(at or now())})
+    store["requests"].append({"from": a, "to": b, "session_id": sid, "at": iso(at or now()),
+                              "reason": reason})
     return True
 
 
@@ -195,5 +197,6 @@ def pending(state, tool: str, at: datetime | None = None) -> list[dict]:
             continue  # already answered (or the plans changed so it no longer crosses)
         key = _key(r["from"], r["to"])
         if key not in out or r["at"] < out[key]["at"]:
-            out[key] = {"from": r["from"], "to": r["to"], "at": r["at"]}
+            out[key] = {"from": r["from"], "to": r["to"], "at": r["at"],
+                        "reason": r.get("reason", "limit")}
     return sorted(out.values(), key=lambda r: (r["at"], r["from"], r["to"]))

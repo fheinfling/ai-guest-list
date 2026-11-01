@@ -130,6 +130,6 @@ def switch(ctx: Context, state: State, tool: str, email: str, *, sync: bool = Tr
             else:
                 seatkind.chosen(state, tool, origin, email)
         for origin, sid, home in asks:   # after chosen(), which closes a direction's requests
-            seatkind.request(state, tool, origin, email, sid, home=home)
+            seatkind.request(state, tool, origin, email, sid, home=home, reason="switch")
     if save:
         state.save()
