@@ -7,17 +7,16 @@ the rules, ``GET /__fake/log`` returns the request log).
 
 Rules:
 
-- ``status_by_token``: token sha256[:10] -> 401 | 429 (a usage limit) | 4291 (a transient 429) | 529
+- ``status_by_token``: token label -> 401 | 429 (a usage limit) | 4291 (a transient 429) | 529
 - ``next``: forced statuses for the next ``/v1/messages`` calls, consumed in order
 - ``tool_first``: answer a fresh user turn with a Bash ``tool_use``, then text once a result is back
 - ``chunk_delay``: seconds between SSE deltas, to prove the proxy does not buffer a stream
 
-Tokens are logged as sha256[:10] only.
+Tokens are logged as process-local labels (seat-1, seat-2, ...) only.
 """
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import threading
 import time
@@ -26,10 +25,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 TRANSIENT_429 = 4291
+_TOKEN_LABELS: dict[str, str] = {}
+_TOKEN_LABEL_LOCK = threading.Lock()
 
 
 def tok(secret: str | None) -> str | None:
-    return hashlib.sha256(secret.encode()).hexdigest()[:10] if secret else None
+    if not secret:
+        return None
+    with _TOKEN_LABEL_LOCK:
+        if secret not in _TOKEN_LABELS:
+            _TOKEN_LABELS[secret] = f"seat-{len(_TOKEN_LABELS) + 1}"
+        return _TOKEN_LABELS[secret]
 
 
 def bearer(headers: dict) -> str | None:

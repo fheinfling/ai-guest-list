@@ -2635,10 +2635,10 @@ test("block heading keeps only the seat name and disambiguator, with kind and pl
   const tool = toolOf(buildHTML(snapshot), "claude");
   const heading = elements(tool, "div", (tag) => tag.includes('class="now"'))[0];
   const meta = elements(tool, "div", (tag) => tag.includes('class="meta"'))[0];
-  const headingText = heading.replace(/<[^>]*>/g, "");
-  assert.match(headingText, /Studio · gmail.*on now.*80%/);
-  assert.doesNotMatch(headingText, /business|team/);
-  assert.match(meta.replace(/<[^>]*>/g, ""), /business · team · 5h resets in 3h/);
+  assert.match(heading, /class="seat-identity"[^>]*>Studio · gmail<\/span>/);
+  assert.match(heading, /class="tag">on now<\/span>.*class="fig">80<small>%<\/small>/);
+  assert.doesNotMatch(heading, /class="seat-metadata"|>[^<]*(?:business|team)[^<]*</);
+  assert.match(meta, /business · team · <span[^>]*>5h resets in 3h<\/span>/);
   const sheet = elements(buildHTML(snapshot), "div", (tag) => tag.includes('class="sheet"'))[0];
   assert.match(sheet, /class="seat-identity"[^>]*>Studio · icloud<\/span><span class="seat-metadata">personal · max<\/span>/);
   assert.match(css, /\.now-seat \{[^}]*flex-wrap:nowrap/);
@@ -2889,7 +2889,8 @@ test("expanded details group usage, session and account with short local reset t
       assert.match(groups[0], new RegExp(`data-usage-at="${fetched}"`));
       assert.ok(groups[0].includes(`datetime="${today}"`));
       assert.ok(groups[0].includes(`data-reset-at="${today}"`));
-      assert.doesNotMatch(detail.replace(/<[^>]*>/g, ""), /11\/1\/2026|2026,|:00:00 PM|updated updated/);
+      // Check visible text directly; full timestamps may still appear in title attributes.
+      assert.doesNotMatch(detail, />[^<]*(?:11\/1\/2026|2026,|:00:00 PM|updated updated)[^<]*</);
       assert.match(groups[1], /terminal attached<span[^>]*> · 11m<\/span>/);
       assert.match(groups[1], /last used <time[^>]*>12:31 PM<\/time>/);
       assert.match(groups[1], new RegExp(`data-session-at="${started}"`));

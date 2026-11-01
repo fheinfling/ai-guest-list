@@ -21,6 +21,7 @@ import pytest
 
 from acctsw import seatproxy as SP
 from acctsw.seatproxy import Hit, Seat, SeatProxy, classify, tok
+from acctsw.sessionca import SessionCA
 
 sys.path.insert(0, str(Path(__file__).parent / "fixtures"))
 import fake_anthropic as FA  # noqa: E402
@@ -216,7 +217,7 @@ def parse(raw: bytes, method: str = "POST") -> Parsed:
 def rules(h: Harness, **by_seat) -> None:
     """``rules(h, a=429, b=401)``: answer seat A's token with 429, seat B's with 401."""
     seats = {"a": A, "b": B, "c": C, "client": Seat("", CLIENT_TOKEN)}
-    h.fake.update({"status_by_token": {tok(seats[k].token): v for k, v in by_seat.items()}})
+    h.fake.update({"status_by_token": {FA.tok(seats[k].token): v for k, v in by_seat.items()}})
 
 
 def bearers(h: Harness) -> list[str | None]:
@@ -412,7 +413,7 @@ def test_unbound_proxy_is_pure_passthrough():
     h = Harness()
     assert h.proxy.bound() == Seat("", None)
     h.send()
-    assert bearers(h) == [tok(CLIENT_TOKEN)]
+    assert bearers(h) == [FA.tok(CLIENT_TOKEN)]
 
 
 def test_hop_by_hop_headers_are_dropped_and_length_recomputed():
@@ -450,14 +451,14 @@ def test_limit_replays_on_the_decided_seat_and_binds_it():
     h.answers = [B]
     resp, _ = h.send()
     assert resp.status == 200
-    assert bearers(h) == [tok(A.token), tok(B.token)]
+    assert bearers(h) == [FA.tok(A.token), FA.tok(B.token)]
     assert h.proxy.bound() == B
     [hit] = h.hits
     assert (hit.kind, hit.seat, hit.claim) == ("limit", A.email, "five_hour")
     assert datetime.fromisoformat(hit.reset_at).timestamp() == h.fake.reset
     assert "rate limit" in hit.detail
     h.send()    # the next request goes straight to B
-    assert bearers(h)[-1] == tok(B.token) and len(h.hits) == 1
+    assert bearers(h)[-1] == FA.tok(B.token) and len(h.hits) == 1
 
 
 @pytest.mark.parametrize("claim", ["five_hour", "seven_day", "seven_day_opus", None])
@@ -487,7 +488,7 @@ def test_limit_on_home_replays_on_a_seat():
     h.answers = [B]
     resp, _ = h.send()
     assert resp.status == 200
-    assert bearers(h) == [tok(CLIENT_TOKEN), tok(B.token)]
+    assert bearers(h) == [FA.tok(CLIENT_TOKEN), FA.tok(B.token)]
     assert h.hits[0].seat == HOME.email
 
 
@@ -498,7 +499,7 @@ def test_limit_back_to_home_uses_the_client_login():
     h.answers = [HOME]
     resp, _ = h.send()
     assert resp.status == 200
-    assert bearers(h) == [tok(A.token), tok(CLIENT_TOKEN)]
+    assert bearers(h) == [FA.tok(A.token), FA.tok(CLIENT_TOKEN)]
     assert h.proxy.bound() == HOME
 
 
@@ -510,7 +511,7 @@ def test_transient_429_and_529_pass_through(status):
     h.answers = [B]
     resp, _ = h.send()
     assert resp.status == (429 if status == FA.TRANSIENT_429 else 529)
-    assert h.hits == [] and bearers(h) == [tok(A.token)]
+    assert h.hits == [] and bearers(h) == [FA.tok(A.token)]
     assert h.proxy.bound() == A
 
 
@@ -523,7 +524,7 @@ def test_limit_without_an_answer_passes_the_429_through_verbatim():
     assert resp.headers["anthropic-ratelimit-unified-status"] == "rejected"
     assert resp.headers["anthropic-ratelimit-unified-reset"] == str(h.fake.reset)
     assert resp.json()["error"]["type"] == "rate_limit_error"
-    assert bearers(h) == [tok(A.token)] and h.proxy.bound() == A
+    assert bearers(h) == [FA.tok(A.token)] and h.proxy.bound() == A
 
 
 def test_decide_timeout_passes_the_limit_through():
@@ -541,7 +542,7 @@ def test_decide_timeout_passes_the_limit_through():
         gate.set()
         worker.join(5)
     assert out["r"][0].status == 429
-    assert bearers(h) == [tok(A.token)]
+    assert bearers(h) == [FA.tok(A.token)]
     assert any(e == "decide_timeout" for e, _ in h.logs)
 
 
@@ -586,7 +587,7 @@ def test_each_credential_is_tried_once():
     rules(h, a=429, b=429)
     resp, _ = h.send()
     assert resp.status == 429
-    assert bearers(h) == [tok(A.token), tok(B.token)]
+    assert bearers(h) == [FA.tok(A.token), FA.tok(B.token)]
 
 
 def test_answering_the_seat_that_hit_is_not_a_replay():
@@ -594,7 +595,7 @@ def test_answering_the_seat_that_hit_is_not_a_replay():
     h.proxy.bind(A)
     rules(h, a=429)
     resp, _ = h.send()
-    assert resp.status == 429 and bearers(h) == [tok(A.token)]
+    assert resp.status == 429 and bearers(h) == [FA.tok(A.token)]
 
 
 def test_upstream_sends_are_capped():
@@ -622,7 +623,7 @@ def test_concurrent_rebind_is_followed_without_asking():
     h.t.before_response = another_request_moved_on
     resp, _ = h.send()
     assert resp.status == 200
-    assert bearers(h) == [tok(A.token), tok(B.token)]
+    assert bearers(h) == [FA.tok(A.token), FA.tok(B.token)]
     assert h.hits == []
 
 
@@ -654,7 +655,7 @@ def test_home_401_passes_through_without_decide():
     h.answers = [B]
     resp, _ = h.send()
     assert resp.status == 401
-    assert h.hits == [] and bearers(h) == [tok(CLIENT_TOKEN)]
+    assert h.hits == [] and bearers(h) == [FA.tok(CLIENT_TOKEN)]
     assert h.proxy.bound() == HOME
 
 
@@ -666,7 +667,7 @@ def test_injected_401_replays_on_a_reread_token():
     h.answers = [fresh]
     resp, _ = h.send()
     assert resp.status == 200
-    assert bearers(h) == [tok(B.token), tok(fresh.token)]
+    assert bearers(h) == [FA.tok(B.token), FA.tok(fresh.token)]
     assert h.hits[0].kind == "auth" and h.hits[0].seat == B.email
     assert h.hits[0].reset_at is None and h.hits[0].detail == "OAuth token has expired."
     assert h.proxy.bound() == fresh
@@ -678,7 +679,7 @@ def test_injected_401_without_answer_fails_open():
     rules(h, b=401)
     resp, _ = h.send()
     assert resp.status == 200
-    assert bearers(h) == [tok(B.token), tok(CLIENT_TOKEN)]
+    assert bearers(h) == [FA.tok(B.token), FA.tok(CLIENT_TOKEN)]
     assert h.proxy.bound() == B    # no answer, no rebind
 
 
@@ -688,7 +689,7 @@ def test_injected_401_then_client_401_passes_through():
     rules(h, b=401, client=401)
     resp, _ = h.send()
     assert resp.status == 401
-    assert bearers(h) == [tok(B.token), tok(CLIENT_TOKEN)]
+    assert bearers(h) == [FA.tok(B.token), FA.tok(CLIENT_TOKEN)]
     assert len(h.hits) == 1
 
 
@@ -918,6 +919,7 @@ def test_tls_context_adds_the_users_ca_files(no_proxy_env):
     no_proxy_env.setenv("NODE_EXTRA_CA_CERTS", "/etc/corp-ca.pem")
     up = SP._Upstream("https://api.anthropic.com")
     assert up.ssl is ctx
+    assert ctx.minimum_version == SP.ssl.TLSVersion.TLSv1_2
     assert ctx.loaded == [("capath", "/etc/corp-certs"), ("cafile", "/etc/corp-ca.pem")]
 
 
@@ -926,6 +928,7 @@ def test_tls_context_without_extras_is_the_default(no_proxy_env):
         no_proxy_env.delenv(var, raising=False)
     ctx = SP._tls_context()
     assert ctx.verify_mode == SP.ssl.CERT_REQUIRED and ctx.check_hostname
+    assert ctx.minimum_version == SP.ssl.TLSVersion.TLSv1_2
 
 
 def test_preflight_sends_a_tokenless_head_on_a_fresh_connection():
@@ -953,12 +956,10 @@ def test_preflight_reports_why_upstream_is_unusable(exc, reason):
     assert got is not None and got.startswith(reason) and len(got) <= 200
 
 
-def test_preflight_real_tls_needs_the_users_ca(tmp_path, no_proxy_env):
+def test_preflight_real_tls_needs_the_users_ca(tmp_path, session_ca, no_proxy_env):
     """A TLS handshake over a socketpair against a certificate from a private CA: it fails with the
     default trust and passes once NODE_EXTRA_CA_CERTS names the CA."""
-    certs = _make_certs(tmp_path)
-    server_ctx = SP.ssl.SSLContext(SP.ssl.PROTOCOL_TLS_SERVER)
-    server_ctx.load_cert_chain(certs["leaf"], certs["key"])
+    server_ctx = session_ca.server_context()
     fake = FA.FakeAnthropic()
     handler = FA.make_handler(fake)
 
@@ -979,7 +980,9 @@ def test_preflight_real_tls_needs_the_users_ca(tmp_path, no_proxy_env):
         no_proxy_env.delenv(var, raising=False)
     untrusted = SeatProxy(lambda hit: None).preflight(timeout=5)
     assert untrusted is not None and untrusted.startswith("tls: "), untrusted
-    no_proxy_env.setenv("NODE_EXTRA_CA_CERTS", str(certs["ca"]))
+    ca_path = tmp_path / "ca.pem"
+    ca_path.write_text(session_ca.ca_pem())
+    no_proxy_env.setenv("NODE_EXTRA_CA_CERTS", str(ca_path))
     assert SeatProxy(lambda hit: None).preflight(timeout=5) is None
     assert [r["method"] for r in fake.requests] == ["HEAD"]
     assert fake.requests[0]["bearer"] is None
@@ -988,25 +991,6 @@ def test_preflight_real_tls_needs_the_users_ca(tmp_path, no_proxy_env):
 class _NoDelaySocket(socket.socket):
     def setsockopt(self, *_args):
         pass
-
-
-def _make_certs(tmp: Path) -> dict:
-    import shutil
-    import subprocess
-    if not shutil.which("openssl"):
-        pytest.skip("openssl not available to mint a throwaway CA")
-    run = lambda *a: subprocess.run(["openssl", *a], cwd=tmp, check=True, capture_output=True)
-    run("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", "ca.key", "-out", "ca.pem", "-days", "1",
-        "-subj", "/CN=seatproxy test CA", "-addext", "basicConstraints=critical,CA:TRUE",
-        "-addext", "keyUsage=critical,keyCertSign,cRLSign")
-    run("req", "-newkey", "rsa:2048", "-nodes", "-keyout", "leaf.key", "-out", "leaf.csr",
-        "-subj", "/CN=api.anthropic.com")
-    (tmp / "leaf.ext").write_text("subjectAltName=DNS:api.anthropic.com\nbasicConstraints=CA:FALSE\n"
-                                  "extendedKeyUsage=serverAuth\nsubjectKeyIdentifier=hash\n"
-                                  "authorityKeyIdentifier=keyid,issuer\n")
-    run("x509", "-req", "-in", "leaf.csr", "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial",
-        "-out", "leaf.pem", "-days", "1", "-extfile", "leaf.ext")
-    return {"ca": tmp / "ca.pem", "leaf": tmp / "leaf.pem", "key": tmp / "leaf.key"}
 
 
 # --- over the wire: socketpairs always, TCP on 127.0.0.1 where binding is allowed ---------------
@@ -1142,11 +1126,11 @@ def live(request, monkeypatch):
 
 def test_wire_limit_failover_and_secret(live):
     live.proxy.bind(A)
-    live.fake.update({"status_by_token": {tok(A.token): 429}})
+    live.fake.update({"status_by_token": {FA.tok(A.token): 429}})
     live.answers.append(B)
     _, resp = live.post("/v1/messages?beta=true")
     assert resp.status == 200 and json.loads(resp.read())["type"] == "message"
-    assert [r["bearer"] for r in live.fake.requests] == [tok(A.token), tok(B.token)]
+    assert [r["bearer"] for r in live.fake.requests] == [FA.tok(A.token), FA.tok(B.token)]
     assert live.proxy.bound() == B
     conn = live.client()
     conn.request("POST", "/v1/messages", body=MSG)
@@ -1156,7 +1140,7 @@ def test_wire_limit_failover_and_secret(live):
 
 def test_wire_limit_passes_through_verbatim(live):
     live.proxy.bind(A)
-    live.fake.update({"status_by_token": {tok(A.token): 429}})
+    live.fake.update({"status_by_token": {FA.tok(A.token): 429}})
     _, resp = live.post("/v1/messages")
     assert resp.status == 429
     assert resp.headers["anthropic-ratelimit-unified-status"] == "rejected"
@@ -1234,24 +1218,12 @@ def test_tcp_stop_closes_the_listener(monkeypatch):
 
 # --- CONNECT: the HTTPS_PROXY transport (socketpairs only) -------------------------------------
 
-class FakeCA:
-    """Stands in for ``sessionca.SessionCA``: a server context for api.anthropic.com from a
-    throwaway CA, ``ca_path`` for the client side to trust."""
-
-    def __init__(self, certs: dict):
-        self.certs = certs
-        self.ca_path = str(certs["ca"])
-
-    def server_context(self):
-        ctx = SP.ssl.SSLContext(SP.ssl.PROTOCOL_TLS_SERVER)
-        ctx.load_cert_chain(self.certs["leaf"], self.certs["key"])
-        ctx.set_alpn_protocols(["http/1.1"])
-        return ctx
-
-
 @pytest.fixture(scope="module")
 def session_ca(tmp_path_factory):
-    return FakeCA(_make_certs(tmp_path_factory.mktemp("session-ca")))
+    # Use the production extensions even with macOS LibreSSL and Python's strict verifier.
+    ca = SessionCA(tmp_root=tmp_path_factory.mktemp("session-ca"))
+    yield ca
+    ca.close()
 
 
 def _proxy_auth(proxy, user=SP.PROXY_USER, secret=None) -> str:
@@ -1363,8 +1335,9 @@ def test_start_url_carries_the_proxy_credentials(monkeypatch):
     assert proxy._proxy_auth_ok(_proxy_auth(proxy, user=unquote(u.username), secret=unquote(u.password)))
 
 
-def _tls(sock, ca: FakeCA | None):
-    ctx = SP.ssl.create_default_context(cafile=ca.ca_path if ca else None)
+def _tls(sock, ca: SessionCA | None):
+    ctx = SP.ssl.create_default_context(cadata=ca.ca_pem() if ca else None)
+    ctx.verify_flags |= SP.ssl.VERIFY_X509_STRICT
     return ctx.wrap_socket(sock, server_hostname="api.anthropic.com")
 
 
@@ -1390,7 +1363,7 @@ def test_connect_to_the_api_is_decrypted_and_injected(session_ca):
         resp, body = _oauth_post(conn)
         assert resp.status == 200 and json.loads(body)["type"] == "message"
     conn.close()
-    assert bearers(h) == [tok(B.token), tok(B.token)]
+    assert bearers(h) == [FA.tok(B.token), FA.tok(B.token)]
     assert h.t.sent[0]["url"] == "/v1/messages?beta=true"
     assert h.proxy.messages_seen() == 2
 
@@ -1407,7 +1380,7 @@ def test_connect_to_the_api_limit_replays_inside_the_tunnel(session_ca):
     resp, _ = _oauth_post(conn)
     conn.close()
     assert (status, resp.status) == (200, 200)
-    assert bearers(h) == [tok(A.token), tok(B.token)]
+    assert bearers(h) == [FA.tok(A.token), FA.tok(B.token)]
 
 
 @pytest.mark.parametrize("target,address", [("example.com:443", ("example.com", 443)),
@@ -1504,7 +1477,7 @@ def test_decrypted_request_needs_no_secret_path():
         ("Authorization", f"Bearer {CLIENT_TOKEN}"), ("anthropic-beta", "oauth-2025-04-20")],
         MSG, wire, authority="api.anthropic.com:443")
     assert parse(wire.getvalue()).status == 200
-    assert bearers(h) == [tok(B.token)]
+    assert bearers(h) == [FA.tok(B.token)]
     wire = Wire()
     h.proxy.handle("GET", "http://api.anthropic.com/v1/models", [], b"", wire,
                    authority="api.anthropic.com:443")
@@ -1524,13 +1497,13 @@ def loopback_only(monkeypatch):
     monkeypatch.setattr(socket, "create_connection", local_only)
 
 
-def _tcp_client(url: str, ca: FakeCA | None, *, auth: bool = True):
+def _tcp_client(url: str, ca: SessionCA | None, *, auth: bool = True):
     """An ``http.client`` HTTPS connection to api.anthropic.com through the proxy at ``url``,
     the way any HTTPS_PROXY-aware client tunnels (CONNECT, then TLS inside)."""
     import base64
     from urllib.parse import unquote, urlsplit
     u = urlsplit(url)
-    ctx = SP.ssl.create_default_context(cafile=ca.ca_path if ca else None)
+    ctx = SP.ssl.create_default_context(cadata=ca.ca_pem() if ca else None)
     conn = http.client.HTTPSConnection(u.hostname, u.port, timeout=10, context=ctx)
     headers = {}
     if auth:
@@ -1554,7 +1527,7 @@ def test_tcp_connect_is_decrypted_and_injected(loopback_only, session_ca):
         conn.close()
     finally:
         h.proxy.stop()
-    assert bearers(h) == [tok(B.token), tok(B.token)]
+    assert bearers(h) == [FA.tok(B.token), FA.tok(B.token)]
     assert h.proxy.messages_seen() == 2
 
 
@@ -1784,7 +1757,7 @@ class WsUpstream:
 
 def _ws_proxy(session_ca, **kwargs):
     proxy = SeatProxy(lambda hit: None, ca=session_ca, **kwargs)
-    proxy._transport.ssl = SP.ssl.create_default_context(cafile=session_ca.ca_path)
+    proxy._transport.ssl = SP.ssl.create_default_context(cadata=session_ca.ca_pem())
     proxy.bind(B)
     return proxy
 

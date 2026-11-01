@@ -190,6 +190,7 @@ def _tls_context() -> ssl.SSLContext:
     """The default trust store plus the CA files the user points Python, OpenSSL or Node at (a
     corporate TLS-inspecting proxy is usually trusted only through one of those)."""
     ctx = ssl.create_default_context()
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     for var, kind in (("SSL_CERT_FILE", "cafile"), ("SSL_CERT_DIR", "capath"),
                       ("NODE_EXTRA_CA_CERTS", "cafile")):
         value = os.environ.get(var)
@@ -889,6 +890,9 @@ def _make_handler(proxy: SeatProxy, authority: str | None = None):
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        # A two-word request line (e.g. "CONNECT  HTTP/1.1", empty authority) is HTTP/0.9 to the
+        # stdlib on 3.11, and 0.9 error replies carry no status line. This proxy never speaks 0.9.
+        default_request_version = "HTTP/1.1"
         timeout = CLIENT_IDLE_TIMEOUT
         # Unbuffered: nothing past a head may be read ahead. After a CONNECT those bytes belong to
         # the tunnel or the TLS handshake, after an upgrade to the spliced stream.

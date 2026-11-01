@@ -375,7 +375,7 @@ def test_a_seat_already_tried_is_not_asked_for_again():
     h.answers += [B, B]
     resp, _ = h.send()
     assert resp.status == 429
-    assert TS.bearers(h) == [tok(A.token), tok(B.token)]    # B is not retried
+    assert TS.bearers(h) == [TS.FA.tok(A.token), TS.FA.tok(B.token)]    # B is not retried
 
 
 def test_a_passed_through_limit_is_logged_as_a_request():

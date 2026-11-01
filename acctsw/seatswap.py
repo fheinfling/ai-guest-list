@@ -623,6 +623,7 @@ class SeatSwap:
             server_sock.settimeout(SELFTEST_TIMEOUT_S)
             client_sock.settimeout(SELFTEST_TIMEOUT_S)
             client_ctx = ssl.create_default_context(cadata=self.ca.ca_pem())   # nothing else
+            client_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
             server_ctx = self.ca.server_context()
 
             def serve():

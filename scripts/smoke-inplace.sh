@@ -56,7 +56,7 @@ from pathlib import Path
 root, out, claude = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
 sys.path[:0] = [str(root), str(root / "tests" / "fixtures")]
 import fake_anthropic as FA
-from acctsw.seatproxy import Seat, SeatProxy, tok
+from acctsw.seatproxy import Seat, SeatProxy
 from acctsw.sessionca import SessionCA
 
 # The proxy's own upstream decisions read the launcher-side environment: the fake API on 127.0.0.1
@@ -68,7 +68,7 @@ os.environ["NO_PROXY"] = os.environ["no_proxy"] = "127.0.0.1,localhost"
 A = Seat("a@smoke.invalid", "sk-ant-oat01-smoke-A-" + secrets.token_hex(12))
 B = Seat("b@smoke.invalid", "sk-ant-oat01-smoke-B-" + secrets.token_hex(12))
 CLIENT = "sk-ant-oat01-smoke-client-" + secrets.token_hex(12)
-NAMES = {tok(A.token): "A", tok(B.token): "B", tok(CLIENT): "client"}
+NAMES = {FA.tok(A.token): "A", FA.tok(B.token): "B", FA.tok(CLIENT): "client"}
 
 STAND_IN = r'''
 import base64, http.client, json, os, ssl, sys
@@ -225,14 +225,14 @@ run("a-intercept", "say hi", bind=B, rules={}, answer=None, trust_ca=True, expec
     "claude succeeded": lambda f: f["rc"] == 0 and not f["is_error"],
     "went through the intercepted tunnel": lambda f: f["intercepts"] >= 1 and f["proxy_auth_failed"] == 0,
     "fake API saw seat B's injected bearer": lambda f: f["upstream"] and all(s == "B" for s, _ in f["upstream"]),
-    "answered by B": lambda f: tok(B.token) in f["result"],
+    "answered by B": lambda f: FA.tok(B.token) in f["result"],
     "no tls reject": lambda f: f["tls_rejects"] == 0})
 run("b-limit", "run the tool", bind=A, answer=B, trust_ca=True,
-    rules={"tool_first": True, "next": [200], "status_by_token": {tok(A.token): 429}}, expect={
+    rules={"tool_first": True, "next": [200], "status_by_token": {FA.tok(A.token): 429}}, expect={
     "claude succeeded": lambda f: f["rc"] == 0 and not f["is_error"],
     "A, A 429, then B": lambda f: f["upstream"][:3] == [("A", 200), ("A", 429), ("B", 200)],
     "one limit hit on A": lambda f: f["hits"] == [("limit", A.email)],
-    "session continued on B": lambda f: tok(B.token) in f["result"]})
+    "session continued on B": lambda f: FA.tok(B.token) in f["result"]})
 run("c-tls-reject", "say hi", bind=B, rules={}, answer=None, trust_ca=False, expect={
     "on_tls_reject fired once": lambda f: f["tls_rejects"] == 1,
     "nothing reached the fake API": lambda f: f["upstream"] == [],
