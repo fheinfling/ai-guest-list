@@ -48,6 +48,7 @@ import unicodedata
 
 from . import codexhome
 from .errors import AcctswError, CredentialIdentityMismatch, MissingSnapshot
+from .keychain import KeychainError
 from .util import atomic_write_text, iso, now, parse_iso
 
 PRIVATE = frozenset({
@@ -275,8 +276,13 @@ def prepare(ctx, email: str) -> None:
 
 
 def prepare_all(ctx) -> None:
+    """Prepare homes without letting a failed preparation abort the remaining seats."""
     for email in ctx.load_state().accounts("claude"):
-        prepare(ctx, email)
+        try:
+            prepare(ctx, email)
+        except (KeychainError, OSError):
+            # Leave this home alone if preparation itself failed.
+            logging.getLogger(__name__).warning("Skipping unreadable Claude home for %s", email)
 
 
 def ensure_home(ctx, email: str, *, promote: bool = False, capture: bool = False) -> Path:
@@ -356,14 +362,14 @@ def mirror_identity(ctx, email: str) -> None:
         atomic_write_text(path, json.dumps(config, indent=2), mode=0o600)
 
 
-def load(ctx, email: str) -> str | None:
+def load(ctx, email: str, *, strict: bool = False) -> str | None:
     """Fresh per-seat bytes; a different /login identity is never attributed to the old seat."""
     home = ctx.claude_home(email)
     if not home.exists():
-        return ctx.snapshot_get("claude", email)  # pre-migration
+        return ctx.snapshot_get("claude", email, strict=strict)  # pre-migration
     if (home / ".acctsw-quarantined").exists():
         return None
-    return ctx.claude_cred(email).get_live()
+    return ctx.claude_cred(email).get_live(strict=strict)
 
 
 def keep_warm(ctx, at=None, *, run=None) -> str | None:

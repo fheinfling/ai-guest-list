@@ -824,7 +824,14 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
                 # my seat" tapped before sign-in completes (creds unchanged) is rejected instead of
                 # silently re-adding the old seat. (sync_back doesn't change live creds, so capturing
                 # here == capturing just before launch.) Reading creds is a quick, lock-free read.
-                self._login_baseline[msg["tool"]] = (op, self._credDigest(msg["tool"]))
+                from acctsw.keychain import KeychainError
+                try:
+                    digest = self._credDigest(msg["tool"])
+                except (KeychainError, OSError):
+                    self._pushResult({"ok": False, "add_op": True, "tool": msg["tool"],
+                                      "error": "couldn't read the current login; unlock Keychain and try again"})
+                    return
+                self._login_baseline[msg["tool"]] = (op, digest)
                 # Off the main thread: prepare_then_login holds ctx.locked() and spawns `open` to launch
                 # the sign-in terminal — on the main thread it would beachball behind a usage poll
                 # holding the same lock.

@@ -56,7 +56,7 @@ def codex_jwt_matches(email: str, blob: str) -> bool:
 
 class CredLocation(Protocol):
     tool: str
-    def get_live(self) -> str | None: ...
+    def get_live(self, *, strict: bool = False) -> str | None: ...
     def set_live(self, blob: str) -> None: ...
     def email_of(self, blob: str) -> str | None: ...
 
@@ -69,7 +69,7 @@ class CodexCredLocation:
     def __init__(self, auth_path: Path) -> None:
         self.auth_path = Path(auth_path)
 
-    def get_live(self) -> str | None:
+    def get_live(self, *, strict: bool = False) -> str | None:
         try:
             return self.auth_path.read_text(encoding="utf-8")
         except FileNotFoundError:
@@ -122,9 +122,9 @@ class ClaudeCredLocation:
         self.service = service
         self.account = account
 
-    def get_live(self) -> str | None:
+    def get_live(self, *, strict: bool = False) -> str | None:
         try:
-            stored = self.keychain.get_raw(self.service, self.account)
+            stored = self.keychain.get_raw(self.service, self.account, strict=strict)
         except Exception:
             raise KeychainError("Claude credentials could not be read") from None
         if stored is None or _is_json(stored):

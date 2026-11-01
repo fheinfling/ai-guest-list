@@ -63,3 +63,22 @@ def test_restart_timeout_reports_failure_without_launching(monkeypatch):
     call("waitForCodexExit_", receiver, timer)
     assert receiver._codex_restart_pending is False
     assert events == [("couldn't restart Codex", "Codex did not quit within 10 seconds")]
+
+
+@pytest.mark.parametrize("failure", ["keychain", "os"])
+def test_login_with_unreadable_baseline_returns_a_correlated_error(failure):
+    from acctsw.keychain import KeychainError
+    replies = []
+
+    def unreadable(tool):
+        raise (KeychainError if failure == "keychain" else OSError)("locked")
+
+    receiver = SimpleNamespace(_login_seq=0, _login_baseline={}, _credDigest=unreadable,
+                               _pushResult=replies.append)
+    message = SimpleNamespace(body=lambda: {"action": "login", "tool": "claude"})
+    menubar.AGLDelegate.userContentController_didReceiveScriptMessage_.callable(receiver, None, message)
+    assert len(replies) == 1
+    assert replies[0]["ok"] is False and replies[0]["add_op"] is True
+    assert replies[0]["tool"] == "claude"
+    assert "couldn't read" in replies[0]["error"]
+    assert receiver._login_baseline == {}

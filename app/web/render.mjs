@@ -60,7 +60,15 @@ export function needsHello(seat) {
 // not signed out and keeps "check your subscription".
 export function signedOut(seat) {
   if (typeof seat?.signed_out === "boolean") return seat.signed_out;
-  return seat?.needs_login === true || needsHello(seat || {});
+  return !entitlementRevoked(seat) && (seat?.needs_login === true || needsHello(seat || {}));
+}
+
+function entitlementRevoked(seat) {
+  return seat?.entitlement_revoked === true || seat?.usage?.error === "forbidden";
+}
+
+function signinNeeded(seat) {
+  return seat?.needs_login === true && !entitlementRevoked(seat);
 }
 
 // The engine marks the seat in use with `active`, also when its status is "needs-login".
@@ -77,7 +85,7 @@ export function signinExpiring(seat, now = Date.now()) {
 
 // A seat that can actually take work: ready or on now, and signed in.
 export function usable(seat) {
-  return !seat?.limited && ["ready", "active"].includes(seat?.status) && !signedOut(seat);
+  return !seat?.limited && ["ready", "active"].includes(seat?.status) && !signinNeeded(seat) && !entitlementRevoked(seat) && !signedOut(seat);
 }
 
 // A window whose reset time already passed is mid-refresh, not "in now": say so neutrally.
@@ -196,6 +204,8 @@ function bar(seat, win, label) {
 // 0% and the reset countdown, so the label only has to carry "despite that".
 function seatAction(tool, seat, placement = "all") {
   const add = (label) => placement === "switch" ? "" : `<button class="row-action" data-action="add" data-tool="${tool}" data-email="${esc(seat.email)}">${label}</button>`;
+  if (entitlementRevoked(seat)) return "";
+  if (signinNeeded(seat)) return add("sign in");
   if (signedOut(seat)) return add("sign in");
   const again = signinExpiring(seat) ? add("sign in again") : "";
   if (isActive(seat)) return again;
@@ -215,7 +225,9 @@ function seatCard(tool, seat) {
   const reported = seat?.usage?.reported_windows;
   const weeklyOnly = tool === "codex" && Array.isArray(reported) && reported.includes("weekly") && !reported.includes("5h");
   const out = signedOut(seat);
-  const stateText = out ? (isActive(seat) ? "on now · signed out" : "signed out")
+  const stateText = entitlementRevoked(seat) ? "check your subscription to refresh usage"
+    : !out && signinNeeded(seat) ? "sign-in needed"
+    : out ? (isActive(seat) ? "on now · signed out" : "signed out")
     : seat.status === "resting"
     ? `<span data-reset-at="${esc(seat.limited_until)}" data-clock-prefix="back in" title="${esc(fmtClock(seat.limited_until))}">back in ${fmtCountdown(seat.limited_until)}</span>`
     : isActive(seat) ? (seat.in_session ? "on the floor" : "selected")
@@ -653,7 +665,9 @@ function ledgerFacts(state) {
   }
   for (const seat of seats) {
     const name = `${esc(TOOL_META[seat.tool].label)} ${esc(seat.name || seat.email)}`;
-    if (signedOut(seat)) facts.push(`${name} signed out`);
+    if (entitlementRevoked(seat)) facts.push(`${name}: check your subscription to refresh usage`);
+    else if (signedOut(seat)) facts.push(`${name} signed out`);
+    else if (signinNeeded(seat)) facts.push(`${name}: sign-in needed`);
     else if (signinExpiring(seat)) facts.push(`${name}: ${signinExpiryLine(seat, "span")}`);
   }
   return facts.length ? `<div class="ledger-facts" role="status">${stateGlyph("warn")}<span>${facts.join("; ")}</span></div>` : "";
@@ -677,7 +691,7 @@ function groupNext(tool, seats, state) {
 
 function usageIssue(tool, seat) {
   const error = seat.usage?.error;
-  return ({ rate_limited: "updates throttled; retrying automatically", network: "connection unavailable; retrying automatically",
+  return entitlementRevoked(seat) ? "check your subscription to refresh usage" : ({ rate_limited: "updates throttled; retrying automatically", network: "connection unavailable; retrying automatically",
     token_expired: `open ${TOOL_META[tool].label} to refresh usage`, unauthorized: "sign in to refresh usage", forbidden: "check your subscription to refresh usage", no_token: "sign in to refresh usage" })[error] || (error ? "usage update failed; retrying automatically" : "");
 }
 
@@ -697,7 +711,8 @@ function rosterTable(state) {
         const active = isActive(seat);
         const out = signedOut(seat);
         const limited = limitedSeat(seat);
-        const status = out ? (active ? "on now · signed out" : "signed out") : limited ? "limited" : active ? "on now" : "ready";
+        const attention = signinNeeded(seat) || entitlementRevoked(seat);
+        const status = entitlementRevoked(seat) ? "check your subscription to refresh usage" : !out && signinNeeded(seat) ? "sign-in needed" : out ? (active ? "on now · signed out" : "signed out") : limited ? "limited" : active ? "on now" : "ready";
         const resets = [];
         const windows = ["5h", "weekly"].map((win) => {
           const reported = seat.usage?.reported_windows;
@@ -718,12 +733,13 @@ function rosterTable(state) {
           ? ` data-action="switch" data-tool="${esc(tool)}" data-email="${esc(seat.email)}"` : "";
         const issues = [];
         if (out) issues.push("signed out; sign in to see usage");
+        if (!out && signinNeeded(seat)) issues.push("sign-in needed");
         if (!out && signinExpiring(seat)) issues.push(signinExpiryLine(seat, "span"));
         if (limited) issues.push(`limited; ${returnTime(seat)}`);
         const error = usageIssue(tool, seat);
         if (!out && error) issues.push(esc(error));
         if (!out && (seat.usage_stale || seat.usage_unknown)) issues.push(`${seat.usage_unknown ? "usage unknown" : "last known reading"}; <span data-usage-at="${esc(seat.usage_fetched_at || seat.usage?.fetched_at || "")}">${fmtUsageAge(seat.usage_fetched_at || seat.usage?.fetched_at)}</span>`);
-        return `<tr class="${active && !out ? "roster-active" : ""}${out ? " roster-signedout" : ""}${limited ? " roster-limited" : ""}${rowAction ? " roster-actionable" : ""}"${rowAction} data-seat-email="${esc(seat.email)}"><td class="roster-state">${stateGlyph(out ? "out" : limited ? "limited" : active ? "active" : "ready")}<span class="roster-status">${status}</span></td><th scope="row">${identity}</th>${windows}<td class="roster-last">${action && !limited ? action : ""}${resets.length ? `<span class="roster-resets${action && !limited ? " sr-only" : ""}">${resets.join("")}</span>` : ""}</td></tr>${issues.length ? `<tr class="roster-issue${out ? " issue-danger" : ""}" data-tool="${esc(tool)}" data-email="${esc(seat.email)}"><td colspan="5"><div class="issue-line" role="group" aria-label="${esc(TOOL_META[tool].label)} ${esc(seat.name || seat.email)} attention">${stateGlyph(out ? "out" : "warn")}<span class="issue-text">${issues.join("; ")}</span>${signin}${limited ? action : ""}</div></td></tr>` : ""}`;
+        return `<tr class="${active && !out && !attention ? "roster-active" : ""}${out ? " roster-signedout" : ""}${limited ? " roster-limited" : ""}${rowAction ? " roster-actionable" : ""}"${rowAction} data-seat-email="${esc(seat.email)}"><td class="roster-state">${stateGlyph(out ? "out" : attention ? "warn" : limited ? "limited" : active ? "active" : "ready")}<span class="roster-status">${status}</span></td><th scope="row">${identity}</th>${windows}<td class="roster-last">${action && !limited ? action : ""}${resets.length ? `<span class="roster-resets${action && !limited ? " sr-only" : ""}">${resets.join("")}</span>` : ""}</td></tr>${issues.length ? `<tr class="roster-issue${out ? " issue-danger" : ""}" data-tool="${esc(tool)}" data-email="${esc(seat.email)}"><td colspan="5"><div class="issue-line" role="group" aria-label="${esc(TOOL_META[tool].label)} ${esc(seat.name || seat.email)} attention">${stateGlyph(out ? "out" : "warn")}<span class="issue-text">${issues.join("; ")}</span>${signin}${limited ? action : ""}</div></td></tr>` : ""}`;
       }).join("")}${keys.map((key) => `<tr class="roster-key roster-actionable" data-action="key-terminal" data-id="${esc(key.id)}"><td class="roster-state">${stateGlyph("key")}<span class="roster-status">${spending.has(key.id) ? "spending now" : "api key"}</span></td><th scope="row"><span class="roster-identity" title="${esc(key.label)}">${esc(key.label)}</span>${key.model ? `<span class="roster-meta" title="${esc(key.model)}">${esc(key.model)}</span>` : ""}</th><td class="roster-key-terms" colspan="2"><span class="key-terms">paid per token<span class="sr-only">; no app spend cap</span></span></td><td class="roster-last"><button class="row-action key-use" data-action="key-terminal" data-id="${esc(key.id)}" aria-label="${esc(`use ${key.label} in a new paid terminal`)}" title="use in a new paid terminal">new terminal</button></td></tr>`).join("")}</tbody>`;
       }).join("")}
     </table>`;

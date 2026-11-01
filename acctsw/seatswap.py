@@ -61,7 +61,6 @@ from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from . import seatkind, seattier
-from .keychain import KeychainError
 from .seatproxy import Seat
 from .selection import choose
 from .util import iso, now, parse_iso, write_json
@@ -317,10 +316,12 @@ class _Unreadable(Exception):
 
 
 def _load(ctx, email: str) -> str | None:
-    from . import claudehome
+    from . import claudehome, usage
     try:
-        return claudehome.load(ctx, email)
-    except (KeychainError, OSError) as exc:
+        # Eligibility and maintenance classify whether this login can still serve a session.
+        # A denied read is unknown, not an absent token that warrants moving or restarting it.
+        return claudehome.load(ctx, email, strict=True)
+    except usage.UNREADABLE as exc:
         raise _Unreadable(str(exc)) from None
 
 

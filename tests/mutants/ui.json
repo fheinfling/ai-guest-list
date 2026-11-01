@@ -13,8 +13,8 @@
  {
   "label": "signedOut ignores needs_login (old engine field)",
   "file": "app/web/render.mjs",
-  "old": "return seat?.needs_login === true ||",
-  "new": "return false ||",
+  "old": "return !entitlementRevoked(seat) && (seat?.needs_login === true ||",
+  "new": "return !entitlementRevoked(seat) && (false ||",
   "cmd": [
    "node",
    "--test",
@@ -57,7 +57,7 @@
  {
   "label": "signed-out active seat loses 'on now' honesty",
   "file": "app/web/render.mjs",
-  "old": "out ? (active ? \"on now \u00b7 signed out\" : \"signed out\") : limited ? \"limited\"",
+  "old": "out ? (active ? \"on now · signed out\" : \"signed out\") : limited ? \"limited\"",
   "new": "out ? \"signed out\" : limited ? \"limited\"",
   "cmd": [
    "node",
@@ -68,8 +68,8 @@
  {
   "label": "signed-out row still gets active styling",
   "file": "app/web/render.mjs",
-  "old": "${active && !out ? \"roster-active\"",
-  "new": "${active ? \"roster-active\"",
+  "old": "${active && !out && !attention ? \"roster-active\"",
+  "new": "${active && !attention ? \"roster-active\"",
   "cmd": [
    "node",
    "--test",
@@ -101,7 +101,7 @@
  {
   "label": "past roster reset renders 'in now'",
   "file": "app/web/render.mjs",
-  "old": "${resetIsPast(reset) ? \"resetting\u2026\" : `in ${fmtCountdown(reset)}`}",
+  "old": "${resetIsPast(reset) ? \"resetting…\" : `in ${fmtCountdown(reset)}`}",
   "new": "${`in ${fmtCountdown(reset)}`}",
   "cmd": [
    "node",
@@ -112,7 +112,7 @@
  {
   "label": "past window bar reset renders 'resets in now'",
   "file": "app/web/render.mjs",
-  "old": "${resetIsPast(reset) ? \"resetting\u2026\" : `window resets in ${fmtCountdown(reset)}`}",
+  "old": "${resetIsPast(reset) ? \"resetting…\" : `window resets in ${fmtCountdown(reset)}`}",
   "new": "${`window resets in ${fmtCountdown(reset)}`}",
   "cmd": [
    "node",
@@ -282,6 +282,52 @@
   "cmd": [
    "node",
    "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "ledger summary omits the signed-out warning",
+  "file": "app/web/render.mjs",
+  "old": "    else if (signedOut(seat)) facts.push(`${name} signed out`);",
+  "new": "    else if (false) facts.push(`${name} signed out`);",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "ledger verdict counts signed-out seats as ready",
+  "file": "app/web/render.mjs",
+  "old": "const ready = seats.filter(usable);\n  const facts",
+  "new": "const ready = seats.filter((s) => [\"ready\", \"active\"].includes(s.status));\n  const facts",
+  "cmd": [
+   "node",
+   "--test",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "signed-in auth failure loses its sign-in affordance",
+  "file": "app/web/render.mjs",
+  "old": "  if (signinNeeded(seat)) return add(\"sign in\");",
+  "new": "",
+  "cmd": [
+   "node",
+   "--test",
+   "--test-name-pattern=signed-in login failure",
+   "app/web/render.test.mjs"
+  ]
+ },
+ {
+  "label": "revoked entitlement is mistaken for a sign-in failure",
+  "file": "app/web/render.mjs",
+  "old": "  return seat?.entitlement_revoked === true || seat?.usage?.error === \"forbidden\";",
+  "new": "  return false;",
+  "cmd": [
+   "node",
+   "--test",
+   "--test-name-pattern=revoked subscription",
    "app/web/render.test.mjs"
   ]
  }

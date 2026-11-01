@@ -47,9 +47,9 @@ ITEM_NOT_FOUND = 44
 class KeychainBackend(Protocol):
     """Minimal generic-password store keyed by (service, account)."""
 
-    def get(self, service: str, account: str) -> str | None: ...
+    def get(self, service: str, account: str, *, strict: bool = False) -> str | None: ...
     def set(self, service: str, account: str, secret: str) -> None: ...
-    def get_raw(self, service: str, account: str) -> str | None: ...   # None only when absent
+    def get_raw(self, service: str, account: str, *, strict: bool = False) -> str | None: ...
     def set_raw(self, service: str, account: str, value: str) -> None: ...
     def delete(self, service: str, account: str) -> bool: ...
 
@@ -64,22 +64,21 @@ class SecurityKeychain:
     def __init__(self, security_path: str = "/usr/bin/security") -> None:
         self._security = security_path
 
-    def get(self, service: str, account: str) -> str | None:
-        stored = self.get_raw(service, account)
+    def get(self, service: str, account: str, *, strict: bool = False) -> str | None:
+        stored = self.get_raw(service, account, strict=strict)
         return None if stored is None else _decode(stored)
 
-    def get_raw(self, service: str, account: str) -> str | None:
-        """The item's bytes exactly as stored — no base64/hex decoding."""
+    def get_raw(self, service: str, account: str, *, strict: bool = False) -> str | None:
+        """Stored bytes, or None on failure. Strict reads distinguish unreadable from absent."""
         proc = subprocess.run(
             [self._security, "find-generic-password", "-s", service, "-a", account, "-w"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
         )
-        if proc.returncode == ITEM_NOT_FOUND:
-            return None
         if proc.returncode != 0:
-            # A locked keychain, a denied prompt or a broken backend says nothing about the item:
-            # reporting it absent would read as a logout of every seat at once.
-            raise KeychainError("keychain read failed")
+            if strict and proc.returncode != ITEM_NOT_FOUND:
+                # A locked keychain or denied prompt cannot prove a seat is signed out.
+                raise KeychainError("keychain read failed")
+            return None
         # `-w` prints the password with a trailing newline.
         return proc.stdout.rstrip("\n")
 
@@ -122,11 +121,11 @@ class InMemoryKeychain:
     def __init__(self) -> None:
         self._store: dict[tuple[str, str], str] = {}
 
-    def get(self, service: str, account: str) -> str | None:
-        stored = self.get_raw(service, account)
+    def get(self, service: str, account: str, *, strict: bool = False) -> str | None:
+        stored = self.get_raw(service, account, strict=strict)
         return None if stored is None else _decode(stored)
 
-    def get_raw(self, service: str, account: str) -> str | None:
+    def get_raw(self, service: str, account: str, *, strict: bool = False) -> str | None:
         return self._store.get((service, account))
 
     def set(self, service: str, account: str, secret: str) -> None:

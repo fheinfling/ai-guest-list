@@ -382,7 +382,7 @@ def test_removed_seat_cannot_be_recreated_by_a_foreign_identity_answer(ctx, prof
 def test_credential_backend_errors_never_expose_payload(ctx, profile, monkeypatch, operation):
     seat(ctx,profile)
     secret = 'fake-private-keychain-payload'
-    def fail(*_):
+    def fail(*_, **kwargs):
         raise KeychainError(secret)
     if operation == 'item-read':
         monkeypatch.setattr(ctx.keychain,'get_raw',fail)

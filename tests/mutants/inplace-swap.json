@@ -1668,5 +1668,14 @@
    "--test",
    "app/web/render.test.mjs"
   ]
+ },
+ {
+  "label": "in-place: unreadable credentials are mistaken for absent tokens during maintenance",
+  "file": "acctsw/seatswap.py",
+  "old": "return claudehome.load(ctx, email, strict=True)",
+  "new": "return claudehome.load(ctx, email)",
+  "test": [
+   "tests/test_seatswap.py::test_failed_security_read_preserves_the_borrowed_binding"
+  ]
  }
 ]

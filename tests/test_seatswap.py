@@ -494,10 +494,10 @@ def _locked_keychain(monkeypatch, *emails):
     from acctsw.keychain import KeychainError
     real = claudehome.load
 
-    def load(ctx, email):
+    def load(ctx, email, **kwargs):
         if email in emails:
             raise KeychainError("keychain read failed")
-        return real(ctx, email)
+        return real(ctx, email, **kwargs)
     monkeypatch.setattr(claudehome, "load", load)
 
 
@@ -515,6 +515,31 @@ def test_maintain_keeps_the_binding_when_the_keychain_is_unreadable(ctx, monkeyp
     swap, proxy, clock = make(ctx)
     proxy.bind(Seat("b@x", "b"))
     _locked_keychain(monkeypatch, "b@x")
+    for _ in range(3):
+        assert swap.maintain() is None
+        clock.t += seatswap.MAINTAIN_EVERY_S
+    assert proxy.bound() == Seat("b@x", "b") and len(proxy.binds) == 2
+
+
+@pytest.mark.parametrize("locked", ["home@x", "b@x"])
+def test_failed_security_read_preserves_the_borrowed_binding(ctx, monkeypatch, locked):
+    from acctsw.keychain import SecurityKeychain
+
+    put_seat(ctx, "home@x")
+    put_seat(ctx, "b@x", token="b", minutes=60)
+    swap, proxy, clock = make(ctx)
+    proxy.bind(Seat("b@x", "b"))
+    service = ctx.claude_cred(locked).service
+    real = ctx.keychain.get_raw
+    denied = SecurityKeychain("/usr/bin/false")
+
+    def read(item_service, account, **kwargs):
+        if item_service == service:
+            return denied.get_raw(item_service, account, **kwargs)
+        return real(item_service, account, **kwargs)
+
+    monkeypatch.setattr(ctx.keychain, "get_raw", read)
+    assert seatswap.eligible_reason(ctx, "b@x", home_email="home@x") == "unreadable"
     for _ in range(3):
         assert swap.maintain() is None
         clock.t += seatswap.MAINTAIN_EVERY_S

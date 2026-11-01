@@ -63,8 +63,9 @@ def _lock_keychain(ctx, monkeypatch, reads=lambda service: True):
     real ``SecurityKeychain`` code runs a ``security`` that exits non-zero (not 44, not found)."""
     real = ctx.keychain.get_raw
     locked = SecurityKeychain("/usr/bin/false")
-    monkeypatch.setattr(ctx.keychain, "get_raw", lambda service, account: (
-        locked.get_raw(service, account) if reads(service) else real(service, account)))
+    monkeypatch.setattr(ctx.keychain, "get_raw", lambda service, account, **kwargs: (
+        locked.get_raw(service, account, **kwargs) if reads(service)
+        else real(service, account, **kwargs)))
 
 
 def _counting(calls, body=None):
@@ -151,7 +152,7 @@ def test_snapshot_is_consulted_only_when_the_home_copy_is_dead(ctx):
     _seed_claude(ctx, ["a@test"])
     reads = []
     original = ctx.snapshot_get
-    ctx.snapshot_get = lambda tool, email: reads.append(email) or original(tool, email)
+    ctx.snapshot_get = lambda tool, email, **kwargs: reads.append(email) or original(tool, email, **kwargs)
     verdict, _, login = U._signin_for(ctx, "claude", "a@test", LIVE_REFRESH)
     assert verdict.signed_out is False and reads == [] and login == LIVE_REFRESH
     ctx.snapshot_set("claude", "a@test", EXPIRED_SNAPSHOT)
@@ -210,6 +211,18 @@ def test_a_locked_keychain_signs_nobody_out(ctx, monkeypatch):
     assert calls == [] and sel.email is not None
     assert {e: _verdicts(ctx, e) for e in before} == before
     assert accounts.take_signin_notices(ctx.load_state())[0] == []
+
+
+def test_launch_login_plan_uses_snapshot_when_home_item_is_unreadable(ctx, monkeypatch):
+    """As on main, a failed home read permits the normal snapshot fallback during launch."""
+    state = _seed_claude(ctx)
+    email = state.active("claude")
+    item = ctx.claude_cred(email)
+    snapshot = ctx.snapshot_get("claude", email)
+    _lock_keychain(ctx, monkeypatch, reads=lambda service: service == item.service)
+
+    with ctx.locked():
+        assert launcher.plan_claude_login(ctx, state, email) == ("restore", snapshot, None)
 
 
 # --- polling ----------------------------------------------------------------------------------
@@ -417,9 +430,9 @@ def test_launcher_capacity_check_reads_credentials_outside_the_state_lock(ctx, m
     held = []
     real = ctx.keychain.get_raw
 
-    def spy(service, account):
+    def spy(service, account, **kwargs):
         held.append(ctx._store_lock_held())
-        return real(service, account)
+        return real(service, account, **kwargs)
     monkeypatch.setattr(ctx.keychain, "get_raw", spy)
     first_fetch = []
 
@@ -631,6 +644,55 @@ def test_expiring_is_announced_once_until_the_seat_leaves_the_window(ctx):
     assert len(accounts.take_signin_notices(state)[0]) == 1
 
 
+def test_expiring_notice_survives_convergence_and_an_active_only_poll(ctx, monkeypatch):
+    _seed_claude(ctx)
+    expiry = _ms(timedelta(days=2))
+    old = _claude(access="a@test", expires=_ms(timedelta(hours=1)), refresh_expires=expiry)
+    ctx.claude_cred("a@test").set_live(old)
+    ctx.snapshot_set("claude", "a@test", old)
+    U.refresh_live(ctx, "claude", force=True, get=_counting([]), user_agent="test")
+    notices = bridge._take_signin_notices(ctx)
+    assert len(notices) == 1 and "a@test" in notices[0]["text"]
+    marks = ctx.load_state().get_seat("claude", "a@test")["signin_notified"].copy()
+
+    # Claude rotates access credentials while retaining the same refresh-token expiry.
+    rotated = _claude(access="a@test", expires=_ms(timedelta(hours=2)), refresh_expires=expiry)
+    ctx.claude_cred("a@test").set_live(rotated)
+
+    def resolve(ctx, *, email=None):
+        from acctsw.identity import ClaudeLiveIdentity
+        item = ctx.claude_cred(email) if email else ctx.cred["claude"]
+        blob = item.get_live()
+        return ClaudeLiveIdentity(blob, json.loads(blob)["claudeAiOauth"]["accessToken"])
+
+    monkeypatch.setattr(claudesync.identity, "claude_live_identity", resolve)
+    claudesync.converge(ctx)
+    assert ctx.snapshot_get("claude", "a@test") == rotated
+    assert "signin" not in ctx.load_state().get_seat("claude", "a@test")
+
+    summary = U.refresh_live(ctx, "claude", active_only=True, force=True,
+                             get=_counting([]), user_agent="test")
+    assert set(summary["claude"]) == {"b@test"}
+    notices.extend(bridge._take_signin_notices(ctx))
+    assert ctx.load_state().get_seat("claude", "a@test")["signin_notified"] == marks
+
+    U.refresh_live(ctx, "claude", force=True, get=_counting([]), user_agent="test")
+    notices.extend(bridge._take_signin_notices(ctx))
+    assert len(notices) == 1
+    assert ctx.load_state().get_seat("claude", "a@test")["signin"]["expires_at"] == marks["expiring"]
+
+
+@pytest.mark.parametrize("verdict", [None, {}])
+def test_unknown_signin_verdict_preserves_all_notification_marks(ctx, verdict):
+    state = _seed_claude(ctx)
+    seat = state.get_seat("claude", "a@test")
+    seat["signin"] = verdict
+    marks = {"signed_out": True, "expiring": iso(now() + timedelta(days=2))}
+    seat["signin_notified"] = dict(marks)
+    assert accounts.take_signin_notices(state) == ([], False)
+    assert seat["signin_notified"] == marks
+
+
 def test_bridge_poll_delivers_each_notice_once_and_honours_the_setting(ctx, monkeypatch):
     _seed_claude(ctx)
     monkeypatch.setattr(bridge.usage_mod, "refresh_live", lambda *_a, **_k: {"claude": {}})
@@ -653,3 +715,46 @@ def test_bridge_poll_delivers_each_notice_once_and_honours_the_setting(ctx, monk
     state.set_setting("notify", True)
     state.save()
     assert bridge.handle(ctx, {"action": "usage", "tool": "claude"})["signin_notices"] == []
+
+
+@pytest.mark.parametrize("access,refresh,expires,refresh_expires,usable", [
+    ("setup", "", 3600, None, True),
+    ("", "refresh", -3600, 3600, True),
+    ("", "refresh", -3600, None, True),
+    ("", "", 0, None, False),
+    ("setup", "", -3600, None, False),
+    ("", "refresh", -3600, -3600, False),
+])
+def test_partial_home_login_matches_launch_and_signin(ctx, monkeypatch, access, refresh,
+                                                      expires, refresh_expires, usable):
+    _seed_claude(ctx, ["a@test"])
+    at = now()
+    monkeypatch.setattr(U, "now", lambda: at)
+    blob = _claude(access, refresh, (at + timedelta(seconds=expires)).timestamp() * 1000,
+                   None if refresh_expires is None else
+                   (at + timedelta(seconds=refresh_expires)).timestamp() * 1000)
+    ctx.claude_cred("a@test").set_live(blob)
+    ctx.snapshot_set("claude", "a@test", EXPIRED_SNAPSHOT)
+    reads = []
+    original = ctx.snapshot_get
+    monkeypatch.setattr(ctx, "snapshot_get", lambda tool, email, **kwargs: reads.append(email) or original(tool, email, **kwargs))
+    verdict, _, login = U._signin_for(ctx, "claude", "a@test", blob, at)
+    assert verdict.signed_out is not usable
+    assert login == (blob if usable else None)
+    with ctx.locked():
+        plan = launcher.plan_claude_login(ctx, ctx.load_state(), "a@test")
+    if usable:
+        assert plan == ("intact", blob, blob)
+        assert reads == []
+        assert launcher.apply_claude_login(ctx, "a@test", "intact", "racing bytes", blob)
+    else:
+        assert reads == ["a@test", "a@test"]
+
+
+def test_home_login_uses_the_classification_clock(ctx):
+    _seed_claude(ctx, ["a@test"])
+    at = now() - timedelta(days=2)
+    blob = _claude(access="setup", refresh="", expires=(at + timedelta(hours=1)).timestamp() * 1000)
+    verdict, _, login = U._signin_for(ctx, "claude", "a@test", blob, at)
+    assert verdict.signed_out is False
+    assert login == blob

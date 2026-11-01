@@ -97,11 +97,11 @@ def test_heal_never_overwrites_a_login_that_landed_meanwhile():
     real_get_raw = kc.get_raw
     reads = []
 
-    def racing_get_raw(service, account):
+    def racing_get_raw(service, account, **kwargs):
         reads.append(1)
         if len(reads) == 2:
             kc.set_raw(SVC, ACCT, fresh)  # the login lands right before the re-check
-        return real_get_raw(service, account)
+        return real_get_raw(service, account, **kwargs)
 
     kc.get_raw = racing_get_raw  # type: ignore[method-assign]
     ClaudeCredLocation(kc, SVC, ACCT).get_live()
@@ -120,14 +120,17 @@ def test_heal_failure_still_returns_the_credentials():
     assert ClaudeCredLocation(kc, SVC, ACCT).get_live() == blob
 
 
-def test_in_memory_keychain_stores_what_security_would():
+@pytest.mark.parametrize("strict", [False, True])
+def test_in_memory_keychain_stores_what_security_would(strict):
     kc = InMemoryKeychain()
+    assert kc.get_raw("svc", "acct", strict=strict) is None
+    assert kc.get("svc", "acct", strict=strict) is None
     kc.set("svc", "acct", "secret")
-    assert kc.get_raw("svc", "acct") == _encode("secret")
-    assert kc.get("svc", "acct") == "secret"
+    assert kc.get_raw("svc", "acct", strict=strict) == _encode("secret")
+    assert kc.get("svc", "acct", strict=strict) == "secret"
     kc.set_raw("svc", "acct", '{"a": 1}')
-    assert kc.get_raw("svc", "acct") == '{"a": 1}'
-    assert kc.get("svc", "acct") == '{"a": 1}'
+    assert kc.get_raw("svc", "acct", strict=strict) == '{"a": 1}'
+    assert kc.get("svc", "acct", strict=strict) == '{"a": 1}'
 
 
 class _Security:
@@ -157,20 +160,36 @@ def test_security_set_raw_failure_raises(monkeypatch):
         SecurityKeychain().set_raw(SVC, ACCT, "{}")
 
 
-def test_security_get_raw_returns_stored_bytes_and_get_decodes(monkeypatch):
+@pytest.mark.parametrize("strict", [False, True])
+def test_security_get_raw_returns_stored_bytes_and_get_decodes(monkeypatch, strict):
     blob = make_claude_blob("team")
     sec = _Security(monkeypatch, stdout=_encode(blob) + "\n")
     kc = SecurityKeychain("/usr/bin/security")
-    assert kc.get_raw(SVC, ACCT) == _encode(blob)
+    assert kc.get_raw(SVC, ACCT, strict=strict) == _encode(blob)
     assert sec.calls[-1] == ["/usr/bin/security", "find-generic-password",
                              "-s", SVC, "-a", ACCT, "-w"]
-    assert kc.get(SVC, ACCT) == blob
+    assert kc.get(SVC, ACCT, strict=strict) == blob
 
 
-def test_security_get_of_a_missing_item_is_none(monkeypatch):
+@pytest.mark.parametrize("strict", [False, True])
+def test_security_get_of_a_missing_item_is_none(monkeypatch, strict):
     _Security(monkeypatch, returncode=44)
-    assert SecurityKeychain().get_raw(SVC, ACCT) is None
-    assert SecurityKeychain().get(SVC, ACCT) is None
+    assert SecurityKeychain().get_raw(SVC, ACCT, strict=strict) is None
+    assert SecurityKeychain().get(SVC, ACCT, strict=strict) is None
+
+
+@pytest.mark.parametrize("returncode", [1, 36, 51, 128])
+def test_security_read_failure_is_none_by_default_and_raises_when_strict(monkeypatch, returncode):
+    """Only errSecItemNotFound (44) proves an item absent. A locked keychain or a denied prompt
+    must not read as a logout of every seat."""
+    _Security(monkeypatch, returncode=returncode)
+    kc = SecurityKeychain()
+    assert kc.get_raw(SVC, ACCT) is None
+    assert kc.get(SVC, ACCT) is None
+    with pytest.raises(KeychainError):
+        kc.get_raw(SVC, ACCT, strict=True)
+    with pytest.raises(KeychainError):
+        kc.get(SVC, ACCT, strict=True)
 
 
 @pytest.mark.parametrize("returncode", [1, 36, 51, 128])
@@ -179,9 +198,9 @@ def test_security_read_failure_other_than_not_found_raises(monkeypatch, returnco
     must not read as a logout of every seat."""
     _Security(monkeypatch, returncode=returncode)
     with pytest.raises(KeychainError):
-        SecurityKeychain().get_raw(SVC, ACCT)
+        SecurityKeychain().get_raw(SVC, ACCT, strict=True)
     with pytest.raises(KeychainError):
-        SecurityKeychain().get(SVC, ACCT)
+        SecurityKeychain().get(SVC, ACCT, strict=True)
 
 
 def test_get_live_decodes_but_never_rewrites_a_hex_item_it_did_not_write():

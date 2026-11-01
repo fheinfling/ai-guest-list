@@ -365,12 +365,15 @@ def take_signin_notices(state: State,
     next poll repeats them. A seat that recovers drops its signed-out mark so a later logout is news
     again; likewise the expiring mark is dropped only once the seat leaves the expiring window (a
     fresh login), not whenever the stated expiry moves within it. Returns the notices and whether
-    any mark changed (the caller then saves state)."""
+    any mark changed (the caller then saves state). An unknown verdict preserves all marks until
+    a poll classifies the seat again."""
     at = at or now()
     notices: list[dict[str, str]] = []
     changed = False
     for tool in ("codex", "claude"):
         for email, seat in state.accounts(tool).items():
+            if not seat.get("signin"):
+                continue  # credential convergence cleared the verdict, not the notification history
             signed_out, expires, expiring = _signin_view(seat, at)
             marks = seat.get("signin_notified") or {}
             before = dict(marks)

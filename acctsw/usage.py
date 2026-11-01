@@ -414,7 +414,7 @@ def classify_signin(tool: str, blobs, at=None) -> SignIn:
 
 
 def claude_login_present(blob: str | None) -> bool:
-    """A Claude credential item Claude Code can sign in with: raw JSON carrying both OAuth tokens."""
+    """The two-token shape required by the snapshot restore safety checks."""
     try:
         oauth = json.loads(blob)["claudeAiOauth"]
     except (TypeError, ValueError, KeyError):
@@ -433,11 +433,11 @@ def claude_login_wiped(blob: str | None) -> bool:
 
 
 def claude_launch_login(current: str | None, read_snapshot: Callable[[], str | None],
-                        last: str | None) -> tuple[str, str] | None:
+                        last: str | None, at=None) -> tuple[str, str] | None:
     """Which login a launch on a seeded Claude home would run on: ``("home", current)``,
     ``("snapshot", snapshot)`` when the launcher would reinstall the seat's snapshot, or None when
     it has nothing it may use. ``current`` is the home item's bytes, ``last`` the last copy this
-    process saw there; the snapshot is read only when the home item is not a login.
+    process saw there; the snapshot is read only when the home item is not a usable login.
 
     Claude rotates refresh tokens, so a snapshot taken before the child last refreshed carries a
     consumed refresh token, and installing it would end in another invalid_grant — after which
@@ -448,7 +448,7 @@ def claude_launch_login(current: str | None, read_snapshot: Callable[[], str | N
 
     plan_claude_login acts on this, and the sign-in verdict reports it, so a seat reads signed in
     exactly when a launch on it would get a login."""
-    if claude_login_present(current):
+    if login_usable("claude", current, at):
         return "home", current
     snapshot = read_snapshot()
     if not claude_login_present(snapshot):
@@ -484,11 +484,11 @@ def _signin_for(ctx, tool: str, email: str, blob: str | None,
         read = [blob]
 
         def snapshot() -> str | None:
-            read.append(ctx.snapshot_get(tool, email))
+            read.append(ctx.snapshot_get(tool, email, strict=True))
             return read[-1]
         seen = claudesync.tracker(ctx).seen.get(email)
         last = seen.blob if seen else None
-        launch = claude_launch_login(blob, snapshot, last)
+        launch = claude_launch_login(blob, snapshot, last, at)
         login = launch[1] if launch else None
         verdict = classify_signin(tool, [login], at)
         digest = (_credential_digest(blob) if len(read) == 1
@@ -496,7 +496,7 @@ def _signin_for(ctx, tool: str, email: str, blob: str | None,
         return verdict, digest, None if verdict.signed_out else login
     if login_usable(tool, blob, at):
         return classify_signin(tool, [blob], at), _credential_digest(blob), blob
-    snapshot = ctx.snapshot_get(tool, email)
+    snapshot = ctx.snapshot_get(tool, email, strict=True)
     blobs = [blob, snapshot]
     verdict = classify_signin(tool, blobs, at)
     login = next((b for b in blobs if login_usable(tool, b, at)), None)
@@ -819,12 +819,12 @@ DEFAULT_COOLDOWN = timedelta(hours=5)
 FALSE_ALARM_MAX_PCT = 90.0
 
 
-def _seat_blob(ctx, state, tool: str, email: str) -> str | None:
+def _seat_blob(ctx, state, tool: str, email: str, *, strict: bool = False) -> str | None:
     """Freshest credentials that can be proved to belong to the requested seat."""
     if tool == "claude":
         from . import claudehome
-        return claudehome.load(ctx, email)
-    snapshot = ctx.snapshot_get(tool, email)
+        return claudehome.load(ctx, email, strict=strict)
+    snapshot = ctx.snapshot_get(tool, email, strict=strict)
     if state.active(tool) != email:
         return snapshot
     if tool == "codex":
@@ -835,13 +835,13 @@ def _seat_blob(ctx, state, tool: str, email: str) -> str | None:
         running = session.active_session(ctx.data_dir, "codex", email=email)
         if running and running.get("email") == email:
             return snapshot
-        live = ctx.cred[tool].get_live()
+        live = ctx.cred[tool].get_live(strict=strict)
         if live:
             from .credlocations import codex_jwt_matches
             if codex_jwt_matches(email, live):
                 return live
         return snapshot
-    live = ctx.cred[tool].get_live()
+    live = ctx.cred[tool].get_live(strict=strict)
     return live or snapshot
 
 
@@ -939,7 +939,7 @@ def refresh(ctx, state, tool: str | None = None, *, only: str | None = None,
                 summary[t][email] = "cached"
                 continue
             try:
-                blob = _seat_blob(ctx, state, t, email)
+                blob = _seat_blob(ctx, state, t, email, strict=True)
                 signin, digest, login = _signin_for(ctx, t, email, blob, at)
             except UNREADABLE:
                 summary[t][email] = "unreadable"
@@ -974,7 +974,8 @@ def _credential_digest(blob: str | None) -> str | None:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest() if blob else None
 
 
-def _detached_blob(ctx, state, tool: str, email: str, *, active: bool) -> str | None:
+def _detached_blob(ctx, state, tool: str, email: str, *, active: bool,
+                   strict: bool = False) -> str | None:
     """Read credentials for a detached fetch without assigning a live login to the wrong seat.
 
     Codex credentials identify themselves, so a mismatched live mirror falls back to that seat's
@@ -983,8 +984,8 @@ def _detached_blob(ctx, state, tool: str, email: str, *, active: bool) -> str | 
     """
     if tool == "claude":
         from . import claudehome
-        return claudehome.load(ctx, email)
-    snapshot = ctx.snapshot_get(tool, email)
+        return claudehome.load(ctx, email, strict=strict)
+    snapshot = ctx.snapshot_get(tool, email, strict=strict)
     if not active:
         return snapshot
     if tool == "codex":
@@ -994,7 +995,7 @@ def _detached_blob(ctx, state, tool: str, email: str, *, active: bool) -> str | 
         running = session.active_session(ctx.data_dir, "codex")
         if running and running.get("email") == email:
             return snapshot
-    live = ctx.cred[tool].get_live()
+    live = ctx.cred[tool].get_live(strict=strict)
     if not live:
         return snapshot
     if tool == "codex":
@@ -1028,7 +1029,8 @@ def _commit_fetch_result(ctx, result: UsageFetchResult) -> str:
     # Keychain reads are subprocesses on macOS.  Keep them outside the flock, then verify below that
     # the active pointer did not change while the credential bytes were being read.
     try:
-        current_blob = _detached_blob(ctx, before, job.tool, job.email, active=was_active)
+        current_blob = _detached_blob(ctx, before, job.tool, job.email, active=was_active,
+                                      strict=True)
         # A verdict that rested on more than the primary blob (the snapshot) is re-derived too.
         current_signin = (_signin_for(ctx, job.tool, job.email, current_blob)[1]
                           if job.signin_digest != job.credential_digest else job.signin_digest)
@@ -1136,6 +1138,7 @@ def _recover_parked_codex(ctx, job: UsageFetchJob, *, post,
 
 def refresh_live(ctx, tool: str | None = None, *, only: str | None = None,
                  active_only: bool = False, force: bool = False,
+                 unreadable: set[tuple[str, str]] | None = None,
                  get: HttpGet = _default_get, post=_default_post,
                  min_seconds: int = USAGE_MIN_REFRESH_SECONDS,
                  active_min_seconds: int = P.USAGE_ACTIVE_REFRESH_SECONDS,
@@ -1146,6 +1149,7 @@ def refresh_live(ctx, tool: str | None = None, *, only: str | None = None,
     parallel so a slow provider cannot postpone the other provider's live card; each response is
     committed immediately under a fresh, short lock.  Parked seats follow afterward on the gentler
     cadence.  Commit revalidates the seat incarnation, credential bytes, and attempt ordering.
+    Seats whose reconciliation credentials were unreadable are left untouched for this poll.
     """
     from . import session
 
@@ -1165,6 +1169,9 @@ def refresh_live(ctx, tool: str | None = None, *, only: str | None = None,
             active = email == active_email
             if active_only and not active:
                 continue
+            if unreadable and (t, email) in unreadable:
+                summary[t][email] = "unreadable"
+                continue
             interval = active_min_seconds if active else min_seconds
             previous = seat.get("usage") or {}
             if (not force or previous.get("error")) and not _due(previous, at, interval, active=active):
@@ -1179,7 +1186,7 @@ def refresh_live(ctx, tool: str | None = None, *, only: str | None = None,
     prepared: list[UsageFetchJob] = []
     for t, email, added_at, was_active in candidates:
         try:
-            blob = _detached_blob(ctx, initial, t, email, active=was_active)
+            blob = _detached_blob(ctx, initial, t, email, active=was_active, strict=True)
             signin, digest, login = _signin_for(ctx, t, email, blob, at)
         except UNREADABLE:
             summary[t][email] = "unreadable"
