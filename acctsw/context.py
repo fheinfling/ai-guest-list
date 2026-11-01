@@ -245,7 +245,7 @@ class Context:
             )
         self.cred[tool].set_live(blob)
 
-    def snapshot_get(self, tool: str, email: str) -> str | None:
+    def snapshot_get(self, tool: str, email: str, *, strict: bool = False) -> str | None:
         if tool == "codex":
             from . import codexhome
             blob = codexhome.load(email, root=self._homes_root)
@@ -253,7 +253,8 @@ class Context:
             # its label.  The caller can re-authenticate that seat without harming another one.
             return blob if blob and codex_jwt_matches(email, blob) else None
         try:
-            return self.keychain.get(self.keychain_service, self.snapshot_key(tool, email))
+            return self.keychain.get(self.keychain_service, self.snapshot_key(tool, email),
+                                     strict=strict)
         except Exception:
             raise KeychainError("Claude snapshot could not be read") from None
 

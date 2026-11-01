@@ -294,9 +294,9 @@ def test_signin_claude_reads_raw_item_and_profile_outside_lock(ctx, fakes, monke
         return A
     monkeypatch.setattr(identity, "claude_profile_email", profile)
     get = ctx.keychain.get
-    def snapshot_only(service, account):
+    def snapshot_only(service, account, **kwargs):
         assert service == ctx.keychain_service
-        return get(service, account)
+        return get(service, account, **kwargs)
     monkeypatch.setattr(ctx.keychain, "get", snapshot_only)
     assert authflows.signin(ctx, "claude", args=["--email", A]) == 0
     assert captured == [blob("claude", A)]

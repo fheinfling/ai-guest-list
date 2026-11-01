@@ -273,13 +273,12 @@ def prepare(ctx, email: str) -> None:
 
 
 def prepare_all(ctx) -> None:
-    """Prepare readable homes; ensure_home still requires the actual launch seat to be readable."""
+    """Prepare homes without letting a failed preparation abort the remaining seats."""
     for email in ctx.load_state().accounts("claude"):
         try:
             prepare(ctx, email)
         except (KeychainError, OSError):
-            # Unknown is not missing. Leave this home alone; the selected seat's strict
-            # ensure_home read will still fail before spawn if it is the unreadable one.
+            # Leave this home alone if preparation itself failed.
             logging.getLogger(__name__).warning("Skipping unreadable Claude home for %s", email)
 
 
@@ -360,14 +359,14 @@ def mirror_identity(ctx, email: str) -> None:
         atomic_write_text(path, json.dumps(config, indent=2), mode=0o600)
 
 
-def load(ctx, email: str) -> str | None:
+def load(ctx, email: str, *, strict: bool = False) -> str | None:
     """Fresh per-seat bytes; a different /login identity is never attributed to the old seat."""
     home = ctx.claude_home(email)
     if not home.exists():
-        return ctx.snapshot_get("claude", email)  # pre-migration
+        return ctx.snapshot_get("claude", email, strict=strict)  # pre-migration
     if (home / ".acctsw-quarantined").exists():
         return None
-    return ctx.claude_cred(email).get_live()
+    return ctx.claude_cred(email).get_live(strict=strict)
 
 
 def sync_back(ctx, state, email: str, *, live_identity=None) -> bool:

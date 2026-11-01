@@ -294,8 +294,8 @@ def _auto_switch_after_usage(ctx: Context, summary: dict[str, Any], *,
     def saved_blob(tool, email):
         if tool == "claude":
             from . import claudehome
-            return claudehome.load(ctx, email)
-        return ctx.snapshot_get(tool, email)
+            return claudehome.load(ctx, email, strict=True)
+        return ctx.snapshot_get(tool, email, strict=True)
 
     excluded_by_tool = excluded_by_tool or {}
     for tool, tool_summary in summary.items():
@@ -349,7 +349,7 @@ def _auto_switch_after_usage(ctx: Context, summary: dict[str, Any], *,
         # Keychain access is a subprocess on macOS.  Pin both snapshots with no state flock held;
         # the receipt revision below makes a state writer invalidate this decision before commit.
         try:
-            outgoing_blob = saved_blob(tool, active) if tool == "claude" else ctx.cred[tool].get_live()
+            outgoing_blob = saved_blob(tool, active) if tool == "claude" else ctx.cred[tool].get_live(strict=True)
             outgoing_digest = _blob_digest(outgoing_blob)
             active_snapshot_digest = _blob_digest(saved_blob(tool, active))
             candidate_digest_before = _blob_digest(saved_blob(tool, candidate))
@@ -391,7 +391,7 @@ def _auto_switch_after_usage(ctx: Context, summary: dict[str, Any], *,
                 live_identity = claudesync.cached_identity(ctx, email=active)
             else:
                 live_identity = None
-            outgoing_after = saved_blob(tool, active) if tool == "claude" else ctx.cred[tool].get_live()
+            outgoing_after = saved_blob(tool, active) if tool == "claude" else ctx.cred[tool].get_live(strict=True)
             candidate_after = saved_blob(tool, candidate)
         except usage_mod.UNREADABLE:
             continue
@@ -645,8 +645,8 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
             if want_claude and before.accounts("claude"):
                 active_claude = before.active("claude")
                 try:
-                    live_claude = ctx.cred["claude"].get_live()
-                    saved_claude = (ctx.snapshot_get("claude", active_claude)
+                    live_claude = ctx.cred["claude"].get_live(strict=True)
+                    saved_claude = (ctx.snapshot_get("claude", active_claude, strict=True)
                                     if active_claude else None)
                     captured = before.data["tools"]["claude"].get("captured_stock_digest")
                     if live_claude != saved_claude and (

@@ -311,7 +311,7 @@ def _verify_capacity(ctx: Context, tool: str, get, *, at, force: bool,
     pending = []
     for email, prev in due:   # Keychain reads are subprocesses — no lock held; the commit re-checks
         try:
-            blob = usage_mod._seat_blob(ctx, state, tool, email)
+            blob = usage_mod._seat_blob(ctx, state, tool, email, strict=True)
             # Same verdict and dead-credential gate as the app's poll: a signed-out seat is
             # recorded without a request, and identical dead bytes are not re-read until max backoff.
             signin, digest, login = usage_mod._signin_for(ctx, tool, email, blob, at)
@@ -365,7 +365,7 @@ def _same_signin(ctx: Context, state, tool: str, email: str, blob: str | None,
     when the verdict also rested on the snapshot, every credential behind it (its digest). An
     unreadable credential counts as changed: nothing is committed on it."""
     try:
-        current = usage_mod._seat_blob(ctx, state, tool, email)
+        current = usage_mod._seat_blob(ctx, state, tool, email, strict=True)
         if current != blob:
             return False
         return (digest == usage_mod._credential_digest(current)

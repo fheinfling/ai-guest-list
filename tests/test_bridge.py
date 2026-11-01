@@ -591,10 +591,10 @@ def test_unreadable_claude_item_does_not_block_usage_or_codex_handoff(ctx, monke
     stored = dict(ctx.keychain._store)
     original = ctx.keychain.get_raw
 
-    def read(service, account):
+    def read(service, account, **kwargs):
         if (service, account) == target:
             raise (KeychainError if failure == "keychain" else OSError)("locked")
-        return original(service, account)
+        return original(service, account, **kwargs)
 
     monkeypatch.setattr(ctx.keychain, "get_raw", read)
     fetched = []
@@ -637,13 +637,13 @@ def test_unreadable_handoff_receipt_keeps_selection(ctx, monkeypatch, read_numbe
     original = ctx.snapshot_get
     reads = 0
 
-    def read(tool, email):
+    def read(tool, email, **kwargs):
         nonlocal reads
         if email == "spare@x.com":
             reads += 1
             if reads == read_number:
                 raise error_type("locked")
-        return original(tool, email)
+        return original(tool, email, **kwargs)
 
     monkeypatch.setattr(ctx, "snapshot_get", read)
     monkeypatch.setattr(bridge.usage_mod, "refresh_live", lambda *args, **kwargs:

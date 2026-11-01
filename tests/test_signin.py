@@ -63,8 +63,9 @@ def _lock_keychain(ctx, monkeypatch, reads=lambda service: True):
     real ``SecurityKeychain`` code runs a ``security`` that exits non-zero (not 44, not found)."""
     real = ctx.keychain.get_raw
     locked = SecurityKeychain("/usr/bin/false")
-    monkeypatch.setattr(ctx.keychain, "get_raw", lambda service, account: (
-        locked.get_raw(service, account) if reads(service) else real(service, account)))
+    monkeypatch.setattr(ctx.keychain, "get_raw", lambda service, account, **kwargs: (
+        locked.get_raw(service, account, **kwargs) if reads(service)
+        else real(service, account, **kwargs)))
 
 
 def _counting(calls, body=None):
@@ -151,7 +152,7 @@ def test_snapshot_is_consulted_only_when_the_home_copy_is_dead(ctx):
     _seed_claude(ctx, ["a@test"])
     reads = []
     original = ctx.snapshot_get
-    ctx.snapshot_get = lambda tool, email: reads.append(email) or original(tool, email)
+    ctx.snapshot_get = lambda tool, email, **kwargs: reads.append(email) or original(tool, email, **kwargs)
     verdict, _, login = U._signin_for(ctx, "claude", "a@test", LIVE_REFRESH)
     assert verdict.signed_out is False and reads == [] and login == LIVE_REFRESH
     ctx.snapshot_set("claude", "a@test", EXPIRED_SNAPSHOT)
@@ -212,33 +213,16 @@ def test_a_locked_keychain_signs_nobody_out(ctx, monkeypatch):
     assert accounts.take_signin_notices(ctx.load_state())[0] == []
 
 
-@pytest.mark.parametrize("unreadable", ["a@test", "b@test"])
-def test_launch_skips_unreadable_parked_home_but_requires_launch_home(ctx, monkeypatch,
-                                                                  caplog, unreadable):
+def test_launch_login_plan_uses_snapshot_when_home_item_is_unreadable(ctx, monkeypatch):
+    """As on main, a failed home read permits the normal snapshot fallback during launch."""
     state = _seed_claude(ctx)
-    assert state.active("claude") == "b@test"
-    item = ctx.claude_cred(unreadable)
-    read_raw = ctx.keychain.get_raw
-    before = read_raw(item.service, item.account)
-    snapshot = ctx.snapshot_get("claude", unreadable)
+    email = state.active("claude")
+    item = ctx.claude_cred(email)
+    snapshot = ctx.snapshot_get("claude", email)
     _lock_keychain(ctx, monkeypatch, reads=lambda service: service == item.service)
-    launches = []
 
-    def spawn(argv, on_output, on_tick=None, *, env=None):
-        launches.append(env["CLAUDE_CONFIG_DIR"])
-        return 0
-
-    if unreadable == "b@test":
-        with pytest.raises(KeychainError):
-            launcher.run(ctx, "claude", [], spawn=spawn)
-        assert launches == []
-    else:
-        assert launcher.run(ctx, "claude", [], spawn=spawn) == 0
-        assert launches == [str(ctx.claude_home("b@test"))]
-        # Both the initial pass and the final pre-spawn pass must skip the parked seat.
-        assert caplog.text.count("Skipping unreadable Claude home for a@test") >= 2
-    assert read_raw(item.service, item.account) == before
-    assert ctx.snapshot_get("claude", unreadable) == snapshot
+    with ctx.locked():
+        assert launcher.plan_claude_login(ctx, state, email) == ("restore", snapshot, None)
 
 
 # --- polling ----------------------------------------------------------------------------------
@@ -446,9 +430,9 @@ def test_launcher_capacity_check_reads_credentials_outside_the_state_lock(ctx, m
     held = []
     real = ctx.keychain.get_raw
 
-    def spy(service, account):
+    def spy(service, account, **kwargs):
         held.append(ctx._store_lock_held())
-        return real(service, account)
+        return real(service, account, **kwargs)
     monkeypatch.setattr(ctx.keychain, "get_raw", spy)
     first_fetch = []
 
@@ -753,7 +737,7 @@ def test_partial_home_login_matches_launch_and_signin(ctx, monkeypatch, access, 
     ctx.snapshot_set("claude", "a@test", EXPIRED_SNAPSHOT)
     reads = []
     original = ctx.snapshot_get
-    monkeypatch.setattr(ctx, "snapshot_get", lambda tool, email: reads.append(email) or original(tool, email))
+    monkeypatch.setattr(ctx, "snapshot_get", lambda tool, email, **kwargs: reads.append(email) or original(tool, email, **kwargs))
     verdict, _, login = U._signin_for(ctx, "claude", "a@test", blob, at)
     assert verdict.signed_out is not usable
     assert login == (blob if usable else None)
