@@ -1,4 +1,4 @@
-"""Archive safety, signing order, offline native dry run and workflow event guards."""
+"""Archive safety, signing order, the ad-hoc requirement check and workflow event guards."""
 import importlib.util
 import io
 import os
@@ -147,18 +147,27 @@ def test_signing_refuses_hidden_native_before_codesign(tmp_path, monkeypatch):
         bundle.sign_bundle(app, "identity", REPO / "app/entitlements.plist")
 
 
-def test_workflow_drafts_on_push_and_tap_only_on_publication():
+def release_jobs():
     workflow = (REPO / ".github/workflows/release.yml").read_text()
     jobs = dict(re.findall(r"^  ([a-z][a-z-]+):\n(.*?)(?=^  [a-z][a-z-]+:|\Z)",
                            workflow.split("jobs:\n", 1)[1], re.M | re.S))
+    return workflow, jobs
+
+
+def test_workflow_drafts_on_push_and_tap_only_on_publication():
+    workflow, jobs = release_jobs()
+    assert list(jobs) == ["build", "sign", "publish", "update-tap"]
     assert "tags: [\"v*\"]" in workflow
     assert "release:\n    types: [published]" in workflow
-    build = jobs["build-and-release"]
+    build = jobs["build"]
     assert "if: github.event_name == 'push'" in build
-    assert "draft: true" in build
-    assert "files: AI-Guest-List-${{ github.ref_name }}-unsigned.zip" in build
-    assert "softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64" in build
     assert "runs-on: macos-14" in build and 'python-version: "3.11"' in build
+    assert "needs: build" in jobs["sign"] and "needs: sign" in jobs["publish"]
+    publish = jobs["publish"]
+    assert "draft: true" in publish
+    assert "AI-Guest-List-${{ github.ref_name }}.zip\n            latest.json\n" in publish
+    assert "softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64" in publish
+    assert "unsigned" not in publish
     tap = jobs["update-tap"]
     assert "if: github.event_name == 'release' && github.event.action == 'published'" in tap
     assert "needs:" not in tap
@@ -169,8 +178,25 @@ def test_workflow_drafts_on_push_and_tap_only_on_publication():
     assert "token: ${{ secrets.TAP_PUSH_TOKEN }}" in tap
 
 
+def test_sign_job_checks_the_build_before_signing_and_after_stapling():
+    sign = release_jobs()[1]["sign"]
+    order = ['shasum -a 256 -c', 'release-bundle.py check-zip "$RUNNER_TEMP/in/unsigned.zip"', '["read_app"]',
+             'release-bundle.py sign "$APP" --identity="$IDENTITY" --entitlements app/entitlements.plist',
+             'codesign --verify --deep --strict -R "=$requirement" "$APP"', "xcrun notarytool submit",
+             "xcrun stapler staple", "spctl --assess", 'release-bundle.py check-zip "$ASSET"',
+             'codesign --verify --deep --strict -R "=$requirement" "$RUNNER_TEMP/final-check/AI Guest List.app"',
+             'xcrun stapler validate "$RUNNER_TEMP/final-check/AI Guest List.app"', "scripts/update-manifest.py --zip"]
+    positions = [sign.index(step) for step in order]
+    assert positions == sorted(positions)
+    # The identity is chosen by SHA-1 from the throwaway keychain, never by display name.
+    assert "awk '/\"Developer ID Application:/ { print $2; exit }'" in sign
+    cleanup = sign.index("- name: Delete the keychain and key files")
+    assert "if: always()" in sign[cleanup:cleanup + 120]
+    assert 'security delete-keychain "$KC"' in sign[cleanup:]
+
+
 @pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS native signing tools")
-def test_offline_adhoc_signing_rejects_developer_id_requirement(tmp_path):
+def test_adhoc_signing_rejects_developer_id_requirement(tmp_path):
     import _struct  # A real copied extension, never modify the installed original.
 
     app = tmp_path / "AI Guest List.app"
@@ -183,34 +209,15 @@ def test_offline_adhoc_signing_rejects_developer_id_requirement(tmp_path):
         "CFBundleIdentifier": "com.fheinfling.aiguestlist", "CFBundleShortVersionString": "1.3.0",
         "CFBundleVersion": "412", "LSMinimumSystemVersion": "12.0",
         "CFBundleExecutable": "main", "CFBundlePackageType": "APPL"}))
-    archive = tmp_path / "input.zip"
-    subprocess.run(["ditto", "-c", "-k", "--norsrc", "--keepParent", str(app), str(archive)], check=True)
-    # Simulate the maintainer's local run even when this suite itself runs in CI.
-    env = {key: value for key, value in os.environ.items() if key not in {"CI", "GITHUB_ACTIONS"}}
-    env.update(AGL_SIGN_ID="-", AGL_SKIP_NOTARIZE="1", PY=sys.executable)
-    # A gh sentinel ensures the local mode is entirely offline.
-    bindir = tmp_path / "bin"
-    bindir.mkdir()
-    (bindir / "gh").write_text("#!/bin/sh\necho 'GH MUST NOT RUN' >&2\nexit 99\n")
-    (bindir / "gh").chmod(0o755)
-    env["PATH"] = str(bindir) + os.pathsep + env["PATH"]
-    result = subprocess.run(["bash", str(REPO / "scripts/release-sign.sh"), "v1.3.0",
-                             "--from-zip", str(archive)], env=env, text=True, capture_output=True)
-    assert result.returncode != 0
-    assert "Ad-hoc signatures verified" in result.stdout, result.stdout + result.stderr
+    result = subprocess.run([sys.executable, str(REPO / "scripts/release-bundle.py"), "sign", str(app),
+                             "--identity=-", "--entitlements", str(REPO / "app/entitlements.plist"), "--adhoc"],
+                            text=True, capture_output=True)
+    assert result.returncode == 0, result.stdout + result.stderr
     assert "copied.so" in result.stdout
-    assert "code failed to satisfy specified code requirement" in result.stderr, result.stderr
-    assert "GH MUST NOT RUN" not in result.stderr
-
-
-@pytest.mark.skipif(sys.platform != "darwin", reason="script preflight requires macOS")
-@pytest.mark.parametrize("settings", [{"AGL_SIGN_ID": "-"}, {"AGL_SKIP_NOTARIZE": "1"},
-                                      {"AGL_SIGN_ID": "-", "AGL_SKIP_NOTARIZE": "1"}])
-def test_dry_run_refuses_github_mode(settings):
-    env = {key: value for key, value in os.environ.items()
-           if key not in {"AGL_SIGN_ID", "AGL_SKIP_NOTARIZE", "CI", "GITHUB_ACTIONS"}}
-    env.update(settings)
-    result = subprocess.run(["bash", str(REPO / "scripts/release-sign.sh"), "v1.3.0"],
-                            env=env, text=True, capture_output=True)
-    assert result.returncode != 0
-    assert "requires BOTH" in result.stderr or "upload/publish is forbidden" in result.stderr
+    subprocess.run(["codesign", "--verify", "--deep", "--strict", str(app)], check=True)
+    # The release job's designated-requirement check must refuse anything but the Developer ID team.
+    requirement = (REPO / "scripts/update-requirement.txt").read_text().strip()
+    check = subprocess.run(["codesign", "--verify", "--deep", "--strict", "-R", "=" + requirement, str(app)],
+                           text=True, capture_output=True)
+    assert check.returncode != 0
+    assert "code failed to satisfy specified code requirement" in check.stderr, check.stderr

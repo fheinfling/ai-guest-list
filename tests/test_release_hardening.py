@@ -38,20 +38,39 @@ def test_every_action_is_sha_pinned(workflow):
         assert re.fullmatch(r"[\w./-]+@[0-9a-f]{40}\s+# v[0-9][^\n]*", action), action
 
 
-def test_attestation_only_has_build_job_permissions():
-    workflow = (REPO / ".github/workflows/release.yml").read_text()
-    prefix, jobs = workflow.split("jobs:\n", 1)
-    build, tap = jobs.split("  update-tap:\n", 1)
+APPLE_SECRETS = ("secrets.MACOS_CERT_P12", "secrets.MACOS_CERT_PASSWORD", "secrets.NOTARY_API_KEY",
+                 "secrets.NOTARY_API_KEY_ID", "secrets.NOTARY_API_ISSUER")
+
+
+def test_signing_secrets_and_attestation_are_confined():
+    from test_release_signing import release_jobs
+
+    workflow, jobs = release_jobs()
+    prefix = workflow.split("jobs:\n", 1)[0]
     assert "permissions:\n  contents: read" in prefix
-    assert "id-token:" not in prefix + tap and "attestations:" not in prefix + tap
-    assert "    permissions:\n      contents: write\n      id-token: write\n      attestations: write\n" in build
-    assert "if: github.event_name == 'push'" in build
-    assert re.search(r"uses: actions/attest-build-provenance@[0-9a-f]{40}\s+# v", build)
-    assert "subject-path: AI-Guest-List-${{ github.ref_name }}-unsigned.zip" in build
-    assert 'shasum -a 256 "AI-Guest-List-${GITHUB_REF_NAME}-unsigned.zip"' in build
-    assert build.index("ditto -c -k") < build.index("shasum -a 256") < build.index("uses: actions/attest-build-provenance@") < build.index("uses: softprops/action-gh-release@")
-    assert "release-sign.sh" not in build
-    assert "notarytool" not in build and "--sign" not in build
+    sign = jobs["sign"]
+    # Apple credentials exist only in the sign job, which GitHub runs only after the owner approves it.
+    assert "    environment: release\n" in sign
+    for secret in APPLE_SECRETS:
+        assert secret in sign, secret
+    for name, job in jobs.items():
+        if name != "sign":
+            assert not any(secret in job for secret in APPLE_SECRETS), name
+            assert "environment:" not in job, name
+    assert "permissions:" not in sign and "id-token:" not in prefix + sign
+    # Only publish (no secrets) may write releases and attestations.
+    publish = jobs["publish"]
+    assert "    permissions:\n      contents: write        # create the draft release\n      id-token: write" in publish
+    assert "      attestations: write\n" in publish
+    for name in ("build", "sign", "update-tap"):
+        assert "id-token:" not in jobs[name] and "attestations:" not in jobs[name], name
+    assert re.search(r"uses: actions/attest-build-provenance@[0-9a-f]{40}\s+# v", publish)
+    assert "subject-path: AI-Guest-List-${{ github.ref_name }}.zip" in publish
+    assert publish.index("uses: actions/attest-build-provenance@") < publish.index("uses: softprops/action-gh-release@")
+    # The signing secrets never reach the build, its tests or any third-party action.
+    assert "notarytool" not in jobs["build"] and "--sign" not in jobs["build"]
+    for action in re.findall(r"uses: ([\w./-]+)@", sign):
+        assert action.startswith("actions/"), action
 
 
 def test_dependabot_maintains_action_pins():
@@ -74,12 +93,12 @@ def test_team_identifier_only_in_mechanical_requirement():
 
 def test_updater_contract_requires_signature_verification():
     docs = (REPO / "docs/RELEASING.md").read_text()
-    script = (REPO / "scripts/release-sign.sh").read_text()
+    workflow = (REPO / ".github/workflows/release.yml").read_text()
     assert "Any updater MUST enforce" in docs and "SecStaticCode" in docs
     assert "manifest SHA-256" in docs and "codesign -R" in docs
-    assert "Any updater MUST enforce" in script
-    assert 'requirement="$(cat "$SCRIPT_DIR/update-requirement.txt")"' in script
-    assert 'codesign --verify --deep --strict -R "=$requirement"' in script
+    assert "Any updater MUST enforce" in workflow
+    assert 'requirement="$(cat scripts/update-requirement.txt)"' in workflow
+    assert 'codesign --verify --deep --strict -R "=$requirement"' in workflow
 
 
 def test_version_and_install_release_flow():
@@ -95,6 +114,6 @@ def test_version_and_install_release_flow():
     assert "older builds" in readme and "Open Anyway" in readme
     assert "update themselves in-app" not in readme
     docs = (REPO / "docs/RELEASING.md").read_text()
-    assert "scripts/release-sign.sh vX.Y.Z --no-publish" in docs
-    assert docs.index("--no-publish") < docs.index("gh release edit vX.Y.Z")
-    assert "attestation" in docs and "test the signed app" in docs
+    assert "Review deployments" in docs
+    assert docs.index("Review deployments") < docs.index("test the signed app") < docs.index("gh release edit vX.Y.Z")
+    assert "gh attestation verify" in docs
