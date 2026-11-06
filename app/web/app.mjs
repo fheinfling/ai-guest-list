@@ -187,7 +187,9 @@ function resetTransientUI() {
   openSeatDetails.clear();
   openMenu = null;
   if (screen === "settings") screen = "main";
-  else if (screen === "paid-key" && !paidTerminal?.pending) { paidTerminal = null; screen = "main"; }
+  // Also when its request is still out: a late "paid use is off" reply must not bring the gate back.
+  paidTerminal = null;
+  if (screen === "paid-key") screen = "main";
   if (screen !== "main") return;
   render();
   const body = root.querySelector(".body");

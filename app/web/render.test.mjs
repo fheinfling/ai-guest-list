@@ -2604,6 +2604,11 @@ test("closing the popover drops the paid-key gate but keeps a key being typed", 
   app.window.AGL.closed();
   assert.doesNotMatch(app.root.innerHTML, /data-action="paid-key-enable"/);
 
+  app.click({ action: "key-terminal", id: "key-1" }); // its reply arrives only after the close
+  app.window.AGL.closed();
+  app.window.AGL.result({ ok: false, code: "paid_use_disabled", key_action: "key_terminal", key_target_id: "key-1", error: "off" });
+  assert.doesNotMatch(app.root.innerHTML, /data-action="paid-key-enable"/);
+
   app.click({ action: "key-start" });
   const typing = app.root.innerHTML;
   app.window.AGL.closed();
