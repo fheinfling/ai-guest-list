@@ -103,7 +103,8 @@ connect through the official tools.
   still running, and resumes the conversation. `codex exec`, `claude -p`, paid key seats, sessions
   started with a prompt or flags that can't be safely rebuilt, and Codex sessions sharing the Mac
   with another Codex session stay as they are; so do sessions started on older engines, which need
-  a manual restart. The popover keeps warning about any that can't restart themselves.
+  a manual restart. The popover keeps warning about any that can't restart themselves. Turn it off
+  with "restart idle sessions after an update" in settings; running sessions follow within a minute.
 - **Add / remove seats** — official browser sign-in, plus a no-browser path for Codex (paste an
   `auth.json`). Claude is browser sign-in only: a `claude setup-token` is an env-var token, not the
   Keychain login the switcher reads. Credentials live only in the Keychain / the tools' own stores.

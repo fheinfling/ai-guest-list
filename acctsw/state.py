@@ -9,8 +9,8 @@ Holds only metadata — NEVER credentials (those live in the Keychain). Shape::
         "claude": {"active": "<email>|null", "accounts": {"<email>": <Seat>}}
       },
       "keys": {"<id>": <key-seat metadata>},
-      "settings": {"auto_switch": true, "same_tool_only": true, "notify": true,
-                   "restart_app": false, "celebrations": true, "supervise_shell": true,
+      "settings": {"auto_switch": true, "notify": true,
+                   "restart_app": false, "supervise_shell": true, "engine_restart": true,
                    "theme": "light", "confirm_key_switch": true, "key_fallback": false,
                    "in_place_switch": true, "in_place_cross_tier": false},
       "engine": {"last_writer": "<version>", "newest_writer": "<version>",
@@ -103,10 +103,8 @@ def _label_from_email(email: str) -> str:
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "auto_switch": True,
-    "same_tool_only": True,   # "keep me on the same tool"
     "notify": True,           # "tell me when it switches"
     "restart_app": False,     # "restart the Codex app after a swap"
-    "celebrations": True,     # "little celebrations"
     "supervise_shell": True,  # wire terminal codex/claude through the supervised cx/cl launchers
     "strategy": "soonest_back",  # "soonest_back" | "most_headroom"
     "theme": "light",         # the design default
@@ -116,6 +114,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "keep_warm": True,        # let Claude Code renew idle parked seats before access expires
     "crossing_auto": False,   # business<->personal switches happen without asking each time
     "in_place_cross_tier": False,  # ...also between plan tiers (Max/Pro/Team): models may differ
+    "engine_restart": True,   # an idle session restarts itself onto a newer engine and resumes
 }
 
 

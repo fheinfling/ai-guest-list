@@ -491,7 +491,7 @@ function buildSettings(state) {
       ${toggleRow("auto_switch", "auto-switch", "move when a seat runs out", s.auto_switch)}
       ${segBlock("choose the next seat", "", "set_strategy", strat, STRATEGY_OPTS)}
       ${toggleRow("supervise_shell", "supervise terminals", "include codex and claude commands", s.supervise_shell !== false)}
-      ${toggleRow("same_tool_only", "stay on the same tool", "Codex to Codex; Claude to Claude", s.same_tool_only)}
+      ${toggleRow("engine_restart", "restart idle sessions after an update", "same terminal, the conversation resumes", s.engine_restart !== false)}
       ${toggleRow("notify", "notify when switched", "show which seat is ready", s.notify)}
       ${toggleRow("restart_app", "restart the Codex app", "refresh its account after a switch", s.restart_app)}
       ${toggleRow("in_place_switch", "switch seats without restarting claude", "the conversation keeps running", s.in_place_switch !== false)}

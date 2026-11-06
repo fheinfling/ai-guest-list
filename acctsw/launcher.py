@@ -3321,7 +3321,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 if at < tick["engine_next"]:
                     return False
                 tick["engine_next"] = at + enginerestart.CHECK_INTERVAL_S
-                can_restart = could_restart and _engine_can_see_work()
+                can_restart = (could_restart and _engine_can_see_work()
+                               and ctx.load_state().settings().get("engine_restart", True))
                 if can_restart != session_mod.SELF_RESTART:
                     # The app keeps warning about a session that lost its way to restart.
                     session_mod.SELF_RESTART = can_restart
