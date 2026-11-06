@@ -191,8 +191,10 @@ class InputTracker:
 
     def _submit(self) -> None:
         command = _COMMAND.match(bytes(self._line))
+        # Keys we couldn't follow mean the box may differ from what we tracked: Enter on a recalled
+        # line or in a picker, or Ctrl+U then a command after text we still think is there.
         if (command and command.group(1).decode().lower() not in _SAME_CONVERSATION) or (
-                self._unsure and not self._line):  # Enter on a recalled line or in a picker
+                self._unsure and (not self._line or b"/" in self._line)):
             self.moved = True
         self._line.clear()
         self._unsure = False

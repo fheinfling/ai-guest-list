@@ -1504,7 +1504,11 @@ document.addEventListener("click", (e) => {
         send("switch", { tool, email, confirmed_crossing: true }); render();
       }
       break;
-    case "remove": if (confirm(`wave goodbye to ${email}?`)) send("remove", { tool, email }); break;
+    // Asked in place: confirm() answers false with no dialog in a WKWebView without a UI delegate.
+    case "remove":
+      el.textContent = `wave goodbye to ${email}?`; el.dataset.action = "remove-confirm";
+      reportHeight(); break;
+    case "remove-confirm": send("remove", { tool, email }); break;
     // add-a-seat sub-view (spec §9). Header ＋ (no tool) → provider step; per-provider add-row and
     // the needs-login "log in" button carry a tool → deep-link straight to details, provider preset.
     case "add":

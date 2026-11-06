@@ -2830,7 +2830,8 @@ def test_idle_codex_restarts_into_its_own_thread_with_its_flags(ctx, monkeypatch
         run(ctx, "codex", ["--search", "-m", "gpt-x"], spawn=FakeSpawn([(None, 0, ticks)]),
             get=fake_get({}), notify=lambda m: None)
     assert raised.value.argv == ["/new/acctsw", "run", "codex", "resume", "01a0abcd",
-                                 "--search", "-m", "gpt-x"]
+                                 "--search", "-m", "gpt-x",
+                                 "-c", "check_for_update_on_startup=false"]
     assert raised.value.seat == ctx.load_state().active("codex")
 
 

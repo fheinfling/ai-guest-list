@@ -154,7 +154,7 @@ def test_backspacing_a_box_empty_is_no_draft():
 
 
 @pytest.mark.parametrize("line", [b"/resume\r", b"/clear\r", b"/resume abc\r", b"/my-skill\r",
-                                  b"/plugin:skill x\r", b"\x1b[A\r", b"/CLEAR\r",
+                                  b"/plugin:skill x\r", b"\x1b[A\r", b"/CLEAR\r", b"draft\x15/resume abc\r",
                                   b"\x1b[200~/resume\x1b[201~\r"])
 def test_a_submitted_line_that_may_change_conversation_is_remembered(line):
     t = InputTracker()

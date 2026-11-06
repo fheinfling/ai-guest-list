@@ -2809,7 +2809,7 @@ test("footer confirmations use text, survive a poll and restore the live status"
   assert.equal(status.textContent, "codex is on personal now");
 });
 
-test("remove seat lives in every subscription's inline details with its original confirmation", () => {
+test("remove seat lives in every subscription's inline details and asks in place", () => {
   for (const tool of ["codex", "claude"]) {
     for (const status of ["active", "ready", "resting", "queued", "needs-login"]) {
       const email = 'seat"<&@example.test', s = seat({ email, status });
@@ -2821,15 +2821,14 @@ test("remove seat lives in every subscription's inline details with its original
       assert.doesNotMatch(visibleMarkup(html), /data-action="remove"/);
       const opened = buildHTML(snapshot, null, new Set([JSON.stringify([tool, email])]));
       assert.match(visibleMarkup(opened), /data-action="remove"/);
-      const confirmations = [];
-      let approved = false;
-      const app = keyApp({ confirm: (text) => { confirmations.push(text); return approved; } });
+      const app = keyApp({ confirm: () => assert.fail("confirm() does nothing in the app's web view") });
+      const button = { dataset: { action: "remove", tool, email }, textContent: "remove seat" };
+      const press = () => app.handlers.click({ target: { closest: (selector) => selector === "[data-action]" ? button : null } });
       const sentBefore = app.sent.length;
-      app.click({ action: "remove", tool, email });
+      press();
       assert.equal(app.sent.length, sentBefore);
-      approved = true;
-      app.click({ action: "remove", tool, email });
-      assert.deepEqual(confirmations, [`wave goodbye to ${email}?`, `wave goodbye to ${email}?`]);
+      assert.equal(button.textContent, `wave goodbye to ${email}?`);
+      press();
       assert.deepEqual(JSON.parse(JSON.stringify(app.sent.at(-1))), { action: "remove", tool, email });
     }
   }

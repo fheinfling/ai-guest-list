@@ -3359,6 +3359,10 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 with ctx.locked():
                     if not _restart_seat_usable(ctx.load_state(), tool, running_seat()):
                         return False
+                if tool == "codex":
+                    # Nobody chose this launch: Codex's update prompt would be waiting for whoever
+                    # comes back, with Enter meaning "update now".
+                    rest = [*rest, "-c", "check_for_update_on_startup=false"]
                 tick["engine_argv"] = [target, "run", tool, *rest]
                 hit.update(reason="engine", active=running_seat(), handled=True)
                 notify(f"{tool}: restarting on the new engine ({newest}), resuming your work ✨")
