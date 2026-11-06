@@ -1301,7 +1301,8 @@ def test_connect_requires_the_proxy_credentials(auth, monkeypatch, session_ca):
     proxy = SeatProxy(lambda hit: None, ca=session_ca)
     far = FarEnd(monkeypatch)
     if auth == "wrong-secret":
-        auth = _proxy_auth(proxy, secret="x" + proxy._secret[1:])
+        # Differs for certain: a fixed first letter would match about one secret in 64.
+        auth = _proxy_auth(proxy, secret=("y" if proxy._secret[0] == "x" else "x") + proxy._secret[1:])
     elif auth == "wrong-user":
         auth = _proxy_auth(proxy, user="someone")
     sock, status, head = _connect(proxy, "example.com:443", auth=auth)

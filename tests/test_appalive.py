@@ -268,3 +268,57 @@ def test_run_gate_supervises_when_app_open(isolated, monkeypatch):
     cli.main(["run", "codex", "hi"])
     assert calls["supervised"] is True
     assert calls["stock"] is False
+
+
+def _engine_restart(ctx, monkeypatch, *, exec_fails=False):
+    from acctsw import enginerestart, headroom
+    seen = {}
+    appalive.mark_alive(ctx.data_dir)
+    monkeypatch.setattr(headroom, "legacy_present", lambda ctx: False)
+
+    def restart(*a, **k):
+        raise enginerestart.EngineRestart(["/new/acctsw", "run", "claude", "--resume", "t"], seat="a@x")
+
+    def execvpe(path, argv, env):
+        seen.update(path=path, argv=argv, env=env)
+        if exec_fails:
+            raise OSError("gone")
+        raise SystemExit(0)   # a real exec never returns
+    monkeypatch.setattr(launcher, "run", restart)
+    monkeypatch.setattr(cli.os, "execvpe", execvpe)
+    return seen
+
+
+def test_engine_restart_becomes_the_new_engine_and_hands_over_the_seat(isolated, monkeypatch):
+    from acctsw import enginerestart
+    seen = _engine_restart(isolated, monkeypatch)
+    with pytest.raises(SystemExit):
+        cli.main(["run", "claude", "--", "--chrome"])
+    assert seen["path"] == "/new/acctsw"
+    assert seen["argv"] == ["/new/acctsw", "run", "claude", "--resume", "t"]
+    assert seen["env"][enginerestart.SEAT_ENV] == "a@x"
+
+
+def test_engine_restart_that_cant_exec_says_how_to_continue(isolated, monkeypatch, capsys):
+    _engine_restart(isolated, monkeypatch, exec_fails=True)
+    assert cli.main(["run", "claude", "--", "--chrome"]) == 127
+    assert "/new/acctsw run claude --resume t" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("why", ["app closed", "no seats"])
+def test_handed_over_seat_never_falls_to_stock(isolated, monkeypatch, why, capsys):
+    from acctsw import enginerestart, headroom
+    stock = []
+    monkeypatch.setenv(enginerestart.SEAT_ENV, "a@x")
+    monkeypatch.setattr(headroom, "legacy_present", lambda ctx: False)
+    monkeypatch.setattr(launcher, "exec_stock", lambda *a: stock.append(a) or 0)
+    if why == "no seats":
+        appalive.mark_alive(isolated.data_dir)
+
+        def none_left(*a, **k):
+            raise launcher.NoSeats("none")
+        monkeypatch.setattr(launcher, "run", none_left)
+    assert cli.main(["run", "claude", "--", "--resume", "t"]) == launcher.EXIT_GAVE_UP
+    assert stock == []
+    assert "a@x" in capsys.readouterr().err
+

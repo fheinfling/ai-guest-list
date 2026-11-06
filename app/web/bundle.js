@@ -491,7 +491,7 @@ function buildSettings(state) {
       ${toggleRow("auto_switch", "auto-switch", "move when a seat runs out", s.auto_switch)}
       ${segBlock("choose the next seat", "", "set_strategy", strat, STRATEGY_OPTS)}
       ${toggleRow("supervise_shell", "supervise terminals", "include codex and claude commands", s.supervise_shell !== false)}
-      ${toggleRow("same_tool_only", "stay on the same tool", "Codex to Codex; Claude to Claude", s.same_tool_only)}
+      ${toggleRow("engine_restart", "restart idle sessions after an update", "same terminal, the conversation resumes", s.engine_restart !== false)}
       ${toggleRow("notify", "notify when switched", "show which seat is ready", s.notify)}
       ${toggleRow("restart_app", "restart the Codex app", "refresh its account after a switch", s.restart_app)}
       ${toggleRow("in_place_switch", "switch seats without restarting claude", "the conversation keeps running", s.in_place_switch !== false)}
@@ -1163,6 +1163,7 @@ window.AGL = {
   // Native popover lifecycle: tick cached countdowns only while this surface is actually visible.
   // This never asks the bridge for data and never touches lastRev.
   setVisible(visible) { setPopoverVisible(Boolean(visible)); },
+  closed: resetTransientUI,
   celebrate,
 };
 
@@ -1267,6 +1268,31 @@ function setPopoverVisible(visible) {
   } else if (!visible && clockTimer !== null) {
     clearInterval(clockTimer);
     clockTimer = null;
+  }
+}
+
+// The web view outlives the popover by days, so what was left open must not greet the next opening
+// as if it were current, and a consent question must never stay armed across a close. Only the native
+// close calls this: `document.hidden` also flips on display sleep with the popover still up. The
+// add-seat and add-key flows stay, because clicking away to copy a key closes the popover too.
+function resetTransientUI() {
+  pendingSwitch = null;
+  openSeatDetails.clear();
+  openMenu = null;
+  if (screen === "settings") screen = "main";
+  // Also when its request is still out: a late "paid use is off" reply must not bring the gate back.
+  paidTerminal = null;
+  if (screen === "paid-key") screen = "main";
+  if (screen !== "main") return;
+  render();
+  const body = root.querySelector(".body");
+  if (body) body.scrollTop = 0;
+  // Size it now, while closed: animation frames can wait until the next open, which would show the
+  // old height first.
+  const height = contentHeight();
+  if (Number.isFinite(height) && height > 0 && height !== lastHeight) {
+    lastHeight = height;
+    send("resize", { height });
   }
 }
 
@@ -1478,7 +1504,11 @@ document.addEventListener("click", (e) => {
         send("switch", { tool, email, confirmed_crossing: true }); render();
       }
       break;
-    case "remove": if (confirm(`wave goodbye to ${email}?`)) send("remove", { tool, email }); break;
+    // Asked in place: confirm() answers false with no dialog in a WKWebView without a UI delegate.
+    case "remove":
+      el.textContent = `wave goodbye to ${email}?`; el.dataset.action = "remove-confirm";
+      reportHeight(); break;
+    case "remove-confirm": send("remove", { tool, email }); break;
     // add-a-seat sub-view (spec §9). Header ＋ (no tool) → provider step; per-provider add-row and
     // the needs-login "log in" button carry a tool → deep-link straight to details, provider preset.
     case "add":

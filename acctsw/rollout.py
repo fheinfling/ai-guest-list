@@ -281,6 +281,19 @@ class RolloutWatcher:
         self.unambiguous = False
 
     # --- attach ---------------------------------------------------------------------------------
+    def other_interactive_logs(self) -> list[Path]:
+        """Interactive logs anywhere, other than the attached one, that moved since the spawn.
+        Attachment is decided once; this looks again, for a caller about to act on it."""
+        found = []
+        for path, mtime in scan_rollouts(self._roots).items():
+            previous = self._before.get(path)
+            if path == self.attached or (previous is not None and mtime <= previous):
+                continue
+            meta = session_meta(path) or {}
+            if meta.get("source") == "cli":
+                found.append(path)
+        return found
+
     def _try_attach(self) -> None:
         """Find our child's rollout — and keep looking while the answer is only a guess.
 

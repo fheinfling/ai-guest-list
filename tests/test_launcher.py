@@ -2791,3 +2791,88 @@ def test_pty_shutdown_handler_is_not_reentrant(monkeypatch, via_signal):
         L.pty_spawn(['/bin/sh', '-c', 'echo ready; exec sleep 30'], output)
     assert len(calls) == 1
     assert deaths == [L.signal.SIGTERM]
+
+
+# --- restarting codex onto a newer engine -----------------------------------------------------------
+
+def _codex_engine_ready(ctx, monkeypatch, tmp_path, *, source="cli"):
+    """Every gate open, and a tick script that writes this child's log, then sits idle far past the
+    quiet period. The clock is the launcher's own, moved by hand."""
+    import types
+    from acctsw import enginerestart as er, launcher as L
+    monkeypatch.chdir(tmp_path)
+    _two_codex(ctx)
+    st = ctx.load_state()
+    st.data["engine"] = {"newest_writer": "99.0"}
+    st.save()
+    path = write_rollout(_codex_sessions(ctx), thread="01a0abcd", cwd=os.getcwd(), source=source)
+    moved = {"by": 0.0}
+    monkeypatch.setattr(L, "time", types.SimpleNamespace(
+        monotonic=lambda: time.monotonic() + moved["by"],
+        time=lambda: time.time() + moved["by"], sleep=time.sleep))
+    monkeypatch.setattr(L.sys, "stdin", types.SimpleNamespace(isatty=lambda: True, fileno=lambda: 0))
+    monkeypatch.setattr(L.appalive, "app_running", lambda _d: True)
+    monkeypatch.setattr(er, "target_engine", lambda *a, **k: "/new/acctsw")
+    monkeypatch.setattr(er, "has_late_descendants", lambda *a, **k: False)
+    monkeypatch.setattr(L, "USER_INPUT", er.InputTracker())
+
+    def later():
+        moved["by"] += er.RESTART_QUIET_S + er.CHECK_INTERVAL_S + 10
+        time.sleep(0.01)   # lets the wrapper probe's thread answer
+    typed = lambda: L.USER_INPUT.note(b"hello\r", -1e9)   # noqa: E731
+    return [_appender(path, "{}"), typed, later, later, later, later]
+
+
+def test_idle_codex_restarts_into_its_own_thread_with_its_flags(ctx, monkeypatch, tmp_path):
+    from acctsw.enginerestart import EngineRestart
+    ticks = _codex_engine_ready(ctx, monkeypatch, tmp_path)
+    with pytest.raises(EngineRestart) as raised:
+        run(ctx, "codex", ["--search", "-m", "gpt-x"], spawn=FakeSpawn([(None, 0, ticks)]),
+            get=fake_get({}), notify=lambda m: None)
+    assert raised.value.argv == ["/new/acctsw", "run", "codex", "resume", "01a0abcd",
+                                 "--search", "-m", "gpt-x",
+                                 "-c", "check_for_update_on_startup=false"]
+    assert raised.value.seat == ctx.load_state().active("codex")
+
+
+def test_codex_stays_when_the_log_it_found_may_not_be_its_own(ctx, monkeypatch, tmp_path):
+    ticks = _codex_engine_ready(ctx, monkeypatch, tmp_path, source={"subagent": "review"})
+    assert run(ctx, "codex", ["--search"], spawn=FakeSpawn([(None, 0, ticks)]),
+               get=fake_get({}), notify=lambda m: None) == 0
+
+
+def test_codex_stays_beside_another_live_codex_session(ctx, monkeypatch, tmp_path):
+    from acctsw import session as session_mod
+    ticks = _codex_engine_ready(ctx, monkeypatch, tmp_path)
+    monkeypatch.setattr(session_mod, "active_sessions", lambda *_a, **_k: [
+        {"pid": pid, "email": "a@x.com", "started_at": iso(now())} for pid in (1, 2)])
+    assert run(ctx, "codex", ["--search"], spawn=FakeSpawn([(None, 0, ticks)]),
+               get=fake_get({}), notify=lambda m: None) == 0
+
+
+def test_codex_stays_when_another_interactive_log_moved_after_attaching(ctx, monkeypatch, tmp_path):
+    ticks = _codex_engine_ready(ctx, monkeypatch, tmp_path)
+    sibling = write_rollout(_codex_sessions(ctx), thread="01a0bbbb", cwd=os.getcwd(), source="cli")
+    ticks.insert(2, _appender(sibling, "{}"))
+    assert run(ctx, "codex", ["--search"], spawn=FakeSpawn([(None, 0, ticks)]),
+               get=fake_get({}), notify=lambda m: None) == 0
+
+
+def test_codex_stays_if_nothing_was_typed_into_it(ctx, monkeypatch, tmp_path):
+    ticks = _codex_engine_ready(ctx, monkeypatch, tmp_path)
+    del ticks[1]   # the log that moved can only be some exited sibling's
+    assert run(ctx, "codex", ["--search"], spawn=FakeSpawn([(None, 0, ticks)]),
+               get=fake_get({}), notify=lambda m: None) == 0
+
+
+def test_codex_exec_is_never_restarted(ctx, monkeypatch, tmp_path):
+    from acctsw import session as session_mod
+    ticks = _codex_engine_ready(ctx, monkeypatch, tmp_path)
+    child = FakeSpawn([(None, 0, ticks)])
+
+    def spawn(argv, on_output, on_tick=None, *, env=None, stdin_null=False):
+        return child(argv, on_output, on_tick, env=env)
+    assert run(ctx, "codex", ["exec", "do it"], spawn=spawn, get=fake_get({}),
+               notify=lambda m: None) == 0
+    assert session_mod.SELF_RESTART is False
+

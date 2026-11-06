@@ -2559,6 +2559,62 @@ test("row detail buttons disclose locally and survive a poll without sending a s
   }
 });
 
+test("closing the popover drops open questions, rows and menus, but hiding alone does not", () => {
+  const app = keyApp();
+  const snapshot = state({ tools: { claude: { active: "current@x", seats: [
+    seat({ email: "current@x", name: "Current", active: true, status: "active", kind: "personal" }),
+    seat({ email: "target@x", name: "Target", kind: "business" }),
+  ] } } });
+  const expand = () => {
+    const button = { dataset: { action: "seat-details", tool: "claude", email: "target@x" },
+      setAttribute() {}, getAttribute: () => "none" };
+    app.handlers.click({ target: { closest: (selector) => selector === "[data-action]" ? button : null } });
+  };
+  const expanded = /data-email="target@x"[^>]*aria-expanded="true"/;
+  app.window.AGL.update(snapshot);
+  app.click({ action: "switch", tool: "claude", email: "target@x" });
+  expand();
+  app.window.AGL.update(snapshot); // a poll while open keeps both
+  app.window.AGL.setVisible(false); // display sleep or a Space change: the popover may still be up
+  app.window.AGL.update(snapshot);
+  assert.match(app.root.innerHTML, /data-action="switch-confirm"/);
+  assert.match(app.root.innerHTML, expanded);
+
+  app.window.AGL.closed();
+  assert.doesNotMatch(app.root.innerHTML, /data-action="switch-confirm"/);
+  assert.doesNotMatch(app.root.innerHTML, /aria-expanded="true"/);
+  const before = app.sent.length;
+  app.click({ action: "switch-confirm", tool: "claude", email: "target@x" }); // no longer armed
+  assert.equal(app.sent.length, before);
+
+  // Closing on settings still clears the rows behind it and comes back to the main screen.
+  expand();
+  app.click({ action: "settings" });
+  app.window.AGL.closed();
+  assert.doesNotMatch(app.root.innerHTML, /aria-expanded="true"/);
+  assert.match(app.root.innerHTML, /data-action="switch"/);
+});
+
+test("closing the popover drops the paid-key gate but keeps a key being typed", () => {
+  const app = keyApp();
+  app.window.AGL.update(state({ keys: [keySeat()] }));
+  app.click({ action: "key-terminal", id: "key-1" });
+  app.window.AGL.result({ ok: false, code: "paid_use_disabled", key_action: "key_terminal", key_target_id: "key-1", error: "off" });
+  assert.match(app.root.innerHTML, /data-action="paid-key-enable"/);
+  app.window.AGL.closed();
+  assert.doesNotMatch(app.root.innerHTML, /data-action="paid-key-enable"/);
+
+  app.click({ action: "key-terminal", id: "key-1" }); // its reply arrives only after the close
+  app.window.AGL.closed();
+  app.window.AGL.result({ ok: false, code: "paid_use_disabled", key_action: "key_terminal", key_target_id: "key-1", error: "off" });
+  assert.doesNotMatch(app.root.innerHTML, /data-action="paid-key-enable"/);
+
+  app.click({ action: "key-start" });
+  const typing = app.root.innerHTML;
+  app.window.AGL.closed();
+  assert.equal(app.root.innerHTML, typing);
+});
+
 test("ledger uses clickdummy row, column, glyph, bar and control dimensions", () => {
 assert.match(css, /grid-template-columns:58px 1fr; column-gap:6px; padding:9px 16px 11px/);
 assert.match(css, /height:44px; padding:0 8px 0 16px/);
@@ -2753,7 +2809,7 @@ test("footer confirmations use text, survive a poll and restore the live status"
   assert.equal(status.textContent, "codex is on personal now");
 });
 
-test("remove seat lives in every subscription's inline details with its original confirmation", () => {
+test("remove seat lives in every subscription's inline details and asks in place", () => {
   for (const tool of ["codex", "claude"]) {
     for (const status of ["active", "ready", "resting", "queued", "needs-login"]) {
       const email = 'seat"<&@example.test', s = seat({ email, status });
@@ -2765,15 +2821,14 @@ test("remove seat lives in every subscription's inline details with its original
       assert.doesNotMatch(visibleMarkup(html), /data-action="remove"/);
       const opened = buildHTML(snapshot, null, new Set([JSON.stringify([tool, email])]));
       assert.match(visibleMarkup(opened), /data-action="remove"/);
-      const confirmations = [];
-      let approved = false;
-      const app = keyApp({ confirm: (text) => { confirmations.push(text); return approved; } });
+      const app = keyApp({ confirm: () => assert.fail("confirm() does nothing in the app's web view") });
+      const button = { dataset: { action: "remove", tool, email }, textContent: "remove seat" };
+      const press = () => app.handlers.click({ target: { closest: (selector) => selector === "[data-action]" ? button : null } });
       const sentBefore = app.sent.length;
-      app.click({ action: "remove", tool, email });
+      press();
       assert.equal(app.sent.length, sentBefore);
-      approved = true;
-      app.click({ action: "remove", tool, email });
-      assert.deepEqual(confirmations, [`wave goodbye to ${email}?`, `wave goodbye to ${email}?`]);
+      assert.equal(button.textContent, `wave goodbye to ${email}?`);
+      press();
       assert.deepEqual(JSON.parse(JSON.stringify(app.sent.at(-1))), { action: "remove", tool, email });
     }
   }
