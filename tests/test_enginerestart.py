@@ -107,7 +107,7 @@ def test_last_input_keeps_the_latest_real_key():
     assert t.last_input == 1.0
 
 
-@pytest.mark.parametrize("data", [b"a", b" ", "é".encode(), b"a\x7f", b"a\rb", b"a\r\x03",
+@pytest.mark.parametrize("data", [b"a", b" ", "é".encode(), b"a\rb", b"a\r\x03",
                                   b"\x1b[Ia"])
 def test_printable_text_is_a_draft(data):
     t = InputTracker()
@@ -123,7 +123,7 @@ def test_enter_clears_the_draft(enter):
     assert t.draft is False
 
 
-@pytest.mark.parametrize("data", [b"\x7f", b"\x03", b"\x15", b"\x1b[A", b"\x1bOA", b"\x1b[97;1u", b"\x1b", b"\x1b\r"])
+@pytest.mark.parametrize("data", [b"\x03", b"\x15", b"\x1b[A", b"\x1bOA", b"\x1b[97;1u", b"\x1b", b"\x1b\r"])
 def test_any_other_key_may_have_left_text_in_the_box(data):
     # Up-arrow recalls history, Tab completes, kitty mode encodes letters: all look like escapes.
     for start in (b"", b"draft"):
@@ -137,6 +137,42 @@ def test_ctrl_j_is_a_newline_in_the_box_not_a_submit():
     t = InputTracker()
     t.note(b"first line\n", 1.0)
     assert t.draft is True
+
+
+@pytest.mark.parametrize("parts", [[b"line\\\r"], [b"line\\", b"\r"], [b"\\\r"]])
+def test_backslash_enter_is_a_newline_in_the_box_not_a_submit(parts):
+    t = InputTracker()
+    for part in parts:
+        t.note(part, 1.0)
+    assert t.draft is True
+
+
+def test_backspacing_a_box_empty_is_no_draft():
+    t = InputTracker()
+    t.note(b"ab\x7f\x7f", 1.0)
+    assert t.draft is False
+
+
+@pytest.mark.parametrize("line", [b"/resume\r", b"/clear\r", b"/resume abc\r", b"/my-skill\r",
+                                  b"/plugin:skill x\r", b"\x1b[A\r", b"/CLEAR\r",
+                                  b"\x1b[200~/resume\x1b[201~\r"])
+def test_a_submitted_line_that_may_change_conversation_is_remembered(line):
+    t = InputTracker()
+    t.note(line, 1.0)
+    assert t.moved is True
+    t.note(b"hello\r", 2.0)
+    assert t.moved is True   # for the rest of this child
+    t.reset()
+    assert t.moved is False
+
+
+@pytest.mark.parametrize("line", [b"hello\r", b"/status\r", b"/model opus\r", b"/Users/me/x.py fix\r",
+                                  b"\r", b"\x1bnew text\r", b"x/resume\r"])
+def test_ordinary_lines_stay_in_the_conversation(line):
+    t = InputTracker()
+    t.note(line, 1.0)
+    assert t.moved is False
+    assert t.draft is False
 
 
 def test_reset_is_a_new_childs_empty_box():

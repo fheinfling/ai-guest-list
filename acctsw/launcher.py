@@ -1562,7 +1562,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
     relogin_at: dict = {}      # seat → monotonic time of its last same-seat login restore (loop guard)
     # Set by a login restore: the next child runs on THIS seat, not active. An engine restart hands
     # over the seat it was billing, so another terminal's switch can't move this conversation.
-    relaunch_seat = os.environ.pop(enginerestart.SEAT_ENV, None)
+    handed_seat = relaunch_seat = os.environ.pop(enginerestart.SEAT_ENV, None)
 
     # A key is a separate runtime, NEVER an OAuth account installed behind state.active(). Keep
     # the pending consent separate from the runtime too: neither config nor env exists pre-approval.
@@ -2756,6 +2756,13 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 claudehome.prepare_all(ctx)
             with ctx.locked():
                 st = ctx.load_state()
+                # The seat could have gone during the preparation above; never fall back from it.
+                if (handed_seat and relaunch_seat == handed_seat
+                        and not _restart_seat_usable(st, tool, handed_seat)):
+                    notify(f"{tool}: {handed_seat} can't take this session right now. Your work "
+                           f"is saved: start {tool} again when it can.")
+                    return EXIT_GAVE_UP
+                handed_seat = None
                 launch_email = (relaunch_seat if relaunch_seat and st.get_seat(tool, relaunch_seat)
                                 else st.active(tool))
                 relaunch_seat = None
@@ -3321,7 +3328,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 if at < tick["engine_next"]:
                     return False
                 tick["engine_next"] = at + enginerestart.CHECK_INTERVAL_S
-                can_restart = (could_restart and _engine_can_see_work()
+                can_restart = (could_restart and _engine_can_see_work() and not USER_INPUT.moved
                                and ctx.load_state().settings().get("engine_restart", True))
                 if can_restart != session_mod.SELF_RESTART:
                     # The app keeps warning about a session that lost its way to restart.

@@ -13,6 +13,7 @@ a guessed argv can re-send a prompt or drop the sandbox.
 """
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -157,42 +158,80 @@ def visible_input(data: bytes) -> bytes:
     return b"".join(chunk for kind, chunk in tokens if kind == "text")
 
 
+# Slash commands known to stay in the same conversation. Anything else (/resume, /clear, /new, /fork,
+# a skill we've never heard of) may have moved this session somewhere its id no longer describes.
+_SAME_CONVERSATION = frozenset({
+    "help", "status", "cost", "usage", "context", "model", "effort", "config", "mcp", "memory",
+    "theme", "statusline", "doctor", "permissions", "diff",
+})
+_COMMAND = re.compile(rb"/([A-Za-z0-9:_-]+)(?:\s|$)")
+
+
 class InputTracker:
-    """When the user last touched the keyboard, and whether unsent text may be in the prompt box."""
+    """What the user has done in this child's terminal: when they last touched the keyboard, whether
+    unsent text may be in the prompt box, and whether they may have left the original conversation."""
 
     def __init__(self) -> None:
+        self._carry = b""
+        self._carry_at = 0.0
         self.reset()
 
     def reset(self) -> None:
-        """A new child: it starts with an empty prompt box."""
+        """A new child: an empty prompt box, in the conversation it was started on."""
         self.last_input: float | None = None
-        self._draft = False
-        self._carry = b""
-        self._carry_at = 0.0
+        self.moved = False
+        self._line = bytearray()
+        self._unsure = False     # keys we can't follow: recalled history, completion, kitty encoding
         self._in_paste = False
+        self._carry = b""
 
     @property
     def draft(self) -> bool:
-        return self._draft or bool(self._carry)  # a held-back Esc may yet be a key
+        return bool(self._line) or self._unsure or bool(self._carry)  # a held-back Esc may be a key
+
+    def _submit(self) -> None:
+        command = _COMMAND.match(bytes(self._line))
+        if (command and command.group(1).decode().lower() not in _SAME_CONVERSATION) or (
+                self._unsure and not self._line):  # Enter on a recalled line or in a picker
+            self.moved = True
+        self._line.clear()
+        self._unsure = False
+
+    def _typed(self, chunk: bytes) -> None:
+        for byte in chunk:
+            if byte == 0x0d:  # raw mode: Enter is CR
+                if self._line.endswith(b"\\"):
+                    self._line[-1:] = b"\n"  # backslash+Enter: a newline in the box, not a submit
+                else:
+                    self._submit()
+            elif byte in (0x7f, 0x08):
+                if self._line:
+                    self._line.pop()
+            elif byte == 0x0a or byte >= 0x20:  # LF is Ctrl+J, also a newline in the box
+                self._line.append(byte)
+            else:
+                self._unsure = True
 
     def note(self, data: bytes, at: float) -> None:
         if self._carry and at - self._carry_at > _SPLIT_WINDOW_S:
+            self._unsure = True  # it was a real Esc press
             self._carry = b""
         started = self._carry_at if self._carry else at
         tokens, tail = _scan(self._carry + data)
         self._carry = tail if len(tail) <= _MAX_CARRY else b""
         self._carry_at = started
-
         for kind, chunk in tokens:
             if kind == "paste_on":
                 self._in_paste = True
             elif kind == "paste_off":
                 self._in_paste = False
             elif kind == "typed":
-                self._draft = True  # recalled history, completion, kitty-encoded text: can't tell
+                self._unsure = True
             elif kind == "text":
-                # Raw mode: Enter is CR. LF is Ctrl+J, a newline inside the prompt, not a submit.
-                self._draft = self._in_paste or not chunk.endswith(b"\r")
+                if self._in_paste:
+                    self._line.extend(chunk)
+                else:
+                    self._typed(chunk)
         if tail or any(kind != "passive" for kind, _ in tokens):
             self.last_input = at
 

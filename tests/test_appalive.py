@@ -303,3 +303,22 @@ def test_engine_restart_that_cant_exec_says_how_to_continue(isolated, monkeypatc
     _engine_restart(isolated, monkeypatch, exec_fails=True)
     assert cli.main(["run", "claude", "--", "--chrome"]) == 127
     assert "/new/acctsw run claude --resume t" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("why", ["app closed", "no seats"])
+def test_handed_over_seat_never_falls_to_stock(isolated, monkeypatch, why, capsys):
+    from acctsw import enginerestart, headroom
+    stock = []
+    monkeypatch.setenv(enginerestart.SEAT_ENV, "a@x")
+    monkeypatch.setattr(headroom, "legacy_present", lambda ctx: False)
+    monkeypatch.setattr(launcher, "exec_stock", lambda *a: stock.append(a) or 0)
+    if why == "no seats":
+        appalive.mark_alive(isolated.data_dir)
+
+        def none_left(*a, **k):
+            raise launcher.NoSeats("none")
+        monkeypatch.setattr(launcher, "run", none_left)
+    assert cli.main(["run", "claude", "--", "--resume", "t"]) == launcher.EXIT_GAVE_UP
+    assert stock == []
+    assert "a@x" in capsys.readouterr().err
+

@@ -282,7 +282,7 @@ class RolloutWatcher:
 
     # --- attach ---------------------------------------------------------------------------------
     def other_interactive_logs(self) -> list[Path]:
-        """Interactive logs in this cwd, other than the attached one, that moved since the spawn.
+        """Interactive logs anywhere, other than the attached one, that moved since the spawn.
         Attachment is decided once; this looks again, for a caller about to act on it."""
         found = []
         for path, mtime in scan_rollouts(self._roots).items():
@@ -290,7 +290,7 @@ class RolloutWatcher:
             if path == self.attached or (previous is not None and mtime <= previous):
                 continue
             meta = session_meta(path) or {}
-            if meta.get("cwd") == self._cwd and meta.get("source") == "cli":
+            if meta.get("source") == "cli":
                 found.append(path)
         return found
 

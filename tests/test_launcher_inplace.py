@@ -2127,6 +2127,29 @@ def test_turning_it_off_reaches_a_running_session_and_the_banner(seats, engine_r
     assert L.session_mod.SELF_RESTART is False
 
 
+def test_a_conversation_switching_command_means_stay_and_warn(seats, engine_ready):
+    spawn = Spawn(_idle_child(engine_ready, lambda: L.USER_INPUT.note(b"/resume\r", -1e9)))
+    assert run(seats, "claude", ["--resume", THREAD], spawn=spawn, get=fake_get({}),
+               swap_factory=lambda _c: _quiet_swap(), notify=lambda m: None) == 0
+    assert L.session_mod.SELF_RESTART is False
+
+
+def test_handed_over_seat_lost_during_preparation_never_falls_back(seats, tokens, monkeypatch):
+    from acctsw import claudehome
+    from acctsw.enginerestart import SEAT_ENV
+    monkeypatch.setenv(SEAT_ENV, C2)
+    real = claudehome.prepare_all
+
+    def prepare(ctx):
+        real(ctx)
+        _drop(ctx, C2)
+    monkeypatch.setattr(claudehome, "prepare_all", prepare)
+    spawn = Spawn(([None], 0))
+    assert run(seats, "claude", [], spawn=spawn, get=fake_get({}), swap_factory=lambda _c: None,
+               notify=lambda m: None) == L.EXIT_GAVE_UP
+    assert spawn.calls == []
+
+
 def test_losing_the_proxy_tells_the_app_this_session_wont_restart(seats, engine_ready):
     swap = _quiet_swap()
     swap.env = lambda _env: None
