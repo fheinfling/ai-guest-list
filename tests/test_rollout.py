@@ -53,14 +53,15 @@ def task_complete_error_line(code="usage_limit_exceeded", message=OUT_OF_CREDITS
                         started_at=1_789_136_132, completed_at=1_789_136_137, duration_ms=4992)
 
 
-def write_rollout(dir, *, thread="01a0abcd", cwd="/work/x", ts=TS, lines=()):
+def write_rollout(dir, *, thread="01a0abcd", cwd="/work/x", ts=TS, lines=(), source=None):
     """Create ``<dir>/YYYY/MM/DD/rollout-<ts>-<thread>.jsonl`` with a session_meta header."""
     y, m, d = ts[:10].split("-")
     dest = Path(dir) / y / m / d
     dest.mkdir(parents=True, exist_ok=True)
     path = dest / f"rollout-{ts.replace(':', '-')}-{thread}.jsonl"
     meta = rollout_line("session_meta", timestamp=ts, id=thread, cwd=cwd,
-                        originator="codex-tui", cli_version="0.153.4")
+                        originator="codex-tui", cli_version="0.153.4",
+                        **({"source": source} if source else {}))
     path.write_text("\n".join([meta, *lines]) + "\n")
     return path
 

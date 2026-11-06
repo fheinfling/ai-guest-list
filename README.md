@@ -96,7 +96,14 @@ connect through the official tools.
 - **Zero-touch setup** — installing the app wires `codex` / `claude` to the supervised launchers; when
   the app is closed ordinary work sessions run the stock tool. Sign-in and logout stay protected.
   If your terminals or running sessions use an older engine than the app (e.g. a source checkout
-  that wasn't pulled), the popover says so, and an older engine never moves credentials.
+  that wasn't pulled), the popover says so. An engine below the store's minimum writer version
+  won't move credentials; a compatible older one still can, so restart it to get current behaviour.
+  From this release on, a session restarts itself in the same terminal when a newer engine is
+  installed, once it has been idle for over an hour with no unsent draft and nothing it started
+  still running, and resumes the conversation. `codex exec`, `claude -p`, paid key seats, sessions
+  started with a prompt or flags that can't be safely rebuilt, and Codex sessions sharing the Mac
+  with another Codex session stay as they are; so do sessions started on older engines, which need
+  a manual restart. The popover keeps warning about any that can't restart themselves.
 - **Add / remove seats** — official browser sign-in, plus a no-browser path for Codex (paste an
   `auth.json`). Claude is browser sign-in only: a `claude setup-token` is an env-var token, not the
   Keychain login the switcher reads. Credentials live only in the Keychain / the tools' own stores.
@@ -175,7 +182,9 @@ gh attestation verify AI-Guest-List-vX.Y.Z.zip --repo fheinfling/ai-guest-list
 
 **Upgrading:** `brew upgrade --cask ai-guest-list` replaces the app on disk, but a menubar app that
 is already running keeps the engine it started with. **Quit it from the menubar and open it again**
-after upgrading, so the terminal and the app agree on how the store is laid out.
+after upgrading, so the terminal and the app agree on how the store is laid out. Terminal sessions
+are separate: those that can restart themselves move to the new engine once idle, and the rest keep
+their engine until you restart them.
 
 **From source (CLI engine):**
 ```sh
