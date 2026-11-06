@@ -477,6 +477,10 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
             # Transient popovers also close when the user clicks elsewhere, bypassing togglePopover_.
             self._setWebVisible(False)
             self._setUsagePollInterval(usage_poll_interval(False))
+            # A late notification after a quick reopen must not wipe what's on screen.
+            if self.webview and not self.popover.isShown():
+                self.webview.evaluateJavaScript_completionHandler_(
+                    "window.AGL && window.AGL.closed && window.AGL.closed();", None)
 
         @objc.python_method
         def _startStateTimer(self):

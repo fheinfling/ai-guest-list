@@ -1163,6 +1163,7 @@ window.AGL = {
   // Native popover lifecycle: tick cached countdowns only while this surface is actually visible.
   // This never asks the bridge for data and never touches lastRev.
   setVisible(visible) { setPopoverVisible(Boolean(visible)); },
+  closed: resetTransientUI,
   celebrate,
 };
 
@@ -1267,6 +1268,29 @@ function setPopoverVisible(visible) {
   } else if (!visible && clockTimer !== null) {
     clearInterval(clockTimer);
     clockTimer = null;
+  }
+}
+
+// The web view outlives the popover by days, so what was left open must not greet the next opening
+// as if it were current, and a consent question must never stay armed across a close. Only the native
+// close calls this: `document.hidden` also flips on display sleep with the popover still up. The
+// add-seat and add-key flows stay, because clicking away to copy a key closes the popover too.
+function resetTransientUI() {
+  pendingSwitch = null;
+  openSeatDetails.clear();
+  openMenu = null;
+  if (screen === "settings") screen = "main";
+  else if (screen === "paid-key" && !paidTerminal?.pending) { paidTerminal = null; screen = "main"; }
+  if (screen !== "main") return;
+  render();
+  const body = root.querySelector(".body");
+  if (body) body.scrollTop = 0;
+  // Size it now, while closed: animation frames can wait until the next open, which would show the
+  // old height first.
+  const height = contentHeight();
+  if (Number.isFinite(height) && height > 0 && height !== lastHeight) {
+    lastHeight = height;
+    send("resize", { height });
   }
 }
 
