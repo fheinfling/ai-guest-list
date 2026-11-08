@@ -237,6 +237,9 @@ class State:
             self.set_active(tool, None)
         return existed
 
+    def set_seat_name(self, tool: str, email: str, name: str) -> None:
+        self.accounts(tool)[email]["name"] = name
+
     def set_limited_until(self, tool: str, email: str, until_iso: str | None,
                           source: str | None = None) -> None:
         seat = self.get_seat(tool, email)

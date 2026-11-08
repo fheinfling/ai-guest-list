@@ -109,6 +109,7 @@ connect through the official tools.
 - **Add / remove seats** — official browser sign-in, plus a no-browser path for Codex (paste an
   `auth.json`). Claude is browser sign-in only: a `claude setup-token` is an env-var token, not the
   Keychain login the switcher reads. Credentials live only in the Keychain / the tools' own stores.
+- **Rename subscription seats** — click a seat name, edit **Name**, and save; leave it blank to show the email's local part.
 - **Pay-per-token key seats** — an API key becomes a seat too, for when every subscription is
   resting or when you want one terminal on a specific model. Paid use is off by default,
   and confirmation is on by default. One switch stops every paid session. See [below](#bring-your-own-key).
