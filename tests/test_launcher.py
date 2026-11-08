@@ -2876,3 +2876,36 @@ def test_codex_exec_is_never_restarted(ctx, monkeypatch, tmp_path):
                notify=lambda m: None) == 0
     assert session_mod.SELF_RESTART is False
 
+
+def test_preload_imports_every_engine_module_so_an_app_update_cant_mix_versions():
+    import pkgutil
+    import sys
+    import acctsw
+    from acctsw.launcher import preload_engine
+    assert preload_engine() == []
+    names = {m.name for m in pkgutil.iter_modules(acctsw.__path__)} - {"__main__"}
+    assert all(f"acctsw.{n}" in sys.modules for n in names)
+
+    from acctsw.launcher import LAZY_STDLIB
+    assert all(name in sys.modules for name in LAZY_STDLIB)
+
+
+def test_every_lazy_standard_library_import_is_preloaded():
+    # The bundle ships compiled modules, so the list can't be found at run time: keep it complete.
+    import ast
+    import sys
+    from pathlib import Path
+    import acctsw
+    from acctsw.launcher import LAZY_STDLIB
+    lazy = set()
+    for source in Path(acctsw.__file__).parent.glob("*.py"):
+        for fn in ast.walk(ast.parse(source.read_text(encoding="utf-8"))):
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for node in ast.walk(fn):
+                    if isinstance(node, ast.Import):
+                        lazy.update(a.name for a in node.names)
+                    elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                        lazy.add(node.module)
+    stdlib = {m for m in lazy if m.split(".")[0] in sys.stdlib_module_names}
+    assert stdlib <= set(LAZY_STDLIB), sorted(stdlib - set(LAZY_STDLIB))
+

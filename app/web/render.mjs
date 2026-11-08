@@ -243,6 +243,35 @@ export function engineBanner(state) {
   return engineWarnings(state).map((w) => `<div class="issue issue--hard app-problem engine-problem" role="alert">${ICON.alert}<div>${esc(w.text)}</div>${w.action === "adopt_engine" ? `<button class="row-action" data-action="engine-adopt">use this app's engine</button>` : ""}</div>`).join("");
 }
 
+// In-app updater (calm, never counted in the header's "needs you"): the engine checks on its own
+// and installs only when the user clicks. `update` is absent when nothing newer is known.
+const UPDATE_BUSY = {
+  downloading: (v) => `updating to ${v}…`,
+  verifying: (v) => `checking ${v}…`,
+  installing: (v) => `installing ${v}, the app will reopen`,
+};
+export function updateCanInstall(update) {
+  return Boolean(update?.version) && ["available", "failed"].includes(update.phase);
+}
+export function updateLine(state) {
+  const u = state?.update;
+  if (!u?.version) return "";
+  const v = esc(u.version);
+  const notes = '<button class="pricing-link" data-action="update-notes">what\'s new</button>';
+  const line = (tone, icon, text, acts) => `<div class="issue issue--${tone} update-line" role="status" aria-label="app update">${icon}<span class="issue-text">${text}</span><span class="update-acts">${acts}</span></div>`;
+  if (u.phase === "available") return line("calm", ICON.update, `${v} is ready`, `${notes}<button class="row-action" data-action="update-install">update</button>`);
+  if (u.phase === "failed") return line("soft", ICON.alert, `couldn't update to ${v}${u.error ? `: ${esc(u.error)}` : ""}`, `${notes}<button class="row-action" data-action="update-install">try again</button>`);
+  if (UPDATE_BUSY[u.phase]) return line("calm", ICON.update, UPDATE_BUSY[u.phase](v), '<button class="row-action" data-action="update-install" disabled aria-busy="true">update</button>');
+  return "";
+}
+
+// Reply to a manual "check for updates": always says something, never a raw engine error.
+function updateCheckFlash(check) {
+  if (!check.ok || check.error) return "couldn't check for updates";
+  if (check.up_to_date) return "you're on the latest version";
+  return check.version ? `${check.version} is available` : "couldn't check for updates";
+}
+
 // --- add-a-seat sub-view (spec §9) — a pushed screen like settings, NOT a modal ----------------
 // Four steps: provider → details → connecting → done. The provider accent (teal Codex / coral
 // Claude) rides a single `--accent` CSS var on the root, so step markup never branches on tool.
@@ -322,6 +351,7 @@ export function reduceReply(ui, res) {
   // current flow (a stale/other-tool one would pop over main/settings or the wrong add out of nowhere).
   if (res.error && !res.background && (!res.add_op || forThisFlow)) flash = res.error;
   else if (res.message && !res.background) flash = res.message;
+  if (res.update_check && !res.background) flash = updateCheckFlash(res.update_check);
   if (res.celebrate) celebrate = true;
 
   return { screen, add, lastRev, state, render, flash, celebrate, closeFlow };
@@ -483,6 +513,7 @@ export function buildSettings(state) {
   const strat = s.strategy === "most_headroom" ? "most_headroom" : "soonest_back";
   const app = state?.app;
   const version = app ? `v${app.version}${app.build && app.build !== "dev" ? ` · build ${app.build}` : ""}` : "";
+  const newer = state?.update?.version ? ` · ${state.update.version} available` : "";
   return `<div class="app set-app theme-${theme}"><header class="set-head"><button class="set-back" data-action="settings-back" aria-label="back">‹</button><span class="set-title">settings</span><button class="set-done" data-action="settings-back">done</button></header>
     <div class="set-body"><section class="set-sec"><h1 class="set-label">switching</h1>
       ${toggleRow("auto_switch", "auto-switch", "move when a seat runs out", s.auto_switch)}
@@ -505,7 +536,7 @@ export function buildSettings(state) {
       ${segBlock("theme", "", "set_theme", theme, THEME_OPTS)}
       <div class="set-legend"><p>in your menu bar</p><div>${doorMark({door:"open"})}<span>a model is free</span></div><div>${doorMark({door:"shut"})}<span>every seat is resting</span></div>
       <p>gold: just switched you</p><p>rose: sign-in needed</p></div>
-    </section><p class="set-ver">ai guest list ${esc(version)}</p></div></div>`;
+    </section><p class="set-ver">ai guest list ${esc(version + newer)}</p></div></div>`;
 }
 
 
@@ -638,6 +669,7 @@ const ICON = {
   plus: '<svg viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M8 3v10M3 8h10"/></svg>',
   more: '<svg viewBox="0 0 16 16" aria-hidden="true" fill="currentColor"><circle cx="3.2" cy="8" r="1.4"/><circle cx="8" cy="8" r="1.4"/><circle cx="12.8" cy="8" r="1.4"/></svg>',
   chev: '<svg class="chev" viewBox="0 0 10 10" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2 3.6l3 3 3-3"/></svg>',
+  update: '<svg viewBox="0 0 14 14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="7" cy="7" r="6.2"/><path d="M7 10.2V4.2M4.6 6.4L7 4l2.4 2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   switch: '<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="M2 4h7l-2-2M10 8H3l2 2"/></svg>',
 };
 const mark = (tool) => `<span class="mark${tool === "claude" ? " mark--claude" : ""}" aria-hidden="true"></span>`;
@@ -813,7 +845,7 @@ export function buildHTML(state, pendingSwitch = null, openDetails = new Set()) 
   const theme = state?.settings?.theme === "dark" ? "dark" : "light";
   const seats = subscriptionSeats(state), paid = paidCount(state);
   const mood = paid ? "spending" : seats.some(usable) ? "ready" : seats.length ? "resting" : "empty";
-  const problems = engineBanner(state) + supervisionBanner(state);
+  const problems = engineBanner(state) + supervisionBanner(state), update = updateLine(state);
   const prompts = keyConfirmations(state), asking = prompts.includes('class="key-confirm"');
   const tools = [...new Set(["codex", "claude", ...(state.keys || []).map((k) => k.harness || "codex"), ...(state.pending_crossings || []).map((r) => r.tool), ...(state.pending_tier_requests || []).map((r) => r.tool)])];
   const plans = tools.map((tool) => toolPlan(tool, state)).filter((p) => p.seats.length || p.keys.length || (state.pending_crossings || []).some((r) => r.tool === p.tool) || (state.pending_tier_requests || []).some((r) => r.tool === p.tool));
@@ -822,8 +854,8 @@ export function buildHTML(state, pendingSwitch = null, openDetails = new Set()) 
   return `<div class="app ambient-app now-next theme-${theme} mood-${mood}">
     <header class="top"><span class="brand">${appIcon()}</span>${headerVerdict(state)}<div class="top-actions">
       <div class="header-menu"><button class="ibtn" data-action="menu" data-menu="add" aria-label="add a subscription seat or API key" aria-haspopup="menu" aria-expanded="false">${ICON.plus}</button><nav class="menu" role="menu" aria-label="add" hidden><button role="menuitem" data-action="add" data-tool="codex">codex seat <span class="sub">sign in</span></button><button role="menuitem" data-action="add" data-tool="claude">claude seat <span class="sub">sign in</span></button><hr><button role="menuitem" data-action="key-start">api key <span class="sub">paid</span></button><button role="menuitem" data-action="add">a subscription seat</button></nav></div>
-      <div class="header-menu"><button class="ibtn" data-action="menu" data-menu="more" aria-label="app menu" aria-haspopup="menu" aria-expanded="false">${ICON.more}</button><nav class="menu" role="menu" aria-label="more" hidden><button role="menuitemcheckbox" aria-checked="${!!state?.settings?.auto_switch}" data-action="toggle" data-key="auto_switch">auto-switch <span class="sub">${state?.settings?.auto_switch ? "on" : "off"}</span></button><button role="menuitem" data-action="set_strategy" data-value="${state?.settings?.strategy === "most_headroom" ? "soonest_back" : "most_headroom"}">next seat <span class="sub">${strategy.replace(" first", "")}</span></button><hr><button role="menuitem" data-action="settings">settings…</button><button role="menuitem" data-action="quit">quit</button></nav></div></div></header>
-    <div class="body" aria-label="seat availability" tabindex="0"><div class="content">${problems ? `<div class="app-problems">${problems}</div>` : ""}${prompts}${paid ? paidUseControl(state) : ""}${plans.length ? `<div class="field">${plans.map((p) => toolBlock(p, state, pendingSwitch, openDetails)).join("")}</div><div class="sheet">${plans.map((p) => listRows(p, state, openDetails)).join("")}</div>` : !asking ? `<div class="field welcome"><p class="welcome-title">no seats yet</p><p>use ＋ above to add a subscription or API key.</p><button class="act act--strong" data-action="add">add a seat</button></div>` : ""}${emptyWithoutWelcome ? `<p class="empty">use ＋ above to add a subscription or API key.</p>` : ""}</div></div>
+      <div class="header-menu"><button class="ibtn" data-action="menu" data-menu="more" aria-label="app menu" aria-haspopup="menu" aria-expanded="false">${ICON.more}</button><nav class="menu" role="menu" aria-label="more" hidden><button role="menuitemcheckbox" aria-checked="${!!state?.settings?.auto_switch}" data-action="toggle" data-key="auto_switch">auto-switch <span class="sub">${state?.settings?.auto_switch ? "on" : "off"}</span></button><button role="menuitem" data-action="set_strategy" data-value="${state?.settings?.strategy === "most_headroom" ? "soonest_back" : "most_headroom"}">next seat <span class="sub">${strategy.replace(" first", "")}</span></button><hr><button role="menuitem" data-action="update-check">check for updates</button><button role="menuitem" data-action="settings">settings…</button><button role="menuitem" data-action="quit">quit</button></nav></div></div></header>
+    <div class="body" aria-label="seat availability" tabindex="0"><div class="content">${problems ? `<div class="app-problems">${problems}</div>` : ""}${update ? `<div class="app-notes">${update}</div>` : ""}${prompts}${paid ? paidUseControl(state) : ""}${plans.length ? `<div class="field">${plans.map((p) => toolBlock(p, state, pendingSwitch, openDetails)).join("")}</div><div class="sheet">${plans.map((p) => listRows(p, state, openDetails)).join("")}</div>` : !asking ? `<div class="field welcome"><p class="welcome-title">no seats yet</p><p>use ＋ above to add a subscription or API key.</p><button class="act act--strong" data-action="add">add a seat</button></div>` : ""}${emptyWithoutWelcome ? `<p class="empty">use ＋ above to add a subscription or API key.</p>` : ""}</div></div>
     <footer class="foot">${ICON.switch}<span class="footer-status" role="status" aria-live="polite">${state?.settings?.auto_switch ? `auto-switch on, ${strategy}` : "auto-switch off, you switch by hand"}</span></footer></div>`;
 }
 

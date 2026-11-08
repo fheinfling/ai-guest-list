@@ -329,6 +329,8 @@ def _cmd_run(ctx: Context, ns) -> int:
     args = list(ns.args or [])
     if args and args[0] == "--":  # argparse REMAINDER keeps a leading separator
         args = args[1:]
+    from .launcher import preload_engine
+    preload_engine()   # before the app can update (and replace) the bundle this runs from
     # A newer engine manages this store: supervising would move logins in our older format
     # (how a stale checkout once signed every Claude session out). Fall back to the stock tool,
     # which uses the login as-is, and say how to fix it instead of corrupting anything.

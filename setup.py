@@ -63,6 +63,8 @@ _web = [f for f in glob("app/web/*") if os.path.isfile(f) and _shippable(f)]
 DATA_FILES = [
     ("web", _web),
     ("web/fonts", glob("app/web/fonts/*")),
+    # The publisher's pinned signing identity: the in-app updater installs only apps that meet it.
+    ("", ["scripts/update-requirement.txt"]),
 ]
 
 # CPython's own test suites (fixture data, public dummy TLS keys) are never imported by the app.

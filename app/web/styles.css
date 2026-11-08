@@ -497,6 +497,12 @@ button { color:inherit; }
 .foot .footer-status { flex:1; min-width:0; padding:6px 0; }
 .app-problems { padding:0 16px 9px; background:var(--field-a); display:flow-root; }
 .app-problem { flex-wrap:wrap; }
+.app-notes { padding:0 16px 9px; background:var(--field-a); display:flow-root; }
+.app-problems + .app-notes { padding-top:0; margin-top:-9px; }
+.issue--calm { background:transparent; color:var(--ink); border-color:var(--line); }
+.update-line { flex-wrap:wrap; }
+.update-acts { display:flex; align-items:center; gap:10px; margin-left:auto; }
+.update-line .pricing-link { font-size:12px; min-height:0; padding:0; }
 .key-management { display:flex; flex-direction:column; gap:8px; }
 .empty { padding:12px 16px; color:var(--support); }
 /* Empty, paid spending, and pending paid approval keep the established mood palettes. */

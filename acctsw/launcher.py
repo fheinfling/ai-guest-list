@@ -810,6 +810,31 @@ def _exitcode(raw_status: int) -> int:
             if hasattr(os, "waitstatus_to_exitcode") else raw_status)
 
 
+# Standard-library modules the engine imports inside functions. A test keeps this list complete.
+LAZY_STDLIB = ("datetime", "email.utils", "hashlib", "importlib", "json", "math", "pathlib",
+               "pkgutil", "plistlib", "shlex", "signal", "time")
+
+
+def preload_engine() -> list[str]:
+    """Import every engine module, and what they import lazily, now. A supervisor runs for days
+    from the app bundle; an app update replaces that bundle, and a module first imported afterwards
+    (on a seat switch, say) would come from the new archive into an old process, or not load at all.
+    What a standard-library module imports lazily itself is out of reach; an idle session restarts
+    onto the new engine to close that gap. Returns what failed, which then loads lazily as before."""
+    import importlib
+    import pkgutil
+    from . import __path__ as package_path
+    names = [*LAZY_STDLIB, *(f"{__package__}.{m.name}" for m in pkgutil.iter_modules(package_path)
+                             if m.name != "__main__")]
+    failed = []
+    for name in names:
+        try:
+            importlib.import_module(name)
+        except Exception:
+            failed.append(name)
+    return failed
+
+
 # What the user typed into this terminal: an engine restart must not discard an unsent draft.
 USER_INPUT = enginerestart.InputTracker()
 ENGINE_REPROBE_S = 3600.0   # a wrapper that wasn't newer yet may be by now

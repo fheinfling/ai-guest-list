@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import importlib
 import importlib.util
 import subprocess
@@ -101,6 +102,8 @@ WEB_DIR = Path(__file__).resolve().parent / "web"
 # numbers, so keep its cache moving promptly.  Hidden polling stays deliberately slower: both
 # usage endpoints throttle hard and the engine applies its own per-seat backoff as a second guard.
 USAGE_POLL_OPEN_SECONDS = 30.0
+UPDATE_FIRST_CHECK_S = 60.0          # after launch, once the first usage poll has had its turn
+UPDATE_CHECK_EVERY_S = 6 * 3600.0    # the engine throttles real requests to one per 20 hours
 USAGE_POLL_HIDDEN_SECONDS = 180.0
 STATE_POLL_SECONDS = 3.0
 # The menu-bar mark is the door (icon handoff): open onto the disco when a model's free, shut when
@@ -348,6 +351,8 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
             self._login_baseline = {}             # tool → (op, digest of live creds at that login launch)
             self._login_seq = 0                   # monotonic login op id (see the login handler)
             self._key_notices = KeySwitchNotices()
+            self._update_inflight = False         # one install at a time; the app quits at its end
+            self._update_timer = None
             return self
 
         # --- lifecycle ----------------------------------------------------------------------
@@ -364,6 +369,15 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
             self._buildPopover()
             self._startStateTimer()  # consent expires in 2m; the hidden usage poll takes 3m
             self._startUsageTimer()
+            self._startUpdateChecks()
+            try:
+                # Tell an install helper that's waiting that this version came up: only then does
+                # it delete the previous app it kept for putting back.
+                from acctsw import updater
+                updater.acknowledge(self.ctx.data_dir)
+                updater.reconcile(self.ctx.data_dir)   # nothing is installing in a fresh process
+            except Exception as exc:
+                _log_exception(exc)
             # One-time cleanup of the retired "save credit" Headroom feature — off the main thread so a
             # config restore never blocks the menubar on launch. No-op once nothing remains.
             self.performSelectorInBackground_withObject_(
@@ -881,6 +895,19 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
                 self.performSelectorInBackground_withObject_(
                     objc.selector(self.adoptEngineBg_, signature=b"v@:@"), msg)
                 return
+            if action == "update_check":
+                self.performSelectorInBackground_withObject_(
+                    objc.selector(self.updateCheckBg_, signature=b"v@:@"), msg)
+                return
+            if action == "update_install":
+                if not self._update_inflight:   # the page guards too; this one can't be raced
+                    self._update_inflight = True
+                    self.performSelectorInBackground_withObject_(
+                        objc.selector(self.updateInstallBg_, signature=b"v@:@"), msg)
+                return
+            if action == "update_notes":
+                self._openUpdateNotes()
+                return
             if action == "switch":
                 # Claude identity can take seconds; keep paints and usage updates responsive.
                 self.performSelectorInBackground_withObject_(
@@ -927,6 +954,113 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
             result["key_target_id"] = msg.get("id")
             self.performSelectorOnMainThread_withObject_waitUntilDone_(
                 objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
+
+        # --- in-app updates -------------------------------------------------------------------
+        # Checks are automatic and quiet; installing happens only on the user's click. The engine
+        # (acctsw.updater) validates the manifest, downloads and verifies the signed app; this side
+        # only knows where the running bundle lives and how to hand over to the install helper.
+        @objc.python_method
+        def _startUpdateChecks(self):
+            # Soon after launch, then a few times a day; the engine throttles to one real request
+            # every 20 hours, so these are cheap no-ops in between.
+            self.performSelector_withObject_afterDelay_(
+                objc.selector(self.autoUpdateCheck_, signature=b"v@:@"), None, UPDATE_FIRST_CHECK_S)
+            self._update_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                UPDATE_CHECK_EVERY_S, self, objc.selector(self.autoUpdateCheck_, signature=b"v@:@"),
+                None, True)
+
+        def autoUpdateCheck_(self, _sender):
+            self.performSelectorInBackground_withObject_(
+                objc.selector(self.updateCheckBg_, signature=b"v@:@"), {"background": True})
+
+        def updateCheckBg_(self, msg):
+            msg = dict(msg or {})
+            try:
+                result = dict(bridge.handle(self.ctx, {"action": "update_check",
+                                                       "force": bool(msg.get("force"))}))
+            except Exception as exc:
+                _log_exception(exc)
+                result = {"ok": False, "update_check": {"ok": False, "error": "unexpected error"}}
+            if msg.get("background"):
+                result.pop("update_check", None)   # a quiet check only refreshes the line
+                result["background"] = True
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
+
+        @objc.python_method
+        def _pushUpdateState(self):
+            """The page takes only snapshots with a newer state revision, and update progress lives
+            outside state.json: bump the revision so each phase reaches the popover."""
+            try:
+                with self.ctx.locked():
+                    self.ctx.load_state().save()
+                result = dict(bridge.handle(self.ctx, {"action": "status"}))
+            except Exception as exc:
+                _log_exception(exc)
+                return
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
+
+        def updateInstallBg_(self, _msg):
+            from acctsw import updater
+            data_dir = Path(self.ctx.data_dir)
+            quitting = False
+            try:
+                target = Path(str(NSBundle.mainBundle().bundlePath()))
+                # Find out before downloading anything whether this copy can be replaced in place.
+                if target.suffix != ".app" or "AppTranslocation" in target.parts:
+                    raise updater.UpdateError("can't update in place: open the app from Applications")
+                if not os.access(target.parent, os.W_OK):
+                    raise updater.UpdateError(f"can't update in place: {target.parent} isn't writable")
+                resources = Path(str(NSBundle.mainBundle().resourcePath()))
+                requirement = updater.load_requirement([resources / "update-requirement.txt"])
+                updater.set_phase(data_dir, "downloading")
+                self._pushUpdateState()
+                workdir = data_dir / "updates"
+                workdir.mkdir(mode=0o700, exist_ok=True)
+                staged = updater.prepare(data_dir, workdir=workdir, requirement=requirement,
+                                         target_parent=target.parent)
+                backup = target.parent / f".{target.stem}.previous-{os.getpid()}.app"
+                from acctsw import __version__
+                argv = updater.install_command(staged, target, os.getpid(), backup,
+                                               ack=data_dir / updater.ACK_FILE,
+                                               expected_current=__version__,
+                                               requirement=requirement)
+                updater.set_phase(data_dir, "installing")
+                self._pushUpdateState()
+                # The helper outlives this process: keep what it says, or a failed restore is silent.
+                log = open(data_dir / "update-helper.log", "ab")
+                try:
+                    subprocess.Popen(argv, start_new_session=True, close_fds=True,
+                                     stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+                finally:
+                    log.close()
+                quitting = True
+                # The helper waits for this process to exit, swaps the bundle and reopens it.
+                self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                    objc.selector(self.quitForUpdate_, signature=b"v@:@"), None, False)
+            except updater.UpdateError as exc:
+                updater.set_phase(data_dir, "failed", str(exc))
+                self._pushUpdateState()
+            except Exception as exc:
+                _log_exception(exc)
+                updater.set_phase(data_dir, "failed", "unexpected error")
+                self._pushUpdateState()
+            finally:
+                if not quitting:
+                    self._update_inflight = False
+
+        def quitForUpdate_(self, _sender):
+            NSApplication.sharedApplication().terminate_(self)
+
+        @objc.python_method
+        def _openUpdateNotes(self):
+            from acctsw import updater
+            known = updater.status(self.ctx.data_dir) or {}
+            url = known.get("notes_url")
+            # Only the release page of a validated manifest, never a URL from the page itself.
+            if isinstance(url, str) and url.startswith(f"{updater.REPO_URL}/releases/tag/v"):
+                NSWorkspace.sharedWorkspace().openURL_(NSURL.URLWithString_(url))
 
         def adoptEngineBg_(self, msg):
             try:

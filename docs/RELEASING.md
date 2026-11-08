@@ -89,8 +89,10 @@ under Notes.
    ```
 
    `update-tap` runs only on the **release published** event: it checks the published zip's
-   SHA-256 against the manifest and bumps the cask. Homebrew manages upgrades because this branch
-   has no in-app updater; the job removes any obsolete `auto_updates` declaration and the legacy
+   SHA-256 against the manifest and bumps the cask. The app updates itself on the user's click
+   (see below), so the job sets `auto_updates true`: `brew upgrade` then leaves the app alone unless run with
+   `--greedy`, and either route installs the same signed build. Brew's own receipt can lag behind an
+   in-app update; that is expected. It also removes the legacy
    unsigned-build `caveats` notice. Verify that job succeeds.
 
 ## Recovery and local checks
@@ -121,7 +123,8 @@ under Notes.
 - The shared updater requirement is in [`scripts/update-requirement.txt`](../scripts/update-requirement.txt).
   Any updater MUST enforce this designated requirement using codesign -R / SecStaticCode, in
   addition to the manifest SHA-256, before installing an update. A matching hash alone does not
-  authenticate the publisher. No updater code is included on this branch. The requirement's Team ID
+  authenticate the publisher. The in-app updater (`acctsw/updater.py`) does both, plus `spctl`,
+  and the app bundles this file as `Contents/Resources/update-requirement.txt`. The requirement's Team ID
   is mechanically required public code-signing metadata, visible in every signed app; it stays in
   that file only. Documentation uses `<TEAM_ID>` instead.
   [`app/entitlements.plist`](../app/entitlements.plist) allows unsigned executable memory for
