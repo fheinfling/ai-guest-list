@@ -1151,6 +1151,20 @@ def test_tls_failures_are_distinct_from_network(monkeypatch, wrapped, error_type
     assert result.ok is False
 
 
+@pytest.mark.parametrize("status", [0, 1, 200])
+@pytest.mark.parametrize("tool", ["codex", "claude"])
+def test_transport_error_takes_precedence_over_status(monkeypatch, status, tool):
+    def no_classify(*args):
+        pytest.fail("an explicit transport error must bypass HTTP status classification")
+
+    monkeypatch.setattr(U, "_classify", no_classify)
+    get = lambda *_: U.HttpReply(status, "", None, error="tls")
+    result = (U.fetch_codex("token", None, get=get) if tool == "codex"
+              else U.fetch_claude("token", get=get, user_agent="test"))
+    assert result.error == "tls"
+    assert result.ok is False
+
+
 @pytest.mark.parametrize("error", [TimeoutError("secret"), ConnectionRefusedError("secret")])
 @pytest.mark.parametrize("wrapped", [False, True])
 def test_real_connection_failures_keep_status_zero(monkeypatch, error, wrapped):
@@ -1184,4 +1198,31 @@ def test_worker_records_internal_error_redacts_traceback_and_keeps_attempt_order
     assert "Traceback (most recent call last):" in output
     assert "broken_transport" in output
     assert "ValueError" in output and "RuntimeError" in output
+    assert output.count("Caused by / during handling of:\n") == 1
     assert "stored-credential-secret" not in output and "submitted-credential-secret" not in output
+
+
+@pytest.mark.parametrize("link", ["__cause__", "__context__"])
+def test_fetch_exception_log_stops_at_a_self_referencing_chain(monkeypatch, capsys, link):
+    error = RuntimeError("fake-token-must-never-appear")
+    setattr(error, link, error)
+    real_walk = U.traceback.walk_tb
+    traversals = []
+
+    def walk_tb(tb):
+        # Fail promptly if a regression would otherwise spin forever and exhaust memory.
+        traversals.append(tb)
+        assert len(traversals) == 1, "an exception cycle must be traversed only once"
+        return real_walk(tb)
+
+    monkeypatch.setattr(U.traceback, "walk_tb", walk_tb)
+    U._log_fetch_exception(error)
+    output = capsys.readouterr().err
+    assert len(traversals) == 1
+    assert output.count("RuntimeError\n") == 1
+    assert "fake-token-must-never-appear" not in output
+
+
+def test_fetch_exception_log_has_no_cause_separator_without_a_chain(capsys):
+    U._log_fetch_exception(ValueError("fake-token-must-never-appear"))
+    assert capsys.readouterr().err == "Traceback (most recent call last):\nValueError\n"

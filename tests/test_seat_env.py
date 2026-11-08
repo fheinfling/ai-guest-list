@@ -11,9 +11,9 @@ PROXY = "http://acctsw:seat-secret@127.0.0.1:50024"
 CA_VARS = ("NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")
 
 
-def seat_env(base):
+def seat_env(base, *, proxy=PROXY):
     swap = object.__new__(seatswap.SeatSwap)
-    swap.proxy_url = PROXY
+    swap.proxy_url = proxy
     swap.ca = SimpleNamespace(bundle_paths=lambda env: {
         key: f"/tmp/acctsw-ca-session/{key}.pem" for key in CA_VARS})
     return swap.env(base)
@@ -119,3 +119,71 @@ def test_update_helper_gets_explicitly_shed_environment(monkeypatch):
     assert kw["start_new_session"] is True and kw["close_fds"] is True
     assert kw["stdout"] is kw["stderr"] is log
     assert inherited["HTTPS_PROXY"] == PROXY
+
+
+def test_nested_child_sheds_back_to_the_users_proxy():
+    base = {"PATH": "/bin", "HTTPS_PROXY": "http://proxy.corp:8080",
+            "NO_PROXY": "internal.corp", "SSL_CERT_FILE": "/corp/ca.pem"}
+    outer = seat_env(base)
+    before = dict(outer)
+    inner_proxy = "http://acctsw:inner-secret@127.0.0.1:50025"
+    child = seat_env(outer, proxy=inner_proxy)
+    assert child["HTTPS_PROXY"] == child["https_proxy"] == inner_proxy
+    assert procenv.shed_seat_env(child) is True
+    assert child == base
+    assert outer == before
+
+
+def test_child_no_proxy_keeps_user_hosts_and_loopback_but_routes_anthropic():
+    child = seat_env({"NO_PROXY": "internal.corp,api.anthropic.com,.anthropic.com",
+                      "no_proxy": "lower.corp,*.anthropic.com,API.Anthropic.COM:443"})
+    expected = {"internal.corp", "lower.corp", "127.0.0.1", "localhost"}
+    for key in ("NO_PROXY", "no_proxy"):
+        assert set(child[key].split(",")) == expected
+
+
+def test_nested_swap_reuses_preflight_verdict_for_the_users_environment(ctx):
+    base = {"HTTPS_PROXY": "http://proxy.corp:8080", "NO_PROXY": "internal.corp",
+            "no_proxy": "lower.corp", "SSL_CERT_FILE": "/corp/full.pem",
+            "NODE_EXTRA_CA_CERTS": "/corp/node.pem"}
+    calls = []
+
+    def preflight():
+        calls.append(True)
+        assert len(calls) == 1, "nested sessions must reuse the clean environment's verdict"
+        return None
+
+    def proxy():
+        return SimpleNamespace(start=lambda: PROXY, stop=lambda: None, preflight=preflight)
+
+    clean = seatswap.SeatSwap(ctx, proxy=proxy(), environ=base)
+    try:
+        assert clean.preflight() is None
+        inherited = seat_env(base)
+        before = dict(inherited)
+        nested = seatswap.SeatSwap(ctx, proxy=proxy(), environ=inherited)
+        try:
+            assert nested.upstream_proxy == base["HTTPS_PROXY"]
+            assert nested.preflight() is None
+            assert calls == [True]
+            assert inherited == before
+        finally:
+            nested.stop()
+    finally:
+        clean.stop()
+
+
+@pytest.mark.parametrize("environ, expected", [
+    ({}, False),
+    ({"PATH": "/bin", "HTTPS_PROXY": "http://proxy.corp:8080"}, False),
+    ({"ACCTSW_SEAT_ENV": "{}"}, True),
+    ({"HTTPS_PROXY": PROXY}, True),
+    ({"HTTPS_PROXY": PROXY, "ALL_PROXY": PROXY}, True),
+    ({"https_proxy": PROXY, "all_proxy": PROXY}, True),
+    *[({key: f"/tmp/acctsw-ca-legacy/{key}.pem"}, True) for key in CA_VARS],
+])
+def test_shed_return_value_reports_whether_the_environment_changed(environ, expected):
+    before = dict(environ)
+    assert procenv.shed_seat_env(environ) is expected
+    assert (environ != before) is expected
+    assert procenv.shed_seat_env(environ) is False
