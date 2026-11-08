@@ -299,3 +299,14 @@ def test_stale_engines_report_which_sessions_will_restart_themselves(ctx, monkey
                {**base, "pid": 102, "engine": "1.3.0", "self_restart": "yes"})
     stale = sorted(session.stale_engines(ctx.data_dir), key=lambda s: s["pid"])
     assert [s["self_restart"] for s in stale] == [True, False]
+
+
+@pytest.mark.parametrize("tty_fd", [0, 1, 2])
+def test_heartbeat_finds_the_terminal_on_any_standard_stream(ctx, monkeypatch, tty_fd):
+    def ttyname(fd):
+        if fd != tty_fd:
+            raise OSError("not a terminal")
+        return f"/dev/ttys00{fd}"
+    monkeypatch.setattr(session.os, "ttyname", ttyname)
+    session.mark_session(ctx.data_dir, "codex", "a@x.com")
+    assert session.active_session(ctx.data_dir, "codex")["tty"] == f"/dev/ttys00{tty_fd}"

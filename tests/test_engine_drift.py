@@ -201,3 +201,16 @@ def test_mixed_sessions_count_and_name_only_those_needing_a_manual_restart():
     assert two[0]["text"].startswith("2 terminals run an older engine than this app (")
     assert "Restart them" in two[0]["text"] and "1.6.9" not in two[0]["text"]
     assert two[0]["pids"] == [2, 3]
+
+
+def test_two_sessions_are_both_named_with_no_more_suffix():
+    sessions = [{"tool": "claude", "pid": i, "email": f"s{i}@x.com", "engine": "1.6.1"} for i in (1, 2)]
+    text = engine.drift_warnings(None, sessions)[0]["text"]
+    assert "s1@x.com" in text and "s2@x.com" in text and "more" not in text
+
+
+@pytest.mark.parametrize("cwd", [123, "", None, ["/x"]])
+def test_a_missing_or_malformed_folder_is_left_out(cwd):
+    warning, = engine.drift_warnings(None, [{"tool": "codex", "pid": 1, "engine": "1.6.1", "cwd": cwd}])
+    assert warning["text"] == ("A Codex terminal runs engine 1.6.1. "
+                               "Restart it when convenient to get the latest switching.")
