@@ -217,9 +217,9 @@ function switchNeedsConfirmation(state, tool, email) {
 
 function switchConfirmation(tool, seat, pending) {
   if (pending?.tool !== tool || pending.email !== seat.email) return "";
-  const kind = seat.kind === "business" ? "work seat" : seat.kind === "personal" ? "personal seat" : "unknown seat kind";
+  const kind = seat.kind === "business" ? "work seat" : seat.kind === "personal" ? "personal seat" : "";
   const data = `data-tool="${esc(tool)}" data-email="${esc(seat.email)}"`;
-  return `<div class="issue issue--soft switch-confirm" role="group" aria-label="confirm seat switch"><span class="issue-text">switch ${esc(tool)} to ${esc(seat.name || seat.email)} (${kind})? running sessions move too</span><button class="row-action" data-action="switch-confirm" ${data}>switch</button><button class="row-action" data-action="switch-cancel" ${data}>cancel</button></div>`;
+  return `<div class="issue issue--soft switch-confirm" role="group" aria-label="confirm seat switch"><span class="issue-text">switch ${esc(tool)} to ${esc(seat.name || seat.email)}${kind ? ` (${kind})` : ""}? running sessions move too</span><button class="row-action" data-action="switch-confirm" ${data}>switch</button><button class="row-action" data-action="switch-cancel" ${data}>cancel</button></div>`;
 }
 
 // Infrastructure problems share the main view's problem lines and header count.
@@ -242,8 +242,10 @@ function supervisionBanner(state) {
 }
 
 // Older terminal engines share this app's store, regardless of supervision preferences.
+// A soft one (an older but safe terminal) is a calm notice; a warning without severity is hard.
+const hardWarning = (w) => w.severity !== "soft";
 function engineBanner(state) {
-  return engineWarnings(state).map((w) => `<div class="issue issue--hard app-problem engine-problem" role="alert">${ICON.alert}<div>${esc(w.text)}</div>${w.action === "adopt_engine" ? `<button class="row-action" data-action="engine-adopt">use this app's engine</button>` : ""}</div>`).join("");
+  return engineWarnings(state).map((w) => `<div class="issue issue--${hardWarning(w) ? "hard" : "soft"} app-problem engine-problem" role="${hardWarning(w) ? "alert" : "status"}">${hardWarning(w) ? ICON.alert : ICON.clock}<div>${esc(w.text)}</div>${w.action === "adopt_engine" ? `<button class="row-action" data-action="engine-adopt">use this app's engine</button>` : ""}</div>`).join("");
 }
 
 // In-app updater (calm, never counted in the header's "needs you"): the engine checks on its own
@@ -651,18 +653,20 @@ function seatIdentity(seat, peers = [], includeMetadata = true) {
   let suffix = duplicate.length > 1 ? short(seat.email) : "";
   if (suffix && duplicate.some((s) => s.email !== seat.email && short(s.email) === suffix)) suffix = String(seat.email).split("@")[0];
   if (suffix && duplicate.some((s) => s.email !== seat.email && String(s.email).split("@")[0] === suffix)) suffix = seat.email;
-  const kind = ["business", "personal"].includes(seat.kind) ? seat.kind : "kind unknown";
-  const raw = typeof seat.plan === "string" ? seat.plan.trim().toLowerCase() : "";
-  const plan = Object.prototype.hasOwnProperty.call(PLAN_CHIPS, raw) ? raw : "plan unknown";
-  const parts = [name, kind, plan].filter((part, i, all) => !all.slice(0, i).some((prior) => prior.toLowerCase() === part.toLowerCase()));
+  const parts = [name, ...seatTraits(seat)].filter((part, i, all) => !all.slice(0, i).some((prior) => prior.toLowerCase() === part.toLowerCase()));
   return (includeMetadata ? parts.join(" · ") : name) + (suffix ? ` · ${suffix}` : "");
 }
 
-function seatMetadata(seat) {
-  const kind = ["business", "personal"].includes(seat.kind) ? seat.kind : "kind unknown";
+// Kind and plan when known. A plan the app doesn't recognise (providers add new ones, e.g.
+// "Self_Serve_Business_Prolite") is left out rather than shown as "plan unknown".
+function seatTraits(seat) {
+  const kind = ["business", "personal"].includes(seat.kind) ? seat.kind : "";
   const raw = typeof seat.plan === "string" ? seat.plan.trim().toLowerCase() : "";
-  const plan = Object.prototype.hasOwnProperty.call(PLAN_CHIPS, raw) ? raw : "plan unknown";
-  return [...new Set([kind, plan])].join(" · ");
+  const plan = Object.prototype.hasOwnProperty.call(PLAN_CHIPS, raw) ? raw : "";
+  return [...new Set([kind, plan].filter(Boolean))];
+}
+function seatMetadata(seat) {
+  return seatTraits(seat).join(" · ");
 }
 
 const ICON = {
@@ -700,7 +704,8 @@ function tighter(seat) {
 }
 const leftText = (seat) => {
   const left = tighter(seat)?.left;
-  return left == null ? "usage unknown" : `${seat.usage_stale ? "~" : ""}${left === 100 ? "full" : `${left}% left`}`;
+  // No reading is not news: say nothing rather than "usage unknown" (callers drop the empty part).
+  return left == null ? "" : `${seat.usage_stale ? "~" : ""}${left === 100 ? "full" : `${left}% left`}`;
 };
 function timed(at, prefix = "", past = "resetting…", approximate = false) {
   if (!Number.isFinite(Date.parse(at))) return "reset time unknown";
@@ -742,7 +747,7 @@ function rowDetails(tool, seat, peers, openDetails) {
     const fetched = seat.usage_fetched_at || seat.usage?.fetched_at || "";
     rows = "";
     if (signedOut(seat)) rows += '<dt>status</dt><dd>signed out; sign in to see usage</dd>';
-    else rows += seatWindows(seat).map((w) => `<dt>${w.label}</dt><dd>${w.left == null ? "usage unknown" : `${seat.usage_stale ? "~" : ""}${w.left}% left`}${w.reset ? ` · resets <time datetime="${esc(w.reset)}">${esc(detailClock(w.reset))}</time> (${timed(w.reset, "in")})` : ""}</dd>`).join("");
+    else rows += seatWindows(seat).map((w) => `<dt>${w.label}</dt><dd>${w.left == null ? "no reading yet" : `${seat.usage_stale ? "~" : ""}${w.left}% left`}${w.reset ? ` · resets <time datetime="${esc(w.reset)}">${esc(detailClock(w.reset))}</time> (${timed(w.reset, "in")})` : ""}</dd>`).join("");
     const action = limitedSeat(seat) || (!isActive(seat) && !signedOut(seat) && !usable(seat)) ? seatAction(tool, seat, "switch") : "";
     if (action) rows += `<dt>action</dt><dd>${action}</dd>`;
     rows = detailGroup("usage", rows + `<dt class="sr-only">updated</dt><dd class="detail-note">${seat.usage_stale ? "last known reading; " : ""}<span data-usage-at="${esc(fetched)}">${fmtUsageAge(fetched)}</span></dd>`);
@@ -772,7 +777,7 @@ function headerVerdict(state) {
   const hard = seats.filter((s) => signedOut(s) || signinNeeded(s) || entitlementRevoked(s)).length
     + (state?.pending_crossings || []).length + (state?.pending_tier_requests || []).length
     + (state?.pending_key_switches || []).filter((r) => r.status === "pending" && Date.parse(r.expires_at) > Date.now()).length
-    + engineWarnings(state).length + Number(Boolean(supervisionProblem(state)));
+    + engineWarnings(state).filter(hardWarning).length + Number(Boolean(supervisionProblem(state)));
   if (hard) return `<button class="chip chip--hard" data-action="attention">${ICON.alert}${hard} needs you</button>`;
   if (seats.length && !ready.length && seats.every(limitedSeat)) return `<span class="chip chip--soft">${ICON.rest}all limited</span>`;
   if (seats.some((s) => signinExpiring(s))) return `<span class="chip chip--soft">${ICON.clock}renew soon</span>`;
@@ -785,7 +790,7 @@ function thenLine(p, state) {
   if (next) {
     const approval = switchNeedsConfirmation(state, p.tool, next.email)
       || (state.pending_crossings || []).some((r) => r.tool === p.tool && r.to === next.email);
-    text = `${label(next)}, ${leftText(next)}${approval ? ' <span class="muted">(needs approval)</span>' : ""}`;
+    text = `${[label(next), leftText(next)].filter(Boolean).join(", ")}${approval ? ' <span class="muted">(needs approval)</span>' : ""}`;
   } else {
     const back = p.limited.find((s) => s !== p.lead);
     const key = p.keys[0];
@@ -819,10 +824,10 @@ function toolBlock(p, state, pending, openDetails) {
     const active = isActive(s) && !out && !signinNeeded(s) && !entitlementRevoked(s) && !limited;
     const name = `<div class="now-seat">${nameButton(p.tool, s, p.seats, openDetails)}${active ? '<span class="tag">on now</span>' : ""}</div>`;
     if (attention) head = `<div class="now">${name}</div>`;
-    else if (limited) head = `<div class="now">${name}<span class="fig fig--time">${backText(s, "")}</span><span class="fig-l">until back</span></div><div class="meta limited-meta"><span>${esc(seatMetadata(s))} · limited${t && backAt(s) && !resetIsPast(backAt(s)) ? `, ${t.label} refills ${refillClock(backAt(s))}` : ""}</span>${other ? `<span>${other.label} ${other.left == null ? "unknown" : `${s.usage_stale ? "~" : ""}${other.left}%`}</span>` : ""}</div>`;
-    else head = `<div class="now">${name}<span class="fig">${t?.left == null ? "—" : `${s.usage_stale ? "~" : ""}${t.left}<small>%</small>`}</span><span class="fig-l">${t?.left == null ? "usage unknown" : `of ${t.label} left`}</span></div>
+    else if (limited) head = `<div class="now">${name}<span class="fig fig--time">${backText(s, "")}</span><span class="fig-l">until back</span></div><div class="meta limited-meta"><span>${[esc(seatMetadata(s)), `limited${t && backAt(s) && !resetIsPast(backAt(s)) ? `, ${t.label} refills ${refillClock(backAt(s))}` : ""}`].filter(Boolean).join(" · ")}</span>${other && other.left != null ? `<span>${other.label} ${s.usage_stale ? "~" : ""}${other.left}%</span>` : ""}</div>`;
+    else head = `<div class="now">${name}<span class="fig">${t?.left == null ? "—" : `${s.usage_stale ? "~" : ""}${t.left}<small>%</small>`}</span><span class="fig-l">${t?.left == null ? "no reading yet" : `of ${t.label} left`}</span></div>
       ${t?.left != null ? `<div class="bar" role="img" aria-label="${s.usage_stale ? "last known: " : ""}${t.left}% of the ${t.label} window left"><i style="width:${t.left}%"></i></div>` : ""}
-      <div class="meta"><span>${esc(seatMetadata(s))} · ${t?.reset ? timed(t.reset, `${t.label} resets in`) : "reset time unknown"}</span>${other ? `<span aria-label="${s.usage_stale ? "last known: " : ""}${other.label} ${other.left == null ? "unknown" : `${other.left}% left`}">${other.label} ${other.left == null ? "unknown" : `${s.usage_stale ? "~" : ""}${other.left}%`}</span>` : ""}</div>`;
+      <div class="meta"><span>${[esc(seatMetadata(s)), t?.reset ? timed(t.reset, `${t.label} resets in`) : ""].filter(Boolean).join(" · ")}</span>${other && other.left != null ? `<span aria-label="${s.usage_stale ? "last known: " : ""}${other.label} ${other.left}% left">${other.label} ${s.usage_stale ? "~" : ""}${other.left}%</span>` : ""}</div>`;
     head += rowDetails(p.tool, s, p.seats, openDetails);
   }
   const crossings = crossingRequests({ pending_crossings: (state.pending_crossings || []).filter((r) => r.tool === p.tool) });
@@ -836,7 +841,7 @@ function listRows(p, state, openDetails) {
   const spending = new Set([...(state.running_key_seats || []), ...(state.pinned_sessions || []).map((s) => s.key_seat?.id || s.email)]);
   return rest.map((s, i) => {
     const key = p.keys.includes(s), limited = !key && limitedSeat(s);
-    const text = key ? `${spending.has(s.id) ? "spending now, " : ""}paid per token<span class="sr-only">; no app spend cap</span>` : limited ? `limited, ${backText(s)}` : `${p.next === s ? '<span class="state--strong">next</span>, ' : ""}${leftText(s)}`;
+    const text = key ? `${spending.has(s.id) ? "spending now, " : ""}paid per token<span class="sr-only">; no app spend cap</span>` : limited ? `limited, ${backText(s)}` : [p.next === s ? '<span class="state--strong">next</span>' : "", leftText(s)].filter(Boolean).join(", ");
     const action = key ? `<button class="row-action" data-action="key-terminal" data-id="${esc(s.id)}" aria-label="${esc(`use ${s.label} in a new paid terminal`)}">new terminal</button>` : limited ? "" : seatAction(p.tool, s, "switch");
     return `<div class="seat${i === 0 ? " first-of-tool" : ""}${key ? " key-seat" : ""}" data-seat-email="${esc(key ? s.id : s.email)}"><div class="row"><span class="toolname">${i === 0 ? `${mark(p.tool)}${esc(p.tool)}` : `<span class="sr-only">${esc(p.tool)}</span>`}</span>${nameButton(key ? "key" : p.tool, s, p.seats, openDetails, true)}<span class="state">${text}</span>${action}</div>${rowDetails(key ? "key" : p.tool, s, p.seats, openDetails)}</div>`;
   }).join("");

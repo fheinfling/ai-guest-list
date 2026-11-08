@@ -544,7 +544,9 @@ def test_snapshot_warns_about_a_stale_wrapper_and_old_supervisors(ctx, monkeypat
                 "started_at": "2026-10-01"})
     warnings = {w["kind"]: w for w in bridge.snapshot_state(ctx)["engine_warnings"]}
     assert "1.1.2" in warnings["wrapper"]["text"] and warnings["wrapper"]["action"] == "adopt_engine"
-    assert warnings["sessions"]["text"].startswith("1 terminal session runs an older engine")
+    assert warnings["sessions"]["text"].startswith("A Claude terminal on a@x.com (started ")
+    assert "runs an older engine" in warnings["sessions"]["text"]
+    assert warnings["sessions"]["severity"] == "hard"   # no engine stamp: may write logins unsafely
 
 
 def test_snapshot_warns_when_this_app_is_older_than_the_store(ctx):

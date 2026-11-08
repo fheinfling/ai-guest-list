@@ -72,6 +72,22 @@ _START_CACHE: dict[int, str] = {}
 SELF_RESTART = False
 
 
+def _where_am_i() -> dict:
+    """This supervisor's working folder and terminal, each only when the OS can say."""
+    out = {}
+    try:
+        out["cwd"] = os.getcwd()
+    except OSError:
+        pass
+    for fd in (0, 1, 2):
+        try:
+            out["tty"] = os.ttyname(fd)
+            break
+        except OSError:
+            continue
+    return out
+
+
 def mark_session(data_dir: Path, tool: str, email: str, *, pin: str | None = None,
                  key_seat: dict | None = None, home: str | None = None) -> None:
     """Record this supervisor and its active seat at launch and after every successful hop.
@@ -98,6 +114,8 @@ def mark_session(data_dir: Path, tool: str, email: str, *, pin: str | None = Non
         "capabilities": list(CAPABILITIES),
         "self_restart": SELF_RESTART,
     }
+    # Where this terminal is, so a notice about it can say which one ("started 19:23 in ~/Work/x").
+    data.update(_where_am_i())
     if home is not None and home != email:
         data["home"] = home
     if pin is not None:
@@ -289,6 +307,9 @@ def _read_session(path: Path, *, strict: bool = False) -> dict | None:
     public = {"email": email, "pid": pid, "started_at": started_at}
     if isinstance(data.get("home"), str) and data["home"] != email:
         public["home"] = data["home"]
+    for key in ("cwd", "tty"):
+        if isinstance(data.get(key), str) and data[key]:
+            public[key] = data[key]
     # Absent from a heartbeat written before engines stamped themselves (necessarily older).
     if isinstance(data.get("engine"), str):
         public["engine"] = data["engine"]
@@ -303,7 +324,8 @@ def _read_session(path: Path, *, strict: bool = False) -> dict | None:
 def stale_engines(data_dir: Path, live: dict[str, list[dict]] | None = None) -> list[dict]:
     """Live supervisors running an engine older than (or missing features of) this one.
 
-    Each is ``{"tool", "pid", "engine", "self_restart"}``; ``engine`` is None for a heartbeat from
+    Each is ``{"tool", "pid", "engine", "self_restart"}`` plus whichever of ``email``,
+    ``started_at``, ``cwd`` and ``tty`` the heartbeat recorded; ``engine`` is None for a heartbeat from
     before engines stamped themselves, which is necessarily older. A supervisor keeps its engine
     until it is restarted, whatever the wrapper now points at: one with ``self_restart`` does that
     itself once idle; any other needs a manual restart.
@@ -319,7 +341,9 @@ def stale_engines(data_dir: Path, live: dict[str, list[dict]] | None = None) -> 
             if version is None or compare({"version": version,
                                            "capabilities": record.get("capabilities")}):
                 out.append({"tool": tool, "pid": record["pid"], "engine": version,
-                            "self_restart": record.get("self_restart") is True})
+                            "self_restart": record.get("self_restart") is True,
+                            **{k: record[k] for k in ("email", "started_at", "cwd", "tty")
+                               if isinstance(record.get(k), str)}})
     return out
 
 

@@ -117,10 +117,12 @@ def test_drift_warnings_name_path_versions_and_fix():
     assert "/u/.local/bin/acctsw" in text and "$VENV/bin/python" in text
     assert "1.1.2" in text and "1.4.2" in text and "git pull" in text and "acctsw install" in text
     assert kinds["wrapper"]["action"] == "adopt_engine"
-    assert kinds["sessions"]["text"].startswith("2 terminal sessions run an older engine (1.1.2)")
-    assert "restart them" in kinds["sessions"]["text"]
+    assert kinds["sessions"]["text"].startswith("2 terminals run an older engine than this app (")
+    assert "Claude terminal (engine 1.1.2)" in kinds["sessions"]["text"]
+    assert "Codex terminal (an older engine)" in kinds["sessions"]["text"]
+    assert "Restart them" in kinds["sessions"]["text"]
     one = engine.drift_warnings(None, sessions[1:])
-    assert one[0]["text"].startswith("1 terminal session runs an older engine than")
+    assert one[0]["text"].startswith("A Codex terminal runs an older engine. Restart it")
     assert engine.drift_warnings(None, []) == []
     assert engine.drift_warnings(None, [], "too old")[0]["kind"] == "app"
 
@@ -136,15 +138,53 @@ def test_sessions_that_cant_restart_themselves_keep_the_warning(flag):
     warnings = engine.drift_warnings(None, [{"tool": "codex", "pid": 2, "engine": "1.3.1",
                                              "self_restart": flag}])
     assert [w["kind"] for w in warnings] == ["sessions"]
-    assert warnings[0]["text"].startswith("1 terminal session runs an older engine (1.3.1)")
+    assert warnings[0]["text"].startswith("A Codex terminal runs engine 1.3.1. Restart it")
 
 
 @pytest.mark.parametrize("version,unsafe", [("1.5.0", False), ("1.3.1", False), ("1.3.0", True),
                                             (None, True)])
 def test_only_an_engine_below_the_floor_is_said_to_risk_signing_you_out(version, unsafe):
-    text = engine.drift_warnings(None, [{"tool": "claude", "pid": 1, "engine": version}])[0]["text"]
+    warning = engine.drift_warnings(None, [{"tool": "claude", "pid": 1, "engine": version}])[0]
+    assert warning["severity"] == ("hard" if unsafe else "soft")
+    text = warning["text"]
     assert ("can't sign you out" in text) is unsafe
     assert ("latest switching" in text) is not unsafe
+
+
+def test_app_and_wrapper_drift_stay_hard():
+    warnings = engine.drift_warnings({"path": "/old/acctsw", "version": "1.6.1"}, [], "too old")
+    assert [(w["kind"], w["severity"]) for w in warnings] == [("app", "hard"), ("wrapper", "hard")]
+
+
+def test_safe_session_notice_names_the_terminal_in_local_time_and_home_folder(monkeypatch):
+    import time
+    from pathlib import Path
+    monkeypatch.setenv("TZ", "Europe/Berlin")
+    time.tzset()
+    try:
+        warning, = engine.drift_warnings(None, [{
+            "tool": "claude", "pid": 42, "email": "business@x.com", "engine": "1.6.1",
+            "started_at": "2026-11-08T18:23:00Z", "cwd": str(Path.home() / "Work/now"),
+        }])
+        assert warning == {"kind": "sessions", "severity": "soft", "text": (
+            "A Claude terminal on business@x.com (started 19:23 in ~/Work/now) runs engine 1.6.1. "
+            "Restart it when convenient to get the latest switching."), "pids": [42]}
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+
+
+def test_session_notice_caps_names_but_checks_the_safety_of_every_session():
+    sessions = [{"tool": "codex", "pid": i, "email": f"seat{i}@x.com", "engine": "1.6.1"}
+                for i in range(4)]
+    sessions[-1]["engine"] = "1.3.0"
+    warning, = engine.drift_warnings(None, sessions)
+    assert warning["severity"] == "hard"
+    assert "Codex terminal on seat0@x.com" in warning["text"]
+    assert "Codex terminal on seat1@x.com" in warning["text"]
+    assert "+2 more" in warning["text"]
+    assert "seat2@x.com" not in warning["text"] and "seat3@x.com" not in warning["text"]
+    assert "so a seat switch can't sign you out" in warning["text"]
 
 
 def test_mixed_sessions_count_and_name_only_those_needing_a_manual_restart():
@@ -152,11 +192,12 @@ def test_mixed_sessions_count_and_name_only_those_needing_a_manual_restart():
     one = engine.drift_warnings(None, [capable, {"tool": "codex", "pid": 2, "engine": "1.3.0",
                                                  "capabilities": []}])
     assert len(one) == 1
-    assert one[0]["text"].startswith("1 terminal session runs an older engine (1.3.0) than")
-    assert "restart it" in one[0]["text"] and "1.6.9" not in one[0]["text"]
+    assert one[0]["text"].startswith("A Codex terminal runs engine 1.3.0. Restart it")
+    assert "1.6.9" not in one[0]["text"] and one[0]["pids"] == [2]
     two = engine.drift_warnings(None, [capable, {"tool": "codex", "pid": 2, "engine": "1.3.0",
                                                  "capabilities": []},
                                        {"tool": "codex", "pid": 3, "engine": None,
                                         "capabilities": []}])
-    assert two[0]["text"].startswith("2 terminal sessions run an older engine (1.3.0) than")
-    assert "restart them" in two[0]["text"] and "1.6.9" not in two[0]["text"]
+    assert two[0]["text"].startswith("2 terminals run an older engine than this app (")
+    assert "Restart them" in two[0]["text"] and "1.6.9" not in two[0]["text"]
+    assert two[0]["pids"] == [2, 3]

@@ -187,3 +187,23 @@ def test_shed_return_value_reports_whether_the_environment_changed(environ, expe
     assert procenv.shed_seat_env(environ) is expected
     assert (environ != before) is expected
     assert procenv.shed_seat_env(environ) is False
+
+
+@pytest.mark.parametrize("warning,key", [
+    ({"kind": "sessions", "severity": "soft", "text": "older but safe", "pids": [7]}, None),
+    ({"kind": "sessions", "severity": "hard", "text": "started 19:23", "pids": [7, 9]},
+     ("sessions", (7, 9))),
+    ({"kind": "sessions", "text": "no severity from an older bridge"},
+     ("sessions", "no severity from an older bridge")),
+    ({"kind": "app", "severity": "hard", "text": "out of date"}, ("app", "out of date")),
+    ({"kind": "wrapper", "severity": "hard", "text": ""}, None),
+    (None, None),
+])
+def test_only_hard_drift_warnings_toast_and_sessions_dedupe_on_their_terminals(warning, key):
+    assert menubar.engine_warning_toast_key(warning) == key
+
+
+def test_a_hopping_session_does_not_retoast_when_its_start_time_moves():
+    first = {"kind": "sessions", "severity": "hard", "pids": [7], "text": "started 19:23"}
+    later = {**first, "text": "started 19:41"}
+    assert menubar.engine_warning_toast_key(first) == menubar.engine_warning_toast_key(later)

@@ -131,16 +131,18 @@ def drift_warnings(wrapper: dict | None, sessions: list[dict],
     the state guard's refusal for THIS engine. Each warning is ``{"kind", "text"}``; the wrapper
     one also names the bridge ``action`` that replaces it with this app's engine (with consent).
     Pure, so the exact wording is testable and identical for the banner and the toast.
-    Every warning here is a "needs you" alarm (banner, header count, toast), so a session that
-    will restart itself (``self_restart``) gets none; only the others are counted and named.
+    ``severity`` "hard" is a "needs you" alarm (banner, header count, toast); "soft" is a calm
+    notice (banner only). A session that will restart itself (``self_restart``) gets nothing; an
+    older session that writes logins safely is soft; app/wrapper drift and unsafe sessions are hard.
     """
     out = []
     if writer_block:
-        out.append({"kind": "app", "text": f"AI Guest List is out of date: {writer_block}"})
+        out.append({"kind": "app", "severity": "hard", "text": f"AI Guest List is out of date: {writer_block}"})
     if wrapper:
         via = f" (via {wrapper['exe']})" if wrapper.get("exe") else ""
         out.append({
             "kind": "wrapper",
+            "severity": "hard",
             "action": "adopt_engine",
             "text": (f"terminals run an older engine: {wrapper['path']}{via} is acctsw "
                      f"{wrapper['version']}, this app is {wrapper.get('app_version') or __version__}. "
@@ -149,19 +151,59 @@ def drift_warnings(wrapper: dict | None, sessions: list[dict],
         })
     manual = [s for s in sessions if not _restarts_itself(s)]
     if manual:
-        known = sorted({s["engine"] for s in manual if s.get("engine")},
-                       key=lambda v: parse_version(v) or ())
-        which = f"an older engine ({', '.join(known)})" if known else "an older engine"
-        n = len(manual)
         # Only an engine below the credential floor, or too old to say, writes logins unsafely.
+        # Anything else is a calm notice: it works, it just misses the latest switching.
         from .state import MIN_CREDENTIAL_WRITER
         unsafe = any(not s.get("engine") or older_than(s["engine"], MIN_CREDENTIAL_WRITER)
                      for s in manual)
-        why = "so a seat switch can't sign you out" if unsafe else "to get the latest switching"
-        out.append({
-            "kind": "sessions",
-            "text": (f"{n} terminal session{'s' if n != 1 else ''} run{'s' if n == 1 else ''} "
-                     f"{which} than this app ({__version__}) — restart "
-                     f"{'them' if n != 1 else 'it'} {why}."),
-        })
+        why = ("so a seat switch can't sign you out" if unsafe
+               else "when convenient to get the latest switching")
+        if len(manual) == 1:
+            s = manual[0]
+            where = _session_where(s)
+            text = (f"A {_terminal(s)}{f' ({where})' if where else ''} runs "
+                    f"{_engine_words(s)}. Restart it {why}.")
+        else:
+            named = [f"{_terminal(s)} ({', '.join(filter(None, [_session_where(s), _engine_words(s)]))})"
+                     for s in manual[:SESSIONS_NAMED]]
+            if len(manual) > SESSIONS_NAMED:
+                named.append(f"+{len(manual) - SESSIONS_NAMED} more")
+            text = (f"{len(manual)} terminals run an older engine than this app ({__version__}): "
+                    f"{', '.join(named)}. Restart them {why}.")
+        out.append({"kind": "sessions", "severity": "hard" if unsafe else "soft", "text": text,
+                    "pids": sorted(s["pid"] for s in manual if isinstance(s.get("pid"), int))})
     return out
+
+
+SESSIONS_NAMED = 2   # name this many stale terminals, then "+N more"
+_TOOL_LABEL = {"claude": "Claude", "codex": "Codex"}
+
+
+def _terminal(s: dict) -> str:
+    label = _TOOL_LABEL.get(s.get("tool"), "")
+    email = s.get("email") if isinstance(s.get("email"), str) else ""
+    return f"{label + ' ' if label else ''}terminal{f' on {email}' if email else ''}"
+
+
+def _engine_words(s: dict) -> str:
+    return f"engine {s['engine']}" if s.get("engine") else "an older engine"
+
+
+def _session_where(s: dict) -> str:
+    """'started 19:23 in ~/Work/now' from the heartbeat, in local time; either half may be absent."""
+    from .util import parse_iso
+    parts = []
+    started = parse_iso(s.get("started_at")) if isinstance(s.get("started_at"), str) else None
+    if started is not None:
+        parts.append(f"started {started.astimezone():%H:%M}")
+    cwd = s.get("cwd")
+    if isinstance(cwd, str) and cwd:
+        home = Path.home()
+        path = Path(cwd)
+        try:
+            rel = path.relative_to(home)
+            shown = "~" if str(rel) == "." else f"~/{rel}"
+        except ValueError:
+            shown = cwd
+        parts.append(f"in {shown}")
+    return " ".join(parts)

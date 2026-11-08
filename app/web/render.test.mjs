@@ -142,10 +142,11 @@ test("unknown roster readings do not imply remaining credit from old cached valu
 const html = buildHTML(state({ tools: { codex: { seats: [seat({ status: "active", usage_unknown: true,
   usage5h: 100, usageWeek: 75, usage_fetched_at: "2026-09-13T12:00:00Z" })] } } }));
 const main = rosterOf(html);
-assert.match(main, /usage unknown/);
+assert.doesNotMatch(main, /unknown/); // no reading is not news: no "usage unknown" anywhere
+assert.match(main, /no reading yet/);
 assert.doesNotMatch(main, /\d+%|class="bar"/);
 assert.match(main, /data-usage-at="2026-09-13T12:00:00Z"/);
-assert.match(detailsOf(html, "codex", "work@x.com"), /usage unknown/);
+assert.match(detailsOf(html, "codex", "work@x.com"), /no reading yet/);
 assert.doesNotMatch(html, /25% left/); // Unknown readings stay unknown in the inline details too.
 });
 
@@ -153,7 +154,8 @@ test("missing usage is explicitly unknown in the roster and disclosures", () => 
 const html = buildHTML(state({ tools: { codex: { seats: [seat({ status: "active", usage_unknown: true,
  usage5h: null, usageWeek: null, usage: { windows: {} } })] } } }));
 assert.match(rosterOf(html), /class="fig">—</);
-assert.match(rosterOf(html), /usage unknown/);
+assert.match(rosterOf(html), /no reading yet/);
+assert.doesNotMatch(rosterOf(html), /unknown/);
 assert.doesNotMatch(rosterOf(html), /class="bar"|0%/);
 assert.doesNotMatch(html, /style="width:0%"/);
 assert.doesNotMatch(html, />0%<|>0% left</);
@@ -1593,7 +1595,7 @@ const render = (over) => rosterHTML(state({ tools: { codex: { seats: [seat({ sta
 assert.match(render({ usage5h: 38, usageWeek: 21 }), /62<small>%[\s\S]*week 79%/);
 assert.match(render({ usage5h: 100, usageWeek: 0 }), /0<small>%[\s\S]*week 100%/);
 for (const over of [{ usage_unknown: true }, { usage5h: null, usageWeek: null }]) {
- assert.match(render(over), /usage unknown/); assert.doesNotMatch(render(over), /\d+%|class="bar"/);
+ assert.match(render(over), /no reading yet/); assert.doesNotMatch(render(over), /unknown|\d+%|class="bar"/);
 }
 const stale = render({ usage_stale: true });
 assert.equal((stale.match(/aria-label="last known:/g) || []).length, 2);
@@ -2713,7 +2715,9 @@ test("seat identity shows kind and plan and disambiguates duplicate names per to
   const distinctTools = rosterHTML(state({ tools: { codex: { seats: [seats[0]] }, claude: { seats: [seats[1]] } } }));
   assert.doesNotMatch(distinctTools, /· gmail|· icloud/);
   assert.equal(seatIdentity(seat({ name: "client", kind: "business", plan: "team" })), "client · business · team");
-  assert.equal(seatIdentity(seat({ name: "work", kind: undefined, plan: null })), "work · kind unknown · plan unknown");
+  // Unknown kind or an unrecognised plan is left out, never shown as "unknown".
+  assert.equal(seatIdentity(seat({ name: "work", kind: undefined, plan: null })), "work");
+  assert.equal(seatIdentity(seat({ name: "client", kind: "business", plan: "Self_Serve_Business_Prolite" })), "client · business");
   assert.match(css, /\.seat-identity \{[^}]*text-overflow:ellipsis; white-space:nowrap/);
   assert.match(css, /\.seat-metadata \{[^}]*flex:none;[^}]*font-weight:400;[^}]*white-space:nowrap/);
 });
@@ -3146,4 +3150,30 @@ test("unknown figures remain dashes without an attention row", () => {
     usage5h: null, usageWeek: null })));
   assert.match(html, /class="fig">—</);
   assert.doesNotMatch(html, /class="issue |checking usage/);
+});
+
+test("a soft engine notice is calm and not counted; hard and severity-less warnings still need you", () => {
+  const base = state({ tools: { codex: { seats: [seat({ status: "active" })] } } });
+  const soft = { kind: "sessions", severity: "soft", text: "A Claude terminal on b@x.com (started 19:23 in ~/Work/now) runs engine 1.6.1." };
+  const banner = engineBanner({ ...base, engine_warnings: [soft] });
+  assert.match(banner, /class="issue issue--soft app-problem engine-problem" role="status"/);
+  assert.match(banner, /started 19:23 in ~\/Work\/now/);
+  assert.doesNotMatch(banner, /issue--hard|role="alert"/);
+  assert.doesNotMatch(headerVerdict({ ...base, engine_warnings: [soft] }), /needs you/);
+  for (const hard of [{ ...soft, severity: "hard" }, { text: soft.text }]) {
+    assert.match(engineBanner({ ...base, engine_warnings: [hard] }), /issue--hard app-problem engine-problem" role="alert"/);
+    assert.match(headerVerdict({ ...base, engine_warnings: [hard, soft] }), /1 needs you/);
+  }
+});
+
+test("a seat with no reading leaves no dangling separators or unknown labels", () => {
+  const html = buildHTML(state({ tools: { codex: { seats: [
+    seat({ status: "active", kind: undefined, plan: "Self_Serve_Business_Prolite", usage5h: null, usageWeek: null, usage: { windows: {} } }),
+    seat({ name: "next one", email: "n@x.com", kind: "business", plan: "team", usage5h: null, usageWeek: null, usage: { windows: {} } }),
+  ] } } }));
+  const visible = visibleMarkup(rosterOf(html));
+  assert.doesNotMatch(visible, /unknown/);
+  assert.doesNotMatch(visible, /<span> · |· <\/span>|, <\/span>|, \(needs approval\)/);
+  assert.match(visible, /class="then"><b>then<\/b> next one · business · team <span class="muted">\(needs approval\)/);
+  assert.match(visible, /<span class="state"><span class="state--strong">next<\/span><\/span>/);
 });

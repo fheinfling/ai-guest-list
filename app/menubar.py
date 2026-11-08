@@ -90,6 +90,23 @@ def spawn_update_helper(argv, log):
                             stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=env)
 
 
+def engine_warning_toast_key(w):
+    """Which drift warnings toast, and the identity a toast is deduplicated on (None = no toast).
+
+    Only "needs you" (hard) warnings toast; a soft notice lives in the popover alone. Text is not
+    the identity: a session notice names a start time that moves with every hop, so it is keyed
+    on its terminals instead. A warning without ``severity`` (an older engine's bridge) is hard.
+    """
+    if not isinstance(w, dict) or not isinstance(w.get("text"), str) or not w["text"]:
+        return None
+    if w.get("severity", "hard") != "hard":
+        return None
+    pids = w.get("pids")
+    if w.get("kind") == "sessions" and isinstance(pids, list) and pids:
+        return ("sessions", tuple(pids))
+    return (w.get("kind"), w["text"])
+
+
 def popover_height(value):
     """Validate the web content height; keep native geometry finite and bounded."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -830,9 +847,10 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
             shares this app's store and can sign every session out, so it must not wait for the
             popover to be opened; the persistent banner (render.mjs engineBanner) carries the fix."""
             for w in ((result.get("state") or {}).get("engine_warnings") or []):
-                text = w.get("text") if isinstance(w, dict) else None
-                if text and text not in self._engineWarned:
-                    self._engineWarned.add(text)
+                key = engine_warning_toast_key(w)
+                if key is not None and key not in self._engineWarned:
+                    self._engineWarned.add(key)
+                    text = w["text"]
                     self._notify("heads up — terminals run an older engine"
                                  if w.get("kind") != "app" else "AI Guest List is out of date", text)
 
