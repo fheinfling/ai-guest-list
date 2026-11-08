@@ -110,6 +110,8 @@ def snapshot_state(ctx: Context) -> dict[str, Any]:
     data["dot"] = dot_for(data)  # single source of truth for the dot (JS + native both read this)
     data["door"] = door_for(data)  # shut/open door icon — same state feeds native glyph + web header
     data["app"] = {"version": __version__, "build": build_number()}  # shown in the settings sheet
+    from . import updater
+    data["update"] = updater.status(ctx.data_dir)   # None unless a newer release is known
     data["supervision"] = install_mod.supervision_status()
     # the signed-in-but-not-added codex account (if any) → drives the one-tap import affordance
     data["codex_live_unregistered"] = _codex_live_unregistered(ctx, state)
@@ -541,6 +543,12 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
                 result.update(ok=False, state=None, error="couldn't refresh status after that key request")
             secret = message.get("secret")
             return _redact_key(result, secret if isinstance(secret, str) else "")
+
+        if action == "update_check":
+            # Network, off the main thread like usage. Installing is native (it quits the app).
+            from . import updater
+            result = updater.check(ctx.data_dir, force=bool(message.get("force")))
+            return {"ok": True, "update_check": result, "state": snapshot_state(ctx)}
 
         if action == "claude_sync":
             from . import claudesync

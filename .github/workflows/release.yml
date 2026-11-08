@@ -152,7 +152,7 @@ jobs:
           APP="$RUNNER_TEMP/app/AI Guest List.app"
           python scripts/release-bundle.py sign "$APP" --identity="$IDENTITY" --entitlements app/entitlements.plist
           # Any updater MUST enforce update-requirement.txt with codesign -R / SecStaticCode,
-          # in addition to manifest SHA-256. No in-app updater exists on this branch.
+          # in addition to manifest SHA-256. The in-app updater (acctsw/updater.py) does both.
           requirement="$(cat scripts/update-requirement.txt)"
           codesign --verify --deep --strict --verbose=2 "$APP"
           codesign --verify --deep --strict -R "=$requirement" "$APP"
@@ -302,8 +302,10 @@ jobs:
           # Fail loudly if the sed patterns stopped matching the cask's formatting:
           grep -Fq "version \"${VER}\""    "$CASK"
           grep -Fq "sha256 \"${SHA256}\""  "$CASK"
-          # This version has no in-app updater; Homebrew must keep managing upgrades.
+          # The app updates itself (on the user's click): Homebrew must not also manage upgrades.
           sed -i -E '/^[[:space:]]*auto_updates[[:space:]]/d' "$CASK"
+          sed -i -E 's/^([[:space:]]*)(sha256[[:space:]]+".*")$/\1\2\n\1auto_updates true/' "$CASK"
+          grep -Eq '^[[:space:]]*auto_updates true$' "$CASK"
           # Published releases are Developer ID signed and notarized: drop the legacy unsigned notice.
           python3 - "$CASK" <<'CASKEOF'
           import re, sys

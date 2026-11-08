@@ -1,6 +1,6 @@
 // Live glue: render state into the DOM and forward user actions to the Python bridge.
 // All rendering logic lives in render.mjs (pure, unit-tested); this file is the thin wiring.
-import { buildHTML, switchNeedsConfirmation, buildSettings, buildAddSeat, addUsesPaste, reduceReply, updateClockText, buildAddKey, KEY_PROVIDERS, keyRequest, reduceKeyReply, keyConfirmations, buildPaidKeyGate, buildModelResults } from "./render.mjs";
+import { buildHTML, switchNeedsConfirmation, buildSettings, buildAddSeat, addUsesPaste, reduceReply, updateClockText, buildAddKey, KEY_PROVIDERS, keyRequest, reduceKeyReply, keyConfirmations, buildPaidKeyGate, buildModelResults, updateCanInstall } from "./render.mjs";
 
 const root = document.getElementById("root");
 const overlay = document.createElement("div");   // toast surface only (siblings of #root)
@@ -33,6 +33,10 @@ window.AGL = {
     const inKeyFlow = screen === "add-key";
     if (inKeyFlow || screen === "paid-key") out.screen = screen; // keep the current input/confirmation
     screen = out.screen; add = out.add; lastRev = out.lastRev; state = out.state;
+    // The click is answered once the engine reports progress (or failure) in a newer snapshot.
+    if (installSentAt !== null && (lastRev > installSentAt || res.error || !updateCanInstall(state.update))) {
+      installSentAt = null; out.render = true;
+    }
     const keyChanged = reduceKeyReply(keyFlow, res);
     let paidChanged = false, paidHandled = false, confirmation = null;
     if (paidTerminal && res.key_action === "key_terminal" && res.key_target_id === paidTerminal.id) {
@@ -157,6 +161,9 @@ let add = null;
 let keyFlow = null;
 let paidTerminal = null;
 let pendingSwitch = null;
+// state.rev when "update" was clicked; until a newer snapshot arrives the line shows the download as
+// started and further clicks do nothing, so a second click can never start a second install.
+let installSentAt = null;
 let keySequence = 0;
 const answering = new Set();
 const proving = new Set();
@@ -218,7 +225,8 @@ function render() {
     : screen === "add" ? buildAddSeat(state, add)
     : screen === "add-key" ? buildAddKey(state, keyFlow)
     : screen === "paid-key" ? buildPaidKeyGate(state, paidTerminal)
-    : buildHTML(state, pendingSwitch, openSeatDetails);
+    : buildHTML(installSentAt === null || !state.update ? state
+      : { ...state, update: { ...state.update, phase: "downloading", error: null } }, pendingSwitch, openSeatDetails);
   if (!root.querySelector(".key-prompts")) {
     root.querySelector(".set-head")?.insertAdjacentHTML("afterend", keyConfirmations(state, answering));
   }
@@ -304,7 +312,7 @@ document.addEventListener("click", (e) => {
       openMenu = openMenu === el.dataset.menu ? null : el.dataset.menu;
       paintMenus(true); break;
     case "attention": {
-      const target = root.querySelector('.issue button, .key-confirm button');
+      const target = root.querySelector('.issue:not(.update-line) button, .key-confirm button');
       target?.scrollIntoView({ block: "nearest" }); target?.focus(); break;
     }
     case "toggle":
@@ -463,6 +471,12 @@ document.addEventListener("click", (e) => {
     }
     case "add-reveal": send("reveal"); break;   // native: reveal ~/.codex/auth.json in Finder
     case "settings": screen = "settings"; render(); break;
+    case "update-install":
+      if (installSentAt !== null || !updateCanInstall(state.update)) break;
+      installSentAt = lastRev; send("update_install"); render(); break;
+    // The native side opens state.update.notes_url itself; the page never names a URL.
+    case "update-notes": send("update_notes"); break;
+    case "update-check": send("update_check", { force: true }); break;
     case "settings-back": screen = "main"; render(); break;
     case "supervision-on": send("toggle", { key: "supervise_shell", value: true }); break;
     case "engine-adopt": send("adopt_engine"); break;

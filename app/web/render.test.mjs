@@ -2902,7 +2902,7 @@ test("engine and supervision problem lines lead the main view and count in the h
   app.click({ action: "supervision-on" });
   assert.deepEqual(JSON.parse(JSON.stringify(app.sent.at(-1))), { action: "toggle", key: "supervise_shell", value: true });
   let focused = false, scrolled = false;
-  app.root.querySelector = (q) => q === '.issue button, .key-confirm button'
+  app.root.querySelector = (q) => q === '.issue:not(.update-line) button, .key-confirm button'
     ? { focus() { focused = true; }, scrollIntoView() { scrolled = true; } } : null;
   app.click({ action: "attention" });
   assert.ok(focused && scrolled);
@@ -3016,4 +3016,115 @@ test("one-line seat rows reserve state and action width and truncate metadata be
   assert.match(rule(".now-seat > .seatname"), /flex:0 1 auto/);
   assert.match(rule(".now-seat > .tag"), /flex:none/);
   assert.match(rule(".seatname .chev"), /flex:none/);
+});
+
+// --- in-app updater: a calm line in the main view, installed only on click -------------------
+const upd = (over = {}) => ({ current: "1.8.0", version: "1.8.1",
+  notes_url: "https://github.com/fheinfling/ai-guest-list/releases/tag/v1.8.1", phase: "available", error: null,
+  checked_at: "2026-11-08T10:00:00Z", ...over });
+const updateLineOf = (html) => elements(html, "div", (tag) => tag.includes("update-line"))[0] || "";
+
+test("update line renders each phase with the right text and button state", () => {
+  const base = state({ tools: { codex: { seats: [seat({ status: "active" })] } } });
+  assert.equal(updateLineOf(buildHTML(base)), "");
+  assert.equal(updateLineOf(buildHTML({ ...base, update: null })), "");
+  assert.equal(updateLineOf(buildHTML({ ...base, update: upd({ phase: "someday" }) })), "");
+  const available = updateLineOf(buildHTML({ ...base, update: upd() }));
+  assert.match(available, /class="issue issue--calm update-line"/);
+  assert.match(available, /<span class="issue-text">1\.8\.1 is ready<\/span>/);
+  assert.match(available, /<button class="pricing-link" data-action="update-notes">what's new<\/button>/);
+  assert.match(available, /<button class="row-action" data-action="update-install">update<\/button>/);
+  assert.doesNotMatch(available, /disabled|aria-busy|https:/);
+  for (const [phase, text] of [["downloading", "updating to 1.8.1…"], ["verifying", "checking 1.8.1…"],
+    ["installing", "installing 1.8.1, the app will reopen"]]) {
+    const line = updateLineOf(buildHTML({ ...base, update: upd({ phase }) }));
+    assert.match(line, new RegExp(`<span class="issue-text">${text.replace(/\./g, "\\.")}</span>`), phase);
+    assert.match(line, /<button class="row-action" data-action="update-install" disabled aria-busy="true">/, phase);
+    assert.doesNotMatch(line, /update-notes/, phase);
+  }
+  const failed = updateLineOf(buildHTML({ ...base, update: upd({ phase: "failed", error: "signature mismatch" }) }));
+  assert.match(failed, /class="issue issue--soft update-line"/);
+  assert.match(failed, /couldn't update to 1\.8\.1: signature mismatch/);
+  assert.match(failed, /data-action="update-notes">what's new/);
+  assert.match(failed, /<button class="row-action" data-action="update-install">try again<\/button>/);
+  assert.doesNotMatch(failed, /disabled/);
+  assert.match(updateLineOf(buildHTML({ ...base, update: upd({ phase: "failed" }) })), /couldn't update to 1\.8\.1<\/span>/);
+  // Sits in the main view after any problem lines, before the seats.
+  const main = rosterOf(buildHTML({ ...base, update: upd(), supervision: { active: false } }));
+  assert.ok(main.indexOf("app-problems") < main.indexOf('class="app-notes"'));
+  assert.ok(main.indexOf('class="app-notes"') < main.indexOf('class="field"'));
+});
+
+test("an update never counts toward the header's needs-you chip", () => {
+  const base = state({ tools: { codex: { seats: [seat({ status: "active" })] } } });
+  for (const phase of ["available", "downloading", "verifying", "installing", "failed"]) {
+    assert.match(factsOf(buildHTML({ ...base, update: upd({ phase, error: "x" }) })), /all good/, phase);
+    const hard = { ...base, supervision: { active: false }, update: upd({ phase, error: "x" }) };
+    assert.match(factsOf(buildHTML(hard)), /1 needs you/, phase);
+  }
+});
+
+test("update version and error are escaped in the line and the settings footer", () => {
+  const hostile = '<img src=x onerror=alert(1)>"';
+  const html = buildHTML(state({ update: upd({ version: hostile, phase: "failed", error: hostile }) }));
+  assert.doesNotMatch(html, /<img src=x/);
+  assert.match(updateLineOf(html), /couldn't update to &lt;img src=x onerror=alert\(1\)&gt;&quot;: &lt;img/);
+  const settings = buildSettings(state({ app: { version: "1.8.0" }, update: upd({ version: hostile }) }));
+  assert.doesNotMatch(settings, /<img src=x/);
+  assert.match(settings, /ai guest list v1\.8\.0 · &lt;img/);
+});
+
+test("settings footer names an available update next to the running version", () => {
+  assert.match(buildSettings(state({ app: { version: "1.8.0" }, update: upd() })), /<p class="set-ver">ai guest list v1\.8\.0 · 1\.8\.1 available<\/p>/);
+  assert.match(buildSettings(state({ app: { version: "1.8.0" } })), /<p class="set-ver">ai guest list v1\.8\.0<\/p>/);
+});
+
+test("the more menu checks for updates with force; what's new sends no URL", () => {
+  const html = buildHTML(state());
+  const more = html.match(/<nav class="menu" role="menu" aria-label="more"[\s\S]*?<\/nav>/)[0];
+  assert.match(more, /<button role="menuitem" data-action="update-check">check for updates<\/button>/);
+  const app = keyApp();
+  app.window.AGL.result({ state: { ...state({ rev: 1 }), update: upd() } });
+  app.click({ action: "update-check" });
+  assert.deepEqual(JSON.parse(JSON.stringify(app.sent.at(-1))), { action: "update_check", force: true });
+  app.click({ action: "update-notes" });
+  assert.deepEqual(JSON.parse(JSON.stringify(app.sent.at(-1))), { action: "update_notes" });
+  assert.ok(!JSON.stringify(app.sent).includes("https://"));
+});
+
+test("update sends update_install once and ignores clicks while an install is under way", () => {
+  const app = keyApp();
+  const installs = () => app.sent.filter((m) => m.action === "update_install");
+  const push = (rev, update) => app.window.AGL.result({ state: { ...state({ rev }), update } });
+  push(1, null);
+  app.click({ action: "update-install" });
+  assert.equal(installs().length, 0);                       // nothing known, nothing to install
+  push(2, upd());
+  app.click({ action: "update-install" });
+  assert.deepEqual(JSON.parse(JSON.stringify(installs())), [{ action: "update_install" }]);
+  assert.match(updateLineOf(app.root.innerHTML), /updating to 1\.8\.1…[\s\S]*disabled aria-busy="true"/);
+  app.click({ action: "update-install" });
+  push(2, upd());                                           // a same-rev poll still reading "available"
+  app.click({ action: "update-install" });
+  assert.equal(installs().length, 1);
+  for (const phase of ["downloading", "verifying", "installing"]) {
+    push(3, upd({ phase }));
+    app.click({ action: "update-install" });
+  }
+  assert.equal(installs().length, 1);
+  push(4, upd({ phase: "failed", error: "network" }));      // failure offers a retry
+  assert.match(updateLineOf(app.root.innerHTML), /couldn't update to 1\.8\.1: network/);
+  app.click({ action: "update-install" });
+  app.click({ action: "update-install" });
+  assert.equal(installs().length, 2);
+});
+
+test("reduceReply flashes each update_check outcome without a raw error", () => {
+  const flashFor = (update_check, extra = {}) => reduceReply(UI(), { ok: true, update_check, ...extra }).flash;
+  assert.equal(flashFor({ ok: true, up_to_date: true, version: "1.8.0", error: null }), "you're on the latest version");
+  assert.equal(flashFor({ ok: true, up_to_date: false, version: "1.8.1", error: null }), "1.8.1 is available");
+  assert.equal(flashFor({ ok: false, up_to_date: false, version: null, error: "timed out" }), "couldn't check for updates");
+  assert.equal(flashFor({ ok: false, error: "timed out" }, { ok: false, error: "timed out" }), "couldn't check for updates");
+  assert.equal(flashFor({ ok: true, up_to_date: false, version: null, error: null }), "couldn't check for updates");
+  assert.equal(flashFor({ ok: true, up_to_date: true }, { background: true }), null);
 });
