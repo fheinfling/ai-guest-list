@@ -133,7 +133,7 @@ test("resting disclosures show one return countdown and retain reading provenanc
   const card = detailsOf(html, "codex", "work@x.com");
   assert.equal((rosterOf(html).match(/data-clock-prefix=""/g) || []).length, 1);
   assert.match(card, /last known reading/);
-  assert.match(html, /connection unavailable; retrying automatically/);
+  assert.doesNotMatch(html, /connection unavailable|class="issue /);
   assert.match(card, /data-usage-at="2026-09-13T18:25:00Z"/);
   assert.doesNotMatch(card, /taking a breather/);
 });
@@ -292,21 +292,21 @@ test("clock ticks update age and reset text without replacing the DOM", () => {
   assert.equal(terminal.textContent, " · 11d");
 });
 
-test("provider throttling is visible alongside retained usage", () => {
+test("provider throttling quietly retains usage", () => {
   const html = buildHTML(state({ tools: { claude: { seats: [seat({ usage_stale: true,
     usage: { error: "rate_limited" }, usage5h: 0, usageWeek: 65 })] } } }));
-  assert.match(html, /updates throttled; retrying automatically/);
+  assert.doesNotMatch(html, /updates throttled|class="issue /);
   assert.match(html, /35%/);
   assert.match(html, /waiting for first reading/);
 });
 
-test("expired Claude token asks for an app refresh without implying logout", () => {
+test("expired Claude access token stays quiet without implying logout", () => {
   const active = buildHTML(state({ tools: {
     codex: { seats: [] },
     claude: { seats: [seat({ status: "active", active: true,
       usage: { error: "token_expired" } })] },
   } }));
-  assert.match(active, /open Claude to refresh usage/);
+  assert.doesNotMatch(active, /open Claude to refresh usage|class="issue /);
   assert.doesNotMatch(active, />log in<|sign in to refresh|retrying automatically/);
 
   const resting = buildHTML(state({ tools: {
@@ -315,17 +315,17 @@ test("expired Claude token asks for an app refresh without implying logout", () 
       limited_until: "2026-09-13T18:57:00Z", usage: { error: "token_expired" } })] },
   } }));
   assert.match(resting, /until back/);
-  assert.doesNotMatch(resting, />log in<|usage refresh pending|sign in to refresh/);
+  assert.doesNotMatch(resting, />log in<|usage refresh pending|sign in to refresh|class="issue /);
 });
 
-test("expired Codex token names Codex without implying logout", () => {
+test("expired Codex token quietly awaits automatic recovery", () => {
   for (const active of [false, true]) {
     const html = buildHTML(state({ tools: {
       codex: { seats: [seat({ active, status: active ? "active" : "ready",
         usage: { error: "token_expired" } })] },
       claude: { seats: [] },
     } }));
-    assert.match(html, /open Codex to refresh usage/);
+    assert.doesNotMatch(html, /open Codex to refresh usage|class="issue /);
     assert.doesNotMatch(html, /open Claude|>log in<|sign in to refresh/);
   }
 });
@@ -2322,22 +2322,19 @@ snapshot.pending_crossings = [{ tool: "claude", to: "client@x" }];
 assert.match(next(), /needs approval/);
 });
 
-test("stale, throttled and unknown problems stay inline; limited resets stay in their column", () => {
-  for (const [over, message] of [
-    [{ usage_stale: true, usage_fetched_at: inHours(-1) }, /last known reading;.*updated 1h ago/],
-    [{ usage_stale: true, usage: { error: "rate_limited" } }, /updates throttled; retrying automatically/],
-    [{ usage_unknown: true }, /usage unknown;.*waiting for first reading/],
+test("stale, throttled and unknown readings stay quiet; limited resets stay in their column", () => {
+  for (const over of [
+    { usage_stale: true, usage_fetched_at: inHours(-1) },
+    { usage_stale: true, usage: { error: "rate_limited" } },
+    { usage_unknown: true },
   ]) {
-    const row = rowOf(buildHTML(claudeState(seat(over))), "work@x.com");
-    if (over.usage_stale && !over.usage?.error) {
-      assert.match(detailsOf(buildHTML(claudeState(seat(over))), "claude", "work@x.com"), message);
-      assert.doesNotMatch(row, /class="issue /);
-      assert.match(row, /~80% left/);
-    } else {
-      assert.match(row, /class="issue issue--soft"/);
-      assert.match(row, message);
+    const html = buildHTML(claudeState(seat(over)));
+    assert.doesNotMatch(html, /class="issue |checking usage|retrying automatically/);
+    if (over.usage_stale) {
+      assert.match(detailsOf(html, "claude", "work@x.com"), /last known reading/);
+      assert.match(rowOf(html, "work@x.com"), /~80% left/);
     }
-    assert.doesNotMatch(row, /back in now|resets in now/);
+    assert.doesNotMatch(rowOf(html, "work@x.com"), /back in now|resets in now/);
   }
   const row = rowOf(buildHTML(claudeState(seat({ limited: true, status: "resting", limited_until: inHours(-1) }))), "work@x.com");
   assert.match(row, /data-past-text="resetting…"[^>]*>resetting…<\/span>/);
@@ -2657,7 +2654,7 @@ test("header chip answers needs you, all limited, renew soon and all good in pri
   all.pending_key_switches[0].expires_at = inHours(-1);
   assert.match(headerVerdict(all), /2 needs you/);
   assert.equal(headerVerdict(state()), "");
-  for (const flag of ["usage_stale", "usage_unknown"]) assert.match(headerVerdict(claudeState(seat({ [flag]: true }))), /checking usage/);
+  for (const flag of ["usage_stale", "usage_unknown"]) assert.doesNotMatch(headerVerdict(claudeState(seat({ [flag]: true }))), /checking usage/);
   assert.doesNotMatch(buildHTML(healthy).split('<div class="body"')[0], /<h1|<h2/);
 });
 
@@ -3127,4 +3124,26 @@ test("reduceReply flashes each update_check outcome without a raw error", () => 
   assert.equal(flashFor({ ok: false, error: "timed out" }, { ok: false, error: "timed out" }), "couldn't check for updates");
   assert.equal(flashFor({ ok: true, up_to_date: false, version: null, error: null }), "couldn't check for updates");
   assert.equal(flashFor({ ok: true, up_to_date: true }, { background: true }), null);
+});
+
+
+for (const tool of ["codex", "claude"]) {
+  for (const error of ["network", "rate_limited", "tls", "internal", "parse", "http_503"]) {
+    test(`${tool} ${error} quietly preserves stale figures and accessible provenance`, () => {
+      const html = buildHTML(state({ tools: { [tool]: { seats: [seat({ status: "active",
+        active: true, usage_stale: true, usage_fetched_at: inHours(-1), usage: { error },
+      })] } } }));
+      assert.doesNotMatch(html, /class="issue |checking usage|retrying automatically/);
+      assert.match(html, /~80<small>%/);
+      assert.match(html, /week ~90%/);
+      assert.match(detailsOf(html, tool, "work@x.com"), /last known reading;.*updated 1h ago/);
+    });
+  }
+}
+
+test("unknown figures remain dashes without an attention row", () => {
+  const html = buildHTML(claudeState(seat({ status: "active", usage_unknown: true,
+    usage5h: null, usageWeek: null })));
+  assert.match(html, /class="fig">—</);
+  assert.doesNotMatch(html, /class="issue |checking usage/);
 });

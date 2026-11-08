@@ -12,14 +12,84 @@ infrastructure, not compression, so they live here.)
 from __future__ import annotations
 
 import os
+import hashlib
+import json
 import re
 import subprocess
+from pathlib import Path
+from urllib.parse import urlsplit
+from collections.abc import MutableMapping
 
 # Interpreter-redirect vars py2app sets on the frozen app; must not leak into a child interpreter.
 _PY_ENV_STRIP = ("PYTHONHOME", "PYTHONPATH", "PYTHONEXECUTABLE", "__PYVENV_LAUNCHER__")
 
 # Belt-and-suspenders: opt out of any third-party telemetry a spawned tool might honor. Local-only.
 HARDENING_ENV = {"DO_NOT_TRACK": "1"}
+
+SEAT_ENV_MARKER = "ACCTSW_SEAT_ENV"
+SEAT_CA_VARS = ("NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")
+SEAT_ENV_VARS = ("HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy", *SEAT_CA_VARS)
+
+
+def shed_seat_env(environ: MutableMapping[str, str]) -> bool:
+    """Undo an inherited SeatSwap environment in place, preserving subsequent user/boot edits.
+
+    New sessions carry original values and digests of their overrides (never another copy of
+    the seat proxy secret). Older sessions can only be recognized structurally; their user's
+    original proxy/CA values are unrecoverable, so remove our proxy and session CA paths only.
+    """
+    marker = environ.pop(SEAT_ENV_MARKER, None)
+    try:
+        saved = json.loads(marker) if marker is not None else None
+    except (ValueError, TypeError):
+        saved = None
+    records = {}
+    if isinstance(saved, dict):
+        for name, record in saved.items():
+            if (name in SEAT_ENV_VARS and isinstance(record, dict)
+                    and "original" in record
+                    and (record["original"] is None or isinstance(record["original"], str))
+                    and isinstance(record.get("digest"), str)
+                    and re.fullmatch(r"[0-9a-f]{64}", record["digest"])):
+                records[name] = record
+    if records:
+        for name, record in records.items():
+            current = environ.get(name)
+            if current is None or hashlib.sha256(current.encode()).hexdigest() != record["digest"]:
+                continue
+            if record["original"] is None:
+                environ.pop(name, None)
+            else:
+                environ[name] = record["original"]
+        return True
+
+    # No usable marker: the upgrade path for children of 1.6–1.8.0 sessions.
+    changed = marker is not None
+    proxies = set()
+    for name in ("HTTPS_PROXY", "https_proxy"):
+        value = environ.get(name)
+        try:
+            parts = urlsplit(value or "")
+            if (parts.scheme != "http" or parts.username != "acctsw"
+                    or parts.hostname not in ("127.0.0.1", "localhost", "::1")):
+                continue
+            parts.port  # reject malformed ports as well as malformed IPv6 URLs
+        except ValueError:
+            continue
+        proxies.add(value)
+        environ.pop(name, None)
+        changed = True
+    for name in ("ALL_PROXY", "all_proxy"):
+        if environ.get(name) in proxies:
+            environ.pop(name, None)
+            changed = True
+    from .sessionca import TEMP_DIR_PREFIX
+    for name in SEAT_CA_VARS:
+        value = environ.get(name)
+        if value and Path(value).parent.name.startswith(TEMP_DIR_PREFIX):
+            environ.pop(name, None)
+            changed = True
+    return changed
 
 
 def harden_env(env: dict | None = None) -> dict:

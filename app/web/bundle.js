@@ -632,10 +632,11 @@ function returnTime(seat, prefix = "back in") {
   return `<span data-reset-at="${esc(at)}" data-clock-prefix="${prefix}" data-past-text="resetting…" title="${esc(new Date(at).toLocaleString())}">${resetIsPast(at) ? "resetting…" : `${prefix} ${fmtCountdown(at)}`}</span>`;
 }
 
-function usageIssue(tool, seat) {
+function usageIssue(seat) {
   const error = seat.usage?.error;
-  return entitlementRevoked(seat) ? "check your subscription to refresh usage" : ({ rate_limited: "updates throttled; retrying automatically", network: "connection unavailable; retrying automatically",
-    token_expired: `open ${TOOL_META[tool].label} to refresh usage`, unauthorized: "sign in to refresh usage", forbidden: "check your subscription to refresh usage", no_token: "sign in to refresh usage" })[error] || (error ? "usage update failed; retrying automatically" : "");
+  return entitlementRevoked(seat) ? "check your subscription to refresh usage" : ({
+    unauthorized: "sign in to refresh usage", forbidden: "check your subscription to refresh usage",
+    no_token: "sign in to refresh usage" })[error] || "";
 }
 
 // Identity stays legible in the block, sheet and inline details. Only known plan
@@ -775,7 +776,6 @@ function headerVerdict(state) {
   if (hard) return `<button class="chip chip--hard" data-action="attention">${ICON.alert}${hard} needs you</button>`;
   if (seats.length && !ready.length && seats.every(limitedSeat)) return `<span class="chip chip--soft">${ICON.rest}all limited</span>`;
   if (seats.some((s) => signinExpiring(s))) return `<span class="chip chip--soft">${ICON.clock}renew soon</span>`;
-  if (seats.some((s) => s.usage_unknown || s.usage_stale || s.usage?.error)) return `<span class="chip chip--soft">${ICON.clock}checking usage</span>`;
   return seats.length || state?.keys?.length ? `<span class="chip chip--calm">${ICON.check}all good</span>` : "";
 }
 function thenLine(p, state) {
@@ -803,9 +803,8 @@ function seatIssues(p, openDetails) {
     else if (out) issues.push(isActive(seat) ? "on now · signed out" : "signed out");
     else if (signinNeeded(seat)) issues.push("sign-in needed");
     if (!out && signinExpiring(seat)) issues.push(signinExpiryLine(seat, "span"));
-    const error = usageIssue(p.tool, seat);
+    const error = usageIssue(seat);
     if (!out && !hard && error) issues.push(esc(error));
-    if (!out && !hard && (seat.usage_unknown || (seat.usage_stale && error))) issues.push(`${seat.usage_unknown ? "usage unknown" : "last known reading"}; <span data-usage-at="${esc(seat.usage_fetched_at || seat.usage?.fetched_at || "")}">${fmtUsageAge(seat.usage_fetched_at || seat.usage?.fetched_at)}</span>`);
     if (!issues.length) return "";
     const representedHere = seat !== p.lead && hard;
     return `<div class="issue issue--${hard ? "hard" : "soft"}" data-tool="${esc(p.tool)}" data-email="${esc(seat.email)}" role="group" aria-label="${esc(p.tool)} ${esc(seat.name || seat.email)} attention">${hard ? ICON.alert : ICON.clock}<div>${representedHere ? nameButton(p.tool, seat, p.seats, openDetails) : `<b>${esc(seatIdentity(seat, p.seats))}</b>`} ${issues.join("; ")}</div>${seatAction(p.tool, seat, "signin")}</div>${representedHere ? rowDetails(p.tool, seat, p.seats, openDetails) : ""}`;

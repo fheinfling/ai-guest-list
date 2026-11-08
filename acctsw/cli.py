@@ -20,7 +20,7 @@ from . import keyseats as keyseats_mod
 from . import paths as P
 from .context import Context
 from .errors import AcctswError, CannotIdentify, NoLiveCreds
-from .procenv import harden_env
+from .procenv import harden_env, shed_seat_env
 from .switch import switch as do_switch
 
 # Exit codes: 0 ok, 1 expected error, 2 argparse usage error, 3 not-implemented-yet.
@@ -479,6 +479,7 @@ HANDLERS = {
 
 
 def main(argv: list[str] | None = None) -> int:
+    shed_seat_env(os.environ)
     parser = build_parser()
     ns = parser.parse_args(argv)
     if ns.capabilities and ns.command:

@@ -47,6 +47,7 @@ check; ``proxy_used()`` is the proxy's ``messages_seen() > 0``; ``tls_rejected()
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
 import socket
@@ -61,6 +62,7 @@ from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from . import seatkind, seattier
+from .procenv import SEAT_ENV_MARKER, shed_seat_env
 from .seatproxy import Seat
 from .selection import choose
 from .util import iso, now, parse_iso, write_json
@@ -399,6 +401,8 @@ def _default_ca():
 def _upstream_proxy(environ) -> str | None:
     """The proxy the user's own traffic to api.anthropic.com went through, if any: ours chains
     to it, since HTTPS_PROXY now points the child at us."""
+    environ = dict(environ)
+    shed_seat_env(environ)
     for name in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
         if _set(environ.get(name)):
             return environ[name].strip()
@@ -435,7 +439,8 @@ class SeatSwap:
         self._tls_rejected = False
         self._upstream_worked = False
         self._preflight_marked = False
-        self._environ = os.environ if environ is None else environ
+        self._environ = dict(os.environ if environ is None else environ)
+        shed_seat_env(self._environ)
         self.upstream_proxy = _upstream_proxy(self._environ)
         r, w = os.pipe()
         os.set_blocking(r, False)
@@ -505,10 +510,13 @@ class SeatSwap:
         talking to api.anthropic.com as itself. Nothing else the user set is removed."""
         if not self.proxy_url:
             raise RuntimeError("SeatSwap.env() before start()")
+        base = dict(base)
+        shed_seat_env(base)
         out = dict(base)
-        out["HTTPS_PROXY"] = out["https_proxy"] = self.proxy_url
+        overrides = {"HTTPS_PROXY": self.proxy_url, "https_proxy": self.proxy_url}
         if self.ca is not None:
-            out.update(self.ca.bundle_paths(base))
+            overrides.update(self.ca.bundle_paths(base))
+        out.update(overrides)
         parts: list[str] = []
         for name in ("NO_PROXY", "no_proxy"):
             for p in str(out.get(name) or "").split(","):
@@ -516,7 +524,12 @@ class SeatSwap:
                 if p and p not in parts and not _routes_api(p):
                     parts.append(p)
         parts += [h for h in ("127.0.0.1", "localhost") if h not in parts]
-        out["NO_PROXY"] = out["no_proxy"] = ",".join(parts)
+        overrides["NO_PROXY"] = overrides["no_proxy"] = ",".join(parts)
+        out.update(overrides)
+        out[SEAT_ENV_MARKER] = json.dumps({
+            name: {"original": base.get(name), "digest": hashlib.sha256(value.encode()).hexdigest()}
+            for name, value in overrides.items()
+        })
         return out
 
     def _on_tls_reject(self, reason: str) -> None:

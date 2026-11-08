@@ -457,3 +457,58 @@ def test_active_expired_codex_without_refresh_still_prompts_login(ctx):
     assert result["codex"][email] == "unauthorized"
     seat = ctx.load_state().get_seat("codex", email)
     assert accounts._seat_view(seat, active=True, at=now())["needs_login"] is True
+
+
+@pytest.mark.parametrize("mirror", ["other", "missing"])
+def test_active_snapshot_only_seat_recovers_and_commits_usage(ctx, monkeypatch, parked_seat, mirror):
+    email = parked_seat
+    state = ctx.load_state()
+    state.set_active("codex", email)
+    state.save()
+    # The fixture verifies every write stays private and the shared mirror remains untouched.
+    if mirror == "missing":
+        monkeypatch.setattr(ctx.cred["codex"], "get_live", lambda **kw: None)
+    posted = []
+
+    def post(*args):
+        posted.append(True)
+        return _renewal_response()
+
+    def get(url, headers, timeout):
+        renewed = ctx.snapshot_get("codex", email)
+        assert usage._codex_refresh_token(renewed) == "renewed-refresh"
+        assert headers["Authorization"] == "Bearer " + json.loads(renewed)["tokens"]["access_token"]
+        return 200, codex_ok_body()
+
+    result = usage.refresh_live(ctx, "codex", active_only=True, post=post, get=get)
+    assert result["codex"][email] == "ok"
+    assert posted == [True]
+    seat = ctx.load_state().get_seat("codex", email)
+    assert seat["usage"]["ok"] is True
+    assert seat["usage"]["error_streak"] == 0
+    assert seat["usage"]["credential_digest"] == usage._credential_digest(ctx.snapshot_get("codex", email))
+    assert not seat.get("auth_error")
+
+
+@pytest.mark.parametrize("selected", [False, True])
+@pytest.mark.parametrize("owner", ["live", "live_case", "session"])
+def test_recovery_follows_ownership_even_when_selected_flag_disagrees(ctx, monkeypatch, selected, owner):
+    email = "person@example.test"
+    blob = _blob(1)
+    state = ctx.load_state()
+    state.upsert_seat("codex", email)
+    state.set_active("codex", email if selected else None)
+    ctx.snapshot_set("codex", email, blob)
+    mirror = (blob if owner == "live" else make_codex_blob(
+        email.upper() if owner == "live_case" else "other@example.test"))
+    ctx.cred["codex"].set_live(mirror)
+    state.save()
+    monkeypatch.setattr(session, "active_session", lambda *a, **kw:
+                        {"email": email} if owner == "session" else None)
+
+    def no_post(*args):
+        pytest.fail("a live mirror or supervised session owns this refresh token")
+
+    result = usage.refresh_live(ctx, "codex", post=no_post, get=lambda *_: (401, "{}"))
+    assert result["codex"][email] == "token_expired"
+    assert ctx.snapshot_get("codex", email) == blob

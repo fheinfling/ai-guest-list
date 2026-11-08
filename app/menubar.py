@@ -59,6 +59,7 @@ except ImportError:  # allows importing this module's pure helpers without pyobj
 
 from acctsw import TOOLS, appalive, bridge, session
 from acctsw.context import Context, hydrate_path
+from acctsw.procenv import harden_env, shed_seat_env
 from acctsw.util import now, parse_iso
 
 
@@ -80,6 +81,14 @@ def _log_exception(exc: BaseException, secret: str = "") -> None:
         if exc is not None:
             lines.append("Caused by / during handling of:\n")
     print(bridge._redact_key("".join(lines), secret), file=sys.stderr, end="")
+
+def spawn_update_helper(argv, log):
+    """A detached update/reopen must never perpetuate a supervised seat's proxy or CA."""
+    env = harden_env()
+    shed_seat_env(env)
+    return subprocess.Popen(argv, start_new_session=True, close_fds=True,
+                            stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=env)
+
 
 def popover_height(value):
     """Validate the web content height; keep native geometry finite and bounded."""
@@ -1031,8 +1040,7 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
                 # The helper outlives this process: keep what it says, or a failed restore is silent.
                 log = open(data_dir / "update-helper.log", "ab")
                 try:
-                    subprocess.Popen(argv, start_new_session=True, close_fds=True,
-                                     stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+                    spawn_update_helper(argv, log)
                 finally:
                     log.close()
                 quitting = True
@@ -1150,6 +1158,7 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
 
 
 def main() -> int:
+    shed_seat_env(os.environ)
     if objc is None:
         print("pyobjc not installed; run `pip install '.[app]'`", file=sys.stderr)
         return 1
