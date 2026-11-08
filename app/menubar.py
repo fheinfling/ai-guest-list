@@ -90,21 +90,25 @@ def spawn_update_helper(argv, log):
                             stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=env)
 
 
-def engine_warning_toast_key(w):
-    """Which drift warnings toast, and the identity a toast is deduplicated on (None = no toast).
+def engine_warning_toast(w, remembered):
+    """Return whether to toast a drift warning and the new identities to remember.
 
     Only "needs you" (hard) warnings toast; a soft notice lives in the popover alone. Text is not
     the identity: a session notice names a start time that moves with every hop, so it is keyed
-    on its terminals instead. A warning without ``severity`` (an older engine's bridge) is hard.
+    on its unsafe terminals individually. A warning without ``severity`` or ``notify_ids`` keeps
+    the older bridge's hard, text-keyed behavior. This helper leaves ``remembered`` unchanged.
     """
     if not isinstance(w, dict) or not isinstance(w.get("text"), str) or not w["text"]:
-        return None
+        return False, set()
     if w.get("severity", "hard") != "hard":
-        return None
-    pids = w.get("pids")
-    if w.get("kind") == "sessions" and isinstance(pids, list) and pids:
-        return ("sessions", tuple(pids))
-    return (w.get("kind"), w["text"])
+        return False, set()
+    notify_ids = w.get("notify_ids")
+    if w.get("kind") == "sessions" and isinstance(notify_ids, list):
+        ids = {("sessions", identity) for identity in notify_ids if isinstance(identity, str) and identity}
+    else:
+        ids = {(w.get("kind"), w["text"])}
+    new_ids = ids - remembered
+    return bool(new_ids), new_ids
 
 
 def popover_height(value):
@@ -847,9 +851,9 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
             shares this app's store and can sign every session out, so it must not wait for the
             popover to be opened; the persistent banner (render.mjs engineBanner) carries the fix."""
             for w in ((result.get("state") or {}).get("engine_warnings") or []):
-                key = engine_warning_toast_key(w)
-                if key is not None and key not in self._engineWarned:
-                    self._engineWarned.add(key)
+                should_notify, new_ids = engine_warning_toast(w, self._engineWarned)
+                if should_notify:
+                    self._engineWarned.update(new_ids)
                     text = w["text"]
                     self._notify("heads up — terminals run an older engine"
                                  if w.get("kind") != "app" else "AI Guest List is out of date", text)

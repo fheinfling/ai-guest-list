@@ -197,7 +197,7 @@ test("only the credential holder is on the floor; a parked terminal keeps its sw
 });
 
 test("parked terminals retain resting, queued, and sign-in signals beside the chip", () => {
-  for (const [status, signal] of [["resting", /until back/], ["queued", /limited/],
+  for (const [status, signal] of [["resting", /limited/], ["queued", /limited/],
     ["needs-login", /data-action="add"/]]) {
     const html = buildHTML(state({ tools: { codex: { seats: [seat({ status, in_session: true })] } } }));
     assert.match(html, /terminal attached/);
@@ -335,7 +335,7 @@ test("expired Codex token quietly awaits automatic recovery", () => {
 test("tool markers and written seat status do not rely on colour or emoji", () => {
 const html = buildHTML(state({ tools: { codex: { seats: [seat({ status: "resting" })] }, claude: { seats: [seat()] } } }));
 assert.match(html, /class="mark"/); assert.match(html, /class="mark mark--claude"/);
-assert.match(html, /limited/); assert.match(html, /until back/);
+assert.match(html, /class="fig fig--time">—<\/span><span class="fig-l">limited<\/span>/);
 assert.doesNotMatch(html, /🟢|🟡|🌸|🌿|💚/);
 });
 
@@ -3170,10 +3170,33 @@ test("a seat with no reading leaves no dangling separators or unknown labels", (
   const html = buildHTML(state({ tools: { codex: { seats: [
     seat({ status: "active", kind: undefined, plan: "Self_Serve_Business_Prolite", usage5h: null, usageWeek: null, usage: { windows: {} } }),
     seat({ name: "next one", email: "n@x.com", kind: "business", plan: "team", usage5h: null, usageWeek: null, usage: { windows: {} } }),
+    seat({ name: "third one", email: "third@x.com", kind: undefined, plan: undefined, usage5h: null, usageWeek: null, usage: { windows: {} } }),
   ] } } }));
   const visible = visibleMarkup(rosterOf(html));
   assert.doesNotMatch(visible, /unknown/);
   assert.doesNotMatch(visible, /<span> · |· <\/span>|, <\/span>|, \(needs approval\)/);
   assert.match(visible, /class="then"><b>then<\/b> next one · business · team <span class="muted">\(needs approval\)/);
   assert.match(visible, /<span class="state"><span class="state--strong">next<\/span><\/span>/);
+  assert.doesNotMatch(visible, /<span(?: class="(?:seat-metadata|state)"[^>]*)?>\s*<\/span>|<div class="meta">\s*<\/div>/);
+  assert.doesNotMatch(rowOf(html, "third@x.com"), /class="state"|class="seat-metadata"/);
+});
+
+test("limited seats without a usable reset show no time and keep their limited status", () => {
+  for (const status of ["resting", "queued", "active"]) {
+    for (const limited_until of [null, "invalid"]) {
+      for (const usage_stale of [false, true]) {
+        const limited = seat({ status, limited: true, limited_until, usage_stale });
+        const html = buildHTML(state({ tools: { codex: { seats: [limited] } } }));
+        const answer = visibleMarkup(answerOf(html));
+        assert.match(answer, /class="fig fig--time">—<\/span><span class="fig-l">limited<\/span>/);
+        assert.doesNotMatch(answer, /unknown|until back|data-reset-at|approximate, last known reading/);
+        const roster = buildHTML(state({ tools: { codex: { seats: [
+          seat({ active: true, status: "active", email: "active@x.com" }),
+          { ...limited, status: status === "active" ? "resting" : status },
+        ] } } }));
+        assert.match(rowOf(roster, limited.email), /class="state">limited<\/span>/);
+        assert.doesNotMatch(visibleMarkup(rosterOf(roster)), /unknown|back in|until back|limited,\s*</);
+      }
+    }
+  }
 });

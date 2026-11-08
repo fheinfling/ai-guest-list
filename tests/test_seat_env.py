@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from acctsw import cli, procenv, seatswap
+from acctsw import cli, engine, procenv, seatswap
 from app import menubar
 
 PROXY = "http://acctsw:seat-secret@127.0.0.1:50024"
@@ -189,21 +189,49 @@ def test_shed_return_value_reports_whether_the_environment_changed(environ, expe
     assert procenv.shed_seat_env(environ) is False
 
 
-@pytest.mark.parametrize("warning,key", [
-    ({"kind": "sessions", "severity": "soft", "text": "older but safe", "pids": [7]}, None),
-    ({"kind": "sessions", "severity": "hard", "text": "started 19:23", "pids": [7, 9]},
-     ("sessions", (7, 9))),
+@pytest.mark.parametrize("warning,ids", [
+    ({"kind": "sessions", "severity": "soft", "text": "older but safe", "notify_ids": ["codex:7"]}, set()),
+    ({"kind": "sessions", "severity": "hard", "text": "started 19:23", "notify_ids": ["codex:9"]},
+     {("sessions", "codex:9")}),
+    ({"kind": "sessions", "severity": "hard", "text": "no unsafe terminals", "notify_ids": []}, set()),
     ({"kind": "sessions", "text": "no severity from an older bridge"},
-     ("sessions", "no severity from an older bridge")),
-    ({"kind": "app", "severity": "hard", "text": "out of date"}, ("app", "out of date")),
-    ({"kind": "wrapper", "severity": "hard", "text": ""}, None),
-    (None, None),
+     {("sessions", "no severity from an older bridge")}),
+    ({"kind": "app", "severity": "hard", "text": "out of date"}, {("app", "out of date")}),
+    ({"kind": "wrapper", "severity": "hard", "text": "out of date"}, {("wrapper", "out of date")}),
+    ({"kind": "wrapper", "severity": "hard", "text": ""}, set()),
+    (None, set()),
 ])
-def test_only_hard_drift_warnings_toast_and_sessions_dedupe_on_their_terminals(warning, key):
-    assert menubar.engine_warning_toast_key(warning) == key
+def test_only_hard_drift_warnings_toast_and_sessions_dedupe_on_their_terminals(warning, ids):
+    remembered = set()
+    assert menubar.engine_warning_toast(warning, remembered) == (bool(ids), ids)
+    assert remembered == set(), "the helper must be pure"
+    assert menubar.engine_warning_toast(warning, ids) == (False, set())
 
 
 def test_a_hopping_session_does_not_retoast_when_its_start_time_moves():
-    first = {"kind": "sessions", "severity": "hard", "pids": [7], "text": "started 19:23"}
+    first = {"kind": "sessions", "severity": "hard", "notify_ids": ["codex:7"], "text": "started 19:23"}
     later = {**first, "text": "started 19:41"}
-    assert menubar.engine_warning_toast_key(first) == menubar.engine_warning_toast_key(later)
+    should_notify, remembered = menubar.engine_warning_toast(first, set())
+    assert should_notify
+    assert menubar.engine_warning_toast(later, remembered) == (False, set())
+
+
+def test_session_notifications_remember_unsafe_terminals_individually():
+    safe = {"tool": "claude", "pid": 7, "engine": "1.6.1"}
+    unsafe = {"tool": "codex", "pid": 9, "engine": "1.3.0"}
+    newcomer = {"tool": "claude", "pid": 10, "engine": None}
+    remembered = set()
+    for sessions, expected in [
+        ([safe, unsafe], {("sessions", "codex:9")}),
+        ([unsafe], set()),  # closing a safe terminal is quiet
+        ([{**safe, "pid": 8}, unsafe], set()),  # opening a safe terminal is quiet
+        ([unsafe, newcomer], {("sessions", "claude:10")}),
+        ([newcomer], set()),  # closing an unsafe terminal is also quiet
+        ([newcomer, unsafe], set()),  # each identity stays remembered
+        ([safe], set()),
+        ([{**unsafe, "pid": 11}], {("sessions", "codex:11")}),
+        ([{**unsafe, "tool": "claude"}], {("sessions", "claude:9")}),
+    ]:
+        warning, = engine.drift_warnings(None, sessions)
+        assert menubar.engine_warning_toast(warning, remembered) == (bool(expected), expected)
+        remembered.update(expected)

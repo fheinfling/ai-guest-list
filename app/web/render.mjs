@@ -625,12 +625,6 @@ function limitedSeat(seat) {
   return !signedOut(seat) && (seat.limited || ["resting", "queued"].includes(seat.status));
 }
 
-function returnTime(seat, prefix = "back in") {
-  const at = seat.limited_until;
-  if (!at || !Number.isFinite(Date.parse(at))) return "reset time unknown";
-  return `<span data-reset-at="${esc(at)}" data-clock-prefix="${prefix}" data-past-text="resetting…" title="${esc(new Date(at).toLocaleString())}">${resetIsPast(at) ? "resetting…" : `${prefix} ${fmtCountdown(at)}`}</span>`;
-}
-
 function usageIssue(seat) {
   const error = seat.usage?.error;
   return entitlementRevoked(seat) ? "check your subscription to refresh usage" : ({
@@ -682,7 +676,8 @@ const detailId = (tool, email) => `seat-detail-${encodeURIComponent(tool)}-${enc
 function nameButton(tool, seat, peers, openDetails, showMetadata = false) {
   const label = tool === "key" ? seat.label : seatIdentity(seat, peers);
   const name = tool === "key" ? seat.label : seatIdentity(seat, peers, false);
-  const metadata = showMetadata && tool !== "key" ? `<span class="seat-metadata" title="${esc(seatMetadata(seat))}">${esc(seatMetadata(seat))}</span>` : "";
+  const traits = showMetadata && tool !== "key" ? seatMetadata(seat) : "";
+  const metadata = traits ? `<span class="seat-metadata" title="${esc(traits)}">${esc(traits)}</span>` : "";
   const email = tool === "key" ? seat.id : seat.email;
   return `<button class="seatname" data-action="seat-details" data-tool="${esc(tool)}" data-email="${esc(email)}" aria-expanded="${openDetails.has(JSON.stringify([tool, email]))}" aria-controls="${detailId(tool, email)}" aria-label="${esc(label)}, details"><span class="seat-identity" title="${esc(label)}">${esc(name)}</span>${metadata}${ICON.chev}</button>`;
 }
@@ -705,7 +700,7 @@ const leftText = (seat) => {
   return left == null ? "" : `${seat.usage_stale ? "~" : ""}${left === 100 ? "full" : `${left}% left`}`;
 };
 function timed(at, prefix = "", past = "resetting…", approximate = false) {
-  if (!Number.isFinite(Date.parse(at))) return "reset time unknown";
+  if (!Number.isFinite(Date.parse(at))) return "";
   return `<span data-reset-at="${esc(at)}" data-clock-prefix="${esc(prefix)}" data-past-text="${esc(past)}"${approximate ? ' data-clock-approx="true"' : ""} title="${esc(new Date(at).toLocaleString())}">${resetIsPast(at) ? past : `${prefix}${prefix ? " " : ""}${approximate ? "~" : ""}${fmtCountdown(at)}`}</span>`;
 }
 function refillClock(iso, now = Date.now()) {
@@ -722,7 +717,9 @@ function backAt(seat) {
   return seatWindows(seat).filter((w) => w.left === 0 && w.reset).sort((a, b) => Date.parse(b.reset) - Date.parse(a.reset))[0]?.reset;
 }
 function backText(seat, prefix = "back in") {
-  return `${seat.usage_stale ? '<span class="sr-only">approximate, last known reading: </span>' : ""}${timed(backAt(seat), prefix, "resetting…", seat.usage_stale)}`;
+  const at = backAt(seat);
+  if (!at) return "";
+  return `${seat.usage_stale ? '<span class="sr-only">approximate, last known reading: </span>' : ""}${timed(at, prefix, "resetting…", seat.usage_stale)}`;
 }
 // Match local calendar days, including across DST boundaries.
 function detailClock(iso, now = Date.now()) {
@@ -791,7 +788,7 @@ function thenLine(p, state) {
   } else {
     const back = p.limited.find((s) => s !== p.lead);
     const key = p.keys[0];
-    text = back ? `${usable(p.lead) ? "nothing ready. " : ""}${label(back)} ${backText(back, usable(p.lead) ? "back in" : "in")}` : '<span class="muted">nothing ready</span>';
+    text = back ? `${usable(p.lead) ? "nothing ready. " : ""}${label(back)} ${backText(back, usable(p.lead) ? "back in" : "in") || "limited"}` : '<span class="muted">nothing ready</span>';
     if (key) text = `${back ? `${text}, or ` : ""}${esc(key.label)} now, paid${key.responses_verified === false || key.last_proof?.outcome === "incompatible" ? "; endpoint unproven" : ""}`;
   }
   return `<p class="then"><b>then</b> ${text}</p>`;
@@ -818,13 +815,16 @@ function toolBlock(p, state, pending, openDetails) {
   if (s) {
     const out = signedOut(s), attention = out || signinNeeded(s) || entitlementRevoked(s);
     const limited = limitedSeat(s), t = tighter(s), other = seatWindows(s).find((w) => w.key !== t?.key);
+    const back = limited ? backAt(s) : null;
+    const metadata = [esc(seatMetadata(s)), t?.reset ? timed(t.reset, `${t.label} resets in`) : ""].filter(Boolean).join(" · ");
+    const secondary = other && other.left != null ? `<span aria-label="${s.usage_stale ? "last known: " : ""}${other.label} ${other.left}% left">${other.label} ${s.usage_stale ? "~" : ""}${other.left}%</span>` : "";
     const active = isActive(s) && !out && !signinNeeded(s) && !entitlementRevoked(s) && !limited;
     const name = `<div class="now-seat">${nameButton(p.tool, s, p.seats, openDetails)}${active ? '<span class="tag">on now</span>' : ""}</div>`;
     if (attention) head = `<div class="now">${name}</div>`;
-    else if (limited) head = `<div class="now">${name}<span class="fig fig--time">${backText(s, "")}</span><span class="fig-l">until back</span></div><div class="meta limited-meta"><span>${[esc(seatMetadata(s)), `limited${t && backAt(s) && !resetIsPast(backAt(s)) ? `, ${t.label} refills ${refillClock(backAt(s))}` : ""}`].filter(Boolean).join(" · ")}</span>${other && other.left != null ? `<span>${other.label} ${s.usage_stale ? "~" : ""}${other.left}%</span>` : ""}</div>`;
+    else if (limited) head = `<div class="now">${name}<span class="fig fig--time">${back ? backText(s, "") : "—"}</span><span class="fig-l">${back ? "until back" : "limited"}</span></div><div class="meta limited-meta"><span>${[esc(seatMetadata(s)), `limited${t && back && !resetIsPast(back) ? `, ${t.label} refills ${refillClock(back)}` : ""}`].filter(Boolean).join(" · ")}</span>${secondary}</div>`;
     else head = `<div class="now">${name}<span class="fig">${t?.left == null ? "—" : `${s.usage_stale ? "~" : ""}${t.left}<small>%</small>`}</span><span class="fig-l">${t?.left == null ? "no reading yet" : `of ${t.label} left`}</span></div>
       ${t?.left != null ? `<div class="bar" role="img" aria-label="${s.usage_stale ? "last known: " : ""}${t.left}% of the ${t.label} window left"><i style="width:${t.left}%"></i></div>` : ""}
-      <div class="meta"><span>${[esc(seatMetadata(s)), t?.reset ? timed(t.reset, `${t.label} resets in`) : ""].filter(Boolean).join(" · ")}</span>${other && other.left != null ? `<span aria-label="${s.usage_stale ? "last known: " : ""}${other.label} ${other.left}% left">${other.label} ${s.usage_stale ? "~" : ""}${other.left}%</span>` : ""}</div>`;
+      ${metadata || secondary ? `<div class="meta">${metadata ? `<span>${metadata}</span>` : ""}${secondary}</div>` : ""}`;
     head += rowDetails(p.tool, s, p.seats, openDetails);
   }
   const crossings = crossingRequests({ pending_crossings: (state.pending_crossings || []).filter((r) => r.tool === p.tool) });
@@ -838,9 +838,9 @@ function listRows(p, state, openDetails) {
   const spending = new Set([...(state.running_key_seats || []), ...(state.pinned_sessions || []).map((s) => s.key_seat?.id || s.email)]);
   return rest.map((s, i) => {
     const key = p.keys.includes(s), limited = !key && limitedSeat(s);
-    const text = key ? `${spending.has(s.id) ? "spending now, " : ""}paid per token<span class="sr-only">; no app spend cap</span>` : limited ? `limited, ${backText(s)}` : [p.next === s ? '<span class="state--strong">next</span>' : "", leftText(s)].filter(Boolean).join(", ");
+    const text = key ? `${spending.has(s.id) ? "spending now, " : ""}paid per token<span class="sr-only">; no app spend cap</span>` : limited ? ["limited", backText(s)].filter(Boolean).join(", ") : [p.next === s ? '<span class="state--strong">next</span>' : "", leftText(s)].filter(Boolean).join(", ");
     const action = key ? `<button class="row-action" data-action="key-terminal" data-id="${esc(s.id)}" aria-label="${esc(`use ${s.label} in a new paid terminal`)}">new terminal</button>` : limited ? "" : seatAction(p.tool, s, "switch");
-    return `<div class="seat${i === 0 ? " first-of-tool" : ""}${key ? " key-seat" : ""}" data-seat-email="${esc(key ? s.id : s.email)}"><div class="row"><span class="toolname">${i === 0 ? `${mark(p.tool)}${esc(p.tool)}` : `<span class="sr-only">${esc(p.tool)}</span>`}</span>${nameButton(key ? "key" : p.tool, s, p.seats, openDetails, true)}<span class="state">${text}</span>${action}</div>${rowDetails(key ? "key" : p.tool, s, p.seats, openDetails)}</div>`;
+    return `<div class="seat${i === 0 ? " first-of-tool" : ""}${key ? " key-seat" : ""}" data-seat-email="${esc(key ? s.id : s.email)}"><div class="row"><span class="toolname">${i === 0 ? `${mark(p.tool)}${esc(p.tool)}` : `<span class="sr-only">${esc(p.tool)}</span>`}</span>${nameButton(key ? "key" : p.tool, s, p.seats, openDetails, true)}${text ? `<span class="state">${text}</span>` : ""}${action}</div>${rowDetails(key ? "key" : p.tool, s, p.seats, openDetails)}</div>`;
   }).join("");
 }
 

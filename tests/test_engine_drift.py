@@ -168,7 +168,7 @@ def test_safe_session_notice_names_the_terminal_in_local_time_and_home_folder(mo
         }])
         assert warning == {"kind": "sessions", "severity": "soft", "text": (
             "A Claude terminal on business@x.com (started 19:23 in ~/Work/now) runs engine 1.6.1. "
-            "Restart it when convenient to get the latest switching."), "pids": [42]}
+            "Restart it when convenient to get the latest switching."), "notify_ids": []}
     finally:
         monkeypatch.undo()
         time.tzset()
@@ -180,11 +180,25 @@ def test_session_notice_caps_names_but_checks_the_safety_of_every_session():
     sessions[-1]["engine"] = "1.3.0"
     warning, = engine.drift_warnings(None, sessions)
     assert warning["severity"] == "hard"
+    assert "Codex terminal on seat3@x.com" in warning["text"]
     assert "Codex terminal on seat0@x.com" in warning["text"]
-    assert "Codex terminal on seat1@x.com" in warning["text"]
+    assert warning["text"].index("seat3@x.com") < warning["text"].index("seat0@x.com")
     assert "+2 more" in warning["text"]
-    assert "seat2@x.com" not in warning["text"] and "seat3@x.com" not in warning["text"]
+    assert "seat1@x.com" not in warning["text"] and "seat2@x.com" not in warning["text"]
     assert "so a seat switch can't sign you out" in warning["text"]
+    assert warning["notify_ids"] == ["codex:3"]
+
+
+def test_session_name_priority_preserves_order_within_each_safety_group():
+    sessions = [{"tool": "claude", "pid": 7, "engine": "1.6.1", "email": "safe@x.com"},
+                {"tool": "codex", "pid": 9, "engine": None, "email": "first@x.com"},
+                {"tool": "claude", "pid": 8, "engine": "1.6.1", "email": "safe2@x.com"},
+                {"tool": "codex", "pid": 3, "engine": "1.3.0", "email": "second@x.com"}]
+    warning, = engine.drift_warnings(None, sessions)
+    assert warning["text"].index("first@x.com") < warning["text"].index("second@x.com")
+    assert "safe@x.com" not in warning["text"] and "safe2@x.com" not in warning["text"]
+    assert warning["notify_ids"] == ["codex:3", "codex:9"]
+    assert engine.drift_warnings(None, sessions[::-1])[0]["notify_ids"] == warning["notify_ids"]
 
 
 def test_mixed_sessions_count_and_name_only_those_needing_a_manual_restart():
@@ -193,14 +207,14 @@ def test_mixed_sessions_count_and_name_only_those_needing_a_manual_restart():
                                                  "capabilities": []}])
     assert len(one) == 1
     assert one[0]["text"].startswith("A Codex terminal runs engine 1.3.0. Restart it")
-    assert "1.6.9" not in one[0]["text"] and one[0]["pids"] == [2]
+    assert "1.6.9" not in one[0]["text"] and one[0]["notify_ids"] == ["codex:2"]
     two = engine.drift_warnings(None, [capable, {"tool": "codex", "pid": 2, "engine": "1.3.0",
                                                  "capabilities": []},
                                        {"tool": "codex", "pid": 3, "engine": None,
                                         "capabilities": []}])
     assert two[0]["text"].startswith("2 terminals run an older engine than this app (")
     assert "Restart them" in two[0]["text"] and "1.6.9" not in two[0]["text"]
-    assert two[0]["pids"] == [2, 3]
+    assert two[0]["notify_ids"] == ["codex:2", "codex:3"]
 
 
 def test_two_sessions_are_both_named_with_no_more_suffix():

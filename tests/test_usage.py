@@ -1174,7 +1174,12 @@ def test_real_connection_failures_keep_status_zero(monkeypatch, error, wrapped):
         raise urllib.error.URLError(error) if wrapped else error
 
     monkeypatch.setattr(U.urllib.request, "urlopen", fail)
-    assert U._default_get("https://example.test", {}, 1) == (0, "")
+    reply = U._default_get("https://example.test", {}, 1)
+    assert isinstance(reply, U.HttpReply)
+    assert reply == (0, "")
+    status, body = reply
+    assert status == 0 and body == ""
+    assert reply.error is None and reply.retry_after is None
     assert U.fetch_codex("token", None).error == "network"
 
 

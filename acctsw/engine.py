@@ -154,8 +154,14 @@ def drift_warnings(wrapper: dict | None, sessions: list[dict],
         # Only an engine below the credential floor, or too old to say, writes logins unsafely.
         # Anything else is a calm notice: it works, it just misses the latest switching.
         from .state import MIN_CREDENTIAL_WRITER
-        unsafe = any(not s.get("engine") or older_than(s["engine"], MIN_CREDENTIAL_WRITER)
-                     for s in manual)
+        unsafe, safe = [], []
+        for s in manual:
+            if not s.get("engine") or older_than(s["engine"], MIN_CREDENTIAL_WRITER):
+                unsafe.append(s)
+            else:
+                safe.append(s)
+        # Apply the name cap after putting the terminals needing action first; keep each order.
+        manual = unsafe + safe
         why = ("so a seat switch can't sign you out" if unsafe
                else "when convenient to get the latest switching")
         if len(manual) == 1:
@@ -164,14 +170,16 @@ def drift_warnings(wrapper: dict | None, sessions: list[dict],
             text = (f"A {_terminal(s)}{f' ({where})' if where else ''} runs "
                     f"{_engine_words(s)}. Restart it {why}.")
         else:
-            named = [f"{_terminal(s)} ({', '.join(filter(None, [_session_where(s), _engine_words(s)]))})"
-                     for s in manual[:SESSIONS_NAMED]]
+            named = [_session_name(s) for s in manual[:SESSIONS_NAMED]]
             if len(manual) > SESSIONS_NAMED:
                 named.append(f"+{len(manual) - SESSIONS_NAMED} more")
             text = (f"{len(manual)} terminals run an older engine than this app ({__version__}): "
                     f"{', '.join(named)}. Restart them {why}.")
+        # Tool/PID identifies a terminal only for its process lifetime: PID reuse during this app
+        # run can suppress a later toast. started_at is not a process identity: it moves on hops.
         out.append({"kind": "sessions", "severity": "hard" if unsafe else "soft", "text": text,
-                    "pids": sorted(s["pid"] for s in manual if isinstance(s.get("pid"), int))})
+                    "notify_ids": sorted(f"{s.get('tool', '')}:{s['pid']}" for s in unsafe
+                                         if isinstance(s.get("pid"), int))})
     return out
 
 
@@ -187,6 +195,11 @@ def _terminal(s: dict) -> str:
 
 def _engine_words(s: dict) -> str:
     return f"engine {s['engine']}" if s.get("engine") else "an older engine"
+
+
+def _session_name(s: dict) -> str:
+    details = ", ".join(filter(None, [_session_where(s), _engine_words(s)]))
+    return f"{_terminal(s)} ({details})"
 
 
 def _session_where(s: dict) -> str:

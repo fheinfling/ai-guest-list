@@ -165,9 +165,9 @@ def _default_get(url: str, headers: dict, timeout: float) -> tuple[int, str]:
     except urllib.error.URLError as e:
         if isinstance(e.reason, ssl.SSLError):
             return HttpReply(0, "", None, error="tls")
-        return 0, ""
+        return HttpReply(0, "", None)
     except (OSError, TimeoutError):
-        return 0, ""  # network failure
+        return HttpReply(0, "", None)  # network failure
 
 
 # --- token extraction -------------------------------------------------------------------------
