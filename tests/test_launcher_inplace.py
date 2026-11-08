@@ -59,6 +59,7 @@ class FakeSwap:
         self.used = True              # the child has sent /v1/messages through the proxy
         self.raising = set()          # method names that blow up
         self.tls_says_no = False      # a client in the child rejected the session CA
+        self.ca_ran_out = False       # the session certificate is past (or near) its end
         self.intercepts = 0           # handshakes with the session CA that went through
         self.upstream_down = False    # the proxy has never got through to the API
         self.in_flight = 0            # the proxy's own view of the child's traffic
@@ -81,6 +82,9 @@ class FakeSwap:
 
     def tls_rejected(self):
         return self.tls_says_no
+
+    def ca_expired(self):
+        return self.ca_ran_out
 
     def intercepts_ok(self):
         return self.intercepts
@@ -1365,6 +1369,34 @@ def test_a_rejected_certificate_restarts_once_without_the_proxy(seats, tokens):
     assert spawn.wakes == [FakeSwap.wake_fd, None] and swap.stopped
     assert seats.load_state().active("claude") == C1
     assert any("Claude Code didn't accept the session certificate, resuming" in n for n in notes)
+
+
+def test_a_session_whose_certificate_ran_out_restarts_once_without_the_proxy(seats, tokens):
+    """Left open or asleep past the certificate's end, Claude Code refuses it after handshakes
+    that worked and messages that went through: unlike another tool refusing, it can't recover by
+    itself, so it restarts once on the same seat, without the proxy, resuming the conversation."""
+    swap = FakeSwap()
+    swap.intercepts = 5
+
+    def ran_out():
+        _transcript(seats, _session(spawn))
+        swap.ca_ran_out = swap.tls_says_no = True
+
+    spawn = Spawn(([ran_out, None], 1), ([None, None, None], 0))
+    notes = []
+    assert _run(seats, spawn, swap, notify=notes.append) == 0
+    assert spawn.stops == 1 and len(spawn.calls) == 2
+    assert spawn.calls[1][-2:] == ["--resume", _session(spawn)]
+    assert spawn.envs[1].get("HTTPS_PROXY") != FakeSwap.PROXY_URL and swap.stopped
+    assert any("session certificate ran out, resuming" in n for n in notes)
+
+
+def test_another_tool_refusing_a_live_certificate_still_never_restarts(seats, tokens):
+    swap = FakeSwap()
+    swap.intercepts = 5
+    spawn = Spawn(([lambda: setattr(swap, "tls_says_no", True), None, None], 0))
+    assert _run(seats, spawn, swap) == 0
+    assert len(spawn.calls) == 1 and spawn.stops == 0
 
 
 def test_a_brand_new_session_whose_certificate_is_rejected_starts_over_as_launched(seats, tokens):

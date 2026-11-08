@@ -3178,10 +3178,15 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 sent, so it restarts the same way even after messages went through. A rejection
                 after a handshake that did succeed is some other tool in the session: never a
                 restart. Otherwise the child keeps running."""
+                expired = False
                 if not inplace["tls"] and _swapcall("tls_rejected", default=False):
                     inplace["tls"] = True
                     why = "tls"
-                    other_tool = (_swapcall("intercepts_ok", default=0) or 0) > 0
+                    # A certificate that ran out (a session left open or asleep for long enough)
+                    # is refused by Claude Code itself, after handshakes that worked: restart it.
+                    expired = bool(_swapcall("ca_expired", default=False))
+                    inplace["expired"] = expired
+                    other_tool = not expired and (_swapcall("intercepts_ok", default=0) or 0) > 0
                 elif not inplace["upstream"] and _swapcall("upstream_failing", default=False):
                     inplace["upstream"] = True
                     why, other_tool = "upstream", False
@@ -3190,7 +3195,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 inplace["off"] = True
                 logging.getLogger(__name__).info("in-place switching off: %s", why)
                 if (not other_tool and not inplace["tls_restart"]
-                        and (why == "upstream" or not _swapcall("proxy_used", default=False))):
+                        and (why == "upstream" or expired
+                             or not _swapcall("proxy_used", default=False))):
                     inplace["tls_restart"] = True
                     hit.update(reason=why, email=launch_email, active=launch_email,
                                hard=False, handled=True)
@@ -3543,7 +3549,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 # resume, so it starts again exactly as the user launched it.
                 resuming = _claude_resumable()
                 notify("claude: restarted this session without seat switching because "
-                       + ("Claude Code didn't accept the session certificate"
+                       + (("its session certificate ran out" if inplace.get("expired")
+                           else "Claude Code didn't accept the session certificate")
                           if hit["reason"] == "tls" else "the switch couldn't reach Anthropic's API")
                        + (", resuming your work ✨" if resuming else " ✨"))
                 _swapcall("stop")
