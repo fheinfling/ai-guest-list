@@ -86,7 +86,8 @@ connect through the official tools.
   the same seat; a seat with no usable login hops like a revoked one.
 - **Live headroom in the bar** — how much of the 5-hour and weekly window each seat has **left**,
   read from the official usage endpoints, one row per seat with the active ones first. Both
-  windows stay visible, and an unknown or stale reading says so rather than showing a zero. Active seats
+  windows stay visible: a missing reading shows a dash and a stale one a `~`, never a zero, and the
+  popover only raises an alert when there is something to do (sign in, check a subscription). Active seats
   refresh every 30 seconds while the popover is open; background and parked-seat refreshes run
   every three minutes. Provider throttling backs off and keeps the last reading visibly stale.
 - **Desktop switching** — the menubar moves a confirmed-limited seat to a verified healthy seat of
