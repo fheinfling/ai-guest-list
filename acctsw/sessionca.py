@@ -4,7 +4,7 @@ A local HTTPS proxy terminates TLS for api.anthropic.com for ONE Claude Code ses
 trusts the CA only through its own environment (NODE_EXTRA_CA_CERTS and friends); nothing
 system-wide (Keychain, trust store) is touched.
 
-The CA and leaf use EC P-256 keys and live at most two days. The CA is CA:TRUE pathlen:0 with
+The CA and leaf use EC P-256 keys and live 397 days. The CA is CA:TRUE pathlen:0 with
 keyCertSign/cRLSign and a nameConstraints extension permitting only the given DNS names. Both
 LibreSSL (macOS /usr/bin/openssl) and OpenSSL 3 accept that from a config file. The leaf key is
 loaded into the server SSLContext and every key file is deleted at once, so no private key
@@ -19,10 +19,14 @@ import shutil
 import ssl
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 _TIMEOUT_S = 20
-_DAYS = 2
+# Claude Code reads the CA once, at start, and a terminal can stay open (or asleep) for days: a
+# certificate that runs out first breaks the session with nothing able to renew it. The CA key is
+# gone after construction and the name constraint allows one host, so a long life costs little.
+_DAYS = 397
 _FALLBACK_ROOTS = "/etc/ssl/cert.pem"
 _KEYCHAINS = ("/Library/Keychains/System.keychain", "/System/Library/Keychains/SystemRootCertificates.keychain")
 _CERT_RE = re.compile(r"-----BEGIN (?P<t>TRUSTED )?CERTIFICATE-----.*?-----END (?(t)TRUSTED )CERTIFICATE-----", re.S)
@@ -75,6 +79,7 @@ class SessionCA:
             raise SessionCAError("invalid host list")
         self._closed = False
         self._dir: Path | None = None
+        self.not_after = time.time() + _DAYS * 86400
         self._ctx: ssl.SSLContext | None = None
         try:
             self._dir = Path(tempfile.mkdtemp(prefix="acctsw-ca-", dir=str(tmp_root) if tmp_root else None))
@@ -155,6 +160,11 @@ class SessionCA:
         if self._ctx is None:
             raise SessionCAError("closed")
         return self._ctx
+
+    def expired(self, at: float | None = None) -> bool:
+        """Has this certificate run out? Wall-clock time, so a sleeping Mac counts. Strictly past
+        the end: before it, a refusal is some client's trust, which must never restart a session."""
+        return (time.time() if at is None else at) >= self.not_after
 
     def ca_pem(self) -> str:
         return self._ca_pem

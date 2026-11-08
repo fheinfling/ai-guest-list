@@ -97,6 +97,10 @@ def test_compare_older_missing_and_newer():
     same_but_behind = engine.compare({"version": __version__, "capabilities": ["run-key-v1"]})
     assert same_but_behind["reason"] == "missing"
     assert "engine-id-v1" in same_but_behind["missing"]
+    # A same-version engine from before self-restart is behind too; a release bump makes it "older".
+    before_restart = [c for c in engine.CAPABILITIES if c != "engine-restart-v1"]
+    assert engine.compare({"version": __version__, "capabilities": before_restart}) == {
+        "reason": "missing", "version": __version__, "missing": ["engine-restart-v1"]}
     assert engine.compare({"version": __version__, "capabilities": list(engine.CAPABILITIES)}) is None
     # A newer terminal engine means THIS app is stale — the store's writer guard covers that.
     assert engine.compare({"version": "99.0", "capabilities": []}) is None
@@ -119,3 +123,40 @@ def test_drift_warnings_name_path_versions_and_fix():
     assert one[0]["text"].startswith("1 terminal session runs an older engine than")
     assert engine.drift_warnings(None, []) == []
     assert engine.drift_warnings(None, [], "too old")[0]["kind"] == "app"
+
+
+def test_sessions_that_will_restart_themselves_raise_no_warning():
+    sessions = [{"tool": "claude", "pid": 1, "engine": "1.7.0", "self_restart": True},
+                {"tool": "codex", "pid": 2, "engine": "1.7.1", "self_restart": True}]
+    assert engine.drift_warnings(None, sessions) == []
+
+
+@pytest.mark.parametrize("flag", [False, None, "true"])
+def test_sessions_that_cant_restart_themselves_keep_the_warning(flag):
+    warnings = engine.drift_warnings(None, [{"tool": "codex", "pid": 2, "engine": "1.3.1",
+                                             "self_restart": flag}])
+    assert [w["kind"] for w in warnings] == ["sessions"]
+    assert warnings[0]["text"].startswith("1 terminal session runs an older engine (1.3.1)")
+
+
+@pytest.mark.parametrize("version,unsafe", [("1.5.0", False), ("1.3.1", False), ("1.3.0", True),
+                                            (None, True)])
+def test_only_an_engine_below_the_floor_is_said_to_risk_signing_you_out(version, unsafe):
+    text = engine.drift_warnings(None, [{"tool": "claude", "pid": 1, "engine": version}])[0]["text"]
+    assert ("can't sign you out" in text) is unsafe
+    assert ("latest switching" in text) is not unsafe
+
+
+def test_mixed_sessions_count_and_name_only_those_needing_a_manual_restart():
+    capable = {"tool": "claude", "pid": 1, "engine": "1.6.9", "self_restart": True}
+    one = engine.drift_warnings(None, [capable, {"tool": "codex", "pid": 2, "engine": "1.3.0",
+                                                 "capabilities": []}])
+    assert len(one) == 1
+    assert one[0]["text"].startswith("1 terminal session runs an older engine (1.3.0) than")
+    assert "restart it" in one[0]["text"] and "1.6.9" not in one[0]["text"]
+    two = engine.drift_warnings(None, [capable, {"tool": "codex", "pid": 2, "engine": "1.3.0",
+                                                 "capabilities": []},
+                                       {"tool": "codex", "pid": 3, "engine": None,
+                                        "capabilities": []}])
+    assert two[0]["text"].startswith("2 terminal sessions run an older engine (1.3.0) than")
+    assert "restart them" in two[0]["text"] and "1.6.9" not in two[0]["text"]

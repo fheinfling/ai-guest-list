@@ -73,11 +73,25 @@ def test_native_push_reaches_existing_notify_path_even_without_webview(ctx, monk
 @pytest.mark.skipif(menubar.objc is None, reason="native callback requires PyObjC")
 def test_closing_popover_keeps_consent_poll_alive():
     events = []
-    receiver = SimpleNamespace(_stopStateTimer=lambda: pytest.fail("hidden consent must still poll"),
+    receiver = SimpleNamespace(webview=None,
+                               _stopStateTimer=lambda: pytest.fail("hidden consent must still poll"),
                                _setWebVisible=lambda visible: events.append(visible),
                                _setUsagePollInterval=lambda interval: events.append(interval))
     menubar.AGLDelegate.popoverDidClose_.callable(receiver, None)
     assert events == [False, menubar.USAGE_POLL_HIDDEN_SECONDS]
+
+
+@pytest.mark.skipif(menubar.objc is None, reason="native callback requires PyObjC")
+@pytest.mark.parametrize("shown,cleared", [(False, True), (True, False)])
+def test_only_a_real_close_clears_what_was_left_open(shown, cleared):
+    # A late notification after a quick reopen must not wipe what's on screen.
+    scripts = []
+    receiver = SimpleNamespace(
+        webview=SimpleNamespace(evaluateJavaScript_completionHandler_=lambda js, _h: scripts.append(js)),
+        popover=SimpleNamespace(isShown=lambda: shown),
+        _setWebVisible=lambda _v: None, _setUsagePollInterval=lambda _i: None)
+    menubar.AGLDelegate.popoverDidClose_.callable(receiver, None)
+    assert any("AGL.closed" in js for js in scripts) is cleared
 
 
 @pytest.mark.skipif(menubar.objc is None, reason="native callback requires PyObjC")

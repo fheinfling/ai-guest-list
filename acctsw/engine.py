@@ -23,7 +23,9 @@ from . import __version__
 # exposing different options, so callers that need a feature check for it, not for a version.
 # ``engine-id-v1``: stamps its version into session heartbeats and state.json, and honours the
 # shared-state writer guard (state.writer_block).
-CAPABILITIES = ("run-key-v1", "isolated-signin-v1", "engine-id-v1")
+# ``engine-restart-v1``: its supervisors can restart themselves in the same terminal, resuming the
+# conversation, once idle after a newer engine is installed. Whether one will is its ``self_restart``.
+CAPABILITIES = ("run-key-v1", "isolated-signin-v1", "engine-id-v1", "engine-restart-v1")
 
 _VERSION_RE = re.compile(r"(\d+(?:\.\d+)*)")
 
@@ -117,6 +119,10 @@ def probe(exe, *, timeout: float = 15.0) -> dict | None:
     return {"version": m.group(1), "capabilities": caps}
 
 
+def _restarts_itself(session: dict) -> bool:
+    return session.get("self_restart") is True
+
+
 def drift_warnings(wrapper: dict | None, sessions: list[dict],
                    writer_block: str | None = None) -> list[dict]:
     """User-facing warnings for the popover/notifications, one per distinct problem.
@@ -125,6 +131,8 @@ def drift_warnings(wrapper: dict | None, sessions: list[dict],
     the state guard's refusal for THIS engine. Each warning is ``{"kind", "text"}``; the wrapper
     one also names the bridge ``action`` that replaces it with this app's engine (with consent).
     Pure, so the exact wording is testable and identical for the banner and the toast.
+    Every warning here is a "needs you" alarm (banner, header count, toast), so a session that
+    will restart itself (``self_restart``) gets none; only the others are counted and named.
     """
     out = []
     if writer_block:
@@ -139,15 +147,21 @@ def drift_warnings(wrapper: dict | None, sessions: list[dict],
                      "An older engine can sign your sessions out. Update it (in a source checkout: "
                      "git pull, then `acctsw install`), or switch terminals to this app's engine."),
         })
-    if sessions:
-        known = sorted({s["engine"] for s in sessions if s.get("engine")},
+    manual = [s for s in sessions if not _restarts_itself(s)]
+    if manual:
+        known = sorted({s["engine"] for s in manual if s.get("engine")},
                        key=lambda v: parse_version(v) or ())
         which = f"an older engine ({', '.join(known)})" if known else "an older engine"
-        n = len(sessions)
+        n = len(manual)
+        # Only an engine below the credential floor, or too old to say, writes logins unsafely.
+        from .state import MIN_CREDENTIAL_WRITER
+        unsafe = any(not s.get("engine") or older_than(s["engine"], MIN_CREDENTIAL_WRITER)
+                     for s in manual)
+        why = "so a seat switch can't sign you out" if unsafe else "to get the latest switching"
         out.append({
             "kind": "sessions",
             "text": (f"{n} terminal session{'s' if n != 1 else ''} run{'s' if n == 1 else ''} "
                      f"{which} than this app ({__version__}) — restart "
-                     f"{'them' if n != 1 else 'it'} so a seat switch can't sign you out."),
+                     f"{'them' if n != 1 else 'it'} {why}."),
         })
     return out

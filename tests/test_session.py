@@ -254,7 +254,19 @@ def test_stale_engines_finds_older_and_pre_stamp_supervisors(ctx, monkeypatch):
                {**base, "pid": 103, "engine": __version__,
                 "capabilities": list(session.CAPABILITIES)})
     stale = sorted(session.stale_engines(ctx.data_dir), key=lambda s: s["pid"])
-    assert stale == [{"tool": "claude", "pid": 101, "engine": None},
-                     {"tool": "claude", "pid": 102, "engine": "1.3.0"}]
+    assert stale == [{"tool": "claude", "pid": 101, "engine": None, "self_restart": False},
+                     {"tool": "claude", "pid": 102, "engine": "1.3.0", "self_restart": False}]
     # Callers that already read the sessions pass them in instead of re-running ps.
     assert session.stale_engines(ctx.data_dir, {"claude": [], "codex": []}) == []
+
+
+def test_stale_engines_report_which_sessions_will_restart_themselves(ctx, monkeypatch):
+    monkeypatch.setattr(session, "_alive", lambda pid: True)
+    monkeypatch.setattr(session, "_proc_start", lambda pid: "Stable Start")
+    base = {"email": "a@x.com", "process_start": "Stable Start", "started_at": "2026-10-01"}
+    write_json(ctx.data_dir / "session-claude-101.json",
+               {**base, "pid": 101, "engine": "1.3.0", "self_restart": True})
+    write_json(ctx.data_dir / "session-claude-102.json",     # a malformed heartbeat
+               {**base, "pid": 102, "engine": "1.3.0", "self_restart": "yes"})
+    stale = sorted(session.stale_engines(ctx.data_dir), key=lambda s: s["pid"])
+    assert [s["self_restart"] for s in stale] == [True, False]

@@ -67,6 +67,11 @@ _proc_start = proc_start
 _START_CACHE: dict[int, str] = {}
 
 
+# Whether this process's session can reopen itself on a newer engine (set by launcher.run): one that
+# can't, such as `cl "a prompt"`, still needs the user, so the app keeps warning about it.
+SELF_RESTART = False
+
+
 def mark_session(data_dir: Path, tool: str, email: str, *, pin: str | None = None,
                  key_seat: dict | None = None, home: str | None = None) -> None:
     """Record this supervisor and its active seat at launch and after every successful hop.
@@ -91,6 +96,7 @@ def mark_session(data_dir: Path, tool: str, email: str, *, pin: str | None = Non
         # so it must be able to see one still running an older engine (see stale_engines).
         "engine": __version__,
         "capabilities": list(CAPABILITIES),
+        "self_restart": SELF_RESTART,
     }
     if home is not None and home != email:
         data["home"] = home
@@ -288,6 +294,7 @@ def _read_session(path: Path, *, strict: bool = False) -> dict | None:
         public["engine"] = data["engine"]
         caps = data.get("capabilities")
         public["capabilities"] = caps if isinstance(caps, list) else []
+        public["self_restart"] = data.get("self_restart") is True
     if isinstance(data.get("pin"), str):
         public.update({k: data.get(k) for k in ("pin", "paid", "key_seat", "end_requested")})
     return public
@@ -296,9 +303,10 @@ def _read_session(path: Path, *, strict: bool = False) -> dict | None:
 def stale_engines(data_dir: Path, live: dict[str, list[dict]] | None = None) -> list[dict]:
     """Live supervisors running an engine older than (or missing features of) this one.
 
-    Each is ``{"tool", "pid", "engine"}``; ``engine`` is None for a heartbeat from before engines
-    stamped themselves, which is necessarily older. Restarting the terminal is the fix: the
-    supervisor keeps its engine for its whole life, whatever the wrapper now points at.
+    Each is ``{"tool", "pid", "engine", "self_restart"}``; ``engine`` is None for a heartbeat from
+    before engines stamped themselves, which is necessarily older. A supervisor keeps its engine
+    until it is restarted, whatever the wrapper now points at: one with ``self_restart`` does that
+    itself once idle; any other needs a manual restart.
     ``live`` reuses records a caller already read ({tool: active_sessions(...)}), sparing the
     per-record ``ps``.
     """
@@ -310,7 +318,8 @@ def stale_engines(data_dir: Path, live: dict[str, list[dict]] | None = None) -> 
             version = record.get("engine")
             if version is None or compare({"version": version,
                                            "capabilities": record.get("capabilities")}):
-                out.append({"tool": tool, "pid": record["pid"], "engine": version})
+                out.append({"tool": tool, "pid": record["pid"], "engine": version,
+                            "self_restart": record.get("self_restart") is True})
     return out
 
 

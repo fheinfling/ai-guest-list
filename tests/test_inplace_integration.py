@@ -118,7 +118,8 @@ def proxies(monkeypatch, tmp_path):
     monkeypatch.setattr(seatswap, "_default_proxy", factory)
     monkeypatch.setattr(seatswap, "MANAGED_SETTINGS", tmp_path / "managed-settings.json")
     monkeypatch.setenv(seatswap.SWITCH_ENV, "1")
-    for name in (*seatswap.GATE_ENV, *seatswap.GATE_FLAGS):
+    # Run from inside a supervised session, the session's own proxy would read as nesting.
+    for name in (*seatswap.GATE_ENV, *seatswap.GATE_FLAGS, "HTTPS_PROXY", "https_proxy"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.chdir(tmp_path)
     return made

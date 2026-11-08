@@ -39,7 +39,7 @@ from .web_dot import dot_for, door_for
 
 # Settings the UI may toggle (boolean only) — a whitelist so a stray key can't clobber e.g. theme.
 TOGGLE_KEYS = {
-    "auto_switch", "notify", "restart_app", "celebrations", "same_tool_only", "supervise_shell",
+    "auto_switch", "notify", "restart_app", "supervise_shell", "engine_restart",
     "confirm_key_switch", "key_fallback", "in_place_switch", "in_place_cross_tier", "crossing_auto",
     "keep_warm",
 }

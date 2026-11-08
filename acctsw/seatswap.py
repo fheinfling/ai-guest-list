@@ -538,6 +538,13 @@ class SeatSwap:
     def tls_rejected(self) -> bool:
         return self._tls_rejected
 
+    def ca_expired(self) -> bool:
+        """Has this session's certificate run out? Then a refusal is the date, not a client."""
+        try:
+            return bool(self.ca.expired())
+        except Exception:
+            return False
+
     def intercepts_ok(self) -> int:
         """Successful intercepted TLS handshakes (the proxy's count)."""
         return self.proxy.intercepts_ok()

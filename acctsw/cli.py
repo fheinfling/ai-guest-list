@@ -8,6 +8,8 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import os
+import shlex
 import sys
 import warnings
 
@@ -18,6 +20,7 @@ from . import keyseats as keyseats_mod
 from . import paths as P
 from .context import Context
 from .errors import AcctswError, CannotIdentify, NoLiveCreds
+from .procenv import harden_env
 from .switch import switch as do_switch
 
 # Exit codes: 0 ok, 1 expected error, 2 argparse usage error, 3 not-implemented-yet.
@@ -330,11 +333,23 @@ def _cmd_run(ctx: Context, ns) -> int:
     # (how a stale checkout once signed every Claude session out). Fall back to the stock tool,
     # which uses the login as-is, and say how to fix it instead of corrupting anything.
     blocked = ctx.credential_writer_block()
+    # An engine restart hands over the seat its conversation was on. Stock can't honour that and
+    # would resume it on whatever login is there, so stop instead of falling back.
+    from .enginerestart import SEAT_ENV, EngineRestart
+    from .launcher import EXIT_GAVE_UP
+    handed_seat = os.environ.get(SEAT_ENV)
+
+    def stock(tool, rest):
+        if handed_seat:
+            notify(f"can't reopen this session on {handed_seat} right now. Your work is saved: "
+                   f"start {tool} again.")
+            return EXIT_GAVE_UP
+        return exec_stock(ctx, tool, rest)
     if blocked:
         if args and (args[0] == "--key" or args[0].startswith("--key=")):
             raise AcctswError(blocked)
         notify(f"not supervising: {blocked}")
-        return exec_stock(ctx, ns.tool, args)
+        return stock(ns.tool, args)
     # A launcher option precedes agent arguments. Leave later --key text (including prompts
     # after --) alone; it is not permission to spend. Never forward our option to stock codex.
     key = None
@@ -385,13 +400,24 @@ def _cmd_run(ctx: Context, ns) -> int:
     # The app is the master switch for supervision: when it's CLOSED, behave like the stock tool
     # (no auto-switch / no seat-hopping) — exec_stock replaces this process and never returns.
     if not appalive.app_running(ctx.data_dir):
-        return exec_stock(ctx, ns.tool, args)
+        return stock(ns.tool, args)
     try:
         return launch(ctx, ns.tool, args, notify=notify)
+    except EngineRestart as restart:
+        # The supervisor has fully shut down. Becoming the new engine keeps this terminal and pid.
+        try:
+            env = harden_env()
+            if restart.seat:
+                env[SEAT_ENV] = restart.seat
+            os.execvpe(restart.argv[0], restart.argv, env)
+        except OSError as exc:
+            notify(f"couldn't start the new engine ({exc}); your work is saved, to continue run: "
+                   + shlex.join(restart.argv))
+            return 127
     except launcher_mod_NoSeats:
         # App is open but no seats are registered yet (fresh install). There's nothing to supervise,
         # so behave like the stock tool instead of erroring out — plain codex/claude must still work.
-        return exec_stock(ctx, ns.tool, args)
+        return stock(ns.tool, args)
 
 
 def _cmd_install(ctx: Context, ns) -> int:

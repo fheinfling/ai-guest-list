@@ -15,6 +15,7 @@ import types
 from collections import namedtuple
 from dataclasses import dataclass
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 
@@ -58,6 +59,7 @@ class FakeSwap:
         self.used = True              # the child has sent /v1/messages through the proxy
         self.raising = set()          # method names that blow up
         self.tls_says_no = False      # a client in the child rejected the session CA
+        self.ca_ran_out = False       # the session certificate is past (or near) its end
         self.intercepts = 0           # handshakes with the session CA that went through
         self.upstream_down = False    # the proxy has never got through to the API
         self.in_flight = 0            # the proxy's own view of the child's traffic
@@ -80,6 +82,9 @@ class FakeSwap:
 
     def tls_rejected(self):
         return self.tls_says_no
+
+    def ca_expired(self):
+        return self.ca_ran_out
 
     def intercepts_ok(self):
         return self.intercepts
@@ -1366,6 +1371,49 @@ def test_a_rejected_certificate_restarts_once_without_the_proxy(seats, tokens):
     assert any("Claude Code didn't accept the session certificate, resuming" in n for n in notes)
 
 
+def test_a_session_whose_certificate_ran_out_restarts_once_without_the_proxy(seats, tokens):
+    """Left open or asleep past the certificate's end, Claude Code refuses it after handshakes
+    that worked and messages that went through: unlike another tool refusing, it can't recover by
+    itself, so it restarts once on the same seat, without the proxy, resuming the conversation."""
+    swap = FakeSwap()
+    swap.intercepts = 5
+
+    def ran_out():
+        _transcript(seats, _session(spawn))
+        swap.ca_ran_out = swap.tls_says_no = True
+
+    spawn = Spawn(([ran_out, None], 1), ([None, None, None], 0))
+    notes = []
+    assert _run(seats, spawn, swap, notify=notes.append) == 0
+    assert spawn.stops == 1 and len(spawn.calls) == 2
+    assert spawn.calls[1][-2:] == ["--resume", _session(spawn)]
+    assert spawn.envs[1].get("HTTPS_PROXY") != FakeSwap.PROXY_URL and swap.stopped
+    assert any("session certificate ran out, resuming" in n for n in notes)
+
+
+def test_a_run_out_certificate_in_a_moved_conversation_says_so_instead_of_resuming(seats, tokens):
+    swap = FakeSwap()
+    swap.intercepts = 5
+
+    def ran_out():
+        L.USER_INPUT.note(b"/clear\r", 0.0)   # the child may be in another conversation now
+        swap.ca_ran_out = swap.tls_says_no = True
+
+    spawn = Spawn(([ran_out, None, None], 0))
+    notes = []
+    assert _run(seats, spawn, swap, notify=notes.append) == 0
+    assert len(spawn.calls) == 1 and spawn.stops == 0
+    assert any("certificate ran out" in n and "resume the conversation you want" in n for n in notes)
+
+
+def test_another_tool_refusing_a_live_certificate_still_never_restarts(seats, tokens):
+    swap = FakeSwap()
+    swap.intercepts = 5
+    spawn = Spawn(([lambda: setattr(swap, "tls_says_no", True), None, None], 0))
+    assert _run(seats, spawn, swap) == 0
+    assert len(spawn.calls) == 1 and spawn.stops == 0
+
+
 def test_a_brand_new_session_whose_certificate_is_rejected_starts_over_as_launched(seats, tokens):
     """B2(a): nothing was said in it yet, so there is no transcript and `--resume` would fail.
     Relaunch once with the original command, without the proxy, and say why."""
@@ -1983,3 +2031,226 @@ def test_a_failing_model_decision_answers_and_keeps_the_child_alive(seats, token
     spawn = Spawn(([leave, None, refuse, None], 0))
     assert _run(seats, spawn, swap, notify=notify) == 0
     assert swap.answers[-1] == (Hit("model", C2), None) and spawn.stops == 0
+
+
+# --- restarting onto a newer engine ---------------------------------------------------------------
+
+THREAD = "7383292b-d447-4279-b899-1634d45286dd"
+
+
+@pytest.fixture
+def engine_ready(seats, tokens, monkeypatch):
+    """Every gate open: a newer engine, the app up, nothing running in the session."""
+    from acctsw import enginerestart as er
+    st = seats.load_state()
+    st.data["engine"] = {"newest_writer": "99.0"}
+    st.save()
+    monkeypatch.setattr(L.sys, "stdin", types.SimpleNamespace(isatty=lambda: True, fileno=lambda: 0))
+    monkeypatch.setattr(L.appalive, "app_running", lambda _d: True)
+    monkeypatch.setattr(er, "target_engine", lambda *a, **k: "/new/acctsw")
+    monkeypatch.setattr(er, "has_late_descendants", lambda *a, **k: False)
+    monkeypatch.setattr(L, "USER_INPUT", er.InputTracker())
+    monkeypatch.setattr(L, "_claude_transcripts", lambda _c=None: {Path(f"/t/{THREAD}.jsonl"): 1})
+    return Clock(monkeypatch)
+
+
+def _idle_child(clock, *also):
+    """A silent child that sits long past the quiet period, with a tick per period."""
+    from acctsw import enginerestart as er
+
+    def later():
+        clock.advance(er.RESTART_QUIET_S + er.CHECK_INTERVAL_S)
+        time.sleep(0.01)   # lets the wrapper probe's thread answer
+    return ([*also, later, later, later, later], 0)
+
+
+def _quiet_swap():
+    swap = FakeSwap()
+    swap.idle = 1e9
+    return swap
+
+
+def test_idle_session_restarts_on_the_new_engine_with_its_flags_and_seat(seats, engine_ready):
+    from acctsw.enginerestart import EngineRestart
+    said = []
+    spawn = Spawn(_idle_child(engine_ready))
+    with pytest.raises(EngineRestart) as raised:
+        run(seats, "claude", ["--resume", THREAD, "--chrome"], spawn=spawn, get=fake_get({}),
+            swap_factory=lambda _c: _quiet_swap(), notify=said.append)
+    assert raised.value.argv == ["/new/acctsw", "run", "claude", "--chrome", "--resume", THREAD]
+    assert raised.value.seat == C1
+    assert any("new engine" in line for line in said)
+    # Its cleanup ran before the process is replaced.
+    assert L.active_session(seats.data_dir, "claude") is None
+
+
+def test_session_with_nothing_said_restarts_fresh_without_the_pinned_id(seats, engine_ready, monkeypatch):
+    from acctsw.enginerestart import EngineRestart
+    monkeypatch.setattr(L, "_claude_transcripts", lambda _c=None: {})
+    spawn = Spawn(_idle_child(engine_ready))
+    with pytest.raises(EngineRestart) as raised:
+        run(seats, "claude", ["--chrome"], spawn=spawn, get=fake_get({}),
+            swap_factory=lambda _c: _quiet_swap(), notify=lambda m: None)
+    assert raised.value.argv == ["/new/acctsw", "run", "claude", "--chrome"]
+
+
+@pytest.mark.parametrize("args", [["fix the bug"], ["-p", "hello"], ["--unknown-flag"],
+                                  ["--resume", THREAD, "--fork-session"]])
+def test_session_it_cannot_reopen_exactly_keeps_running(seats, engine_ready, args):
+    spawn = Spawn(_idle_child(engine_ready))
+    assert run(seats, "claude", args, spawn=spawn, get=fake_get({}),
+               swap_factory=lambda _c: _quiet_swap(), notify=lambda m: None) == 0
+    assert L.session_mod.SELF_RESTART is False
+
+
+def _gate_case(name):
+    from acctsw import enginerestart as er
+
+    def apply(ctx, monkeypatch, swap):
+        if name == "draft":
+            return lambda: L.USER_INPUT.note(b"half a thought", -1e9)
+        elif name == "request in flight":
+            swap.in_flight = 1
+        elif name == "recent request":
+            swap.idle = 5.0
+        elif name == "background work":
+            monkeypatch.setattr(er, "has_late_descendants", lambda *a, **k: True)
+        elif name == "app closed":
+            monkeypatch.setattr(L.appalive, "app_running", lambda _d: False)
+        elif name == "wrapper not newer":
+            monkeypatch.setattr(er, "target_engine", lambda *a, **k: None)
+        elif name == "no newer engine":
+            st = ctx.load_state()
+            st.data["engine"] = {}
+            st.save()
+        elif name == "turned off":
+            st = ctx.load_state()
+            st.set_setting("engine_restart", False)
+            st.save()
+        elif name == "seat can't carry it":
+            monkeypatch.setattr(L, "_restart_seat_usable", lambda *_a: False)
+        return None
+    return apply
+
+
+@pytest.mark.parametrize("name", ["draft", "request in flight", "recent request", "background work",
+                                  "app closed", "wrapper not newer", "no newer engine",
+                                  "seat can't carry it", "routing failed", "turned off"])
+def test_every_gate_keeps_the_session_running(seats, engine_ready, monkeypatch, name):
+    swap = _quiet_swap()
+    if name == "routing failed":
+        swap.env = lambda _env: None   # the child goes direct while the proxy sits there idle
+    hook = _gate_case(name)(seats, monkeypatch, swap)
+    spawn = Spawn(_idle_child(engine_ready, *([hook] if hook else [])))
+    assert run(seats, "claude", ["--chrome"], spawn=spawn, get=fake_get({}),
+               swap_factory=lambda _c: swap, notify=lambda m: None) == 0
+
+
+def test_claude_without_the_proxy_stays_because_silence_proves_nothing(seats, engine_ready):
+    spawn = Spawn(_idle_child(engine_ready))
+    assert run(seats, "claude", ["--chrome"], spawn=spawn, get=fake_get({}),
+               swap_factory=lambda _c: None, notify=lambda m: None) == 0
+
+
+def test_another_conversation_moving_here_means_stay(seats, engine_ready, monkeypatch):
+    # /resume or /clear inside the child leaves the id we pinned behind, still with a transcript.
+    ours, other = Path(f"/t/{THREAD}.jsonl"), Path("/t/other.jsonl")
+    seen = {ours: 1}
+    monkeypatch.setattr(L, "_claude_transcripts", lambda _c=None: dict(seen))
+    monkeypatch.setattr(L, "_claude_transcript_meta", lambda _p: {"cwd": os.getcwd()})
+    spawn = Spawn(_idle_child(engine_ready, lambda: seen.update({other: 1})))
+    assert run(seats, "claude", ["--resume", THREAD], spawn=spawn, get=fake_get({}),
+               swap_factory=lambda _c: _quiet_swap(), notify=lambda m: None) == 0
+
+
+def test_turning_it_off_reaches_a_running_session_and_the_banner(seats, engine_ready):
+    def off():
+        st = seats.load_state()
+        st.set_setting("engine_restart", False)
+        st.save()
+    spawn = Spawn(_idle_child(engine_ready, off))
+    assert run(seats, "claude", ["--chrome"], spawn=spawn, get=fake_get({}),
+               swap_factory=lambda _c: _quiet_swap(), notify=lambda m: None) == 0
+    assert L.session_mod.SELF_RESTART is False
+
+
+def test_a_conversation_switching_command_means_stay_and_warn(seats, engine_ready):
+    spawn = Spawn(_idle_child(engine_ready, lambda: L.USER_INPUT.note(b"/resume\r", -1e9)))
+    assert run(seats, "claude", ["--resume", THREAD], spawn=spawn, get=fake_get({}),
+               swap_factory=lambda _c: _quiet_swap(), notify=lambda m: None) == 0
+    assert L.session_mod.SELF_RESTART is False
+
+
+def test_handed_over_seat_lost_during_preparation_never_falls_back(seats, tokens, monkeypatch):
+    from acctsw import claudehome
+    from acctsw.enginerestart import SEAT_ENV
+    monkeypatch.setenv(SEAT_ENV, C2)
+    real = claudehome.prepare_all
+
+    def prepare(ctx):
+        real(ctx)
+        _drop(ctx, C2)
+    monkeypatch.setattr(claudehome, "prepare_all", prepare)
+    spawn = Spawn(([None], 0))
+    assert run(seats, "claude", [], spawn=spawn, get=fake_get({}), swap_factory=lambda _c: None,
+               notify=lambda m: None) == L.EXIT_GAVE_UP
+    assert spawn.calls == []
+
+
+def test_losing_the_proxy_tells_the_app_this_session_wont_restart(seats, engine_ready):
+    swap = _quiet_swap()
+    swap.env = lambda _env: None
+    spawn = Spawn(_idle_child(engine_ready))
+    run(seats, "claude", ["--chrome"], spawn=spawn, get=fake_get({}), swap_factory=lambda _c: swap,
+        notify=lambda m: None)
+    assert L.session_mod.SELF_RESTART is False
+
+
+def test_relaunched_child_restarts_as_it_runs_not_as_it_was_typed(seats, engine_ready, monkeypatch):
+    from acctsw.enginerestart import EngineRestart
+    swap = _quiet_swap()
+    swap.proxy_used = lambda: True
+    # First child hands over; the second is what a restart must reopen, without --model.
+    first = ([lambda: swap.post("limit", C1), None], 1)
+    monkeypatch.setattr(L, "_inplace_eligible", lambda *_a, **_k: None)
+    spawn = Spawn(first, _idle_child(engine_ready))
+    with pytest.raises(EngineRestart) as raised:
+        run(seats, "claude", ["--resume", THREAD, "--model", "opus"], spawn=spawn, get=fake_get({}),
+            swap_factory=lambda _c: swap, notify=lambda m: None)
+    assert raised.value.argv == ["/new/acctsw", "run", "claude", "--resume", THREAD]
+
+
+def test_relaunched_child_with_no_known_conversation_never_restarts_fresh(seats, engine_ready, monkeypatch):
+    swap = _quiet_swap()
+    swap.proxy_used = lambda: True
+    monkeypatch.setattr(L, "_inplace_eligible", lambda *_a, **_k: None)
+    monkeypatch.setattr(L, "_claude_transcripts", lambda _c=None: {})
+    spawn = Spawn(([lambda: swap.post("limit", C1), None], 1), _idle_child(engine_ready))
+    assert run(seats, "claude", ["--chrome"], spawn=spawn, get=fake_get({}),
+               swap_factory=lambda _c: swap, notify=lambda m: None) == 0
+
+
+def test_handed_over_seat_that_cant_serve_stops_rather_than_crosses(seats, tokens, monkeypatch):
+    from acctsw.enginerestart import SEAT_ENV
+    monkeypatch.setenv(SEAT_ENV, C2)
+    _rest(seats, C2)
+    said = []
+    spawn = Spawn(([None], 0))
+    assert run(seats, "claude", [], spawn=spawn, get=fake_get({}), swap_factory=lambda _c: None,
+               notify=said.append) == L.EXIT_GAVE_UP
+    assert spawn.calls == []
+    assert any("can't take this session" in line for line in said)
+
+
+def test_restarted_engine_lands_on_the_seat_it_was_billing(seats, tokens, monkeypatch):
+    from acctsw.enginerestart import SEAT_ENV
+    monkeypatch.setenv(SEAT_ENV, C2)
+    spawn = Spawn(([None], 0))
+    envs = []
+    real = L._claude_env
+    monkeypatch.setattr(L, "_claude_env", lambda c, email: envs.append(email) or real(c, email))
+    assert run(seats, "claude", [], spawn=spawn, get=fake_get({}),
+               swap_factory=lambda _c: None, notify=lambda m: None) == 0
+    assert envs == [C2]
+    assert SEAT_ENV not in os.environ   # never inherited by the child
+

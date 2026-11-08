@@ -57,6 +57,7 @@ from . import identity as identity_mod
 from . import rollout
 from . import session as session_mod
 from . import usage as usage_mod
+from . import appalive, enginerestart
 from .context import Context
 from .errors import AcctswError
 from .procenv import harden_env
@@ -809,6 +810,11 @@ def _exitcode(raw_status: int) -> int:
             if hasattr(os, "waitstatus_to_exitcode") else raw_status)
 
 
+# What the user typed into this terminal: an engine restart must not discard an unsent draft.
+USER_INPUT = enginerestart.InputTracker()
+ENGINE_REPROBE_S = 3600.0   # a wrapper that wasn't newer yet may be by now
+
+
 def pty_spawn(argv: list, on_output: Callable[[bytes], bool],
               on_tick: Callable[[], bool] | None = None,
               tick_interval: float = TICK_INTERVAL_S, *, env: dict | None = None,
@@ -945,6 +951,7 @@ def pty_spawn(argv: list, on_output: Callable[[bytes], bool],
                 if inp is None:
                     pass
                 elif inp:
+                    USER_INPUT.note(inp, time.monotonic())
                     os.write(master_fd, inp)
                 elif stdin_is_tty:
                     # A tty only reads EOF/EIO once it is revoked: the window was closed but no
@@ -1414,6 +1421,13 @@ def _load_seatkind():
     return seatkind
 
 
+def _restart_seat_usable(state, tool: str, email: str | None) -> bool:
+    """May this exact seat carry a session across an engine restart?"""
+    if not email or state.get_seat(tool, email) is None:
+        return False
+    return choose(state, tool, exclude=set(state.accounts(tool)) - {email}).available
+
+
 def _crossing_candidate(state, tool: str, exclude, origin: str, home: str | None) -> str | None:
     """The best landing seat that choose() left out only because it crosses business/personal."""
     from . import selection
@@ -1478,6 +1492,12 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
     # `codex exec` is unattended: a hop must relaunch it as `codex exec … resume <thread> <prompt>`
     # on pipes, never the TUI `codex resume` (which waits forever for a keyboard nobody is at).
     exec_job = codexexec.parse(args) if tool == "codex" else None
+    user_args = list(args)     # as typed, before any session id is pinned below
+    # Told to the app through the heartbeat: a session that can't reopen itself keeps its warning.
+    could_restart = (
+        exec_job is None and not claude_print and not claude_fork and pin is None
+        and sys.stdin.isatty() and enginerestart.restart_args(tool, user_args, "thread") is not None)
+    session_mod.SELF_RESTART = could_restart
     exec_thread = exec_job.thread if exec_job is not None else None
     exec_claimed = None
     exec_stay_notified = False
@@ -1540,7 +1560,9 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
 
     auth_failed: set = set()   # seats whose token died THIS run — skip them for the rest of it
     relogin_at: dict = {}      # seat → monotonic time of its last same-seat login restore (loop guard)
-    relaunch_seat = None       # set by a login restore: the next child runs on THIS seat, not active
+    # Set by a login restore: the next child runs on THIS seat, not active. An engine restart hands
+    # over the seat it was billing, so another terminal's switch can't move this conversation.
+    handed_seat = relaunch_seat = os.environ.pop(enginerestart.SEAT_ENV, None)
 
     # A key is a separate runtime, NEVER an OAuth account installed behind state.active(). Keep
     # the pending consent separate from the runtime too: neither config nor env exists pre-approval.
@@ -2096,6 +2118,11 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     from . import accounts as _acct
                     if active_session(ctx.data_dir, tool) is None:
                         _acct.reconcile_codex(ctx, state)
+                if relaunch_seat is not None and not _restart_seat_usable(state, tool, relaunch_seat):
+                    # Falling back to another seat could cross work and personal without asking.
+                    notify(f"{tool}: {relaunch_seat} can't take this session right now. Your work "
+                           f"is saved: start {tool} again when it can.")
+                    return EXIT_GAVE_UP
                 sel = choose(state, tool)
                 if not sel.email and all(s.get("auth_error") for s in state.accounts(tool).values()):
                     notify(f"all {tool} seats need you to sign in again — re-add them via the app")
@@ -2666,6 +2693,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 if not _key_approval_current(cold_start=key_cold_start):
                     return EXIT_GAVE_UP
                 argv = _key_command()
+                session_mod.SELF_RESTART = False   # a paid child never restarts itself
                 notify(f"{key_seat['label']} is taking the floor ✨ — {key_runtime.model}, paid per token; "
                        + ("your work's coming with you" if key_session else "ready for your work"))
                 mark_session(ctx.data_dir, tool, key_runtime.seat_id,
@@ -2728,6 +2756,13 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 claudehome.prepare_all(ctx)
             with ctx.locked():
                 st = ctx.load_state()
+                # The seat could have gone during the preparation above; never fall back from it.
+                if (handed_seat and relaunch_seat == handed_seat
+                        and not _restart_seat_usable(st, tool, handed_seat)):
+                    notify(f"{tool}: {handed_seat} can't take this session right now. Your work "
+                           f"is saved: start {tool} again when it can.")
+                    return EXIT_GAVE_UP
+                handed_seat = None
                 launch_email = (relaunch_seat if relaunch_seat and st.get_seat(tool, relaunch_seat)
                                 else st.active(tool))
                 relaunch_seat = None
@@ -2740,7 +2775,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             # deliberately leave this child alive, preventing the post-exit safety net from turning
             # that same banner into a re-derived hop after the child later exits on its own.
             hit = {
-                "reason": None,       # None | "manual" | "crossing" | "limit" | "auth" | "revoked" | "relogin" | "handover" | "model"
+                "reason": None,       # None | "manual" | "crossing" | "limit" | "auth" | "revoked" | "relogin" | "handover" | "model" | "engine"
                 "email": None,        # exact pre-flight landing seat
                 "active": None,       # seat the still-live child was using
                 "hard": False,
@@ -2772,6 +2807,10 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 "last_structured": None,      # last structured limit signal (post-exit evidence)
                 "proxy_limit_at": None,       # monotonic of the proxy's last structured limit Hit
                 "last_output": time.monotonic(),   # the child's last PTY output (handover waits)
+                "engine_next": 0.0,           # monotonic: next look for a newer engine
+                "engine_probe": None,         # {"for", "done", "target"}: who the wrapper runs now
+                "engine_argv": None,          # what to exec once the child has stopped
+                "routed": False,              # this child's traffic really goes through the proxy
             }
 
             def _tick_state() -> bool:
@@ -3139,10 +3178,21 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 sent, so it restarts the same way even after messages went through. A rejection
                 after a handshake that did succeed is some other tool in the session: never a
                 restart. Otherwise the child keeps running."""
+                expired = False
                 if not inplace["tls"] and _swapcall("tls_rejected", default=False):
                     inplace["tls"] = True
                     why = "tls"
-                    other_tool = (_swapcall("intercepts_ok", default=0) or 0) > 0
+                    # A certificate that ran out (a session left open or asleep for long enough)
+                    # is refused by Claude Code itself, after handshakes that worked: restart it.
+                    expired = bool(_swapcall("ca_expired", default=False))
+                    inplace["expired"] = expired
+                    other_tool = not expired and (_swapcall("intercepts_ok", default=0) or 0) > 0
+                    if expired and (claude_fork or USER_INPUT.moved or not _engine_thread()[0]):
+                        # It may be in another conversation than the one a resume would open.
+                        inplace["off"] = True
+                        notify("claude: this session's certificate ran out, so it can't reach "
+                               "Anthropic any more. Quit it and resume the conversation you want.")
+                        return False
                 elif not inplace["upstream"] and _swapcall("upstream_failing", default=False):
                     inplace["upstream"] = True
                     why, other_tool = "upstream", False
@@ -3151,7 +3201,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 inplace["off"] = True
                 logging.getLogger(__name__).info("in-place switching off: %s", why)
                 if (not other_tool and not inplace["tls_restart"]
-                        and (why == "upstream" or not _swapcall("proxy_used", default=False))):
+                        and (why == "upstream" or expired
+                             or not _swapcall("proxy_used", default=False))):
                     inplace["tls_restart"] = True
                     hit.update(reason=why, email=launch_email, active=launch_email,
                                hard=False, handled=True)
@@ -3209,7 +3260,125 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     _exec_thread_known()   # claim it as soon as it is ours, before a sibling looks
                 # (c) engine state, then (d) the clock: a seat that frees while we are stuck must
                 # actually carry the session over, not merely be announced.
-                return _guarded(_tick_state) or _guarded(_tick_recover)
+                return (_guarded(_tick_state) or _guarded(_tick_recover)
+                        or _guarded(_tick_engine))
+
+            def _engine_target(newest: str) -> str | None:
+                """The newer wrapper, probed off this thread: a probe can take 30s and the tick
+                shares a thread with the terminal's I/O. None until an answer has arrived."""
+                at = time.monotonic()
+                probe = tick["engine_probe"]
+                if (probe is None or probe["for"] != newest
+                        or (probe["done"] and probe["target"] is None
+                            and at - probe["at"] >= ENGINE_REPROBE_S)):
+                    probe = tick["engine_probe"] = {"for": newest, "done": False, "target": None,
+                                                    "at": at}
+
+                    def _probe_wrapper() -> None:
+                        probe["target"] = enginerestart.target_engine()
+                        probe["done"] = True
+                    threading.Thread(target=_probe_wrapper, daemon=True).start()
+                return probe["target"] if probe["done"] else None
+
+            def _engine_can_see_work() -> bool:
+                return tool != "claude" or (swap is not None and not inplace["off"] and tick["routed"])
+
+            def _engine_idle(at: float) -> bool:
+                quiet = enginerestart.RESTART_QUIET_S
+                if at - tick["last_output"] < quiet or USER_INPUT.draft:
+                    return False
+                if USER_INPUT.last_input is not None and at - USER_INPUT.last_input < quiet:
+                    return False
+                if tool == "claude":
+                    # Only the proxy can see a subagent working without a sound.
+                    if not _engine_can_see_work():
+                        return False
+                    try:
+                        if swap.proxy.in_flight() != 0 or swap.proxy.idle_for() < quiet:
+                            return False
+                    except Exception:
+                        return False
+                return not enginerestart.has_late_descendants(os.getpid())
+
+            def _engine_thread() -> tuple[bool, str | None]:
+                """(known, thread): can this session be named for a resume, and as what."""
+                if tool == "claude":
+                    thread = resume_thread if _claude_resumable() else None
+                    # /resume and /clear move this child to another conversation without telling
+                    # us: a transcript here other than ours, moved since the spawn, could be that.
+                    for path, stamp in _claude_transcripts(ctx).items():
+                        if ((claude_before or {}).get(path) != stamp and path.stem != thread
+                                and _claude_transcript_meta(path).get("cwd") == launch_cwd):
+                            return False, None
+                    return True, thread
+                # A sibling's or a subagent's log can look like ours, and resuming the wrong
+                # conversation is far worse than staying: be the only Codex here, on our own log.
+                if rollout_source is None or rollout_source.attached is None \
+                        or not rollout_source.unambiguous \
+                        or len(session_mod.active_sessions(ctx.data_dir, "codex")) != 1 \
+                        or rollout_source.other_interactive_logs():
+                    return False, None
+                meta = rollout.session_meta(rollout_source.attached) or {}
+                thread = meta.get("id")
+                if meta.get("source") != "cli" or meta.get("cwd") != launch_cwd \
+                        or not isinstance(thread, str) or not thread:
+                    return False, None
+                # If nothing was typed here, a log that moved can only be a since-exited sibling's.
+                if (USER_INPUT.last_input is None and thread != resume_thread
+                        and thread not in user_args):
+                    return False, None
+                try:
+                    changed = rollout_source.attached.stat().st_mtime
+                except OSError:
+                    return False, None
+                return time.time() - changed >= enginerestart.RESTART_QUIET_S, thread
+
+            def _tick_engine() -> bool:
+                """A newer engine is installed: once this session is idle, restart into it in this
+                terminal and resume. Anything we can't reopen exactly as it was keeps running."""
+                at = time.monotonic()
+                if at < tick["engine_next"]:
+                    return False
+                tick["engine_next"] = at + enginerestart.CHECK_INTERVAL_S
+                can_restart = (could_restart and _engine_can_see_work() and not USER_INPUT.moved
+                               and ctx.load_state().settings().get("engine_restart", True))
+                if can_restart != session_mod.SELF_RESTART:
+                    # The app keeps warning about a session that lost its way to restart.
+                    session_mod.SELF_RESTART = can_restart
+                    mark_session(ctx.data_dir, tool, running_seat() or launch_email,
+                                 home=launch_email)
+                if not can_restart or key_request is not None:
+                    return False
+                newest = enginerestart.newer_writer(ctx.load_state().data)
+                if newest is None or not _engine_idle(at):
+                    return False
+                # The app being up means its update has finished, and that the restarted engine
+                # supervises rather than falling to stock on some other login. A floor above us
+                # would skip this engine's own cleanup, so that terminal is left alone too.
+                if not appalive.app_running(ctx.data_dir) or ctx.credential_writer_block():
+                    return False
+                target = _engine_target(newest)
+                if target is None:
+                    return False
+                known, thread = _engine_thread()
+                # A relaunched child already runs without the flags it was first given, on purpose
+                # in a model fallback's case: reopen what is running, not what was typed.
+                if not known or (resuming and not thread):
+                    return False
+                rest = enginerestart.restart_args(tool, [] if resuming else user_args, thread)
+                if rest is None:
+                    return False
+                with ctx.locked():
+                    if not _restart_seat_usable(ctx.load_state(), tool, running_seat()):
+                        return False
+                if tool == "codex":
+                    # Nobody chose this launch: Codex's update prompt would be waiting for whoever
+                    # comes back, with Enter meaning "update now".
+                    rest = [*rest, "-c", "check_for_update_on_startup=false"]
+                tick["engine_argv"] = [target, "run", tool, *rest]
+                hit.update(reason="engine", active=running_seat(), handled=True)
+                notify(f"{tool}: restarting on the new engine ({newest}), resuming your work ✨")
+                return True
 
             def on_output(chunk: bytes) -> bool:
                 tick["last_output"] = time.monotonic()
@@ -3307,6 +3476,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             if tool == "claude":
                 claude_before = _claude_transcripts(ctx)
             child_started = True
+            USER_INPUT.reset()
             if tool == "claude":
                 claude_exit_verifications.clear()
                 env = _claude_env(ctx, launch_email)
@@ -3319,6 +3489,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     if routed is not None:   # else this child talks to the API directly
                         env = routed
                         wake = {"wake_fd": swap.wake_fd}
+                        tick["routed"] = True
                 status = spawn(argv, on_output, on_tick=_tick, env=env, **wake)
                 _sync_claude_home(launch_email)
                 _capture_claude_resume()
@@ -3343,6 +3514,10 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     if isinstance(thread, str) and thread:
                         resume_thread = thread
                 rollout_source.close()
+
+            if hit["reason"] == "engine":
+                # Raised so the cleanup below still runs before the process is replaced.
+                raise enginerestart.EngineRestart(tick["engine_argv"], seat=hit["active"])
 
             if key_request is not None:
                 if status < 0 or status in _ABORT_EXITS:
@@ -3380,7 +3555,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 # resume, so it starts again exactly as the user launched it.
                 resuming = _claude_resumable()
                 notify("claude: restarted this session without seat switching because "
-                       + ("Claude Code didn't accept the session certificate"
+                       + (("its session certificate ran out" if inplace.get("expired")
+                           else "Claude Code didn't accept the session certificate")
                           if hit["reason"] == "tls" else "the switch couldn't reach Anthropic's API")
                        + (", resuming your work ✨" if resuming else " ✨"))
                 _swapcall("stop")

@@ -88,7 +88,7 @@ def test_leaf_san_and_validity(ca):
     b.close()
     assert ("DNS", "api.anthropic.com") in cert["subjectAltName"]
     days = (ssl.cert_time_to_seconds(cert["notAfter"]) - ssl.cert_time_to_seconds(cert["notBefore"])) / 86400
-    assert days <= 2.01
+    assert 396.9 <= days <= 397.01   # longer than a terminal stays open, asleep or not
 
 
 def test_ca_properties(ca):
@@ -98,7 +98,7 @@ def test_ca_properties(ca):
     assert "prime256v1" in out or "P-256" in out
     start = ssl.cert_time_to_seconds(_text(ca, "-startdate").split("=")[1].strip())
     end = ssl.cert_time_to_seconds(_text(ca, "-enddate").split("=")[1].strip())
-    assert (end - start) / 86400 <= 2.01
+    assert 396.9 <= (end - start) / 86400 <= 397.01
 
 
 def test_name_constraints_present(ca):
@@ -223,3 +223,11 @@ def test_trusted_certificate_blocks_kept(tmp_path):
     full = open(c.bundle_paths({"SSL_CERT_FILE": str(f)})["SSL_CERT_FILE"]).read()
     assert trusted in full and "PRIVATE KEY" not in full
     a.close(); c.close()
+
+
+def test_expired_means_strictly_past_the_end_by_the_wall_clock(ca):
+    assert ca.expired() is False
+    assert ca.expired(at=ca.not_after - 1) is False   # a refusal before the end is trust, not time
+    assert ca.expired(at=ca.not_after) is True
+    assert ca.expired(at=ca.not_after + 86400) is True
+
