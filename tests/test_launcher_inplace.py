@@ -1391,6 +1391,21 @@ def test_a_session_whose_certificate_ran_out_restarts_once_without_the_proxy(sea
     assert any("session certificate ran out, resuming" in n for n in notes)
 
 
+def test_a_run_out_certificate_in_a_moved_conversation_says_so_instead_of_resuming(seats, tokens):
+    swap = FakeSwap()
+    swap.intercepts = 5
+
+    def ran_out():
+        L.USER_INPUT.note(b"/clear\r", 0.0)   # the child may be in another conversation now
+        swap.ca_ran_out = swap.tls_says_no = True
+
+    spawn = Spawn(([ran_out, None, None], 0))
+    notes = []
+    assert _run(seats, spawn, swap, notify=notes.append) == 0
+    assert len(spawn.calls) == 1 and spawn.stops == 0
+    assert any("certificate ran out" in n and "resume the conversation you want" in n for n in notes)
+
+
 def test_another_tool_refusing_a_live_certificate_still_never_restarts(seats, tokens):
     swap = FakeSwap()
     swap.intercepts = 5

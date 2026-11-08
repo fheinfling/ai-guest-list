@@ -1635,7 +1635,8 @@ def _handshake_outcome(proxy, events=("tls_reject", "tls_handshake_failed")):
 
 @pytest.mark.parametrize("reason", ["TLSV1_ALERT_UNKNOWN_CA", "SSLV3_ALERT_BAD_CERTIFICATE",
                                     "SSLV3_ALERT_CERTIFICATE_UNKNOWN",
-                                    "SSLV3_ALERT_UNSUPPORTED_CERTIFICATE", "TLSV1_ALERT_ACCESS_DENIED"])
+                                    "SSLV3_ALERT_UNSUPPORTED_CERTIFICATE", "TLSV1_ALERT_ACCESS_DENIED",
+                                    "SSLV3_ALERT_CERTIFICATE_EXPIRED"])
 def test_certificate_alerts_are_a_tls_reject(reason):
     rejects = []
     ca = SimpleCA(_FailingCtx(_ssl_error(reason)))
@@ -1671,11 +1672,28 @@ def test_plain_http_or_a_hang_up_after_connect_is_not_a_tls_reject(first, sessio
 
 
 class SimpleCA:
-    def __init__(self, ctx):
+    def __init__(self, ctx, *, ran_out=False):
         self.ctx = ctx
+        self.ran_out = ran_out
 
     def server_context(self):
         return self.ctx
+
+    def expired(self):
+        return self.ran_out
+
+
+@pytest.mark.parametrize("ran_out", [True, False])
+def test_a_hang_up_after_our_certificate_ran_out_is_a_tls_reject_even_after_good_handshakes(ran_out):
+    # Bun hangs up rather than alerting. Earlier handshakes worked, so before the end that's no
+    # signal at all; past the end it is the one thing that tells us the session can't go on.
+    rejects = []
+    eof = SP.ssl.SSLEOFError(8, "EOF occurred in violation of protocol")
+    proxy = SeatProxy(lambda hit: None, ca=SimpleCA(_FailingCtx(eof), ran_out=ran_out),
+                      on_tls_reject=rejects.append)
+    proxy._intercepts_ok = 3
+    _handshake_outcome(proxy)
+    assert rejects == (["certificate expired"] if ran_out else [])
 
 
 def test_intercepts_ok_counts_completed_handshakes_only(session_ca):

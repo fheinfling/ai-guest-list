@@ -27,8 +27,6 @@ _TIMEOUT_S = 20
 # certificate that runs out first breaks the session with nothing able to renew it. The CA key is
 # gone after construction and the name constraint allows one host, so a long life costs little.
 _DAYS = 397
-# A rejection this close to the end is the certificate running out (or the clock jumping), not trust.
-_EXPIRY_MARGIN_S = 86400
 _FALLBACK_ROOTS = "/etc/ssl/cert.pem"
 _KEYCHAINS = ("/Library/Keychains/System.keychain", "/System/Library/Keychains/SystemRootCertificates.keychain")
 _CERT_RE = re.compile(r"-----BEGIN (?P<t>TRUSTED )?CERTIFICATE-----.*?-----END (?(t)TRUSTED )CERTIFICATE-----", re.S)
@@ -164,8 +162,9 @@ class SessionCA:
         return self._ctx
 
     def expired(self, at: float | None = None) -> bool:
-        """Has this certificate run out, or nearly? Wall-clock time, so a sleeping Mac counts."""
-        return (time.time() if at is None else at) >= self.not_after - _EXPIRY_MARGIN_S
+        """Has this certificate run out? Wall-clock time, so a sleeping Mac counts. Strictly past
+        the end: before it, a refusal is some client's trust, which must never restart a session."""
+        return (time.time() if at is None else at) >= self.not_after
 
     def ca_pem(self) -> str:
         return self._ca_pem

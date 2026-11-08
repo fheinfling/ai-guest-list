@@ -3187,6 +3187,12 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     expired = bool(_swapcall("ca_expired", default=False))
                     inplace["expired"] = expired
                     other_tool = not expired and (_swapcall("intercepts_ok", default=0) or 0) > 0
+                    if expired and (claude_fork or USER_INPUT.moved or not _engine_thread()[0]):
+                        # It may be in another conversation than the one a resume would open.
+                        inplace["off"] = True
+                        notify("claude: this session's certificate ran out, so it can't reach "
+                               "Anthropic any more. Quit it and resume the conversation you want.")
+                        return False
                 elif not inplace["upstream"] and _swapcall("upstream_failing", default=False):
                     inplace["upstream"] = True
                     why, other_tool = "upstream", False

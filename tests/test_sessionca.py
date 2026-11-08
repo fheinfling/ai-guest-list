@@ -225,9 +225,9 @@ def test_trusted_certificate_blocks_kept(tmp_path):
     a.close(); c.close()
 
 
-def test_expired_counts_the_wall_clock_with_a_days_margin(ca):
+def test_expired_means_strictly_past_the_end_by_the_wall_clock(ca):
     assert ca.expired() is False
-    assert ca.expired(at=ca.not_after - 2 * 86400) is False
-    assert ca.expired(at=ca.not_after - 3600) is True
-    assert ca.expired(at=ca.not_after + 1) is True
+    assert ca.expired(at=ca.not_after - 1) is False   # a refusal before the end is trust, not time
+    assert ca.expired(at=ca.not_after) is True
+    assert ca.expired(at=ca.not_after + 86400) is True
 

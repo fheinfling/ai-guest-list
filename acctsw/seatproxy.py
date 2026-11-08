@@ -78,7 +78,7 @@ TUNNEL_SEND_TIMEOUT = 300.0    # a tunnel peer that takes no bytes for this long
 # The alerts a client sends when it does not accept the certificate (OpenSSL's reason, after
 # "TLSV1_ALERT_" or "SSLV3_ALERT_"). Any other handshake failure says nothing about our CA.
 CERT_ALERTS = frozenset({"UNKNOWN_CA", "BAD_CERTIFICATE", "CERTIFICATE_UNKNOWN",
-                         "UNSUPPORTED_CERTIFICATE", "ACCESS_DENIED"})
+                         "UNSUPPORTED_CERTIFICATE", "ACCESS_DENIED", "CERTIFICATE_EXPIRED"})
 # Some clients (Claude Code's Bun) reject the certificate by hanging up without an alert. Before any
 # intercepted handshake has succeeded, this many such hang-ups within the window count as a reject.
 EOF_REJECT_COUNT = 3
@@ -497,9 +497,19 @@ class SeatProxy:
     def _intercepts(self, host: str, port: int) -> bool:
         return self._ca is not None and f"{host}:{port}" == self._authority
 
+    def _ca_expired(self) -> bool:
+        try:
+            return bool(self._ca.expired())
+        except Exception:   # a CA without an end date, or one that can't say: not expired
+            return False
+
     def _handshake_failed(self, reason: str, eof: bool) -> None:
         if reason.rpartition("ALERT_")[2] in CERT_ALERTS:
             return self._tls_reject(reason)
+        if eof and self._ca_expired():
+            # Bun hangs up instead of sending an alert, and does so even after earlier handshakes
+            # worked. With our certificate past its end, that hang-up is the date, not a stray client.
+            return self._tls_reject("certificate expired")
         # Plain HTTP or a protocol mismatch says nothing about the CA; neither does one hang-up, or
         # any hang-up once a client has completed a handshake (the CA is trusted).
         now = time.monotonic()
