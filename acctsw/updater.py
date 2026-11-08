@@ -230,6 +230,15 @@ def _stored_manifest(data: dict) -> dict | None:
         return None
 
 
+def reconcile(data_dir) -> None:
+    """At launch, nothing is installing: a busy phase left behind (the app quit mid-download, or a
+    helper put the previous app back) would keep the popover's update button disabled for good."""
+    with _LOCK:
+        data = _load(data_dir)
+        if isinstance(data, dict) and data.get("phase") in ("downloading", "verifying", "installing"):
+            set_phase(data_dir, "failed", "the last update didn't finish")
+
+
 def set_phase(data_dir, phase: str, error: str | None = None) -> None:
     """Record the install phase (and, for ``failed``, a short user-facing error)."""
     if phase not in PHASES:
@@ -606,6 +615,16 @@ fi
 if [ "$(version_of "$candidate")" != "$new" ]; then log "the copied app has the wrong version"; give_up 1; fi
 
 if ! /bin/mv -- "$target" "$backup"; then log "couldn't move the installed app aside"; give_up 1; fi
+# Checked again on what was actually moved aside: the copy above takes a while, and an upgrade
+# that landed meanwhile (Homebrew, say) must not be replaced by this older candidate.
+moved=$(version_of "$backup")
+if [ "$moved" != "$expected" ]; then
+  if ! /bin/mv -- "$backup" "$target"; then
+    log "RESTORE FAILED: the previous app is at $backup"; exit 70
+  fi
+  log "installed version became '$moved' during the copy; nothing changed"
+  /bin/rm -rf -- "$candidate"; cleanup; reopen; exit 3
+fi
 if ! /bin/mv -- "$candidate" "$target"; then
   if ! /bin/mv -- "$backup" "$target"; then
     log "RESTORE FAILED: the previous app is at $backup"; exit 70

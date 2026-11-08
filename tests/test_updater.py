@@ -908,12 +908,12 @@ def test_install_command_validation(tmp_path):
     refused("copy is in the way")
     (target.parent / ".AI Guest List.app.new-1234").rmdir()
     apps = target.parent
-    os.chmod(apps, 0o555)
+    os.chmod(apps, 0o500)
     try:
         if not os.access(apps, os.W_OK):  # root ignores modes
             refused("permission")
     finally:
-        os.chmod(apps, 0o755)
+        os.chmod(apps, 0o700)
     assert U.install_command(**ok)
 
 
@@ -997,6 +997,32 @@ def test_helper_leaves_newer_install_alone(tmp_path):
     assert hooks.log("codesign") == [] and hooks.log("pkill") == []
 
 
+def test_helper_leaves_an_upgrade_that_landed_during_the_copy_alone(tmp_path):
+    staged, target, backup, ack = install_dirs(tmp_path)
+    hooks = Hooks(tmp_path)
+    info = target / "Contents" / "Info.plist"
+    # Verifying the copy takes a while; Homebrew upgrades the installed app right then.
+    hooks.kw["codesign"] = tool(tmp_path, "codesign-slow",
+                                f'/usr/bin/sed -i "" "s/1\\.7\\.0/1.9.0/" "{info}"\nexit 0\n')
+    r = run_helper(command(staged, target, backup, ack, hooks))
+    assert r.returncode == 3 and "became '1.9.0' during the copy" in r.stderr
+    assert b"1.9.0" in info.read_bytes() and marker(target) == "old"
+    assert leftovers(target) == [] and hooks.log("pkill") == []
+
+
+def test_reconcile_unsticks_a_phase_nobody_is_working_on(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    for phase in ("downloading", "verifying", "installing"):
+        U.set_phase(data, phase)
+        U.reconcile(data)
+        raw = U._load(data)
+        assert raw["phase"] == "failed" and "didn't finish" in raw["error"]
+    U.set_phase(data, "available")
+    U.reconcile(data)
+    assert U._load(data)["phase"] == "available"
+
+
 def test_helper_candidate_verification_failure_leaves_target_untouched(tmp_path):
     staged, target, backup, ack = install_dirs(tmp_path)
     hooks = Hooks(tmp_path, codesign_rc=1)
@@ -1051,7 +1077,7 @@ def test_helper_reports_failed_restore_loudly(tmp_path):
     try:
         r = run_helper(command(staged, target, backup, ack, **kw))
     finally:
-        os.chmod(target.parent, 0o755)
+        os.chmod(target.parent, 0o700)
     if os.geteuid() == 0:
         pytest.skip("root ignores directory modes")
     assert r.returncode == 70

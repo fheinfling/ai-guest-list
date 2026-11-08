@@ -375,6 +375,7 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
                 # it delete the previous app it kept for putting back.
                 from acctsw import updater
                 updater.acknowledge(self.ctx.data_dir)
+                updater.reconcile(self.ctx.data_dir)   # nothing is installing in a fresh process
             except Exception as exc:
                 _log_exception(exc)
             # One-time cleanup of the retired "save credit" Headroom feature — off the main thread so a

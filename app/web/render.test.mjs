@@ -3038,7 +3038,7 @@ test("update line renders each phase with the right text and button state", () =
   for (const [phase, text] of [["downloading", "updating to 1.8.1…"], ["verifying", "checking 1.8.1…"],
     ["installing", "installing 1.8.1, the app will reopen"]]) {
     const line = updateLineOf(buildHTML({ ...base, update: upd({ phase }) }));
-    assert.match(line, new RegExp(`<span class="issue-text">${text.replace(/\./g, "\\.")}</span>`), phase);
+    assert.match(line, new RegExp(`<span class="issue-text">${text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}</span>`), phase);
     assert.match(line, /<button class="row-action" data-action="update-install" disabled aria-busy="true">/, phase);
     assert.doesNotMatch(line, /update-notes/, phase);
   }
