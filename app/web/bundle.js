@@ -217,9 +217,9 @@ function switchNeedsConfirmation(state, tool, email) {
 
 function switchConfirmation(tool, seat, pending) {
   if (pending?.tool !== tool || pending.email !== seat.email) return "";
-  const kind = seat.kind === "business" ? "work seat" : seat.kind === "personal" ? "personal seat" : "";
+  const kind = seat.kind === "business" ? "work seat" : seat.kind === "personal" ? "personal seat" : "unknown seat kind";
   const data = `data-tool="${esc(tool)}" data-email="${esc(seat.email)}"`;
-  return `<div class="issue issue--soft switch-confirm" role="group" aria-label="confirm seat switch"><span class="issue-text">switch ${esc(tool)} to ${esc(seat.name || seat.email)}${kind ? ` (${kind})` : ""}? running sessions move too</span><button class="row-action" data-action="switch-confirm" ${data}>switch</button><button class="row-action" data-action="switch-cancel" ${data}>cancel</button></div>`;
+  return `<div class="issue issue--soft switch-confirm" role="group" aria-label="confirm seat switch"><span class="issue-text">switch ${esc(tool)} to ${esc(seat.name || seat.email)} (${kind})? running sessions move too</span><button class="row-action" data-action="switch-confirm" ${data}>switch</button><button class="row-action" data-action="switch-cancel" ${data}>cancel</button></div>`;
 }
 
 // Infrastructure problems share the main view's problem lines and header count.
