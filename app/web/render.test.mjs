@@ -3177,6 +3177,8 @@ test("a seat with no reading leaves no dangling separators or unknown labels", (
   assert.doesNotMatch(visible, /<span> · |· <\/span>|, <\/span>|, \(needs approval\)/);
   assert.match(visible, /class="then"><b>then<\/b> next one · business · team <span class="muted">\(needs approval\)/);
   assert.match(visible, /<span class="state"><span class="state--strong">next<\/span><\/span>/);
+  // A row without state text must not pull its action out of the last column.
+  assert.match(css, /\.row > \.row-action \{ grid-column:4; \}/);
   assert.doesNotMatch(visible, /<span(?: class="(?:seat-metadata|state)"[^>]*)?>\s*<\/span>|<div class="meta">\s*<\/div>/);
   assert.doesNotMatch(rowOf(html, "third@x.com"), /class="state"|class="seat-metadata"/);
 });

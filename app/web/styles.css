@@ -473,6 +473,8 @@ button { color:inherit; }
 .limited-meta { margin-top:5px; }
 .row { grid-template-columns:58px minmax(0,1fr) max-content max-content; padding:5px 0; }
 .row > .seatname { max-width:200px; }
+/* The state text is left out when there is nothing to say; the action keeps its column anyway. */
+.row > .row-action { grid-column:4; }
 /* Shrink kind/plan first; cap the name only after metadata has no width left.
    Reserve the two 4px gaps and the 9px chevron inside the name button. */
 .row .seat-identity { flex:none; max-width:calc(100% - 17px); }
