@@ -3402,6 +3402,37 @@ test("composing a seat name keeps the live input until the composed input is com
   assert.equal(app.field().value, "名前");
 });
 
+for (const commit of ["compositionend", "input"]) {
+  test(`a state push preserves name composition and ${commit} commits the complete draft`, () => {
+    const app = renameApp(); app.type("Draft");
+    const field = app.field(); field.focus(); field.value = "名";
+    app.handlers.input({ target: field, isComposing: true });
+    app.window.AGL.update(renameSnapshot({ rev: 2 }));
+    assert.equal(app.field(), field);
+    assert.equal(field.value, "名");
+    // The stored draft stays complete even if another control tries to save during composition.
+    app.click({ action: "seat-name-save", tool: "codex", email: "work@x.com" });
+    assert.equal(app.sent.filter((m) => m.action === "rename").length, 0);
+    field.value = "名前";
+    app.handlers[commit]({ target: field, isComposing: false });
+    assert.equal(app.field().value, "名前");
+    app.window.AGL.update(renameSnapshot({ rev: 3 }));
+    assert.equal(app.field().value, "名前");
+    app.key("Enter");
+    assert.equal(app.sent.at(-1).name, "名前");
+  });
+}
+
+test("closing during name composition retains the last complete draft", () => {
+  const app = renameApp(); app.type("Draft");
+  const field = app.field(); field.value = "名";
+  app.handlers.input({ target: field, isComposing: true });
+  app.window.AGL.closed();
+  assert.equal(app.field().value, "Draft");
+  app.type("Fresh");
+  assert.equal(app.field().value, "Fresh");
+});
+
 test("instant name validation shares the engine's Unicode caseless and whitespace rules", () => {
   const snapshot = renameSnapshot();
   snapshot.tools.claude.seats[0].name = "Straße";

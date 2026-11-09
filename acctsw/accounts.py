@@ -34,6 +34,8 @@ def name_clash(state: State, tool: str, email: str, name: str) -> tuple[str, dic
 
 
 def validated_name(state: State, tool: str, email: str, name: str) -> str:
+    if not isinstance(name, str):
+        raise AcctswError("Name must be text.")
     name = " ".join(name.split())
     if len(name) > 32:
         raise AcctswError("Keep it to 32 characters.")
@@ -106,6 +108,7 @@ def add(ctx: Context, state: State, tool: str, *, name: str | None = None,
         state.data["tools"][tool]["captured_stock_digest"] = _claude_digest(live)
     seat = state.upsert_seat(tool, em, name=name, plan=plan_of(tool, live))
     if name is not None:
+        # upsert_seat ignores falsy names; set_seat_name also handles clearing the name.
         state.set_seat_name(tool, em, name)
     # Fingerprint the PERSON behind the creds so we can warn when two seats are secretly the same
     # login (shared quota — they can't cover each other), and record the workspace/subscription id

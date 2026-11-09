@@ -45,6 +45,43 @@ def test_rename_errors_leave_store_untouched(ctx, tool, email, name, error):
     assert state.path.read_bytes() == before
 
 
+@pytest.mark.parametrize("name", [None, 42, []])
+def test_validated_name_rejects_non_strings(ctx, name):
+    state = seed(ctx)
+    before = state.path.read_bytes()
+    with pytest.raises(AcctswError, match=r"^Name must be text\.$"):
+        accounts.validated_name(state, "codex", "me@x", name)
+    assert state.path.read_bytes() == before
+
+
+@pytest.mark.parametrize("field", ["tool", "email", "name"])
+def test_bridge_rename_missing_fields_keep_correlation(ctx, field):
+    state = seed(ctx)
+    before = state.path.read_bytes()
+    message = {"action": "rename", "tool": "codex", "email": "me@x",
+               "name": "Next", "rename_request_id": "malformed"}
+    del message[field]
+    assert bridge.handle(ctx, message) == {
+        "ok": False, "error": f"missing field: '{field}'", "rename_request_id": "malformed"}
+    assert state.path.read_bytes() == before
+
+
+@pytest.mark.parametrize("field, value, error", [
+    ("tool", "unknown", "unknown tool: unknown"),
+    *[("email", value, "Email must be text.") for value in (None, 42, [], {})],
+    *[("name", value, "Name must be text.") for value in (None, 42, [])],
+])
+def test_bridge_rename_bad_values_keep_correlation(ctx, field, value, error):
+    state = seed(ctx)
+    before = state.path.read_bytes()
+    message = {"action": "rename", "tool": "codex", "email": "me@x",
+               "name": "Next", "rename_request_id": "malformed"}
+    message[field] = value
+    assert bridge.handle(ctx, message) == {
+        "ok": False, "error": error, "rename_request_id": "malformed"}
+    assert state.path.read_bytes() == before
+
+
 @pytest.mark.parametrize("other_tool, other_name, candidate, display", [
     ("claude", "Other Seat", "  oTHER\t Seat ", "Other Seat"),
     ("codex", "Other Seat", "other seat", "Other Seat"),

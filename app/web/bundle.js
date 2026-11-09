@@ -741,6 +741,7 @@ const normalizeSeatName = (value) => value.replace(/[\u0009-\u000d\u001c-\u0020\
 const effectiveSeatName = (seat) => seat.name || seat.email.split("@")[0];
 const storedSeatName = (seat) => seat.custom_name ?? seat.name ?? "";
 // Expanding upper/lower pairs compare like Python casefold; keep dotless ı distinct from i.
+// Matches Python casefold for Latin, Greek and Cyrillic; rare scripts may differ, covered by the engine's inline refusal.
 const foldedName = (value) => [...value].map((c) => c === "ı" ? c : c.toUpperCase().toLowerCase()).join("").replace(/ß/g, "ss");
 function seatNameClash(state, tool, email, name) {
   return name && subscriptionSeats(state).find((other) =>
@@ -1348,6 +1349,7 @@ const answering = new Set();
 const proving = new Set();
 const openSeatDetails = new Set();
 const nameEdits = new Map();
+let composingName = false;
 let renameSequence = 0;
 let clockTimer = null;
 let mainKeyPromptCount = 0;
@@ -1371,6 +1373,7 @@ function setPopoverVisible(visible) {
 // close calls this: `document.hidden` also flips on display sleep with the popover still up. The
 // add-seat and add-key flows stay, because clicking away to copy a key closes the popover too.
 function resetTransientUI() {
+  composingName = false;
   pendingSwitch = null;
   openSeatDetails.clear();
   openMenu = null;
@@ -1392,6 +1395,7 @@ function resetTransientUI() {
 }
 
 function render() {
+  if (composingName) return; // Keep the live IME input until its complete value can be stored.
   if (screen !== renderedScreen) openMenu = null;
   if (screen !== "main" || (pendingSwitch &&
       !switchNeedsConfirmation(state, pendingSwitch.tool, pendingSwitch.email))) pendingSwitch = null;
@@ -1484,6 +1488,7 @@ function sendKeyFlow(action, extra = {}) {
 }
 
 function saveSeatName(tool, email) {
+  if (composingName) return;
   const key = JSON.stringify([tool, email]), edit = nameEdits.get(key);
   const seat = state.tools?.[tool]?.seats?.find((s) => s.email === email);
   if (!seat || !edit || edit.pending || edit.error || edit.value === undefined) return;
@@ -1695,12 +1700,18 @@ function addBack() {
 
 // Controlled inputs: mirror the add-seat fields into `add` on each keystroke so a background poll
 // re-render (which re-emits value="${...}") reproduces exactly what's typed — no lost text.
-document.addEventListener("input", (e) => {
+document.addEventListener("input", handleInput);
+document.addEventListener("compositionend", (e) => {
+  if (e.target.dataset?.action === "seat-name-input") handleInput(e);
+});
+function handleInput(e) {
   if (e.target.dataset?.action === "seat-name-input") {
     const { tool, email } = e.target.dataset, key = JSON.stringify([tool, email]);
     if (nameEdits.get(key)?.pending) return;
+    if (e.isComposing) { composingName = true; return; }
+    composingName = false;
     nameEdits.set(key, { value: e.target.value });
-    if (!e.isComposing) render();
+    render();
     return;
   }
   if (screen === "add-key" && keyFlow?.step === "models" && e.target.id === "key-model-filter") {
@@ -1713,7 +1724,7 @@ document.addEventListener("input", (e) => {
   if (!add) return;
   if (e.target.id === "add-name") add.name = e.target.value;
   else if (e.target.id === "add-token") add.token = e.target.value;
-});
+}
 
 // toggles fire 'change' (clicking the switch graphic doesn't bubble a data-action click)
 document.addEventListener("change", (e) => {
