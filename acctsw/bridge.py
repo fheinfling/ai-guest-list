@@ -714,6 +714,16 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
                 state.save()
             return {"ok": True, "celebrate": True, "state": snapshot_state(ctx)}
 
+        if action == "rename":
+            correlation = {"rename_request_id": message.get("rename_request_id")}
+            try:
+                with ctx.locked():
+                    state = ctx.load_state()
+                    acct.rename(ctx, state, message["tool"], message["email"], message["name"])
+                return {"ok": True, **correlation, "state": snapshot_state(ctx)}
+            except AcctswError as exc:
+                return {"ok": False, **correlation, "error": str(exc)}
+
         if action == "remove":
             with ctx.locked():
                 state = ctx.load_state()
@@ -812,6 +822,8 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
                 return {"ok": False, "error": "that doesn't look like a valid auth.json"}
             with ctx.locked():
                 state = ctx.load_state()
+                if message.get("name") is not None:
+                    acct.validated_name(state, tool, email, message["name"])
                 sync_back(ctx, state, tool)         # preserve the outgoing seat's rotated token
                 ctx.set_live(tool, blob)
                 seat = acct.add(ctx, state, tool, name=message.get("name"), email=email)

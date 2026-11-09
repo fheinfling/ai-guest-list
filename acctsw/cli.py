@@ -62,6 +62,10 @@ def build_parser() -> argparse.ArgumentParser:
     rm = sub.add_parser("remove", help="remove (sign out) a seat")
     _add_tool_arg(rm)
     rm.add_argument("email", help="account email to remove")
+    rename = sub.add_parser("rename", help="rename a subscription seat (empty name clears it)")
+    _add_tool_arg(rename)
+    rename.add_argument("email", help="account email to rename")
+    rename.add_argument("name", help="new name, or an empty string to show the email local part")
 
     lst = sub.add_parser("list", help="list seats")
     lst.add_argument("--json", action="store_true", help="machine-readable output")
@@ -207,6 +211,13 @@ def _cmd_add(ctx: Context, ns) -> int:
 def _cmd_signin(ctx: Context, ns) -> int:
     from .authflows import signin
     return signin(ctx, ns.tool, seat=ns.seat)
+
+
+def _cmd_rename(ctx: Context, ns) -> int:
+    with ctx.locked():
+        seat = acct.rename(ctx, ctx.load_state(), ns.tool, ns.email, ns.name)
+    print(f"✓ seat renamed — {ns.tool}:{ns.email} ({acct.effective_name(seat)})")
+    return EXIT_OK
 
 
 def _cmd_remove(ctx: Context, ns) -> int:
@@ -466,6 +477,7 @@ HANDLERS = {
     "add": _cmd_add,
     "signin": _cmd_signin,
     "remove": _cmd_remove,
+    "rename": _cmd_rename,
     "list": _cmd_list,
     "status": _cmd_status,
     "daemons": _cmd_daemons,

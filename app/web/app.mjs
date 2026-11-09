@@ -1,6 +1,6 @@
 // Live glue: render state into the DOM and forward user actions to the Python bridge.
 // All rendering logic lives in render.mjs (pure, unit-tested); this file is the thin wiring.
-import { buildHTML, switchNeedsConfirmation, buildSettings, buildAddSeat, addUsesPaste, reduceReply, updateClockText, buildAddKey, KEY_PROVIDERS, keyRequest, reduceKeyReply, keyConfirmations, buildPaidKeyGate, buildModelResults, updateCanInstall } from "./render.mjs";
+import { buildHTML, normalizeSeatName, seatNameError, switchNeedsConfirmation, buildSettings, buildAddSeat, addUsesPaste, reduceReply, updateClockText, buildAddKey, KEY_PROVIDERS, keyRequest, reduceKeyReply, keyConfirmations, buildPaidKeyGate, buildModelResults, updateCanInstall } from "./render.mjs";
 
 const root = document.getElementById("root");
 const overlay = document.createElement("div");   // toast surface only (siblings of #root)
@@ -38,6 +38,23 @@ window.AGL = {
       installSentAt = null; out.render = true;
     }
     const keyChanged = reduceKeyReply(keyFlow, res);
+    let nameChanged = false;
+    if (res.rename_request_id) {
+      for (const [key, edit] of nameEdits) {
+        if (edit.pending !== res.rename_request_id) continue;
+        nameChanged = true;
+        if (res.ok) {
+          const saved = { saved: true };
+          nameEdits.set(key, saved);
+          setTimeout(() => {
+            if (nameEdits.get(key) === saved) { nameEdits.delete(key); render(); }
+          }, 1600);
+        } else {
+          edit.pending = null;
+          edit.error = res.error || "Couldn't save that name. Try again.";
+        }
+      }
+    }
     let paidChanged = false, paidHandled = false, confirmation = null;
     if (paidTerminal && res.key_action === "key_terminal" && res.key_target_id === paidTerminal.id) {
       paidTerminal.pending = false;
@@ -53,9 +70,9 @@ window.AGL = {
     }
     if (res.key_action === "answer_key_switch") answering.delete(res.key_target_id);
     if (res.key_action === "key_prove") proving.delete(res.key_target_id);
-    if (paidChanged || keyChanged || (out.render && !inKeyFlow)) render();
+    if (nameChanged || paidChanged || keyChanged || (out.render && !inKeyFlow)) render();
     else refreshKeyPrompts(); // surface consent without replacing inputs or stealing focus
-    if (out.flash && !res.key_request_id && !paidHandled) flash(out.flash);
+    if (out.flash && !res.rename_request_id && !res.key_request_id && !paidHandled) flash(out.flash);
     if (res.key_action === "key_validate" && res.ok) flash(res.validation?.operation_permitted
       ? "key check passed — this checks account access only" : "key check wasn't permitted — check access with your provider");
     if (confirmation) flash(confirmation);
@@ -168,6 +185,8 @@ let keySequence = 0;
 const answering = new Set();
 const proving = new Set();
 const openSeatDetails = new Set();
+const nameEdits = new Map();
+let renameSequence = 0;
 let clockTimer = null;
 let mainKeyPromptCount = 0;
 function setPopoverVisible(visible) {
@@ -219,6 +238,8 @@ function render() {
   // Only when the screen is unchanged — navigating must start the new screen at the top.
   const focusData = screen === renderedScreen && root.contains?.(document.activeElement)
     && document.activeElement?.dataset?.action ? { ...document.activeElement.dataset } : null;
+  const activeName = focusData?.action === "seat-name-input" ? document.activeElement : null;
+  const nameSelection = activeName ? [activeName.selectionStart, activeName.selectionEnd, activeName.selectionDirection] : null;
   const prevBody = root.querySelector(".body, .set-body");
   const scrollTop = screen === renderedScreen ? prevBody?.scrollTop || 0 : 0;
   root.innerHTML = screen === "settings" ? buildSettings(state)
@@ -226,7 +247,7 @@ function render() {
     : screen === "add-key" ? buildAddKey(state, keyFlow)
     : screen === "paid-key" ? buildPaidKeyGate(state, paidTerminal)
     : buildHTML(installSentAt === null || !state.update ? state
-      : { ...state, update: { ...state.update, phase: "downloading", error: null } }, pendingSwitch, openSeatDetails);
+      : { ...state, update: { ...state.update, phase: "downloading", error: null } }, pendingSwitch, openSeatDetails, nameEdits);
   if (!root.querySelector(".key-prompts")) {
     root.querySelector(".set-head")?.insertAdjacentHTML("afterend", keyConfirmations(state, answering));
   }
@@ -248,6 +269,7 @@ function render() {
     const control = [...root.querySelectorAll("button[data-action], input[data-action]")]
       .find((node) => Object.entries(focusData).every(([key, value]) => node.dataset[key] === value));
     control?.focus({ preventScroll: true });
+    if (nameSelection) control?.setSelectionRange(...nameSelection);
   }
   // mirror the theme onto <body> so overlays (siblings of #root) get the same CSS vars
   const theme = (state.settings && state.settings.theme === "dark") ? "dark" : "light";
@@ -299,6 +321,17 @@ function sendKeyFlow(action, extra = {}) {
   render();
 }
 
+function saveSeatName(tool, email) {
+  const key = JSON.stringify([tool, email]), edit = nameEdits.get(key);
+  const seat = state.tools?.[tool]?.seats?.find((s) => s.email === email);
+  if (!seat || !edit || edit.pending || edit.error || edit.value === undefined) return;
+  const name = normalizeSeatName(edit.value);
+  if (seatNameError(state, tool, email, name) || name === (seat.custom_name ?? seat.name ?? "")) return;
+  edit.pending = `rename-${++renameSequence}`;
+  send("rename", { tool, email, name, rename_request_id: edit.pending });
+  render();
+}
+
 // --- event delegation (whole document, so overlay buttons work too) ---------------------------
 document.addEventListener("click", (e) => {
   if (openMenu && !e.target.closest(".header-menu")) { openMenu = null; paintMenus(); }
@@ -328,6 +361,7 @@ document.addEventListener("click", (e) => {
       reportHeight();
       break;
     }
+    case "seat-name-save": saveSeatName(tool, email); break;
     case "key-start":
       add = null;
       keyFlow = { step: "provider", label: "", secret: "", region: "eu", base_url: "", allow_unverified: false };
@@ -500,6 +534,13 @@ function addBack() {
 // Controlled inputs: mirror the add-seat fields into `add` on each keystroke so a background poll
 // re-render (which re-emits value="${...}") reproduces exactly what's typed — no lost text.
 document.addEventListener("input", (e) => {
+  if (e.target.dataset?.action === "seat-name-input") {
+    const { tool, email } = e.target.dataset, key = JSON.stringify([tool, email]);
+    if (nameEdits.get(key)?.pending) return;
+    nameEdits.set(key, { value: e.target.value });
+    if (!e.isComposing) render();
+    return;
+  }
   if (screen === "add-key" && keyFlow?.step === "models" && e.target.id === "key-model-filter") {
     keyFlow.modelFilter = e.target.value;
     root.querySelector("#key-model-results").innerHTML = buildModelResults(keyFlow);
@@ -522,6 +563,16 @@ document.addEventListener("change", (e) => {
 
 // Esc pops a sub-view (spec §9): settings → main; add → one step back (like the chevron).
 document.addEventListener("keydown", (e) => {
+  const nameInput = e.target?.dataset?.action === "seat-name-input" ? e.target : null;
+  if (nameInput && ["Enter", "Escape"].includes(e.key) && !e.isComposing) {
+    e.preventDefault();
+    const { tool, email } = nameInput.dataset;
+    if (e.key === "Enter") saveSeatName(tool, email);
+    else if (!nameEdits.get(JSON.stringify([tool, email]))?.pending) {
+      nameEdits.delete(JSON.stringify([tool, email])); render();
+    }
+    return;
+  }
   if (openMenu && ["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) {
     const menu = root.querySelector('.header-menu .menu:not([hidden])');
     const buttons = [...(menu?.querySelectorAll("button") || [])];

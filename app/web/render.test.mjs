@@ -3202,3 +3202,214 @@ test("limited seats without a usable reset show no time and keep their limited s
     }
   }
 });
+
+// Rename Version A: controlled subscription input, kept across native state pushes.
+const renameKey = (tool = "codex", email = "work@x.com") => JSON.stringify([tool, email]);
+const renameSnapshot = (over = {}) => state({ rev: 1, tools: {
+  codex: { seats: [seat({ status: "active", custom_name: "Work" }), seat({ email: "next@x", name: "Next" })] },
+  claude: { seats: [seat({ email: "other@x", name: "Other", custom_name: "Other" })] } }, ...over });
+const nameGroup = (html) => elements(html, "section", (tag) => tag.includes('class="detail-group seat-name"'))[0] || "";
+const saveTag = (html) => html.match(/<button[^>]*data-action="seat-name-save"[^>]*>/)?.[0] || "";
+
+test("subscription details start with a labeled name field, local-part placeholder and disabled Save", () => {
+  const html = buildHTML(renameSnapshot());
+  const detail = elements(html, "div", (tag) => tag.includes('class="details"'))[0];
+  assert.ok(detail.indexOf('class="detail-group seat-name"') < detail.indexOf('aria-label="usage"'));
+  const group = nameGroup(html), id = group.match(/<input[^>]*\bid="([^"]+)"/)?.[1];
+  assert.ok(id); assert.match(group, new RegExp(`for="${id}"`));
+  assert.match(group, /value="Work"/); assert.match(group, /placeholder="work"/);
+  assert.match(group, /Leave blank to show work\./); assert.match(saveTag(group), /disabled/);
+  assert.equal(nameGroup(buildHTML(state({ keys: [keySeat()] }))), "");
+  const cleared = buildHTML(renameSnapshot({ tools: { codex: { seats: [seat({ name: "work", custom_name: "" })] } } }));
+  assert.match(nameGroup(cleared), /value=""/);
+});
+
+test("name validation mirrors normalized length, cross-tool names and fallback, with disabled states", () => {
+  const snapshot = renameSnapshot();
+  snapshot.tools.claude.seats.push(seat({ email: "fallback@x", name: "", custom_name: "" }));
+  for (const [value, error, disabled] of [
+    [" Work  ", "", true], ["OTHER", '&quot;Other&quot; is already the Claude seat other@x. Pick another name.', true],
+    ["FALLBACK", '&quot;fallback&quot; is already the Claude seat fallback@x. Pick another name.', true],
+    ["x".repeat(33), "Keep it to 32 characters.", true], ["x".repeat(32), "", false],
+    ["😀".repeat(32), "", false], [" \t ", "", false], ["woRK", "", false], [" New\t Name ", "", false],
+  ]) {
+    const group = nameGroup(buildHTML(snapshot, null, new Set(), new Map([[renameKey(), { value }]])));
+    assert.ok(group.includes(error), value);
+    assert.equal(saveTag(group).includes("disabled"), disabled, value);
+    assert.equal(group.includes('aria-invalid="true"'), Boolean(error), value);
+  }
+  const pending = nameGroup(buildHTML(snapshot, null, new Set(), new Map([[renameKey(), { value: "Fresh", pending: "r1" }]])));
+  assert.match(saveTag(pending), /disabled/);
+});
+
+test("existing duplicate names have a details-only note and leave the attention count unchanged", () => {
+  const snapshot = renameSnapshot();
+  snapshot.tools.claude.seats[0].name = "work";
+  const html = buildHTML(snapshot);
+  assert.equal((html.match(/Another seat is also called /g) || []).length, 2);
+  assert.match(nameGroup(html), /Another seat is also called Work\. Rename one to tell them apart\./);
+  assert.doesNotMatch(visibleMarkup(html), /Another seat|class="issue|needs you/);
+  assert.match(headerVerdict(snapshot), /all good/);
+  const ownCase = nameGroup(buildHTML(snapshot, null, new Set(), new Map([[renameKey(), { value: "WORK" }]])));
+  assert.doesNotMatch(saveTag(ownCase), /disabled/);
+});
+
+test("all name values, clash notes and engine errors escape markup and quotes", () => {
+  const unsafe = '<img onerror="x">';
+  const snapshot = renameSnapshot();
+  snapshot.tools.codex.seats[0].name = unsafe;
+  snapshot.tools.codex.seats[0].custom_name = unsafe;
+  snapshot.tools.claude.seats[0].name = unsafe;
+  let html = buildHTML(snapshot);
+  assert.match(nameGroup(html), /value="&lt;img onerror=&quot;x&quot;&gt;"/);
+  assert.doesNotMatch(html, /<img|value="<|also called </);
+  html = buildHTML(snapshot, null, new Set(), new Map([[renameKey(), { value: unsafe + "'", error: unsafe }]]));
+  assert.doesNotMatch(html, /<img/); assert.match(nameGroup(html), /&lt;img onerror=&quot;x&quot;&gt;/);
+});
+
+function renameApp() {
+  const timers = [], nodes = [];
+  let app, markup = "";
+  const root = { firstElementChild: null, contains: (node) => nodes.includes(node),
+    querySelector: () => null, querySelectorAll: (selector) => selector === "button[data-action], input[data-action]" ? nodes : [],
+    get innerHTML() { return markup; },
+    set innerHTML(value) {
+      markup = value; nodes.length = 0;
+      for (const tag of value.matchAll(/<input[^>]*data-action="seat-name-input"[^>]*>/g)) {
+        const attrs = Object.fromEntries([...tag[0].matchAll(/([\w-]+)="([^"]*)"/g)].map((m) => [m[1], m[2]]));
+        nodes.push({ id: attrs.id, value: attrs.value, dataset: { action: attrs["data-action"], tool: attrs["data-tool"], email: attrs["data-email"] },
+          selectionStart: 0, selectionEnd: 0, selectionDirection: "none",
+          focus() { app.document.activeElement = this; },
+          setSelectionRange(start, end, direction) { this.selectionStart = start; this.selectionEnd = end; this.selectionDirection = direction; } });
+      }
+    } };
+  app = keyApp({ root, setTimeout: (fn, delay) => { timers.push({ fn, delay }); return timers.length; } });
+  app.window.AGL.update(renameSnapshot());
+  const field = () => nodes.find((n) => n.dataset.tool === "codex" && n.dataset.email === "work@x.com");
+  const type = (value) => { const input = field(); input.value = value; input.focus(); app.handlers.input({ target: input }); };
+  const key = (key) => { let prevented = false; app.handlers.keydown({ key, target: field(), preventDefault() { prevented = true; } }); return prevented; };
+  return { ...app, field, type, key, timers };
+}
+
+test("rename draft, focus and selection survive input renders and a newer state push", () => {
+  const app = renameApp();
+  app.type("Half typed");
+  let input = app.field(); input.focus(); input.setSelectionRange(2, 5, "backward");
+  app.window.AGL.update(renameSnapshot({ rev: 2 }));
+  input = app.field();
+  assert.equal(input.value, "Half typed"); assert.equal(app.document.activeElement, input);
+  assert.deepEqual([input.selectionStart, input.selectionEnd, input.selectionDirection], [2, 5, "backward"]);
+  app.type("Other"); assert.match(nameGroup(app.root.innerHTML), /already the Claude seat/);
+  assert.match(saveTag(app.root.innerHTML), /disabled/);
+  app.click({ action: "seat-name-save", tool: "codex", email: "work@x.com" });
+  assert.equal(app.sent.filter((m) => m.action === "rename").length, 0);
+});
+
+test("Return saves once, disables Save during polls, and success renames from the returned snapshot", () => {
+  const app = renameApp(); app.type("  New\t Name  ");
+  assert.ok(app.key("Enter"));
+  const request = app.sent.at(-1);
+  assert.equal(request.action, "rename"); assert.equal(request.name, "New Name");
+  assert.equal(request.tool, "codex"); assert.equal(request.email, "work@x.com"); assert.ok(request.rename_request_id);
+  assert.match(saveTag(app.root.innerHTML), /disabled/);
+  app.window.AGL.update(renameSnapshot({ rev: 2 }));
+  app.key("Enter"); app.click({ action: "seat-name-save", tool: "codex", email: "work@x.com" });
+  assert.equal(app.sent.filter((m) => m.action === "rename").length, 1);
+  const snapshot = renameSnapshot({ rev: 3 });
+  snapshot.tools.codex.seats[0].name = "New Name"; snapshot.tools.codex.seats[0].custom_name = "New Name";
+  app.window.AGL.result({ ok: true, rename_request_id: request.rename_request_id, state: snapshot });
+  assert.match(nameGroup(app.root.innerHTML), /Saved\./);
+  assert.match(visibleMarkup(app.root.innerHTML), /New Name/);
+  assert.match(saveTag(app.root.innerHTML), /disabled/);
+  const savedTimer = app.timers.find((t) => t.delay === 1600); assert.ok(savedTimer); savedTimer.fn();
+  assert.doesNotMatch(nameGroup(app.root.innerHTML), /Saved\./);
+});
+
+test("Escape abandons a draft without sending and the next poll cannot revive it", () => {
+  const app = renameApp(); app.type("Abandoned");
+  assert.ok(app.key("Escape")); assert.equal(app.field().value, "Work");
+  app.window.AGL.update(renameSnapshot({ rev: 2 }));
+  assert.equal(app.field().value, "Work");
+  assert.equal(app.sent.filter((m) => m.action === "rename").length, 0);
+});
+
+test("engine refusal stays inline through pushes, edits clear it, and unrelated replies cannot settle a request", () => {
+  const app = renameApp(); app.type("Fresh");
+  app.click({ action: "seat-name-save", tool: "codex", email: "work@x.com" });
+  const request = app.sent.at(-1);
+  app.window.AGL.result({ ok: false, rename_request_id: "unrelated", error: "wrong reply" });
+  assert.match(saveTag(app.root.innerHTML), /disabled/);
+  assert.doesNotMatch(nameGroup(app.root.innerHTML), /wrong reply/);
+  const error = '"Fresh" is already the Claude seat new@x. Pick another name.';
+  app.window.AGL.result({ ok: false, rename_request_id: request.rename_request_id, error });
+  assert.match(nameGroup(app.root.innerHTML), /&quot;Fresh&quot; is already the Claude seat new@x/);
+  assert.doesNotMatch(app.root.innerHTML.match(/<footer[\s\S]*$/)[0], /already the Claude/);
+  app.window.AGL.update(renameSnapshot({ rev: 2 }));
+  assert.match(nameGroup(app.root.innerHTML), /already the Claude seat new@x/);
+  app.type("Available"); assert.doesNotMatch(nameGroup(app.root.innerHTML), /already the Claude/);
+  assert.doesNotMatch(saveTag(app.root.innerHTML), /disabled/);
+});
+
+test("blank saves clear the custom name and use the returned local-part fallback everywhere", () => {
+  const app = renameApp(); app.type(" "); app.key("Enter");
+  const request = app.sent.at(-1); assert.equal(request.name, "");
+  const snapshot = renameSnapshot({ rev: 2 });
+  snapshot.tools.codex.seats[0].name = "work"; snapshot.tools.codex.seats[0].custom_name = "";
+  app.window.AGL.result({ ok: true, rename_request_id: request.rename_request_id, state: snapshot });
+  assert.equal(app.field().value, ""); assert.match(nameGroup(app.root.innerHTML), /placeholder="work"/);
+});
+
+test("renaming the next seat updates both the then-line and sheet identity from one snapshot", () => {
+  const app = renameApp();
+  app.input(app.field().id, "ignored"); // field IDs alone cannot address a different seat
+  app.handlers.input({ target: { dataset: { action: "seat-name-input", tool: "codex", email: "next@x" }, value: "Next renamed" } });
+  app.click({ action: "seat-name-save", tool: "codex", email: "next@x" });
+  const request = app.sent.at(-1); assert.equal(request.email, "next@x");
+  const snapshot = renameSnapshot({ rev: 2 });
+  snapshot.tools.codex.seats[1].name = "Next renamed";
+  snapshot.tools.codex.seats[1].custom_name = "Next renamed";
+  app.window.AGL.result({ ok: true, rename_request_id: request.rename_request_id, state: snapshot });
+  assert.match(app.root.innerHTML.match(/<p class="then">[\s\S]*?<\/p>/)[0], /Next renamed/);
+  assert.match(rosterOf(app.root.innerHTML), /class="seat-identity"[^>]*>Next renamed</);
+});
+
+test("drafts remain independent across seats and a stale success cannot erase a later edit", () => {
+  const app = renameApp(); app.type("First draft");
+  app.handlers.input({ target: { dataset: { action: "seat-name-input", tool: "claude", email: "other@x" }, value: "Second draft" } });
+  app.click({ action: "seat-name-save", tool: "claude", email: "other@x" });
+  const request = app.sent.at(-1);
+  app.window.AGL.result({ ok: true, rename_request_id: request.rename_request_id, state: renameSnapshot({ rev: 2 }) });
+  assert.equal(app.field().value, "First draft");
+  app.type("Later draft");
+  app.timers.find((t) => t.delay === 1600).fn();
+  assert.equal(app.field().value, "Later draft");
+  app.window.AGL.result({ ok: true, rename_request_id: request.rename_request_id, state: renameSnapshot({ rev: 1 }) });
+  assert.equal(app.field().value, "Later draft");
+});
+
+test("Return during text composition does not save a partial name", () => {
+  const app = renameApp(); app.type("Compose");
+  app.handlers.keydown({ key: "Enter", target: app.field(), isComposing: true, preventDefault() {} });
+  assert.equal(app.sent.filter((m) => m.action === "rename").length, 0);
+});
+
+test("composing a seat name keeps the live input until the composed input is committed", () => {
+  const app = renameApp(), field = app.field();
+  field.value = "名前"; field.focus();
+  app.handlers.input({ target: field, isComposing: true });
+  assert.equal(app.field(), field);
+  app.handlers.input({ target: field, isComposing: false });
+  assert.equal(app.field().value, "名前");
+});
+
+test("instant name validation shares the engine's Unicode caseless and whitespace rules", () => {
+  const snapshot = renameSnapshot();
+  snapshot.tools.claude.seats[0].name = "Straße";
+  let group = nameGroup(buildHTML(snapshot, null, new Set(), new Map([[renameKey(), { value: "STRASSE" }]])));
+  assert.match(group, /already the Claude seat/);
+  group = nameGroup(buildHTML(snapshot, null, new Set(), new Map([[renameKey(), { value: "\u0085Work\u001c" }]])));
+  assert.match(saveTag(group), /disabled/); // Python whitespace is collapsed/trimmed, too.
+  snapshot.tools.claude.seats[0].name = "ı";
+  group = nameGroup(buildHTML(snapshot, null, new Set(), new Map([[renameKey(), { value: "I" }]])));
+  assert.doesNotMatch(saveTag(group), /disabled/); // Dotless i is a distinct name.
+});

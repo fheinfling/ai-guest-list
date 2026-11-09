@@ -403,6 +403,13 @@ input:focus-visible ~ .sw, .free-control:focus-within, .proof-gate:focus-within 
 .detail-group h3, .detail-actions h3 { margin:0 0 4px; color:var(--muted); font-size:10.5px; font-weight:650; letter-spacing:.04em; }
 .detail-group dl { display:grid; grid-template-columns:max-content minmax(0,1fr); gap:3px 8px; }
 .details .detail-note { grid-column:1 / -1; }
+.seat-name-row { display:flex; align-items:center; gap:6px; }
+.seat-name-row input { min-width:0; width:100%; padding:6px 8px; border:1px solid var(--edge); border-radius:7px; background:var(--sheet); }
+.seat-name-row input[aria-invalid="true"] { border-color:var(--hard-edge); }
+.seat-name-row button { flex:none; }
+.seat-name-row button:disabled { cursor:default; opacity:.55; }
+.seat-name-message, .seat-name-note { margin-top:4px; font-size:11px; color:var(--muted); }
+.seat-name-error { color:var(--hard-edge); }
 .detail-actions { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:6px; margin-top:10px; padding-top:8px; border-top:1px solid var(--line); }
 .detail-actions .seat-actions { justify-content:flex-end; }
 .details .destructive { color:var(--hard-edge); border-color:currentColor; }

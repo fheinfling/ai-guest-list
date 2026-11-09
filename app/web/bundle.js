@@ -735,7 +735,40 @@ function detailClock(iso, now = Date.now()) {
 function detailGroup(label, rows) {
   return rows ? `<section class="detail-group" aria-label="${label}"><h3>${label}</h3><dl>${rows}</dl></section>` : "";
 }
-function rowDetails(tool, seat, peers, openDetails) {
+const seatNameId = (tool, email) => `${detailId(tool, email)}-name`;
+// Match Python str.split whitespace (including NEL and the ASCII record separators).
+const normalizeSeatName = (value) => value.replace(/[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+/gu, " ").replace(/^ | $/g, "");
+const effectiveSeatName = (seat) => seat.name || seat.email.split("@")[0];
+const storedSeatName = (seat) => seat.custom_name ?? seat.name ?? "";
+// Expanding upper/lower pairs compare like Python casefold; keep dotless ı distinct from i.
+const foldedName = (value) => [...value].map((c) => c === "ı" ? c : c.toUpperCase().toLowerCase()).join("").replace(/ß/g, "ss");
+function seatNameClash(state, tool, email, name) {
+  return name && subscriptionSeats(state).find((other) =>
+    (other.tool !== tool || other.email !== email) && foldedName(effectiveSeatName(other)) === foldedName(name));
+}
+function seatNameError(state, tool, email, value) {
+  const name = normalizeSeatName(value);
+  if ([...name].length > 32) return "Keep it to 32 characters.";
+  const current = state.tools?.[tool]?.seats?.find((s) => s.email === email);
+  if (current && foldedName(name) === foldedName(effectiveSeatName(current))) return "";
+  const clash = seatNameClash(state, tool, email, name);
+  return clash ? `"${effectiveSeatName(clash)}" is already the ${clash.tool === "codex" ? "Codex" : "Claude"} seat ${clash.email}. Pick another name.` : "";
+}
+function seatNameGroup(state, tool, seat, edits) {
+  const edit = edits.get(JSON.stringify([tool, seat.email]));
+  const value = edit?.value ?? storedSeatName(seat);
+  const error = edit?.error || seatNameError(state, tool, seat.email, value);
+  const id = seatNameId(tool, seat.email), fallback = seat.email.split("@")[0];
+  const data = `data-tool="${esc(tool)}" data-email="${esc(seat.email)}"`;
+  const disabled = edit?.pending || error || normalizeSeatName(value) === storedSeatName(seat);
+  const clash = seatNameClash(state, tool, seat.email, effectiveSeatName(seat));
+  return `<section class="detail-group seat-name" aria-label="Name"><h3><label for="${esc(id)}">Name</label></h3>
+    <div class="seat-name-row"><input type="text" id="${esc(id)}" data-action="seat-name-input" ${data} value="${esc(value)}" placeholder="${esc(fallback)}" aria-invalid="${Boolean(error)}" aria-describedby="${esc(id)}-message"${edit?.pending ? ' readonly aria-busy="true"' : ""}>
+    <button class="row-action" data-action="seat-name-save" ${data}${disabled ? " disabled" : ""}>Save</button></div>
+    <p class="seat-name-message${error ? " seat-name-error" : ""}" id="${esc(id)}-message" role="status">${esc(error || (edit?.saved ? "Saved." : `Leave blank to show ${fallback}.`))}</p>
+    ${clash ? `<p class="seat-name-note">Another seat is also called ${esc(effectiveSeatName(seat))}. Rename one to tell them apart.</p>` : ""}</section>`;
+}
+function rowDetails(tool, seat, peers, openDetails, state, nameEdits) {
   const key = tool === "key", email = key ? seat.id : seat.email;
   const open = openDetails.has(JSON.stringify([tool, email]));
   let rows;
@@ -747,7 +780,7 @@ function rowDetails(tool, seat, peers, openDetails) {
     else rows += seatWindows(seat).map((w) => `<dt>${w.label}</dt><dd>${w.left == null ? "no reading yet" : `${seat.usage_stale ? "~" : ""}${w.left}% left`}${w.reset ? ` · resets <time datetime="${esc(w.reset)}">${esc(detailClock(w.reset))}</time> (${timed(w.reset, "in")})` : ""}</dd>`).join("");
     const action = limitedSeat(seat) || (!isActive(seat) && !signedOut(seat) && !usable(seat)) ? seatAction(tool, seat, "switch") : "";
     if (action) rows += `<dt>action</dt><dd>${action}</dd>`;
-    rows = detailGroup("usage", rows + `<dt class="sr-only">updated</dt><dd class="detail-note">${seat.usage_stale ? "last known reading; " : ""}<span data-usage-at="${esc(fetched)}">${fmtUsageAge(fetched)}</span></dd>`);
+    rows = seatNameGroup(state, tool, seat, nameEdits) + detailGroup("usage", rows + `<dt class="sr-only">updated</dt><dd class="detail-note">${seat.usage_stale ? "last known reading; " : ""}<span data-usage-at="${esc(fetched)}">${fmtUsageAge(fetched)}</span></dd>`);
     let session = "";
     if (seat.in_session) session += `<dt class="sr-only">terminal</dt><dd class="detail-note">terminal attached<span data-session-at="${esc(seat.session_started_at)}">${fmtSessionAge(seat.session_started_at)}</span></dd>`;
     if (seat.last_on_floor) session += `<dt class="sr-only">last used</dt><dd class="detail-note">last used <time datetime="${esc(seat.last_on_floor)}">${esc(detailClock(seat.last_on_floor))}</time></dd>`;
@@ -796,7 +829,7 @@ function thenLine(p, state) {
   }
   return `<p class="then"><b>then</b> ${text}</p>`;
 }
-function seatIssues(p, openDetails) {
+function seatIssues(p, openDetails, state, nameEdits) {
   return p.seats.map((seat) => {
     const out = signedOut(seat), revoked = entitlementRevoked(seat);
     const hard = out || signinNeeded(seat) || revoked;
@@ -809,10 +842,10 @@ function seatIssues(p, openDetails) {
     if (!out && !hard && error) issues.push(esc(error));
     if (!issues.length) return "";
     const representedHere = seat !== p.lead && hard;
-    return `<div class="issue issue--${hard ? "hard" : "soft"}" data-tool="${esc(p.tool)}" data-email="${esc(seat.email)}" role="group" aria-label="${esc(p.tool)} ${esc(seat.name || seat.email)} attention">${hard ? ICON.alert : ICON.clock}<div>${representedHere ? nameButton(p.tool, seat, p.seats, openDetails) : `<b>${esc(seatIdentity(seat, p.seats))}</b>`} ${issues.join("; ")}</div>${seatAction(p.tool, seat, "signin")}</div>${representedHere ? rowDetails(p.tool, seat, p.seats, openDetails) : ""}`;
+    return `<div class="issue issue--${hard ? "hard" : "soft"}" data-tool="${esc(p.tool)}" data-email="${esc(seat.email)}" role="group" aria-label="${esc(p.tool)} ${esc(seat.name || seat.email)} attention">${hard ? ICON.alert : ICON.clock}<div>${representedHere ? nameButton(p.tool, seat, p.seats, openDetails) : `<b>${esc(seatIdentity(seat, p.seats))}</b>`} ${issues.join("; ")}</div>${seatAction(p.tool, seat, "signin")}</div>${representedHere ? rowDetails(p.tool, seat, p.seats, openDetails, state, nameEdits) : ""}`;
   }).join("");
 }
-function toolBlock(p, state, pending, openDetails) {
+function toolBlock(p, state, pending, openDetails, nameEdits) {
   const s = p.lead;
   let head = '<div class="now"><span class="tag">nothing on</span></div>';
   if (s) {
@@ -828,14 +861,14 @@ function toolBlock(p, state, pending, openDetails) {
     else head = `<div class="now">${name}<span class="fig">${t?.left == null ? "—" : `${s.usage_stale ? "~" : ""}${t.left}<small>%</small>`}</span><span class="fig-l">${t?.left == null ? "no reading yet" : `of ${t.label} left`}</span></div>
       ${t?.left != null ? `<div class="bar" role="img" aria-label="${s.usage_stale ? "last known: " : ""}${t.left}% of the ${t.label} window left"><i style="width:${t.left}%"></i></div>` : ""}
       ${metadata || secondary ? `<div class="meta">${metadata ? `<span>${metadata}</span>` : ""}${secondary}</div>` : ""}`;
-    head += rowDetails(p.tool, s, p.seats, openDetails);
+    head += rowDetails(p.tool, s, p.seats, openDetails, state, nameEdits);
   }
   const crossings = crossingRequests({ pending_crossings: (state.pending_crossings || []).filter((r) => r.tool === p.tool) });
   const tiers = tierRequests({ pending_tier_requests: (state.pending_tier_requests || []).filter((r) => r.tool === p.tool) });
   const target = p.seats.find((s) => pending?.tool === p.tool && pending.email === s.email);
-  return `<section class="tool" data-tool="${esc(p.tool)}" aria-label="${esc(p.tool)}"><div class="toolname">${mark(p.tool)}${esc(p.tool)}</div><div class="answer">${head}${thenLine(p, state)}</div>${seatIssues(p, openDetails)}${crossings}${tiers}${target ? switchConfirmation(p.tool, target, pending) : ""}</section>`;
+  return `<section class="tool" data-tool="${esc(p.tool)}" aria-label="${esc(p.tool)}"><div class="toolname">${mark(p.tool)}${esc(p.tool)}</div><div class="answer">${head}${thenLine(p, state)}</div>${seatIssues(p, openDetails, state, nameEdits)}${crossings}${tiers}${target ? switchConfirmation(p.tool, target, pending) : ""}</section>`;
 }
-function listRows(p, state, openDetails) {
+function listRows(p, state, openDetails, nameEdits) {
   const rest = [...p.ready, ...p.keys, ...p.seats.filter((s) => !p.ready.includes(s))]
     .filter((s) => s !== p.lead && (s.id || (!signedOut(s) && !signinNeeded(s) && !entitlementRevoked(s))));
   const spending = new Set([...(state.running_key_seats || []), ...(state.pinned_sessions || []).map((s) => s.key_seat?.id || s.email)]);
@@ -843,12 +876,12 @@ function listRows(p, state, openDetails) {
     const key = p.keys.includes(s), limited = !key && limitedSeat(s);
     const text = key ? `${spending.has(s.id) ? "spending now, " : ""}paid per token<span class="sr-only">; no app spend cap</span>` : limited ? ["limited", backText(s)].filter(Boolean).join(", ") : [p.next === s ? '<span class="state--strong">next</span>' : "", leftText(s)].filter(Boolean).join(", ");
     const action = key ? `<button class="row-action" data-action="key-terminal" data-id="${esc(s.id)}" aria-label="${esc(`use ${s.label} in a new paid terminal`)}">new terminal</button>` : limited ? "" : seatAction(p.tool, s, "switch");
-    return `<div class="seat${i === 0 ? " first-of-tool" : ""}${key ? " key-seat" : ""}" data-seat-email="${esc(key ? s.id : s.email)}"><div class="row"><span class="toolname">${i === 0 ? `${mark(p.tool)}${esc(p.tool)}` : `<span class="sr-only">${esc(p.tool)}</span>`}</span>${nameButton(key ? "key" : p.tool, s, p.seats, openDetails, true)}${text ? `<span class="state">${text}</span>` : ""}${action}</div>${rowDetails(key ? "key" : p.tool, s, p.seats, openDetails)}</div>`;
+    return `<div class="seat${i === 0 ? " first-of-tool" : ""}${key ? " key-seat" : ""}" data-seat-email="${esc(key ? s.id : s.email)}"><div class="row"><span class="toolname">${i === 0 ? `${mark(p.tool)}${esc(p.tool)}` : `<span class="sr-only">${esc(p.tool)}</span>`}</span>${nameButton(key ? "key" : p.tool, s, p.seats, openDetails, true)}${text ? `<span class="state">${text}</span>` : ""}${action}</div>${rowDetails(key ? "key" : p.tool, s, p.seats, openDetails, state, nameEdits)}</div>`;
   }).join("");
 }
 
 // --- popover ----------------------------------------------------------------------------------
-function buildHTML(state, pendingSwitch = null, openDetails = new Set()) {
+function buildHTML(state, pendingSwitch = null, openDetails = new Set(), nameEdits = new Map()) {
   const theme = state?.settings?.theme === "dark" ? "dark" : "light";
   const seats = subscriptionSeats(state), paid = paidCount(state);
   const mood = paid ? "spending" : seats.some(usable) ? "ready" : seats.length ? "resting" : "empty";
@@ -862,7 +895,7 @@ function buildHTML(state, pendingSwitch = null, openDetails = new Set()) {
     <header class="top"><span class="brand">${appIcon()}</span>${headerVerdict(state)}<div class="top-actions">
       <div class="header-menu"><button class="ibtn" data-action="menu" data-menu="add" aria-label="add a subscription seat or API key" aria-haspopup="menu" aria-expanded="false">${ICON.plus}</button><nav class="menu" role="menu" aria-label="add" hidden><button role="menuitem" data-action="add" data-tool="codex">codex seat <span class="sub">sign in</span></button><button role="menuitem" data-action="add" data-tool="claude">claude seat <span class="sub">sign in</span></button><hr><button role="menuitem" data-action="key-start">api key <span class="sub">paid</span></button><button role="menuitem" data-action="add">a subscription seat</button></nav></div>
       <div class="header-menu"><button class="ibtn" data-action="menu" data-menu="more" aria-label="app menu" aria-haspopup="menu" aria-expanded="false">${ICON.more}</button><nav class="menu" role="menu" aria-label="more" hidden><button role="menuitemcheckbox" aria-checked="${!!state?.settings?.auto_switch}" data-action="toggle" data-key="auto_switch">auto-switch <span class="sub">${state?.settings?.auto_switch ? "on" : "off"}</span></button><button role="menuitem" data-action="set_strategy" data-value="${state?.settings?.strategy === "most_headroom" ? "soonest_back" : "most_headroom"}">next seat <span class="sub">${strategy.replace(" first", "")}</span></button><hr><button role="menuitem" data-action="update-check">check for updates</button><button role="menuitem" data-action="settings">settings…</button><button role="menuitem" data-action="quit">quit</button></nav></div></div></header>
-    <div class="body" aria-label="seat availability" tabindex="0"><div class="content">${problems ? `<div class="app-problems">${problems}</div>` : ""}${update ? `<div class="app-notes">${update}</div>` : ""}${prompts}${paid ? paidUseControl(state) : ""}${plans.length ? `<div class="field">${plans.map((p) => toolBlock(p, state, pendingSwitch, openDetails)).join("")}</div><div class="sheet">${plans.map((p) => listRows(p, state, openDetails)).join("")}</div>` : !asking ? `<div class="field welcome"><p class="welcome-title">no seats yet</p><p>use ＋ above to add a subscription or API key.</p><button class="act act--strong" data-action="add">add a seat</button></div>` : ""}${emptyWithoutWelcome ? `<p class="empty">use ＋ above to add a subscription or API key.</p>` : ""}</div></div>
+    <div class="body" aria-label="seat availability" tabindex="0"><div class="content">${problems ? `<div class="app-problems">${problems}</div>` : ""}${update ? `<div class="app-notes">${update}</div>` : ""}${prompts}${paid ? paidUseControl(state) : ""}${plans.length ? `<div class="field">${plans.map((p) => toolBlock(p, state, pendingSwitch, openDetails, nameEdits)).join("")}</div><div class="sheet">${plans.map((p) => listRows(p, state, openDetails, nameEdits)).join("")}</div>` : !asking ? `<div class="field welcome"><p class="welcome-title">no seats yet</p><p>use ＋ above to add a subscription or API key.</p><button class="act act--strong" data-action="add">add a seat</button></div>` : ""}${emptyWithoutWelcome ? `<p class="empty">use ＋ above to add a subscription or API key.</p>` : ""}</div></div>
     <footer class="foot">${ICON.switch}<span class="footer-status" role="status" aria-live="polite">${state?.settings?.auto_switch ? `auto-switch on, ${strategy}` : "auto-switch off, you switch by hand"}</span></footer></div>`;
 }
 
@@ -1167,6 +1200,23 @@ window.AGL = {
       installSentAt = null; out.render = true;
     }
     const keyChanged = reduceKeyReply(keyFlow, res);
+    let nameChanged = false;
+    if (res.rename_request_id) {
+      for (const [key, edit] of nameEdits) {
+        if (edit.pending !== res.rename_request_id) continue;
+        nameChanged = true;
+        if (res.ok) {
+          const saved = { saved: true };
+          nameEdits.set(key, saved);
+          setTimeout(() => {
+            if (nameEdits.get(key) === saved) { nameEdits.delete(key); render(); }
+          }, 1600);
+        } else {
+          edit.pending = null;
+          edit.error = res.error || "Couldn't save that name. Try again.";
+        }
+      }
+    }
     let paidChanged = false, paidHandled = false, confirmation = null;
     if (paidTerminal && res.key_action === "key_terminal" && res.key_target_id === paidTerminal.id) {
       paidTerminal.pending = false;
@@ -1182,9 +1232,9 @@ window.AGL = {
     }
     if (res.key_action === "answer_key_switch") answering.delete(res.key_target_id);
     if (res.key_action === "key_prove") proving.delete(res.key_target_id);
-    if (paidChanged || keyChanged || (out.render && !inKeyFlow)) render();
+    if (nameChanged || paidChanged || keyChanged || (out.render && !inKeyFlow)) render();
     else refreshKeyPrompts(); // surface consent without replacing inputs or stealing focus
-    if (out.flash && !res.key_request_id && !paidHandled) flash(out.flash);
+    if (out.flash && !res.rename_request_id && !res.key_request_id && !paidHandled) flash(out.flash);
     if (res.key_action === "key_validate" && res.ok) flash(res.validation?.operation_permitted
       ? "key check passed — this checks account access only" : "key check wasn't permitted — check access with your provider");
     if (confirmation) flash(confirmation);
@@ -1297,6 +1347,8 @@ let keySequence = 0;
 const answering = new Set();
 const proving = new Set();
 const openSeatDetails = new Set();
+const nameEdits = new Map();
+let renameSequence = 0;
 let clockTimer = null;
 let mainKeyPromptCount = 0;
 function setPopoverVisible(visible) {
@@ -1348,6 +1400,8 @@ function render() {
   // Only when the screen is unchanged — navigating must start the new screen at the top.
   const focusData = screen === renderedScreen && root.contains?.(document.activeElement)
     && document.activeElement?.dataset?.action ? { ...document.activeElement.dataset } : null;
+  const activeName = focusData?.action === "seat-name-input" ? document.activeElement : null;
+  const nameSelection = activeName ? [activeName.selectionStart, activeName.selectionEnd, activeName.selectionDirection] : null;
   const prevBody = root.querySelector(".body, .set-body");
   const scrollTop = screen === renderedScreen ? prevBody?.scrollTop || 0 : 0;
   root.innerHTML = screen === "settings" ? buildSettings(state)
@@ -1355,7 +1409,7 @@ function render() {
     : screen === "add-key" ? buildAddKey(state, keyFlow)
     : screen === "paid-key" ? buildPaidKeyGate(state, paidTerminal)
     : buildHTML(installSentAt === null || !state.update ? state
-      : { ...state, update: { ...state.update, phase: "downloading", error: null } }, pendingSwitch, openSeatDetails);
+      : { ...state, update: { ...state.update, phase: "downloading", error: null } }, pendingSwitch, openSeatDetails, nameEdits);
   if (!root.querySelector(".key-prompts")) {
     root.querySelector(".set-head")?.insertAdjacentHTML("afterend", keyConfirmations(state, answering));
   }
@@ -1377,6 +1431,7 @@ function render() {
     const control = [...root.querySelectorAll("button[data-action], input[data-action]")]
       .find((node) => Object.entries(focusData).every(([key, value]) => node.dataset[key] === value));
     control?.focus({ preventScroll: true });
+    if (nameSelection) control?.setSelectionRange(...nameSelection);
   }
   // mirror the theme onto <body> so overlays (siblings of #root) get the same CSS vars
   const theme = (state.settings && state.settings.theme === "dark") ? "dark" : "light";
@@ -1428,6 +1483,17 @@ function sendKeyFlow(action, extra = {}) {
   render();
 }
 
+function saveSeatName(tool, email) {
+  const key = JSON.stringify([tool, email]), edit = nameEdits.get(key);
+  const seat = state.tools?.[tool]?.seats?.find((s) => s.email === email);
+  if (!seat || !edit || edit.pending || edit.error || edit.value === undefined) return;
+  const name = normalizeSeatName(edit.value);
+  if (seatNameError(state, tool, email, name) || name === (seat.custom_name ?? seat.name ?? "")) return;
+  edit.pending = `rename-${++renameSequence}`;
+  send("rename", { tool, email, name, rename_request_id: edit.pending });
+  render();
+}
+
 // --- event delegation (whole document, so overlay buttons work too) ---------------------------
 document.addEventListener("click", (e) => {
   if (openMenu && !e.target.closest(".header-menu")) { openMenu = null; paintMenus(); }
@@ -1457,6 +1523,7 @@ document.addEventListener("click", (e) => {
       reportHeight();
       break;
     }
+    case "seat-name-save": saveSeatName(tool, email); break;
     case "key-start":
       add = null;
       keyFlow = { step: "provider", label: "", secret: "", region: "eu", base_url: "", allow_unverified: false };
@@ -1629,6 +1696,13 @@ function addBack() {
 // Controlled inputs: mirror the add-seat fields into `add` on each keystroke so a background poll
 // re-render (which re-emits value="${...}") reproduces exactly what's typed — no lost text.
 document.addEventListener("input", (e) => {
+  if (e.target.dataset?.action === "seat-name-input") {
+    const { tool, email } = e.target.dataset, key = JSON.stringify([tool, email]);
+    if (nameEdits.get(key)?.pending) return;
+    nameEdits.set(key, { value: e.target.value });
+    if (!e.isComposing) render();
+    return;
+  }
   if (screen === "add-key" && keyFlow?.step === "models" && e.target.id === "key-model-filter") {
     keyFlow.modelFilter = e.target.value;
     root.querySelector("#key-model-results").innerHTML = buildModelResults(keyFlow);
@@ -1651,6 +1725,16 @@ document.addEventListener("change", (e) => {
 
 // Esc pops a sub-view (spec §9): settings → main; add → one step back (like the chevron).
 document.addEventListener("keydown", (e) => {
+  const nameInput = e.target?.dataset?.action === "seat-name-input" ? e.target : null;
+  if (nameInput && ["Enter", "Escape"].includes(e.key) && !e.isComposing) {
+    e.preventDefault();
+    const { tool, email } = nameInput.dataset;
+    if (e.key === "Enter") saveSeatName(tool, email);
+    else if (!nameEdits.get(JSON.stringify([tool, email]))?.pending) {
+      nameEdits.delete(JSON.stringify([tool, email])); render();
+    }
+    return;
+  }
   if (openMenu && ["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) {
     const menu = root.querySelector('.header-menu .menu:not([hidden])');
     const buttons = [...(menu?.querySelectorAll("button") || [])];

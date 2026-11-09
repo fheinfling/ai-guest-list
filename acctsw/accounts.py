@@ -6,9 +6,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from . import identity, seatkind, session
+from . import TOOLS, identity, seatkind, session
 from .context import Context
-from .errors import CannotIdentify, NoLiveCreds
+from .errors import AcctswError, CannotIdentify, NoLiveCreds
 from .selection import choose
 from .state import State
 from .usage import MAX_TRUSTED_AGE_S, SIGNIN_WARN_S, account_fingerprint, account_workspace
@@ -17,6 +17,46 @@ from .util import email_key, now, iso, parse_iso, jwt_payload
 # raw plan code -> display label (spec §4: Business|Team|Pro|Max|Free)
 _PLAN_LABELS = {"business": "Business", "team": "Team", "enterprise": "Enterprise",
                 "pro": "Pro", "plus": "Plus", "max": "Max", "free": "Free"}
+
+
+def effective_name(seat: dict) -> str:
+    return seat.get("name") or seat["email"].split("@")[0]
+
+
+def name_clash(state: State, tool: str, email: str, name: str) -> tuple[str, dict] | None:
+    """Find another subscription seat with this display name; blank always clears."""
+    for other_tool in TOOLS:
+        for other_email, seat in state.accounts(other_tool).items():
+            if ((other_tool, other_email) != (tool, email) and name
+                    and effective_name(seat).casefold() == name.casefold()):
+                return other_tool, seat
+    return None
+
+
+def validated_name(state: State, tool: str, email: str, name: str) -> str:
+    name = " ".join(name.split())
+    if len(name) > 32:
+        raise AcctswError("Keep it to 32 characters.")
+    current = state.get_seat(tool, email)
+    # A case-only edit of an existing duplicate must not make that old duplicate a new blocker.
+    if current and name.casefold() == effective_name(current).casefold():
+        return name
+    clash = name_clash(state, tool, email, name)
+    if clash:
+        other_tool, seat = clash
+        raise AcctswError(f'"{effective_name(seat)}" is already the {other_tool.title()} seat '
+                          f'{seat["email"]}. Pick another name.')
+    return name
+
+
+def rename(ctx: Context, state: State, tool: str, email: str, name: str) -> dict:
+    if tool not in TOOLS:
+        raise AcctswError(f"unknown tool: {tool}")
+    if state.get_seat(tool, email) is None:
+        raise AcctswError(f"unknown seat: {tool}:{email}")
+    state.set_seat_name(tool, email, validated_name(state, tool, email, name))
+    state.save()
+    return state.get_seat(tool, email)
 
 
 def plan_of(tool: str, blob: str | None) -> str | None:
@@ -57,12 +97,16 @@ def add(ctx: Context, state: State, tool: str, *, name: str | None = None,
         raise CannotIdentify(f"could not determine the account email for {tool}")
     if tool == "claude":
         em = next((known for known in state.accounts(tool) if email_key(known) == email_key(em)), em)
+    if name is not None:
+        name = validated_name(state, tool, em, name)
     ctx.snapshot_set(tool, em, live)
     if tool == "claude":
         from . import claudehome
         claudehome.save(ctx, em, live)
         state.data["tools"][tool]["captured_stock_digest"] = _claude_digest(live)
     seat = state.upsert_seat(tool, em, name=name, plan=plan_of(tool, live))
+    if name is not None:
+        state.set_seat_name(tool, em, name)
     # Fingerprint the PERSON behind the creds so we can warn when two seats are secretly the same
     # login (shared quota — they can't cover each other), and record the workspace/subscription id
     # beside it (colleagues share that one, yet each has their own windows). Stamped now so the
@@ -242,7 +286,8 @@ def _seat_view(seat: dict, *, active: bool, at: datetime,
     signed_out, signin_expires, signin_expiring = _signin_view(seat, at)
     return {
         "email": seat["email"],
-        "name": seat.get("name") or seat["email"].split("@")[0],
+        "name": effective_name(seat),
+        "custom_name": seat.get("name") or "",
         "plan": seat.get("plan"),
         "kind": seatkind.kind(seat),
         "active": active,
