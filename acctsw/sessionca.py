@@ -23,6 +23,7 @@ import time
 from pathlib import Path
 
 _TIMEOUT_S = 20
+TEMP_DIR_PREFIX = "acctsw-ca-"
 # Claude Code reads the CA once, at start, and a terminal can stay open (or asleep) for days: a
 # certificate that runs out first breaks the session with nothing able to renew it. The CA key is
 # gone after construction and the name constraint allows one host, so a long life costs little.
@@ -82,7 +83,7 @@ class SessionCA:
         self.not_after = time.time() + _DAYS * 86400
         self._ctx: ssl.SSLContext | None = None
         try:
-            self._dir = Path(tempfile.mkdtemp(prefix="acctsw-ca-", dir=str(tmp_root) if tmp_root else None))
+            self._dir = Path(tempfile.mkdtemp(prefix=TEMP_DIR_PREFIX, dir=str(tmp_root) if tmp_root else None))
             os.chmod(self._dir, 0o700)
         except OSError as e:
             raise SessionCAError(f"cannot create private dir: {e}") from e

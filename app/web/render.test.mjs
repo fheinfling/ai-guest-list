@@ -133,7 +133,7 @@ test("resting disclosures show one return countdown and retain reading provenanc
   const card = detailsOf(html, "codex", "work@x.com");
   assert.equal((rosterOf(html).match(/data-clock-prefix=""/g) || []).length, 1);
   assert.match(card, /last known reading/);
-  assert.match(html, /connection unavailable; retrying automatically/);
+  assert.doesNotMatch(html, /connection unavailable|class="issue /);
   assert.match(card, /data-usage-at="2026-09-13T18:25:00Z"/);
   assert.doesNotMatch(card, /taking a breather/);
 });
@@ -142,10 +142,11 @@ test("unknown roster readings do not imply remaining credit from old cached valu
 const html = buildHTML(state({ tools: { codex: { seats: [seat({ status: "active", usage_unknown: true,
   usage5h: 100, usageWeek: 75, usage_fetched_at: "2026-09-13T12:00:00Z" })] } } }));
 const main = rosterOf(html);
-assert.match(main, /usage unknown/);
+assert.doesNotMatch(main, /unknown/); // no reading is not news: no "usage unknown" anywhere
+assert.match(main, /no reading yet/);
 assert.doesNotMatch(main, /\d+%|class="bar"/);
 assert.match(main, /data-usage-at="2026-09-13T12:00:00Z"/);
-assert.match(detailsOf(html, "codex", "work@x.com"), /usage unknown/);
+assert.match(detailsOf(html, "codex", "work@x.com"), /no reading yet/);
 assert.doesNotMatch(html, /25% left/); // Unknown readings stay unknown in the inline details too.
 });
 
@@ -153,7 +154,8 @@ test("missing usage is explicitly unknown in the roster and disclosures", () => 
 const html = buildHTML(state({ tools: { codex: { seats: [seat({ status: "active", usage_unknown: true,
  usage5h: null, usageWeek: null, usage: { windows: {} } })] } } }));
 assert.match(rosterOf(html), /class="fig">—</);
-assert.match(rosterOf(html), /usage unknown/);
+assert.match(rosterOf(html), /no reading yet/);
+assert.doesNotMatch(rosterOf(html), /unknown/);
 assert.doesNotMatch(rosterOf(html), /class="bar"|0%/);
 assert.doesNotMatch(html, /style="width:0%"/);
 assert.doesNotMatch(html, />0%<|>0% left</);
@@ -195,7 +197,7 @@ test("only the credential holder is on the floor; a parked terminal keeps its sw
 });
 
 test("parked terminals retain resting, queued, and sign-in signals beside the chip", () => {
-  for (const [status, signal] of [["resting", /until back/], ["queued", /limited/],
+  for (const [status, signal] of [["resting", /limited/], ["queued", /limited/],
     ["needs-login", /data-action="add"/]]) {
     const html = buildHTML(state({ tools: { codex: { seats: [seat({ status, in_session: true })] } } }));
     assert.match(html, /terminal attached/);
@@ -292,21 +294,21 @@ test("clock ticks update age and reset text without replacing the DOM", () => {
   assert.equal(terminal.textContent, " · 11d");
 });
 
-test("provider throttling is visible alongside retained usage", () => {
+test("provider throttling quietly retains usage", () => {
   const html = buildHTML(state({ tools: { claude: { seats: [seat({ usage_stale: true,
     usage: { error: "rate_limited" }, usage5h: 0, usageWeek: 65 })] } } }));
-  assert.match(html, /updates throttled; retrying automatically/);
+  assert.doesNotMatch(html, /updates throttled|class="issue /);
   assert.match(html, /35%/);
   assert.match(html, /waiting for first reading/);
 });
 
-test("expired Claude token asks for an app refresh without implying logout", () => {
+test("expired Claude access token stays quiet without implying logout", () => {
   const active = buildHTML(state({ tools: {
     codex: { seats: [] },
     claude: { seats: [seat({ status: "active", active: true,
       usage: { error: "token_expired" } })] },
   } }));
-  assert.match(active, /open Claude to refresh usage/);
+  assert.doesNotMatch(active, /open Claude to refresh usage|class="issue /);
   assert.doesNotMatch(active, />log in<|sign in to refresh|retrying automatically/);
 
   const resting = buildHTML(state({ tools: {
@@ -315,17 +317,17 @@ test("expired Claude token asks for an app refresh without implying logout", () 
       limited_until: "2026-09-13T18:57:00Z", usage: { error: "token_expired" } })] },
   } }));
   assert.match(resting, /until back/);
-  assert.doesNotMatch(resting, />log in<|usage refresh pending|sign in to refresh/);
+  assert.doesNotMatch(resting, />log in<|usage refresh pending|sign in to refresh|class="issue /);
 });
 
-test("expired Codex token names Codex without implying logout", () => {
+test("expired Codex token quietly awaits automatic recovery", () => {
   for (const active of [false, true]) {
     const html = buildHTML(state({ tools: {
       codex: { seats: [seat({ active, status: active ? "active" : "ready",
         usage: { error: "token_expired" } })] },
       claude: { seats: [] },
     } }));
-    assert.match(html, /open Codex to refresh usage/);
+    assert.doesNotMatch(html, /open Codex to refresh usage|class="issue /);
     assert.doesNotMatch(html, /open Claude|>log in<|sign in to refresh/);
   }
 });
@@ -333,7 +335,7 @@ test("expired Codex token names Codex without implying logout", () => {
 test("tool markers and written seat status do not rely on colour or emoji", () => {
 const html = buildHTML(state({ tools: { codex: { seats: [seat({ status: "resting" })] }, claude: { seats: [seat()] } } }));
 assert.match(html, /class="mark"/); assert.match(html, /class="mark mark--claude"/);
-assert.match(html, /limited/); assert.match(html, /until back/);
+assert.match(html, /class="fig fig--time">—<\/span><span class="fig-l">limited<\/span>/);
 assert.doesNotMatch(html, /🟢|🟡|🌸|🌿|💚/);
 });
 
@@ -1593,7 +1595,7 @@ const render = (over) => rosterHTML(state({ tools: { codex: { seats: [seat({ sta
 assert.match(render({ usage5h: 38, usageWeek: 21 }), /62<small>%[\s\S]*week 79%/);
 assert.match(render({ usage5h: 100, usageWeek: 0 }), /0<small>%[\s\S]*week 100%/);
 for (const over of [{ usage_unknown: true }, { usage5h: null, usageWeek: null }]) {
- assert.match(render(over), /usage unknown/); assert.doesNotMatch(render(over), /\d+%|class="bar"/);
+ assert.match(render(over), /no reading yet/); assert.doesNotMatch(render(over), /unknown|\d+%|class="bar"/);
 }
 const stale = render({ usage_stale: true });
 assert.equal((stale.match(/aria-label="last known:/g) || []).length, 2);
@@ -2322,22 +2324,19 @@ snapshot.pending_crossings = [{ tool: "claude", to: "client@x" }];
 assert.match(next(), /needs approval/);
 });
 
-test("stale, throttled and unknown problems stay inline; limited resets stay in their column", () => {
-  for (const [over, message] of [
-    [{ usage_stale: true, usage_fetched_at: inHours(-1) }, /last known reading;.*updated 1h ago/],
-    [{ usage_stale: true, usage: { error: "rate_limited" } }, /updates throttled; retrying automatically/],
-    [{ usage_unknown: true }, /usage unknown;.*waiting for first reading/],
+test("stale, throttled and unknown readings stay quiet; limited resets stay in their column", () => {
+  for (const over of [
+    { usage_stale: true, usage_fetched_at: inHours(-1) },
+    { usage_stale: true, usage: { error: "rate_limited" } },
+    { usage_unknown: true },
   ]) {
-    const row = rowOf(buildHTML(claudeState(seat(over))), "work@x.com");
-    if (over.usage_stale && !over.usage?.error) {
-      assert.match(detailsOf(buildHTML(claudeState(seat(over))), "claude", "work@x.com"), message);
-      assert.doesNotMatch(row, /class="issue /);
-      assert.match(row, /~80% left/);
-    } else {
-      assert.match(row, /class="issue issue--soft"/);
-      assert.match(row, message);
+    const html = buildHTML(claudeState(seat(over)));
+    assert.doesNotMatch(html, /class="issue |checking usage|retrying automatically/);
+    if (over.usage_stale) {
+      assert.match(detailsOf(html, "claude", "work@x.com"), /last known reading/);
+      assert.match(rowOf(html, "work@x.com"), /~80% left/);
     }
-    assert.doesNotMatch(row, /back in now|resets in now/);
+    assert.doesNotMatch(rowOf(html, "work@x.com"), /back in now|resets in now/);
   }
   const row = rowOf(buildHTML(claudeState(seat({ limited: true, status: "resting", limited_until: inHours(-1) }))), "work@x.com");
   assert.match(row, /data-past-text="resetting…"[^>]*>resetting…<\/span>/);
@@ -2657,7 +2656,7 @@ test("header chip answers needs you, all limited, renew soon and all good in pri
   all.pending_key_switches[0].expires_at = inHours(-1);
   assert.match(headerVerdict(all), /2 needs you/);
   assert.equal(headerVerdict(state()), "");
-  for (const flag of ["usage_stale", "usage_unknown"]) assert.match(headerVerdict(claudeState(seat({ [flag]: true }))), /checking usage/);
+  for (const flag of ["usage_stale", "usage_unknown"]) assert.doesNotMatch(headerVerdict(claudeState(seat({ [flag]: true }))), /checking usage/);
   assert.doesNotMatch(buildHTML(healthy).split('<div class="body"')[0], /<h1|<h2/);
 });
 
@@ -2716,7 +2715,9 @@ test("seat identity shows kind and plan and disambiguates duplicate names per to
   const distinctTools = rosterHTML(state({ tools: { codex: { seats: [seats[0]] }, claude: { seats: [seats[1]] } } }));
   assert.doesNotMatch(distinctTools, /· gmail|· icloud/);
   assert.equal(seatIdentity(seat({ name: "client", kind: "business", plan: "team" })), "client · business · team");
-  assert.equal(seatIdentity(seat({ name: "work", kind: undefined, plan: null })), "work · kind unknown · plan unknown");
+  // Unknown kind or an unrecognised plan is left out, never shown as "unknown".
+  assert.equal(seatIdentity(seat({ name: "work", kind: undefined, plan: null })), "work");
+  assert.equal(seatIdentity(seat({ name: "client", kind: "business", plan: "Self_Serve_Business_Prolite" })), "client · business");
   assert.match(css, /\.seat-identity \{[^}]*text-overflow:ellipsis; white-space:nowrap/);
   assert.match(css, /\.seat-metadata \{[^}]*flex:none;[^}]*font-weight:400;[^}]*white-space:nowrap/);
 });
@@ -3127,4 +3128,77 @@ test("reduceReply flashes each update_check outcome without a raw error", () => 
   assert.equal(flashFor({ ok: false, error: "timed out" }, { ok: false, error: "timed out" }), "couldn't check for updates");
   assert.equal(flashFor({ ok: true, up_to_date: false, version: null, error: null }), "couldn't check for updates");
   assert.equal(flashFor({ ok: true, up_to_date: true }, { background: true }), null);
+});
+
+
+for (const tool of ["codex", "claude"]) {
+  for (const error of ["network", "rate_limited", "tls", "internal", "parse", "http_503"]) {
+    test(`${tool} ${error} quietly preserves stale figures and accessible provenance`, () => {
+      const html = buildHTML(state({ tools: { [tool]: { seats: [seat({ status: "active",
+        active: true, usage_stale: true, usage_fetched_at: inHours(-1), usage: { error },
+      })] } } }));
+      assert.doesNotMatch(html, /class="issue |checking usage|retrying automatically/);
+      assert.match(html, /~80<small>%/);
+      assert.match(html, /week ~90%/);
+      assert.match(detailsOf(html, tool, "work@x.com"), /last known reading;.*updated 1h ago/);
+    });
+  }
+}
+
+test("unknown figures remain dashes without an attention row", () => {
+  const html = buildHTML(claudeState(seat({ status: "active", usage_unknown: true,
+    usage5h: null, usageWeek: null })));
+  assert.match(html, /class="fig">—</);
+  assert.doesNotMatch(html, /class="issue |checking usage/);
+});
+
+test("a soft engine notice is calm and not counted; hard and severity-less warnings still need you", () => {
+  const base = state({ tools: { codex: { seats: [seat({ status: "active" })] } } });
+  const soft = { kind: "sessions", severity: "soft", text: "A Claude terminal on b@x.com (started 19:23 in ~/Work/now) runs engine 1.6.1." };
+  const banner = engineBanner({ ...base, engine_warnings: [soft] });
+  assert.match(banner, /class="issue issue--soft app-problem engine-problem" role="status"/);
+  assert.match(banner, /started 19:23 in ~\/Work\/now/);
+  assert.doesNotMatch(banner, /issue--hard|role="alert"/);
+  assert.doesNotMatch(headerVerdict({ ...base, engine_warnings: [soft] }), /needs you/);
+  for (const hard of [{ ...soft, severity: "hard" }, { text: soft.text }]) {
+    assert.match(engineBanner({ ...base, engine_warnings: [hard] }), /issue--hard app-problem engine-problem" role="alert"/);
+    assert.match(headerVerdict({ ...base, engine_warnings: [hard, soft] }), /1 needs you/);
+  }
+});
+
+test("a seat with no reading leaves no dangling separators or unknown labels", () => {
+  const html = buildHTML(state({ tools: { codex: { seats: [
+    seat({ status: "active", kind: undefined, plan: "Self_Serve_Business_Prolite", usage5h: null, usageWeek: null, usage: { windows: {} } }),
+    seat({ name: "next one", email: "n@x.com", kind: "business", plan: "team", usage5h: null, usageWeek: null, usage: { windows: {} } }),
+    seat({ name: "third one", email: "third@x.com", kind: undefined, plan: undefined, usage5h: null, usageWeek: null, usage: { windows: {} } }),
+  ] } } }));
+  const visible = visibleMarkup(rosterOf(html));
+  assert.doesNotMatch(visible, /unknown/);
+  assert.doesNotMatch(visible, /<span> · |· <\/span>|, <\/span>|, \(needs approval\)/);
+  assert.match(visible, /class="then"><b>then<\/b> next one · business · team <span class="muted">\(needs approval\)/);
+  assert.match(visible, /<span class="state"><span class="state--strong">next<\/span><\/span>/);
+  // A row without state text must not pull its action out of the last column.
+  assert.match(css, /\.row > \.row-action \{ grid-column:4; \}/);
+  assert.doesNotMatch(visible, /<span(?: class="(?:seat-metadata|state)"[^>]*)?>\s*<\/span>|<div class="meta">\s*<\/div>/);
+  assert.doesNotMatch(rowOf(html, "third@x.com"), /class="state"|class="seat-metadata"/);
+});
+
+test("limited seats without a usable reset show no time and keep their limited status", () => {
+  for (const status of ["resting", "queued", "active"]) {
+    for (const limited_until of [null, "invalid"]) {
+      for (const usage_stale of [false, true]) {
+        const limited = seat({ status, limited: true, limited_until, usage_stale });
+        const html = buildHTML(state({ tools: { codex: { seats: [limited] } } }));
+        const answer = visibleMarkup(answerOf(html));
+        assert.match(answer, /class="fig fig--time">—<\/span><span class="fig-l">limited<\/span>/);
+        assert.doesNotMatch(answer, /unknown|until back|data-reset-at|approximate, last known reading/);
+        const roster = buildHTML(state({ tools: { codex: { seats: [
+          seat({ active: true, status: "active", email: "active@x.com" }),
+          { ...limited, status: status === "active" ? "resting" : status },
+        ] } } }));
+        assert.match(rowOf(roster, limited.email), /class="state">limited<\/span>/);
+        assert.doesNotMatch(visibleMarkup(rosterOf(roster)), /unknown|back in|until back|limited,\s*</);
+      }
+    }
+  }
 });

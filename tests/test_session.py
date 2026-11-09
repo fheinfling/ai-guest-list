@@ -241,6 +241,33 @@ def test_mark_session_stamps_the_supervising_engine(ctx):
     assert session.stale_engines(ctx.data_dir) == []
 
 
+def test_heartbeat_records_cwd_and_tty_and_passes_them_to_drift(ctx, monkeypatch, tmp_path):
+    import json
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(session.os, "ttyname", lambda fd: "/dev/ttys042")
+    monkeypatch.setattr(session, "__version__", "1.6.1")
+    session.mark_session(ctx.data_dir, "claude", "business@x.com")
+    raw = json.loads(_path(ctx, "claude").read_text())
+    record = session.active_session(ctx.data_dir, "claude")
+    stale, = session.stale_engines(ctx.data_dir)
+    for data in [raw, record, stale]:
+        assert data["cwd"] == str(tmp_path)
+        assert data["tty"] == "/dev/ttys042"
+        assert data["email"] == "business@x.com"
+        assert data["started_at"] == raw["started_at"]
+
+
+def test_heartbeat_survives_unavailable_cwd_and_tty(ctx, monkeypatch):
+    def unavailable(*args):
+        raise OSError("no terminal or directory")
+    monkeypatch.setattr(session.os, "getcwd", unavailable)
+    monkeypatch.setattr(session.os, "ttyname", unavailable)
+    session.mark_session(ctx.data_dir, "claude", "a@x.com")
+    record = session.active_session(ctx.data_dir, "claude")
+    assert record["email"] == "a@x.com"
+    assert "cwd" not in record and "tty" not in record
+
+
 def test_stale_engines_finds_older_and_pre_stamp_supervisors(ctx, monkeypatch):
     from acctsw import __version__
     monkeypatch.setattr(session, "_alive", lambda pid: True)
@@ -254,8 +281,10 @@ def test_stale_engines_finds_older_and_pre_stamp_supervisors(ctx, monkeypatch):
                {**base, "pid": 103, "engine": __version__,
                 "capabilities": list(session.CAPABILITIES)})
     stale = sorted(session.stale_engines(ctx.data_dir), key=lambda s: s["pid"])
-    assert stale == [{"tool": "claude", "pid": 101, "engine": None, "self_restart": False},
-                     {"tool": "claude", "pid": 102, "engine": "1.3.0", "self_restart": False}]
+    where = {"email": "a@x.com", "started_at": "2026-10-01"}
+    assert stale == [{"tool": "claude", "pid": 101, "engine": None, "self_restart": False, **where},
+                     {"tool": "claude", "pid": 102, "engine": "1.3.0", "self_restart": False,
+                      **where}]
     # Callers that already read the sessions pass them in instead of re-running ps.
     assert session.stale_engines(ctx.data_dir, {"claude": [], "codex": []}) == []
 
@@ -270,3 +299,14 @@ def test_stale_engines_report_which_sessions_will_restart_themselves(ctx, monkey
                {**base, "pid": 102, "engine": "1.3.0", "self_restart": "yes"})
     stale = sorted(session.stale_engines(ctx.data_dir), key=lambda s: s["pid"])
     assert [s["self_restart"] for s in stale] == [True, False]
+
+
+@pytest.mark.parametrize("tty_fd", [0, 1, 2])
+def test_heartbeat_finds_the_terminal_on_any_standard_stream(ctx, monkeypatch, tty_fd):
+    def ttyname(fd):
+        if fd != tty_fd:
+            raise OSError("not a terminal")
+        return f"/dev/ttys00{fd}"
+    monkeypatch.setattr(session.os, "ttyname", ttyname)
+    session.mark_session(ctx.data_dir, "codex", "a@x.com")
+    assert session.active_session(ctx.data_dir, "codex")["tty"] == f"/dev/ttys00{tty_fd}"

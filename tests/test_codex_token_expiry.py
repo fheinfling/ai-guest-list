@@ -8,8 +8,8 @@ import pytest
 
 from acctsw import accounts, codexhome, session, usage
 from acctsw.util import iso, now
-from tests.conftest import make_codex_blob
-from tests.test_usage import codex_ok_body
+from tests.conftest import make_claude_blob, make_codex_blob
+from tests.test_usage import claude_ok_body, codex_ok_body
 
 
 def _jwt(claims):
@@ -457,3 +457,222 @@ def test_active_expired_codex_without_refresh_still_prompts_login(ctx):
     assert result["codex"][email] == "unauthorized"
     seat = ctx.load_state().get_seat("codex", email)
     assert accounts._seat_view(seat, active=True, at=now())["needs_login"] is True
+
+
+@pytest.mark.parametrize("mirror", ["other", "missing"])
+def test_active_snapshot_only_seat_recovers_and_commits_usage(ctx, monkeypatch, parked_seat, mirror):
+    email = parked_seat
+    state = ctx.load_state()
+    state.set_active("codex", email)
+    state.save()
+    # The fixture verifies every write stays private and the shared mirror remains untouched.
+    if mirror == "missing":
+        monkeypatch.setattr(ctx.cred["codex"], "get_live", lambda **kw: None)
+    posted = []
+
+    def post(*args):
+        posted.append(True)
+        return _renewal_response()
+
+    def get(url, headers, timeout):
+        renewed = ctx.snapshot_get("codex", email)
+        assert usage._codex_refresh_token(renewed) == "renewed-refresh"
+        assert headers["Authorization"] == "Bearer " + json.loads(renewed)["tokens"]["access_token"]
+        return 200, codex_ok_body()
+
+    result = usage.refresh_live(ctx, "codex", active_only=True, post=post, get=get)
+    assert result["codex"][email] == "ok"
+    assert posted == [True]
+    seat = ctx.load_state().get_seat("codex", email)
+    assert seat["usage"]["ok"] is True
+    assert seat["usage"]["error_streak"] == 0
+    assert seat["usage"]["credential_digest"] == usage._credential_digest(ctx.snapshot_get("codex", email))
+    assert not seat.get("auth_error")
+
+
+@pytest.mark.parametrize("selected", [False, True])
+@pytest.mark.parametrize("owner", ["live", "live_case", "session"])
+def test_recovery_follows_ownership_even_when_selected_flag_disagrees(ctx, monkeypatch, selected, owner):
+    email = "person@example.test"
+    blob = _blob(1)
+    state = ctx.load_state()
+    state.upsert_seat("codex", email)
+    state.set_active("codex", email if selected else None)
+    ctx.snapshot_set("codex", email, blob)
+    mirror = (blob if owner == "live" else make_codex_blob(
+        email.upper() if owner == "live_case" else "other@example.test"))
+    ctx.cred["codex"].set_live(mirror)
+    state.save()
+    monkeypatch.setattr(session, "active_session", lambda *a, **kw:
+                        {"email": email} if owner == "session" else None)
+
+    def no_post(*args):
+        pytest.fail("a live mirror or supervised session owns this refresh token")
+
+    result = usage.refresh_live(ctx, "codex", post=no_post, get=lambda *_: (401, "{}"))
+    assert result["codex"][email] == "token_expired"
+    assert ctx.snapshot_get("codex", email) == blob
+
+
+@pytest.mark.parametrize("case", ["claude", "unexpired", "no_refresh", "not_due", "session"])
+def test_ineligible_recovery_never_posts(ctx, monkeypatch, case):
+    email = "person@example.test"
+    tool = "claude" if case == "claude" else "codex"
+    blob = (make_claude_blob() if tool == "claude" else _blob(
+        now().timestamp() + 3600 if case == "unexpired" else 1,
+        refresh=None if case == "no_refresh" else "refresh-credential"))
+    state = ctx.load_state()
+    state.upsert_seat(tool, email)
+    state.set_active(tool, None)
+    ctx.snapshot_set(tool, email, blob)
+    if tool == "claude":
+        ctx.claude_home(email).mkdir(parents=True, exist_ok=True)
+        ctx.claude_cred(email).set_live(blob)
+    else:
+        ctx.cred[tool].set_live(make_codex_blob("other@example.test"))
+    if case == "not_due":
+        usage.store_fetch(state, tool, email, usage.Usage(ok=True, fetched_at=iso(now())),
+                          blob=blob)
+    state.save()
+    monkeypatch.setattr(session, "active_session", lambda *a, **kw:
+                        {"email": email} if case == "session" else None)
+
+    def no_post(*args):
+        pytest.fail(f"refresh POST is forbidden for {case}")
+
+    gets = []
+
+    def get(*args):
+        gets.append(True)
+        return 200, claude_ok_body() if tool == "claude" else codex_ok_body()
+
+    # Force makes even a recently polled seat eligible for GET, but must never bypass the
+    # independent refresh-token cadence. Every case therefore reaches job eligibility.
+    result = usage.refresh_live(ctx, tool, force=True, post=no_post, get=get, user_agent="test")
+    assert result[tool][email] == "ok"
+    assert gets == [True]
+    assert ctx.snapshot_get(tool, email) == blob
+    assert not ctx.load_state().get_seat(tool, email).get("auth_error")
+
+
+@pytest.mark.parametrize("error", ["token_expired", "network"])
+def test_active_usage_due_does_not_shorten_recovery_backoff(ctx, monkeypatch, parked_seat, error):
+    email = parked_seat
+    before = ctx.snapshot_get("codex", email)
+    at = now()
+    monkeypatch.setattr(usage, "now", lambda: at)
+    monkeypatch.setattr(session, "active_session", lambda *a, **kw: None)
+    state = ctx.load_state()
+    state.set_active("codex", email)
+    previous = {"ok": False, "error": error, "error_streak": 4,
+                "last_attempted_at": iso(at - timedelta(minutes=6))}
+    state.get_seat("codex", email)["usage"] = previous
+    state.save()
+    # Active usage errors retry within five minutes, while token recovery retains the
+    # gentler parked-seat backoff (forty minutes for this streak), even under force.
+    assert usage._due(previous, at, usage.USAGE_MIN_REFRESH_SECONDS, active=True)
+    assert not usage._due(previous, at, usage.USAGE_MIN_REFRESH_SECONDS, active=False)
+
+    def no_post(*args):
+        pytest.fail("the active GET cadence must not shorten refresh-token backoff")
+
+    result = usage.refresh_live(ctx, "codex", force=True, post=no_post, get=lambda *_: (401, "{}"))
+    assert result["codex"][email] == "token_expired"
+    assert ctx.snapshot_get("codex", email) == before
+    stored = ctx.load_state().get_seat("codex", email)["usage"]
+    assert stored["error_streak"] == 5
+
+
+@pytest.mark.parametrize("change, expected", [
+    ("login", "stale"), ("keychain", "unreadable"), ("disk", "unreadable"),
+])
+def test_recovery_saves_spent_token_but_drops_usage_after_mirror_changes(
+        ctx, monkeypatch, parked_seat, change, expected):
+    email = parked_seat
+    before = ctx.snapshot_get("codex", email)
+    state_before = ctx.state_file.read_bytes()
+    real_get_live = ctx.cred["codex"].get_live
+    posted = []
+
+    def mirror(**kwargs):
+        if not posted:
+            return real_get_live(**kwargs)
+        if change == "login":
+            return before
+        error = usage.KeychainError if change == "keychain" else OSError
+        raise error("mirror unreadable after POST")
+
+    def post(url, payload, timeout):
+        assert payload["refresh_token"] == "refresh-credential"
+        posted.append(True)
+        return _renewal_response()
+
+    def no_get(*args):
+        pytest.fail("a changed or unreadable mirror must block the usage result")
+
+    monkeypatch.setattr(ctx.cred["codex"], "get_live", mirror)
+    result = usage.refresh_live(ctx, "codex", post=post, get=no_get)
+    assert result["codex"][email] == expected
+    assert posted == [True]
+    saved = ctx.snapshot_get("codex", email)
+    assert saved != before
+    assert usage._codex_refresh_token(saved) == "renewed-refresh"
+    assert not usage._codex_access_token_expired(saved)
+    assert (ctx.codex_home(email) / "auth.json").read_text() == saved
+    assert ctx.state_file.read_bytes() == state_before
+
+
+@pytest.mark.parametrize("error_type", [usage.KeychainError, OSError])
+def test_unreadable_mirror_propagates_and_blocks_recovery(ctx, monkeypatch, parked_seat, error_type):
+    email = parked_seat
+    before = ctx.snapshot_get("codex", email)
+    state_before = ctx.state_file.read_bytes()
+    failure = error_type("fake-token-in-unreadable-mirror-diagnostic")
+
+    def mirror(*, strict=False):
+        if strict:
+            raise failure
+        return None  # A lenient reader must not turn an unreadable mirror into absence.
+
+    def forbidden(*args):
+        pytest.fail("an unreadable mirror must block refresh POST and usage GET")
+
+    monkeypatch.setattr(ctx.cred["codex"], "get_live", mirror)
+    with pytest.raises(error_type) as caught:
+        usage._codex_mirror_matches(ctx, email)
+    assert caught.value is failure
+    result = usage.refresh_live(ctx, "codex", post=forbidden, get=forbidden)
+    assert result["codex"][email] == "unreadable"
+    assert ctx.snapshot_get("codex", email) == before
+    assert ctx.state_file.read_bytes() == state_before
+
+
+def test_token_expiring_between_preparation_and_eligibility_can_recover(ctx, monkeypatch, parked_seat):
+    email = parked_seat
+    at = now()
+    clock = at
+    ctx.snapshot_set("codex", email, _blob(at.timestamp() + 1))
+    monkeypatch.setattr(usage, "now", lambda: clock)
+    monkeypatch.setattr(session, "active_session", lambda *a, **kw: None)
+    real_locked = ctx.locked
+
+    @contextmanager
+    def locked():
+        nonlocal clock
+        # The first lock follows the preparation/session-probe pass, when this token was
+        # still valid and had no entry in running_codex. It is expired at eligibility.
+        clock = at + timedelta(seconds=2)
+        with real_locked():
+            yield
+
+    posted = []
+
+    def post(*args):
+        posted.append(True)
+        return _renewal_response()
+
+    monkeypatch.setattr(ctx, "locked", locked)
+    result = usage.refresh_live(ctx, "codex", post=post, get=lambda *_: (200, codex_ok_body()))
+    assert result["codex"][email] == "ok"
+    assert posted == [True]
+    assert usage._codex_refresh_token(ctx.snapshot_get("codex", email)) == "renewed-refresh"

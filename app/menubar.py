@@ -59,6 +59,7 @@ except ImportError:  # allows importing this module's pure helpers without pyobj
 
 from acctsw import TOOLS, appalive, bridge, session
 from acctsw.context import Context, hydrate_path
+from acctsw.procenv import harden_env, shed_seat_env
 from acctsw.util import now, parse_iso
 
 
@@ -80,6 +81,35 @@ def _log_exception(exc: BaseException, secret: str = "") -> None:
         if exc is not None:
             lines.append("Caused by / during handling of:\n")
     print(bridge._redact_key("".join(lines), secret), file=sys.stderr, end="")
+
+def spawn_update_helper(argv, log):
+    """A detached update/reopen must never perpetuate a supervised seat's proxy or CA."""
+    env = harden_env()
+    shed_seat_env(env)
+    return subprocess.Popen(argv, start_new_session=True, close_fds=True,
+                            stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=env)
+
+
+def engine_warning_toast(w, remembered):
+    """Return whether to toast a drift warning and the new identities to remember.
+
+    Only "needs you" (hard) warnings toast; a soft notice lives in the popover alone. Text is not
+    the identity: a session notice names a start time that moves with every hop, so it is keyed
+    on its unsafe terminals individually. A warning without ``severity`` or ``notify_ids`` keeps
+    the older bridge's hard, text-keyed behavior. This helper leaves ``remembered`` unchanged.
+    """
+    if not isinstance(w, dict) or not isinstance(w.get("text"), str) or not w["text"]:
+        return False, set()
+    if w.get("severity", "hard") != "hard":
+        return False, set()
+    notify_ids = w.get("notify_ids")
+    if w.get("kind") == "sessions" and isinstance(notify_ids, list):
+        ids = {("sessions", identity) for identity in notify_ids if isinstance(identity, str) and identity}
+    else:
+        ids = {(w.get("kind"), w["text"])}
+    new_ids = ids - remembered
+    return bool(new_ids), new_ids
+
 
 def popover_height(value):
     """Validate the web content height; keep native geometry finite and bounded."""
@@ -821,9 +851,10 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
             shares this app's store and can sign every session out, so it must not wait for the
             popover to be opened; the persistent banner (render.mjs engineBanner) carries the fix."""
             for w in ((result.get("state") or {}).get("engine_warnings") or []):
-                text = w.get("text") if isinstance(w, dict) else None
-                if text and text not in self._engineWarned:
-                    self._engineWarned.add(text)
+                should_notify, new_ids = engine_warning_toast(w, self._engineWarned)
+                if should_notify:
+                    self._engineWarned.update(new_ids)
+                    text = w["text"]
                     self._notify("heads up — terminals run an older engine"
                                  if w.get("kind") != "app" else "AI Guest List is out of date", text)
 
@@ -1031,8 +1062,7 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
                 # The helper outlives this process: keep what it says, or a failed restore is silent.
                 log = open(data_dir / "update-helper.log", "ab")
                 try:
-                    subprocess.Popen(argv, start_new_session=True, close_fds=True,
-                                     stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+                    spawn_update_helper(argv, log)
                 finally:
                     log.close()
                 quitting = True
@@ -1150,6 +1180,7 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
 
 
 def main() -> int:
+    shed_seat_env(os.environ)
     if objc is None:
         print("pyobjc not installed; run `pip install '.[app]'`", file=sys.stderr)
         return 1

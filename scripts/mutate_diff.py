@@ -39,8 +39,11 @@ KNOWN_BASELINE = Path("/tmp/claude-501/sandbox-baseline-failures.txt")
 TEST_MAP: dict[str, list[str]] = {
     "launcher": ["tests/test_launcher_inplace.py", "tests/test_inplace_integration.py",
                  "tests/test_launcher.py"],
-    "seatswap": ["tests/test_seatswap.py", "tests/test_inplace_integration.py"],
-    "usage": ["tests/test_signin.py", "tests/test_usage.py", "tests/test_claude_live_item.py"],
+    "seatswap": ["tests/test_seatswap.py", "tests/test_inplace_integration.py",
+                 "tests/test_seat_env.py"],
+    "procenv": ["tests/test_seat_env.py"],
+    "usage": ["tests/test_signin.py", "tests/test_usage.py", "tests/test_claude_live_item.py",
+              "tests/test_codex_token_expiry.py"],
     "accounts": ["tests/test_signin.py", "tests/test_usage.py", "tests/test_claude_live_item.py"],
     "keychain": ["tests/test_signin.py", "tests/test_usage.py", "tests/test_claude_live_item.py"],
     "selection": ["tests/test_selection.py", "tests/test_seatkind.py"],

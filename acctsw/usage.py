@@ -21,7 +21,10 @@ from __future__ import annotations
 import json
 import hashlib
 import shutil
+import ssl
 import subprocess
+import sys
+import traceback
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -120,12 +123,13 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class HttpReply(tuple):
-    """Two-value transport result with only a parsed, non-sensitive retry delay attached."""
-    def __new__(cls, status, body, headers):
+    """Two-value transport result with a safe error kind and parsed retry delay attached."""
+    def __new__(cls, status, body, headers, *, error=None):
         import math
         import time
         from email.utils import parsedate_to_datetime
         reply = super().__new__(cls, (status, body))
+        reply.error = error
         reply.retry_after = None
         value = headers.get('Retry-After') if headers else None
         if value is not None:
@@ -156,8 +160,14 @@ def _default_get(url: str, headers: dict, timeout: float) -> tuple[int, str]:
         except Exception:
             pass
         return HttpReply(e.code, body, e.headers)
-    except (urllib.error.URLError, OSError, TimeoutError):
-        return 0, ""  # network failure
+    except ssl.SSLError:
+        return HttpReply(0, "", None, error="tls")
+    except urllib.error.URLError as e:
+        if isinstance(e.reason, ssl.SSLError):
+            return HttpReply(0, "", None, error="tls")
+        return HttpReply(0, "", None)
+    except (OSError, TimeoutError):
+        return HttpReply(0, "", None)  # network failure
 
 
 # --- token extraction -------------------------------------------------------------------------
@@ -734,8 +744,9 @@ def fetch_codex(token: str | None, account_id: str | None, *,
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
     if account_id:
         headers[P.CODEX_ACCOUNT_ID_HEADER] = account_id
-    status, body = get(P.CODEX_USAGE_URL, headers, timeout)
-    err = _classify(status)
+    reply = get(P.CODEX_USAGE_URL, headers, timeout)
+    status, body = reply
+    err = getattr(reply, "error", None) or _classify(status)
     if err:
         u.error = err
         return u
@@ -777,8 +788,9 @@ def fetch_claude(token: str | None, *, user_agent: str | None = None,
         "User-Agent": user_agent or claude_user_agent(),
         "Accept": "application/json",
     }
-    status, body = get(P.CLAUDE_USAGE_URL, headers, timeout)
-    err = _classify(status)
+    reply = get(P.CLAUDE_USAGE_URL, headers, timeout)
+    status, body = reply
+    err = getattr(reply, "error", None) or _classify(status)
     if err:
         u.error = err
         return u
@@ -954,11 +966,11 @@ def refresh(ctx, state, tool: str | None = None, *, only: str | None = None,
                 continue
             else:
                 u = _fetch_for(t, login, get, ua)
-            # NOTE (KR-B2): Codex's refresh tokens are single-use; rotating the active auth.json
-            # can invalidate Codex's own session, so active seats remain observers. Parked seats
-            # differ: no child renews their expired token, leaving usage too stale for handoff.
+            # NOTE (KR-B2): Codex's refresh tokens are single-use; rotating a login held by the
+            # shared mirror or a supervised session can invalidate Codex's own session. Snapshot-
+            # only seats have no tool renewing their expired token, even when marked active.
             # Only refresh_live recovers them: expiry + refresh-token checks prove renewal is
-            # possible, existing backoff limits retries, and session/incarnation/active checks
+            # possible, existing backoff limits retries, and session/mirror/incarnation checks
             # avoid applying usage to a seat now owned by a child or a different login. Its token CAS
             # preserves a newer refresh credential; comparing the sent refresh token on failure
             # prevents a lost race from being called revocation. This accepts, rather than closes,
@@ -1003,18 +1015,39 @@ def _detached_blob(ctx, state, tool: str, email: str, *, active: bool,
     return live if live == snapshot else None
 
 
+def _log_fetch_exception(exc: BaseException) -> None:
+    """Keep exception types and frame locations, never messages, source lines or locals.
+
+    Like the native shell's logger, walk exception chains without formatting provider bodies
+    (which can contain credentials). Do not use traceback.print_exception/format_exc here.
+    """
+    lines = ["Traceback (most recent call last):\n"]
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        for frame, lineno in traceback.walk_tb(exc.__traceback__):
+            lines.append(f'  File "{frame.f_code.co_filename}", line {lineno}, '
+                         f'in {frame.f_code.co_name}\n')
+        lines.append(f"{type(exc).__name__}\n")
+        exc = exc.__cause__ or (None if exc.__suppress_context__ else exc.__context__)
+        if exc is not None:
+            lines.append("Caused by / during handling of:\n")
+    print("".join(lines), file=sys.stderr, end="")
+
+
 def _fetch_job(job: UsageFetchJob, get: HttpGet) -> UsageFetchResult:
     attempted_at = iso(now())
     if job.signin is not None and job.signin.signed_out:
         return UsageFetchResult(job, Usage(error="no_token", fetched_at=attempted_at))
     try:
         fetched = _fetch_for(job.tool, job.blob, get, job.user_agent)
-    except Exception:
+    except Exception as exc:
         # A custom transport may raise even though the stdlib transport normally classifies errors.
         # Background polling must still release its in-flight gate and record a retryable failure.
         # Order failures by request start, like successful fetches. A late exception must not
         # overwrite a successful response from a request that started while this one was pending.
-        fetched = Usage(error="network", fetched_at=attempted_at)
+        _log_fetch_exception(exc)
+        fetched = Usage(error="internal", fetched_at=attempted_at)
     return UsageFetchResult(job, fetched)
 
 
@@ -1075,6 +1108,14 @@ def _codex_refresh_token(blob: str | None) -> str | None:
     return token if isinstance(token, str) and token else None
 
 
+def _codex_mirror_matches(ctx, email: str) -> bool:
+    """A stock Codex may rotate any login in the shared mirror, regardless of our active flag."""
+    from .credlocations import codex_jwt_matches
+
+    live = ctx.cred["codex"].get_live(strict=True)
+    return bool(live and codex_jwt_matches(email, live))
+
+
 def _recover_parked_codex(ctx, job: UsageFetchJob, *, post,
                           min_seconds: int) -> tuple[UsageFetchJob | None, str | None]:
     """Spend outside the flock, then CAS the private snapshot; never write the shared mirror.
@@ -1113,10 +1154,15 @@ def _recover_parked_codex(ctx, job: UsageFetchJob, *, post,
                 return job, None
         is_active = state.active("codex") == job.email
         running = session.active_session(ctx.data_dir, "codex", email=job.email)
-        if (seat is None or seat.get("added_at") != job.added_at or is_active
+        if (seat is None or seat.get("added_at") != job.added_at or is_active != job.active
                 or running is not None):
             # Credential rotation is saved above, but this request no longer owns the usage result.
             return None, "stale"
+        try:
+            if _codex_mirror_matches(ctx, job.email):
+                return None, "stale"
+        except UNREADABLE:
+            return None, "unreadable"
         if _credential_digest(current_blob) != job.credential_digest:
             return None, "refresh_raced"
         if not _due(seat.get("usage"), now(), min_seconds, active=False):
@@ -1211,7 +1257,7 @@ def refresh_live(ctx, tool: str | None = None, *, only: str | None = None,
     # this is only an eligibility hint, and recovery rechecks ownership after its POST.
     running_codex = {
         job.email: session.active_session(ctx.data_dir, "codex", email=job.email) is not None
-        for job in prepared if job.tool == "codex" and not job.active
+        for job in prepared if job.tool == "codex"
         and _codex_access_token_expired(job.blob)
     }
 
@@ -1236,37 +1282,52 @@ def refresh_live(ctx, tool: str | None = None, *, only: str | None = None,
                                                                active=is_active):
                 summary[job.tool][job.email] = "cached"
                 continue
+            recover_codex = False
+            if (job.tool == "codex" and _codex_access_token_expired(job.blob)
+                    and bool(_codex_refresh_token(job.blob))
+                    and _due(previous, checked_at, min_seconds, active=False)
+                    and not running_codex.get(job.email, False)):
+                try:
+                    # These Codex reads are local files, safe under the short lock. The job must
+                    # still hold exactly the private snapshot, and no stock tool may own it.
+                    recover_codex = (
+                        ctx.snapshot_get("codex", job.email, strict=True) == job.blob
+                        and not _codex_mirror_matches(ctx, job.email))
+                except UNREADABLE:
+                    summary[job.tool][job.email] = "unreadable"
+                    continue
             eligible.append(UsageFetchJob(
                 tool=job.tool, email=job.email, blob=job.blob,
                 credential_digest=job.credential_digest, added_at=job.added_at,
                 active=is_active, user_agent=job.user_agent,
                 signin=job.signin, signin_digest=job.signin_digest,
-                recover_codex=(job.tool == "codex" and not is_active and not job.active
-                               and _codex_access_token_expired(job.blob)
-                               and bool(_codex_refresh_token(job.blob))
-                               and _due(previous, checked_at, min_seconds, active=False)
-                               and not running_codex.get(job.email, False)),
+                recover_codex=recover_codex,
             ))
+
+    def fetch(job: UsageFetchJob) -> UsageFetchResult | str:
+        if job.recover_codex:
+            recovered, skipped = _recover_parked_codex(ctx, job, post=post,
+                                                      min_seconds=min_seconds)
+            if recovered is None:
+                return skipped or "stale"
+            job = recovered
+        return _fetch_job(job, get)
 
     active_jobs = [job for job in eligible if job.active]
     parked_jobs = [job for job in eligible if not job.active]
     if active_jobs:
         with ThreadPoolExecutor(max_workers=len(active_jobs),
                                 thread_name_prefix="acctsw-usage") as pool:
-            futures = {pool.submit(_fetch_job, job, get): job for job in active_jobs}
+            futures = {pool.submit(fetch, job): job for job in active_jobs}
             for future in as_completed(futures):
                 result = future.result()
-                summary[result.job.tool][result.job.email] = _commit_fetch_result(ctx, result)
+                job = futures[future]
+                summary[job.tool][job.email] = (result if isinstance(result, str)
+                                               else _commit_fetch_result(ctx, result))
     for job in parked_jobs:
-        if job.recover_codex:
-            recovered, skipped = _recover_parked_codex(ctx, job, post=post,
-                                                      min_seconds=min_seconds)
-            if recovered is None:
-                summary[job.tool][job.email] = skipped
-                continue
-            job = recovered
-        result = _fetch_job(job, get)
-        summary[job.tool][job.email] = _commit_fetch_result(ctx, result)
+        result = fetch(job)
+        summary[job.tool][job.email] = (result if isinstance(result, str)
+                                       else _commit_fetch_result(ctx, result))
     return summary
 
 

@@ -242,8 +242,10 @@ function supervisionBanner(state) {
 }
 
 // Older terminal engines share this app's store, regardless of supervision preferences.
+// A soft one (an older but safe terminal) is a calm notice; a warning without severity is hard.
+const hardWarning = (w) => w.severity !== "soft";
 function engineBanner(state) {
-  return engineWarnings(state).map((w) => `<div class="issue issue--hard app-problem engine-problem" role="alert">${ICON.alert}<div>${esc(w.text)}</div>${w.action === "adopt_engine" ? `<button class="row-action" data-action="engine-adopt">use this app's engine</button>` : ""}</div>`).join("");
+  return engineWarnings(state).map((w) => `<div class="issue issue--${hardWarning(w) ? "hard" : "soft"} app-problem engine-problem" role="${hardWarning(w) ? "alert" : "status"}">${hardWarning(w) ? ICON.alert : ICON.clock}<div>${esc(w.text)}</div>${w.action === "adopt_engine" ? `<button class="row-action" data-action="engine-adopt">use this app's engine</button>` : ""}</div>`).join("");
 }
 
 // In-app updater (calm, never counted in the header's "needs you"): the engine checks on its own
@@ -626,16 +628,11 @@ function limitedSeat(seat) {
   return !signedOut(seat) && (seat.limited || ["resting", "queued"].includes(seat.status));
 }
 
-function returnTime(seat, prefix = "back in") {
-  const at = seat.limited_until;
-  if (!at || !Number.isFinite(Date.parse(at))) return "reset time unknown";
-  return `<span data-reset-at="${esc(at)}" data-clock-prefix="${prefix}" data-past-text="resetting…" title="${esc(new Date(at).toLocaleString())}">${resetIsPast(at) ? "resetting…" : `${prefix} ${fmtCountdown(at)}`}</span>`;
-}
-
-function usageIssue(tool, seat) {
+function usageIssue(seat) {
   const error = seat.usage?.error;
-  return entitlementRevoked(seat) ? "check your subscription to refresh usage" : ({ rate_limited: "updates throttled; retrying automatically", network: "connection unavailable; retrying automatically",
-    token_expired: `open ${TOOL_META[tool].label} to refresh usage`, unauthorized: "sign in to refresh usage", forbidden: "check your subscription to refresh usage", no_token: "sign in to refresh usage" })[error] || (error ? "usage update failed; retrying automatically" : "");
+  return entitlementRevoked(seat) ? "check your subscription to refresh usage" : ({
+    unauthorized: "sign in to refresh usage", forbidden: "check your subscription to refresh usage",
+    no_token: "sign in to refresh usage" })[error] || "";
 }
 
 // Identity stays legible in the block, sheet and inline details. Only known plan
@@ -650,18 +647,20 @@ function seatIdentity(seat, peers = [], includeMetadata = true) {
   let suffix = duplicate.length > 1 ? short(seat.email) : "";
   if (suffix && duplicate.some((s) => s.email !== seat.email && short(s.email) === suffix)) suffix = String(seat.email).split("@")[0];
   if (suffix && duplicate.some((s) => s.email !== seat.email && String(s.email).split("@")[0] === suffix)) suffix = seat.email;
-  const kind = ["business", "personal"].includes(seat.kind) ? seat.kind : "kind unknown";
-  const raw = typeof seat.plan === "string" ? seat.plan.trim().toLowerCase() : "";
-  const plan = Object.prototype.hasOwnProperty.call(PLAN_CHIPS, raw) ? raw : "plan unknown";
-  const parts = [name, kind, plan].filter((part, i, all) => !all.slice(0, i).some((prior) => prior.toLowerCase() === part.toLowerCase()));
+  const parts = [name, ...seatTraits(seat)].filter((part, i, all) => !all.slice(0, i).some((prior) => prior.toLowerCase() === part.toLowerCase()));
   return (includeMetadata ? parts.join(" · ") : name) + (suffix ? ` · ${suffix}` : "");
 }
 
-function seatMetadata(seat) {
-  const kind = ["business", "personal"].includes(seat.kind) ? seat.kind : "kind unknown";
+// Kind and plan when known. A plan the app doesn't recognise (providers add new ones, e.g.
+// "Self_Serve_Business_Prolite") is left out rather than shown as "plan unknown".
+function seatTraits(seat) {
+  const kind = ["business", "personal"].includes(seat.kind) ? seat.kind : "";
   const raw = typeof seat.plan === "string" ? seat.plan.trim().toLowerCase() : "";
-  const plan = Object.prototype.hasOwnProperty.call(PLAN_CHIPS, raw) ? raw : "plan unknown";
-  return [...new Set([kind, plan])].join(" · ");
+  const plan = Object.prototype.hasOwnProperty.call(PLAN_CHIPS, raw) ? raw : "";
+  return [...new Set([kind, plan].filter(Boolean))];
+}
+function seatMetadata(seat) {
+  return seatTraits(seat).join(" · ");
 }
 
 const ICON = {
@@ -680,7 +679,8 @@ const detailId = (tool, email) => `seat-detail-${encodeURIComponent(tool)}-${enc
 function nameButton(tool, seat, peers, openDetails, showMetadata = false) {
   const label = tool === "key" ? seat.label : seatIdentity(seat, peers);
   const name = tool === "key" ? seat.label : seatIdentity(seat, peers, false);
-  const metadata = showMetadata && tool !== "key" ? `<span class="seat-metadata" title="${esc(seatMetadata(seat))}">${esc(seatMetadata(seat))}</span>` : "";
+  const traits = showMetadata && tool !== "key" ? seatMetadata(seat) : "";
+  const metadata = traits ? `<span class="seat-metadata" title="${esc(traits)}">${esc(traits)}</span>` : "";
   const email = tool === "key" ? seat.id : seat.email;
   return `<button class="seatname" data-action="seat-details" data-tool="${esc(tool)}" data-email="${esc(email)}" aria-expanded="${openDetails.has(JSON.stringify([tool, email]))}" aria-controls="${detailId(tool, email)}" aria-label="${esc(label)}, details"><span class="seat-identity" title="${esc(label)}">${esc(name)}</span>${metadata}${ICON.chev}</button>`;
 }
@@ -699,10 +699,11 @@ function tighter(seat) {
 }
 const leftText = (seat) => {
   const left = tighter(seat)?.left;
-  return left == null ? "usage unknown" : `${seat.usage_stale ? "~" : ""}${left === 100 ? "full" : `${left}% left`}`;
+  // No reading is not news: say nothing rather than "usage unknown" (callers drop the empty part).
+  return left == null ? "" : `${seat.usage_stale ? "~" : ""}${left === 100 ? "full" : `${left}% left`}`;
 };
 function timed(at, prefix = "", past = "resetting…", approximate = false) {
-  if (!Number.isFinite(Date.parse(at))) return "reset time unknown";
+  if (!Number.isFinite(Date.parse(at))) return "";
   return `<span data-reset-at="${esc(at)}" data-clock-prefix="${esc(prefix)}" data-past-text="${esc(past)}"${approximate ? ' data-clock-approx="true"' : ""} title="${esc(new Date(at).toLocaleString())}">${resetIsPast(at) ? past : `${prefix}${prefix ? " " : ""}${approximate ? "~" : ""}${fmtCountdown(at)}`}</span>`;
 }
 function refillClock(iso, now = Date.now()) {
@@ -719,7 +720,9 @@ function backAt(seat) {
   return seatWindows(seat).filter((w) => w.left === 0 && w.reset).sort((a, b) => Date.parse(b.reset) - Date.parse(a.reset))[0]?.reset;
 }
 function backText(seat, prefix = "back in") {
-  return `${seat.usage_stale ? '<span class="sr-only">approximate, last known reading: </span>' : ""}${timed(backAt(seat), prefix, "resetting…", seat.usage_stale)}`;
+  const at = backAt(seat);
+  if (!at) return "";
+  return `${seat.usage_stale ? '<span class="sr-only">approximate, last known reading: </span>' : ""}${timed(at, prefix, "resetting…", seat.usage_stale)}`;
 }
 // Match local calendar days, including across DST boundaries.
 function detailClock(iso, now = Date.now()) {
@@ -741,7 +744,7 @@ function rowDetails(tool, seat, peers, openDetails) {
     const fetched = seat.usage_fetched_at || seat.usage?.fetched_at || "";
     rows = "";
     if (signedOut(seat)) rows += '<dt>status</dt><dd>signed out; sign in to see usage</dd>';
-    else rows += seatWindows(seat).map((w) => `<dt>${w.label}</dt><dd>${w.left == null ? "usage unknown" : `${seat.usage_stale ? "~" : ""}${w.left}% left`}${w.reset ? ` · resets <time datetime="${esc(w.reset)}">${esc(detailClock(w.reset))}</time> (${timed(w.reset, "in")})` : ""}</dd>`).join("");
+    else rows += seatWindows(seat).map((w) => `<dt>${w.label}</dt><dd>${w.left == null ? "no reading yet" : `${seat.usage_stale ? "~" : ""}${w.left}% left`}${w.reset ? ` · resets <time datetime="${esc(w.reset)}">${esc(detailClock(w.reset))}</time> (${timed(w.reset, "in")})` : ""}</dd>`).join("");
     const action = limitedSeat(seat) || (!isActive(seat) && !signedOut(seat) && !usable(seat)) ? seatAction(tool, seat, "switch") : "";
     if (action) rows += `<dt>action</dt><dd>${action}</dd>`;
     rows = detailGroup("usage", rows + `<dt class="sr-only">updated</dt><dd class="detail-note">${seat.usage_stale ? "last known reading; " : ""}<span data-usage-at="${esc(fetched)}">${fmtUsageAge(fetched)}</span></dd>`);
@@ -771,11 +774,10 @@ function headerVerdict(state) {
   const hard = seats.filter((s) => signedOut(s) || signinNeeded(s) || entitlementRevoked(s)).length
     + (state?.pending_crossings || []).length + (state?.pending_tier_requests || []).length
     + (state?.pending_key_switches || []).filter((r) => r.status === "pending" && Date.parse(r.expires_at) > Date.now()).length
-    + engineWarnings(state).length + Number(Boolean(supervisionProblem(state)));
+    + engineWarnings(state).filter(hardWarning).length + Number(Boolean(supervisionProblem(state)));
   if (hard) return `<button class="chip chip--hard" data-action="attention">${ICON.alert}${hard} needs you</button>`;
   if (seats.length && !ready.length && seats.every(limitedSeat)) return `<span class="chip chip--soft">${ICON.rest}all limited</span>`;
   if (seats.some((s) => signinExpiring(s))) return `<span class="chip chip--soft">${ICON.clock}renew soon</span>`;
-  if (seats.some((s) => s.usage_unknown || s.usage_stale || s.usage?.error)) return `<span class="chip chip--soft">${ICON.clock}checking usage</span>`;
   return seats.length || state?.keys?.length ? `<span class="chip chip--calm">${ICON.check}all good</span>` : "";
 }
 function thenLine(p, state) {
@@ -785,11 +787,11 @@ function thenLine(p, state) {
   if (next) {
     const approval = switchNeedsConfirmation(state, p.tool, next.email)
       || (state.pending_crossings || []).some((r) => r.tool === p.tool && r.to === next.email);
-    text = `${label(next)}, ${leftText(next)}${approval ? ' <span class="muted">(needs approval)</span>' : ""}`;
+    text = `${[label(next), leftText(next)].filter(Boolean).join(", ")}${approval ? ' <span class="muted">(needs approval)</span>' : ""}`;
   } else {
     const back = p.limited.find((s) => s !== p.lead);
     const key = p.keys[0];
-    text = back ? `${usable(p.lead) ? "nothing ready. " : ""}${label(back)} ${backText(back, usable(p.lead) ? "back in" : "in")}` : '<span class="muted">nothing ready</span>';
+    text = back ? `${usable(p.lead) ? "nothing ready. " : ""}${label(back)} ${backText(back, usable(p.lead) ? "back in" : "in") || "limited"}` : '<span class="muted">nothing ready</span>';
     if (key) text = `${back ? `${text}, or ` : ""}${esc(key.label)} now, paid${key.responses_verified === false || key.last_proof?.outcome === "incompatible" ? "; endpoint unproven" : ""}`;
   }
   return `<p class="then"><b>then</b> ${text}</p>`;
@@ -803,9 +805,8 @@ function seatIssues(p, openDetails) {
     else if (out) issues.push(isActive(seat) ? "on now · signed out" : "signed out");
     else if (signinNeeded(seat)) issues.push("sign-in needed");
     if (!out && signinExpiring(seat)) issues.push(signinExpiryLine(seat, "span"));
-    const error = usageIssue(p.tool, seat);
+    const error = usageIssue(seat);
     if (!out && !hard && error) issues.push(esc(error));
-    if (!out && !hard && (seat.usage_unknown || (seat.usage_stale && error))) issues.push(`${seat.usage_unknown ? "usage unknown" : "last known reading"}; <span data-usage-at="${esc(seat.usage_fetched_at || seat.usage?.fetched_at || "")}">${fmtUsageAge(seat.usage_fetched_at || seat.usage?.fetched_at)}</span>`);
     if (!issues.length) return "";
     const representedHere = seat !== p.lead && hard;
     return `<div class="issue issue--${hard ? "hard" : "soft"}" data-tool="${esc(p.tool)}" data-email="${esc(seat.email)}" role="group" aria-label="${esc(p.tool)} ${esc(seat.name || seat.email)} attention">${hard ? ICON.alert : ICON.clock}<div>${representedHere ? nameButton(p.tool, seat, p.seats, openDetails) : `<b>${esc(seatIdentity(seat, p.seats))}</b>`} ${issues.join("; ")}</div>${seatAction(p.tool, seat, "signin")}</div>${representedHere ? rowDetails(p.tool, seat, p.seats, openDetails) : ""}`;
@@ -817,13 +818,16 @@ function toolBlock(p, state, pending, openDetails) {
   if (s) {
     const out = signedOut(s), attention = out || signinNeeded(s) || entitlementRevoked(s);
     const limited = limitedSeat(s), t = tighter(s), other = seatWindows(s).find((w) => w.key !== t?.key);
+    const back = limited ? backAt(s) : null;
+    const metadata = [esc(seatMetadata(s)), t?.reset ? timed(t.reset, `${t.label} resets in`) : ""].filter(Boolean).join(" · ");
+    const secondary = other && other.left != null ? `<span aria-label="${s.usage_stale ? "last known: " : ""}${other.label} ${other.left}% left">${other.label} ${s.usage_stale ? "~" : ""}${other.left}%</span>` : "";
     const active = isActive(s) && !out && !signinNeeded(s) && !entitlementRevoked(s) && !limited;
     const name = `<div class="now-seat">${nameButton(p.tool, s, p.seats, openDetails)}${active ? '<span class="tag">on now</span>' : ""}</div>`;
     if (attention) head = `<div class="now">${name}</div>`;
-    else if (limited) head = `<div class="now">${name}<span class="fig fig--time">${backText(s, "")}</span><span class="fig-l">until back</span></div><div class="meta limited-meta"><span>${esc(seatMetadata(s))} · limited${t && backAt(s) && !resetIsPast(backAt(s)) ? `, ${t.label} refills ${refillClock(backAt(s))}` : ""}</span>${other ? `<span>${other.label} ${other.left == null ? "unknown" : `${s.usage_stale ? "~" : ""}${other.left}%`}</span>` : ""}</div>`;
-    else head = `<div class="now">${name}<span class="fig">${t?.left == null ? "—" : `${s.usage_stale ? "~" : ""}${t.left}<small>%</small>`}</span><span class="fig-l">${t?.left == null ? "usage unknown" : `of ${t.label} left`}</span></div>
+    else if (limited) head = `<div class="now">${name}<span class="fig fig--time">${back ? backText(s, "") : "—"}</span><span class="fig-l">${back ? "until back" : "limited"}</span></div><div class="meta limited-meta"><span>${[esc(seatMetadata(s)), `limited${t && back && !resetIsPast(back) ? `, ${t.label} refills ${refillClock(back)}` : ""}`].filter(Boolean).join(" · ")}</span>${secondary}</div>`;
+    else head = `<div class="now">${name}<span class="fig">${t?.left == null ? "—" : `${s.usage_stale ? "~" : ""}${t.left}<small>%</small>`}</span><span class="fig-l">${t?.left == null ? "no reading yet" : `of ${t.label} left`}</span></div>
       ${t?.left != null ? `<div class="bar" role="img" aria-label="${s.usage_stale ? "last known: " : ""}${t.left}% of the ${t.label} window left"><i style="width:${t.left}%"></i></div>` : ""}
-      <div class="meta"><span>${esc(seatMetadata(s))} · ${t?.reset ? timed(t.reset, `${t.label} resets in`) : "reset time unknown"}</span>${other ? `<span aria-label="${s.usage_stale ? "last known: " : ""}${other.label} ${other.left == null ? "unknown" : `${other.left}% left`}">${other.label} ${other.left == null ? "unknown" : `${s.usage_stale ? "~" : ""}${other.left}%`}</span>` : ""}</div>`;
+      ${metadata || secondary ? `<div class="meta">${metadata ? `<span>${metadata}</span>` : ""}${secondary}</div>` : ""}`;
     head += rowDetails(p.tool, s, p.seats, openDetails);
   }
   const crossings = crossingRequests({ pending_crossings: (state.pending_crossings || []).filter((r) => r.tool === p.tool) });
@@ -837,9 +841,9 @@ function listRows(p, state, openDetails) {
   const spending = new Set([...(state.running_key_seats || []), ...(state.pinned_sessions || []).map((s) => s.key_seat?.id || s.email)]);
   return rest.map((s, i) => {
     const key = p.keys.includes(s), limited = !key && limitedSeat(s);
-    const text = key ? `${spending.has(s.id) ? "spending now, " : ""}paid per token<span class="sr-only">; no app spend cap</span>` : limited ? `limited, ${backText(s)}` : `${p.next === s ? '<span class="state--strong">next</span>, ' : ""}${leftText(s)}`;
+    const text = key ? `${spending.has(s.id) ? "spending now, " : ""}paid per token<span class="sr-only">; no app spend cap</span>` : limited ? ["limited", backText(s)].filter(Boolean).join(", ") : [p.next === s ? '<span class="state--strong">next</span>' : "", leftText(s)].filter(Boolean).join(", ");
     const action = key ? `<button class="row-action" data-action="key-terminal" data-id="${esc(s.id)}" aria-label="${esc(`use ${s.label} in a new paid terminal`)}">new terminal</button>` : limited ? "" : seatAction(p.tool, s, "switch");
-    return `<div class="seat${i === 0 ? " first-of-tool" : ""}${key ? " key-seat" : ""}" data-seat-email="${esc(key ? s.id : s.email)}"><div class="row"><span class="toolname">${i === 0 ? `${mark(p.tool)}${esc(p.tool)}` : `<span class="sr-only">${esc(p.tool)}</span>`}</span>${nameButton(key ? "key" : p.tool, s, p.seats, openDetails, true)}<span class="state">${text}</span>${action}</div>${rowDetails(key ? "key" : p.tool, s, p.seats, openDetails)}</div>`;
+    return `<div class="seat${i === 0 ? " first-of-tool" : ""}${key ? " key-seat" : ""}" data-seat-email="${esc(key ? s.id : s.email)}"><div class="row"><span class="toolname">${i === 0 ? `${mark(p.tool)}${esc(p.tool)}` : `<span class="sr-only">${esc(p.tool)}</span>`}</span>${nameButton(key ? "key" : p.tool, s, p.seats, openDetails, true)}${text ? `<span class="state">${text}</span>` : ""}${action}</div>${rowDetails(key ? "key" : p.tool, s, p.seats, openDetails)}</div>`;
   }).join("");
 }
 
