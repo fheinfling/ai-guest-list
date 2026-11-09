@@ -738,6 +738,7 @@ export const normalizeSeatName = (value) => value.replace(/[\u0009-\u000d\u001c-
 const effectiveSeatName = (seat) => seat.name || seat.email.split("@")[0];
 const storedSeatName = (seat) => seat.custom_name ?? seat.name ?? "";
 // Expanding upper/lower pairs compare like Python casefold; keep dotless ı distinct from i.
+// Matches Python casefold for Latin, Greek and Cyrillic; rare scripts may differ, covered by the engine's inline refusal.
 const foldedName = (value) => [...value].map((c) => c === "ı" ? c : c.toUpperCase().toLowerCase()).join("").replace(/ß/g, "ss");
 function seatNameClash(state, tool, email, name) {
   return name && subscriptionSeats(state).find((other) =>

@@ -717,12 +717,17 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
         if action == "rename":
             correlation = {"rename_request_id": message.get("rename_request_id")}
             try:
+                tool, email, name = message["tool"], message["email"], message["name"]
+                if not isinstance(email, str):
+                    raise AcctswError("Email must be text.")
                 with ctx.locked():
                     state = ctx.load_state()
-                    acct.rename(ctx, state, message["tool"], message["email"], message["name"])
+                    acct.rename(ctx, state, tool, email, name)
                 return {"ok": True, **correlation, "state": snapshot_state(ctx)}
             except AcctswError as exc:
                 return {"ok": False, **correlation, "error": str(exc)}
+            except KeyError as exc:
+                return {"ok": False, **correlation, "error": f"missing field: {exc}"}
 
         if action == "remove":
             with ctx.locked():
