@@ -7,7 +7,13 @@
 <p align="center">
   <b>Never stop coding because an AI agent hit its usage limit.</b><br>
   A lean macOS menubar app + CLI that <b>auto-switches between your Codex &amp; Claude accounts</b> when one
-  runs out — resuming your work on the next seat.
+  runs out — resuming your work on the next seat. Optional API-key seats (OpenAI, Anthropic,
+  OpenRouter, Langdock) can take over as a paid fallback.
+</p>
+
+<p align="center">
+  <code>brew install --cask fheinfling/tap/ai-guest-list</code><br>
+  <sub>or grab the signed app from <a href="https://github.com/fheinfling/ai-guest-list/releases/latest">Releases</a> · details in <a href="#install">Install</a></sub>
 </p>
 
 <p align="center">
