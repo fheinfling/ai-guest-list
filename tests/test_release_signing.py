@@ -166,7 +166,7 @@ def test_workflow_drafts_on_push_and_tap_only_on_publication():
     publish = jobs["publish"]
     assert "draft: true" in publish
     assert "AI-Guest-List-${{ github.ref_name }}.zip\n            latest.json\n" in publish
-    assert "softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64" in publish
+    assert "softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3" in publish
     assert "unsigned" not in publish
     tap = jobs["update-tap"]
     assert "if: github.event_name == 'release' && github.event.action == 'published'" in tap
