@@ -754,20 +754,25 @@ class SeatProxy:
             self._log("upstream_error", path=path, error=f"{e.__class__.__name__}: {e}"[:200])
             return reply.error(502, "api_error", "seat proxy: upstream unreachable")
         with far:
+            resp = None
             try:
-                far.sendall(_upgrade_head(method, self._transport.base + target, headers,
-                                          self._transport.netloc))
-                resp = http.client.HTTPResponse(_Unbuffered(far), method=method)
-                resp.begin()
-            except (OSError, http.client.HTTPException) as e:
-                self._log("upstream_error", path=path, error=f"{e.__class__.__name__}: {e}"[:200])
-                return reply.error(502, "api_error", "seat proxy: upstream unreachable")
-            self._upstream_result(True)
-            self._log("upgrade", path=path, status=resp.status)
-            if resp.status != 101:
-                resp.fp = io.BufferedReader(resp.fp)    # nothing follows this answer: buffer away
-                return self._relay(resp, reply)
-            reply.head(resp.status, resp.reason, resp.getheaders())
+                try:
+                    far.sendall(_upgrade_head(method, self._transport.base + target, headers,
+                                              self._transport.netloc))
+                    resp = http.client.HTTPResponse(_Unbuffered(far), method=method)
+                    resp.begin()
+                except (OSError, http.client.HTTPException) as e:
+                    self._log("upstream_error", path=path, error=f"{e.__class__.__name__}: {e}"[:200])
+                    return reply.error(502, "api_error", "seat proxy: upstream unreachable")
+                self._upstream_result(True)
+                self._log("upgrade", path=path, status=resp.status)
+                if resp.status != 101:
+                    resp.fp = io.BufferedReader(resp.fp)    # nothing follows this answer: buffer away
+                    return self._relay(resp, reply)
+                reply.head(resp.status, resp.reason, resp.getheaders())
+            finally:
+                if resp is not None:
+                    resp.close()    # Release the makefile reference; far still owns the tunnel.
             try:
                 _pump(client, far)
             except OSError:
@@ -881,7 +886,10 @@ def _pump(a: socket.socket, b: socket.socket, idle: float | None = None) -> None
             if not ready:
                 return
         for src in ready:
-            data = src.recv(CHUNK)
+            try:
+                data = src.recv(CHUNK)
+            except OSError:
+                data = b""    # An abrupt peer close has the same teardown as EOF.
             if data:
                 peer[src].sendall(data)
                 continue

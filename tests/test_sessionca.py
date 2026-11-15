@@ -1,3 +1,4 @@
+import gc
 import os
 import re
 import socket
@@ -5,6 +6,7 @@ import ssl
 import stat
 import subprocess
 import threading
+import weakref
 
 import pytest
 
@@ -173,6 +175,16 @@ def test_close_idempotent(tmp_path):
     c.close()
     c.close()
     assert not list(tmp_path.iterdir())
+
+
+def test_closed_ca_is_collectable(tmp_path):
+    c = SessionCA(tmp_root=tmp_path)
+    ref = weakref.ref(c)
+    c.close()
+    c.close()
+    del c
+    gc.collect()
+    assert ref() is None
 
 
 def test_missing_openssl_raises(tmp_path):
