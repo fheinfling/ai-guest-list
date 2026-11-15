@@ -149,6 +149,7 @@ KEY_PRICING_URLS = {
     "anthropic": "https://www.anthropic.com/pricing",
     "openrouter": "https://openrouter.ai/models",
     "langdock": "https://www.langdock.com/pricing",
+    "langdock_anthropic": "https://www.langdock.com/pricing",
     "deepseek": "https://api-docs.deepseek.com/quick_start/pricing",
     "xai": "https://docs.x.ai/docs/models",
     "groq": "https://groq.com/pricing",
@@ -535,12 +536,6 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
             self.pollState_(None)
 
         @objc.python_method
-        def _stopStateTimer(self):
-            if self._state_timer is not None:
-                self._state_timer.invalidate()
-                self._state_timer = None
-
-        @objc.python_method
         def _stateSignature(self):
             """What "the state changed" means for the popover, cheaply (no network, no subprocess).
 
@@ -684,7 +679,7 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
                 # prepare_then_login resolves this app's engine and launches isolated sign-in
                 # via `open` — no AppleEvents/Automation permission.
                 from app.terminal import prepare_then_login
-                prepare_then_login(self.ctx, tool, seat=msg.get("email"))
+                prepare_then_login(self.ctx, tool, seat=msg.get("email"), name=msg.get("name"))
             except Exception as e:
                 _log_exception(e)
                 # Launch failed. If a NEWER login for this tool has since superseded us (op identity),
@@ -708,7 +703,7 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
                 objc.selector(self.loginNudge_, signature=b"v@:@"), None, False)
 
         def loginNudge_(self, _arg):
-            self._notify("finish signing in", "then tap ‘save my seat’ 🎟️")
+            self._notify("finish signing in", "your seat will be saved automatically 🎟️")
 
         def addBg_(self, msg):
             # `paste`/`snapshot` verify creds against the provider (Claude shells out / hits the
@@ -872,8 +867,6 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
             if action == "quit":
                 NSApplication.sharedApplication().terminate_(self)
                 return
-            if action == "settings":
-                return  # reserved
             if action == "key_pricing":
                 url = KEY_PRICING_URLS.get(msg.get("provider"))
                 if url:

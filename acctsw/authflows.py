@@ -19,12 +19,16 @@ from .util import email_key
 OFFICIAL_LOGIN = {"codex": ["login"], "claude": ["auth", "login"]}
 
 
-def signin(ctx: Context, tool: str, *, seat: str | None = None, args=()) -> int:
+def signin(ctx: Context, tool: str, *, seat: str | None = None, name: str | None = None, args=()) -> int:
     """Capture only an identified login. Like add/reconcile, a successful sign-in selects its owner.
 
     No stock login is used as staging, and cleanup is strictly local: NEVER invoke logout here.
     The child owns the foreground TTY; the store lock covers filing, never login or profile HTTP.
     """
+    if name is not None:
+        # Fail before the browser opens: a name no seat can have would otherwise be found only
+        # after the user has finished signing in.
+        name = accounts.normalized_name(name)
     home = None
     service = None
     try:
@@ -61,11 +65,21 @@ def signin(ctx: Context, tool: str, *, seat: str | None = None, args=()) -> int:
             state = ctx.load_state()
             sync_back(ctx, state, tool, live_identity=stock_identity)
             owner = next((e for e in state.accounts(tool) if email_key(e) == email_key(owner)), owner)
-            saved = accounts.add(ctx, state, tool, email=owner, blob=blob)
+            name_problem = None
+            if name is not None:
+                # A clash depends on which account signed in, so it is only knowable now. The login
+                # is real and done: keep it, and leave the name for a rename instead of failing.
+                try:
+                    accounts.validated_name(state, tool, owner, name)
+                except AcctswError as e:
+                    name_problem, name = str(e), None
+            saved = accounts.add(ctx, state, tool, email=owner, blob=blob, name=name)
             # Explicit sign-in resumes stock mirroring even after a deliberate local logout.
             state.data["tools"][tool].pop("stock_logged_out", None)
             switch(ctx, state, tool, owner, sync=False)
         print(f"✓ seat saved — {tool}:{saved['email']} (now on the floor)")
+        if name_problem:
+            print(f"  name not applied: {name_problem} Rename the seat in the menu bar.")
         return 0
     except AcctswError:
         raise

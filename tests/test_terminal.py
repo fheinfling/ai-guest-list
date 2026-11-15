@@ -103,6 +103,18 @@ def test_resolve_login_command_uses_this_engine(ctx, monkeypatch, tool):
     assert commands == ["isolated-signin-v1", "isolated-signin-v1"]
 
 
+@pytest.mark.parametrize("tool", ["codex", "claude"])
+@pytest.mark.parametrize("name", ["Example's seat; $(false) `false` \"quoted\"", "--example"])
+def test_popover_name_survives_both_terminal_quoting_layers(ctx, monkeypatch, tool, name):
+    monkeypatch.setattr(terminal, "checked_engine_command", lambda _: ["/fake/app engine"])
+    seen = _capture_open(monkeypatch)
+    terminal.prepare_then_login(ctx, tool, seat="seat@example.com", name=name)
+    shell_line = next(line for line in seen["script"].splitlines() if line.startswith("/bin/zsh -lic "))
+    command = shlex.split(shell_line)[2]
+    assert shlex.split(command) == ["/fake/app engine", "signin", tool,
+                                    "--seat", "seat@example.com", f"--name={name}"]
+
+
 @pytest.mark.parametrize("flow", ["key", "signin"])
 @pytest.mark.parametrize("mode", ["source", "bundle", "alias"])
 @pytest.mark.parametrize("tool", ["codex", "claude"])

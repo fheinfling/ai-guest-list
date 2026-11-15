@@ -74,7 +74,6 @@ def test_native_push_reaches_existing_notify_path_even_without_webview(ctx, monk
 def test_closing_popover_keeps_consent_poll_alive():
     events = []
     receiver = SimpleNamespace(webview=None,
-                               _stopStateTimer=lambda: pytest.fail("hidden consent must still poll"),
                                _setWebVisible=lambda visible: events.append(visible),
                                _setUsagePollInterval=lambda interval: events.append(interval))
     menubar.AGLDelegate.popoverDidClose_.callable(receiver, None)
@@ -114,3 +113,16 @@ def test_key_worker_correlates_without_echoing_secret(ctx, monkeypatch):
     menubar.AGLDelegate.keyBg_.callable(receiver, msg)
     assert results[-1]["ok"] is False
     assert msg["secret"] not in str(results[-1])
+
+
+def test_pricing_links_shown_are_exactly_the_native_allowlist():
+    # The popover only says which providers have a pricing page; native owns the URLs. A provider
+    # marked in JS without a native URL renders a dead link, and vice versa an unreachable entry.
+    import re
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "app/web/render.mjs").read_text(encoding="utf-8")
+    block = src[src.index("export const KEY_PROVIDERS = {"):]
+    block = block[:block.index("\n};")]
+    shown = {m.group(1) for m in re.finditer(r"^\s+(\w+): \{[^}]*\bpricing: true\b", block, re.M)}
+    assert shown and shown == set(menubar.KEY_PRICING_URLS)
+    assert all(url.startswith("https://") for url in menubar.KEY_PRICING_URLS.values())
