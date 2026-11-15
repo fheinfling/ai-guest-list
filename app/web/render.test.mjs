@@ -3489,3 +3489,14 @@ test("instant name validation shares the engine's Unicode caseless and whitespac
   group = nameGroup(buildHTML(snapshot, null, new Set(), new Map([[renameKey(), { value: "I" }]])));
   assert.doesNotMatch(saveTag(group), /disabled/); // Dotless i is a distinct name.
 });
+
+test("an opened signed-out seat explains signing in instead of showing usage", () => {
+  for (const tool of ["codex", "claude"]) {
+    const email = `out@${tool}.example`;
+    const s = seat({ status: "needs-login", signed_out: true, email });
+    const html = buildHTML(state({ tools: { [tool]: { seats: [s] } } }), null,
+      new Set([JSON.stringify([tool, email])]));
+    assert.match(html, /<dt>status<\/dt><dd>signed out; sign in to see usage<\/dd>/);
+    assert.doesNotMatch(html, /% left|no reading yet/);
+  }
+});
