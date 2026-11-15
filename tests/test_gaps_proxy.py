@@ -873,9 +873,17 @@ def test_start_and_stop_log_and_release_the_upstream(monkeypatch):
 def test_an_unbuffered_body_read_never_asks_for_more_than_a_chunk(monkeypatch):
     # An unbuffered read allocates the size it asks for: asking for the whole remaining body on every
     # call would allocate quadratically in the body size.
+    # Only the proxy's own reads count: the test's client reads the response through a buffered
+    # reader whose refill size is io.DEFAULT_BUFFER_SIZE (128 KiB since Python 3.14).
     sizes = []
     readinto = socket.SocketIO.readinto
-    monkeypatch.setattr(socket.SocketIO, "readinto", lambda self, b: (sizes.append(len(b)), readinto(self, b))[1])
+
+    def spy(self, b):
+        if threading.current_thread() is not threading.main_thread():
+            sizes.append(len(b))
+        return readinto(self, b)
+
+    monkeypatch.setattr(socket.SocketIO, "readinto", spy)
     body = json.dumps({"model": "m", "max_tokens": 5, "pad": "x" * (3 * SP.CHUNK),
                        "messages": [{"role": "user", "content": "hi"}]}).encode()
     h = Harness()
@@ -884,4 +892,4 @@ def test_an_unbuffered_body_read_never_asks_for_more_than_a_chunk(monkeypatch):
     with sock:
         resp, _ = _read_response(sock)
     assert resp.status == 200 and h.t.sent[0]["body"] == body
-    assert max(sizes) <= SP.CHUNK
+    assert sizes and max(sizes) <= SP.CHUNK
