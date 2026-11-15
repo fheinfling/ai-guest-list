@@ -27,5 +27,37 @@
       "-c",
       "python3 scripts/build-web.py && node --test --test-name-pattern=\"blank recovery: throwing render\" app/web/render.test.mjs"
     ]
+  },
+  {
+    "label": "client error resize leaves the cached height stale",
+    "file": "app/web/app.mjs",
+    "old": "  lastHeight = 220;\n  send(\"resize\", { height: 220 });",
+    "new": "  send(\"resize\", { height: 220 });",
+    "cmd": [
+      "sh",
+      "-c",
+      "python3 scripts/build-web.py && node --test --test-name-pattern=\"restores the content height after a client error\" app/web/render.test.mjs"
+    ]
+  },
+  {
+    "label": "generic add completes on a recovered transient 401",
+    "file": "app/web/render.mjs",
+    "old": "      return !before || signedOut(before) || (add.email && signinNeeded(before))\n        || (add.email && Date.parse(seat.signin_expires_at) > Date.parse(before.signin_expires_at));",
+    "new": "      return !before || signedOut(before) || signinNeeded(before)\n        || (add.email && Date.parse(seat.signin_expires_at) > Date.parse(before.signin_expires_at));",
+    "cmd": [
+      "node",
+      "--test",
+      "--test-name-pattern=generic browser sign-in",
+      "app/web/render.test.mjs"
+    ]
+  },
+  {
+    "label": "refused reload gives the fallback no retry feedback",
+    "file": "app/menubar.py",
+    "old": "                if self.webview:\n                    # The renderer may be broken; update only the independent fallback's text.\n                    self.webview.evaluateJavaScript_completionHandler_(\n                        '(() => { const text = document.querySelector(\\'#root [role=\"alert\"] p\\'); '\n                        'if (text) text.textContent = \"still not drawing \u2014 try again in a minute\"; })();',\n                        None)\n",
+    "new": "",
+    "test": [
+      "tests/test_native_blank.py::test_reload_limit_tells_the_fallback_when_to_retry"
+    ]
   }
 ]

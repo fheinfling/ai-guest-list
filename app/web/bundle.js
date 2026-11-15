@@ -309,7 +309,8 @@ function reduceReply(ui, res) {
     && add.loginSeats && res.state === state && (state.tools?.[add.provider]?.seats || []).find((seat) => {
       if (!isActive(seat) || signedOut(seat) || signinNeeded(seat) || (add.email && seat.email !== add.email)) return false;
       const before = add.loginSeats.find((s) => s.email === seat.email);
-      return !before || signedOut(before) || signinNeeded(before)
+      // A transient 401 can clear on the current seat while a generic add is still signing in.
+      return !before || signedOut(before) || (add.email && signinNeeded(before))
         || (add.email && Date.parse(seat.signin_expires_at) > Date.parse(before.signin_expires_at));
     });
   if ((res.added && forThisFlow && add.pending) || browserSaved) {
@@ -1163,6 +1164,7 @@ function send(action, payload = {}) {
 // This surface can stay alive for days. Keep the last resort independent of all render helpers,
 // state, and theme CSS; never insert error text into the DOM or attach state/input to diagnostics.
 const reportedClientErrors = new Set();
+let lastHeight = 0; // declared before any handler can run: clientError resets it
 let clientFailed = false, clientRendered = false;
 function clientError(error, location = "") {
   let message = "unknown client error", stack = "";
@@ -1180,6 +1182,7 @@ function clientError(error, location = "") {
     reportedClientErrors.add(message);
     send("client_error", { message, stack, location: String(location).slice(0, 512) });
   }
+  lastHeight = 220;
   send("resize", { height: 220 });
 }
 window.addEventListener("error", (event) => clientError(event.error || event.message,
@@ -1309,7 +1312,7 @@ function contentHeight() {
   }
   return Math.ceil(height);
 }
-let heightFrame = null, lastHeight = 0;
+let heightFrame = null;
 function reportHeight() {
   if (heightFrame !== null || !window.requestAnimationFrame) return;
   heightFrame = window.requestAnimationFrame(() => {

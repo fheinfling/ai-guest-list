@@ -306,7 +306,8 @@ export function reduceReply(ui, res) {
     && add.loginSeats && res.state === state && (state.tools?.[add.provider]?.seats || []).find((seat) => {
       if (!isActive(seat) || signedOut(seat) || signinNeeded(seat) || (add.email && seat.email !== add.email)) return false;
       const before = add.loginSeats.find((s) => s.email === seat.email);
-      return !before || signedOut(before) || signinNeeded(before)
+      // A transient 401 can clear on the current seat while a generic add is still signing in.
+      return !before || signedOut(before) || (add.email && signinNeeded(before))
         || (add.email && Date.parse(seat.signin_expires_at) > Date.parse(before.signin_expires_at));
     });
   if ((res.added && forThisFlow && add.pending) || browserSaved) {

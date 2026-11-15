@@ -24,6 +24,7 @@ function send(action, payload = {}) {
 // This surface can stay alive for days. Keep the last resort independent of all render helpers,
 // state, and theme CSS; never insert error text into the DOM or attach state/input to diagnostics.
 const reportedClientErrors = new Set();
+let lastHeight = 0; // declared before any handler can run: clientError resets it
 let clientFailed = false, clientRendered = false;
 function clientError(error, location = "") {
   let message = "unknown client error", stack = "";
@@ -41,6 +42,7 @@ function clientError(error, location = "") {
     reportedClientErrors.add(message);
     send("client_error", { message, stack, location: String(location).slice(0, 512) });
   }
+  lastHeight = 220;
   send("resize", { height: 220 });
 }
 window.addEventListener("error", (event) => clientError(event.error || event.message,
@@ -170,7 +172,7 @@ function contentHeight() {
   }
   return Math.ceil(height);
 }
-let heightFrame = null, lastHeight = 0;
+let heightFrame = null;
 function reportHeight() {
   if (heightFrame !== null || !window.requestAnimationFrame) return;
   heightFrame = window.requestAnimationFrame(() => {

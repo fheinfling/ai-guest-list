@@ -42,7 +42,8 @@ def native(monkeypatch):
 def receiver(native):
     loads, events = [], []
     obj = SimpleNamespace(_web_failed=False, _web_reload_times=[],
-        webview=SimpleNamespace(loadFileURL_allowingReadAccessToURL_=lambda *urls: loads.append(urls)),
+        webview=SimpleNamespace(loadFileURL_allowingReadAccessToURL_=lambda *urls: loads.append(urls),
+            evaluateJavaScript_completionHandler_=lambda js, _done: events.append(("javascript", js))),
         popover=SimpleNamespace(isShown=lambda: False,
             showRelativeToRect_ofView_preferredEdge_=lambda *args: events.append("show")),
         statusItem=SimpleNamespace(button=lambda: SimpleNamespace(bounds=lambda: "bounds")),
@@ -94,6 +95,29 @@ def test_popover_open_after_termination_reloads_before_showing(native):
     assert events[0] == 2
 
 
+def test_reload_limit_tells_the_fallback_when_to_retry(native, monkeypatch):
+    obj, loads, events = receiver(native)
+    clock = [10.0]
+    monkeypatch.setattr(native.time, "monotonic", lambda: clock[0])
+    for _ in range(native.WEB_RELOAD_LIMIT):
+        dispatch(native, obj, {"action": "reload"})
+    assert events == []
+    dispatch(native, obj, {"action": "reload"})
+    assert len(loads) == native.WEB_RELOAD_LIMIT
+    assert obj._web_failed is True
+    assert len(events) == 1
+    kind, script = events[0]
+    assert kind == "javascript"
+    assert 'document.querySelector(\'#root [role="alert"] p\')' in script
+    assert 'if (text)' in script  # safe when the page has no fallback
+    assert 'text.textContent = "still not drawing — try again in a minute"' in script
+    assert "AGL" not in script  # the renderer and its bridge may be broken
+    clock[0] += native.WEB_RELOAD_WINDOW_S
+    dispatch(native, obj, {"action": "reload"})
+    assert len(loads) == native.WEB_RELOAD_LIMIT + 1
+    assert len(events) == 1
+
+
 @pytest.mark.parametrize("failure", [{"action": "client_error", "message": "drawing failed"},
                                      {"action": "client_health", "ok": False}])
 def test_reopening_after_client_failure_reloads_and_good_render_clears_flag(native, failure):
@@ -135,6 +159,16 @@ def test_invalid_client_diagnostic_is_not_stringified(native, message):
     obj, _, _ = receiver(native)
     dispatch(native, obj, {"action": "client_error", "message": message})
     assert native.logs == [("[agl web] client_error: %@", ("unknown client error",))]
+
+
+@pytest.mark.parametrize("token, cut", [("eyJh.e.payload", 7), ("sk-private-secret", 2)])
+def test_client_error_drops_partial_tokens_at_the_input_bound(native, token, cut):
+    obj, _, _ = receiver(native)
+    prefix = "drawing failed "
+    message = prefix + " " * (8192 - len(prefix) - cut) + token + " ignored tail"
+    dispatch(native, obj, {"action": "client_error", "message": message})
+    _, (logged,) = native.logs[0]
+    assert logged == prefix.strip()
 
 
 def test_reload_button_is_handled_natively(native):

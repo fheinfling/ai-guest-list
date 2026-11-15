@@ -142,8 +142,10 @@ def _client_error_message(value):
     """
     if not isinstance(value, str):
         return "unknown client error"
-    # Scrub BEFORE truncating so a token crossing the length boundary cannot leak a prefix.
+    # Bound the input work and drop any token cut by that bound, then scrub before the log cap.
     text = value[:8192]
+    if len(value) > len(text) and not value[len(text)].isspace():
+        text = re.sub(r"\S+$", "", text)
     text = re.sub(r"(['\"`]).*?(?:\1|$)", "[redacted]", text, flags=re.S)
     text = re.sub(r"\S*@\S*", "[redacted]", text)
     text = re.sub(r"(?:https?|file)://\S+", "[redacted]", text, flags=re.I)
@@ -529,6 +531,12 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
                                       if at - t < WEB_RELOAD_WINDOW_S]
             if len(self._web_reload_times) >= WEB_RELOAD_LIMIT:
                 NSLog("[agl web] reload limit reached; leaving page for later retry")
+                if self.webview:
+                    # The renderer may be broken; update only the independent fallback's text.
+                    self.webview.evaluateJavaScript_completionHandler_(
+                        '(() => { const text = document.querySelector(\'#root [role="alert"] p\'); '
+                        'if (text) text.textContent = "still not drawing — try again in a minute"; })();',
+                        None)
                 return
             self._web_reload_times.append(at)
             self._loadWebPage()

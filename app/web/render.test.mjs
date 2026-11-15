@@ -686,6 +686,42 @@ test("browser completion polls ignore old, other-tool, inactive, signed-out and 
   }).add.step, "connecting");
 });
 
+for (const provider of ["codex", "claude"]) {
+  test(`generic browser sign-in for ${provider} ignores a recovered transient 401`, () => {
+    const before = seat({ status: "active", active: true, signed_out: false,
+      needs_login: true, usage: { error: "unauthorized" } });
+    const recovered = { ...before, needs_login: false, usage: { error: null } };
+    const add = mkAdd({ step: "connecting", provider, loginSeats: [before] });
+    const res = { state: { ...stateRev(2), tools: { [provider]: { seats: [recovered] } } } };
+    const out = reduceReply(UI({ screen: "add", add }), res);
+    assert.equal(out.add.step, "connecting");
+    assert.equal(out.add.savedEmail, undefined);
+    assert.equal(out.render, false);
+    assert.equal(out.closeFlow, null);
+    // Explicit reauthentication of this seat still accepts recovery without a new expiry.
+    const targeted = mkAdd({ ...add, email: before.email });
+    const targetedOut = reduceReply(UI({ screen: "add", add: targeted }), res);
+    assert.equal(targetedOut.add.step, "done");
+    assert.equal(targetedOut.closeFlow, targeted);
+  });
+
+  for (const prior of ["new", "signed out"]) {
+    test(`generic browser sign-in for ${provider} completes for a ${prior} seat`, () => {
+      const saved = seat({ status: "active", active: true, signed_out: false, needs_login: false });
+      const loginSeats = prior === "new" ? []
+        : [{ ...saved, status: "needs-login", signed_out: true, needs_login: true }];
+      const add = mkAdd({ step: "connecting", provider, loginSeats });
+      const res = { state: { ...stateRev(2), tools: { [provider]: { seats: [saved] } } } };
+      const out = reduceReply(UI({ screen: "add", add }), res);
+      assert.equal(out.add.step, "done");
+      assert.equal(out.add.savedEmail, saved.email);
+      assert.equal(out.render, true);
+      assert.equal(out.closeFlow, add);
+      assert.equal(reduceReply(out, res).closeFlow, null);
+    });
+  }
+}
+
 test("a poll completes reauthentication of the requested seat and schedules this flow's close once", () => {
   const email = "seat@example.com";
   const add = mkAdd({ step: "connecting", provider: "claude", email,
@@ -3591,6 +3627,31 @@ function throwingRenderState(message = "synthetic drawing failure") {
   // Fail inside buildHTML, before it can assign root.innerHTML. Keep the input state inert
   // everywhere else so this exercises the render boundary, not a reducer failure.
   return { rev: 1, settings: { get theme() { throw new Error(message); } }, tools: {} };
+}
+
+for (const recovery of ["update", "closed"]) {
+  test(`blank recovery: ${recovery} restores the content height after a client error`, () => {
+    const frames = [];
+    const root = { innerHTML: "", firstElementChild: { scrollHeight: 316 },
+      querySelector: () => null, querySelectorAll: () => [] };
+    const app = keyApp({ root,
+      requestAnimationFrame: (fn) => { frames.push(fn); return frames.length; } });
+    const flush = () => { while (frames.length) frames.shift()(); };
+    const heights = () => app.sent.filter((msg) => msg.action === "resize").map((msg) => msg.height);
+    flush();
+    assert.deepEqual(heights(), [316]);
+    app.windowHandlers.error({ error: new Error("synthetic drawing failure") });
+    assert.match(root.innerHTML, /role="alert"/);
+    assert.deepEqual(heights(), [316, 220]);
+    if (recovery === "update") {
+      app.window.AGL.update(state({ rev: 2 }));
+      flush();
+    } else app.window.AGL.closed(); // must resize immediately, even while frames are suspended
+    assert.doesNotMatch(root.innerHTML, /role="alert"/);
+    assert.deepEqual(heights(), [316, 220, 316]);
+    flush();
+    assert.deepEqual(heights(), [316, 220, 316], "unchanged height stays quiet after recovery");
+  });
 }
 
 test("blank recovery: throwing render shows fallback, reports once, then a good update recovers", () => {
