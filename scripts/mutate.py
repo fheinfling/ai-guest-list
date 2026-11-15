@@ -63,7 +63,13 @@ def _no_tests_ran(returncode: int, out: str) -> bool:
         return False
     passed = [int(n) for n in re.findall(r"(?m)^# pass (\d+)$", out)]
     failed = [int(n) for n in re.findall(r"(?m)^# fail (\d+)$", out)]
-    return bool(passed and failed and sum(passed) + sum(failed) == 0)
+    if not (passed and failed):
+        return False
+    # Node 20 reports unselected tests as skipped (pass 0, fail 0). Node 22+ instead reports a file
+    # that ran no tests as one passing pseudo-test named after the file, right after its empty plan:
+    # "1..0" / "# Subtest: x.test.mjs" / "ok N - x.test.mjs". Those wrappers are not tests.
+    empty_files = len(re.findall(r"(?m)^1\.\.0\n# Subtest: ", out))
+    return sum(passed) + sum(failed) - empty_files <= 0
 
 
 def _prepare_cmd(entry: dict) -> list[str]:
