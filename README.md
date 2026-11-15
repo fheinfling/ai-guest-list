@@ -179,8 +179,8 @@ seats**.
 > Releases from **1.4.0** on are Developer ID signed and notarized, with the notarization ticket
 > stapled to the app. Open them normally; no `xattr` command or “Open Anyway” workaround is needed.
 > For older builds, macOS may require **System Settings → Privacy & Security → Open Anyway**.
-> Upgrade with `brew upgrade --cask ai-guest-list` or download the latest zip. This version has no
-> in-app updater.
+> Update in-app from the popover (**… → check for updates**, or click **update** on the release
+> banner), with `brew upgrade --cask --greedy ai-guest-list`, or by downloading the latest zip.
 
 Releases after 1.5.0 are signed on CI and carry a provenance attestation. To check that a zip was
 built and signed by this repo's release workflow:
@@ -189,11 +189,16 @@ built and signed by this repo's release workflow:
 gh attestation verify AI-Guest-List-vX.Y.Z.zip --repo fheinfling/ai-guest-list
 ```
 
-**Upgrading:** `brew upgrade --cask ai-guest-list` replaces the app on disk, but a menubar app that
-is already running keeps the engine it started with. **Quit it from the menubar and open it again**
-after upgrading, so the terminal and the app agree on how the store is laid out. Terminal sessions
-are separate: those that can restart themselves move to the new engine once idle, and the rest keep
-their engine until you restart them.
+**Upgrading:** The built-in in-app updater checks GitHub Releases in the background (and on demand
+via **… → check for updates**); clicking **update** checks the zip's size and SHA-256 against
+`latest.json`, verifies the extracted app bundle against the bundled Developer ID requirement and
+Gatekeeper, swaps the app in place (rolling back automatically if the new build does not acknowledge
+startup), and relaunches the menubar app.
+Because the Homebrew cask sets `auto_updates true`, pass `--greedy` when upgrading through Homebrew
+(`brew upgrade --cask --greedy ai-guest-list`); if you upgrade on disk outside the app, **quit it
+from the menubar and open it again** so the running process picks up the new version. Terminal
+sessions are separate: those that can restart themselves move to the new engine once idle, and the
+rest keep their engine until you restart them.
 
 **From source (CLI engine):**
 ```sh

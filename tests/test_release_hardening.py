@@ -110,9 +110,13 @@ def test_version_and_install_release_flow():
     assert acctsw.__version__ == version
     assert tuple(map(int, version.split("."))) >= (1, 4, 0)
     readme = (REPO / "README.md").read_text()
+    readme_norm = " ".join(readme.lower().split())
     assert "1.4.0" in readme and "signed and notarized" in readme
     assert "older builds" in readme and "Open Anyway" in readme
-    assert "update themselves in-app" not in readme
+    assert "no in-app updater" not in readme_norm
+    assert "in-app updater" in readme_norm
+    assert "check for updates" in readme_norm
+    assert "auto_updates" in readme
     docs = (REPO / "docs/RELEASING.md").read_text()
     assert "Review deployments" in docs
     assert docs.index("Review deployments") < docs.index("test the signed app") < docs.index("gh release edit vX.Y.Z")
