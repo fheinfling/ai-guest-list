@@ -472,7 +472,6 @@ def _auto_switch_after_usage(ctx: Context, summary: dict[str, Any], *,
             try:
                 do_switch(ctx, state, tool, candidate, sync=(tool != "claude"),
                           live_identity=live_identity)
-                state.data["last_switch_at"] = iso(now())
                 state.save()
             except (AcctswError, OSError) as exc:
                 return {"status": "failed", "tool": tool, "from": active, "to": candidate,
@@ -678,7 +677,6 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
                 do_switch(ctx, state, tool, message["email"], manual=True,
                           confirmed_crossing=message.get("confirmed_crossing") is True,
                           live_identity=live_identity)
-                state.data["last_switch_at"] = iso(now())
                 state.save()
             return {"ok": True, "celebrate": True, "state": snapshot_state(ctx)}
 

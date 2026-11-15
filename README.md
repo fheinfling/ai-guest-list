@@ -42,8 +42,9 @@ It's two thin pieces over your stock tools:
 - a **menubar app** showing live usage + a one-glance status, and
 - supervised `cx` / `cl` launchers that wrap stock `codex` / `claude` and do the hop for you.
 
-Your stock `codex` / `claude` and their desktop apps keep working **untouched**. Saved credentials
-stay in the **macOS Keychain** and the official tools’ credential stores.
+Your stock `codex` / `claude` and their desktop apps keep working **untouched**. Claude seat snapshots,
+API keys and factory credential backups stay in the **macOS Keychain**. Codex seat snapshots are
+`0600` files at `~/.account-switcher/ch/<hash>/auth.json`; the official tools also keep their live logins.
 Each Claude account keeps its own login, so sessions on different accounts no longer log each
 other out. Plain `claude` follows the account you select in the app.
 The app talks directly to providers for sign-in, usage and model information; your coding sessions
@@ -114,7 +115,8 @@ connect through the official tools.
   with "restart idle sessions after an update" in settings; running sessions follow within a minute.
 - **Add / remove seats** — official browser sign-in, plus a no-browser path for Codex (paste an
   `auth.json`). Claude is browser sign-in only: a `claude setup-token` is an env-var token, not the
-  Keychain login the switcher reads. Credentials live only in the Keychain / the tools' own stores.
+  Keychain login the switcher reads. Claude snapshots live in the Keychain; Codex snapshots are
+  `0600` files at `~/.account-switcher/ch/<hash>/auth.json`.
 - **Rename subscription seats** — click a seat name, edit **Name**, and save; leave it blank to show the email's local part.
 - **Pay-per-token key seats** — an API key becomes a seat too, for when every subscription is
   resting or when you want one terminal on a specific model. Paid use is off by default,
@@ -274,8 +276,9 @@ Build the app locally with `pip install -e ".[build]" && python scripts/build-we
 
 ## Safety & security
 
-Credentials are only ever moved between the Keychain and the locations the official tools already read
-— nothing is proxied off-device or committed to git. Writes are atomic and `0o600`.
+Claude seat snapshots, API keys and factory credential backups are stored in the Keychain.
+Codex seat snapshots are `0600` files at `~/.account-switcher/ch/<hash>/auth.json`, written atomically.
+The switcher also reads and updates the official tools' live credential stores.
 
 **API keys.** A pasted key goes to the Keychain and nowhere else; the store keeps the provider, the
 model and the last four characters. It reaches the agent through that child's environment — never a

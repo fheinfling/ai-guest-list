@@ -247,7 +247,6 @@ def test_hop_persists_active_floor_and_timestamp_in_one_save(ctx, monkeypatch):
         persisted = ctx.load_state()
         assert persisted.active("claude") == "b@test"
         assert persisted.get_seat("claude", "b@test")["last_on_floor"]
-        assert persisted.data["last_switch_at"]
         tracking = False
         return 0
     get = lambda *a: (200, claude_ok_body(five=100, five_reset=iso(now() + timedelta(hours=1))))

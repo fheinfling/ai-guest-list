@@ -303,12 +303,14 @@ export function reduceReply(ui, res) {
   // Official sign-in captures and activates the seat itself, even with the popover closed.
   // Accept only a current snapshot and a newly signed-in active seat of this flow's provider.
   const browserSaved = inAdd && add.step === "connecting" && !addUsesPaste(add) && !add.importing
-    && add.loginSeats && res.state === state && (state.tools?.[add.provider]?.seats || []).some((seat) => {
+    && add.loginSeats && res.state === state && (state.tools?.[add.provider]?.seats || []).find((seat) => {
       if (!isActive(seat) || signedOut(seat) || signinNeeded(seat) || (add.email && seat.email !== add.email)) return false;
       const before = add.loginSeats.find((s) => s.email === seat.email);
-      return !before || signedOut(before) || signinNeeded(before);
+      return !before || signedOut(before) || signinNeeded(before)
+        || (add.email && Date.parse(seat.signin_expires_at) > Date.parse(before.signin_expires_at));
     });
   if ((res.added && forThisFlow && add.pending) || browserSaved) {
+    add.savedEmail = browserSaved?.email || res.added;
     add.pending = false; add.importing = false; add.step = "done";
     addChanged = true; closeFlow = add;        // caller schedules the auto-close, scoped to this flow
   }
@@ -409,7 +411,7 @@ function addDetailsStep(add, state) {
     <section class="set-sec">
       <span class="set-label">name this seat</span>
       <div class="set-card">
-        <input id="add-name" aria-label="seat name" class="add-input" placeholder="Work, Personal, Late-night" value="${esc(add.name)}">
+        <input id="add-name" aria-label="seat name" class="add-input" maxlength="32" placeholder="Work, Personal, Late-night" value="${esc(add.name)}">
       </div>
     </section>
     ${methodSection}
@@ -433,9 +435,11 @@ function addConnectingStep(add) {
     <div class="add-h">${title}</div><div class="add-sub">${sub}</div>${cta}</div>`;
 }
 
-function addDoneStep(add) {
+function addDoneStep(add, state) {
+  const saved = state?.tools?.[add.provider]?.seats?.find((seat) => seat.email === (add.savedEmail || add.email));
+  const name = normalizeSeatName(saved?.name || add.name || "") || "new seat";
   return `<div class="add-center add-center--done"><div class="add-heart">💛</div>
-    <div class="add-welcome">welcome, ${esc(add.name.trim() || "new seat")}</div>
+    <div class="add-welcome">welcome, ${esc(name)}</div>
     <div class="add-sub">your seat's saved — i'll keep it warm</div></div>`;
 }
 
@@ -449,7 +453,7 @@ export function buildAddSeat(state, add) {
     ? `<button class="add-cancel" data-action="add-cancel">cancel</button>` : "";
   const body = step === "details" ? addDetailsStep(add, state)
     : step === "connecting" ? addConnectingStep(add)
-    : step === "done" ? addDoneStep(add)
+    : step === "done" ? addDoneStep(add, state)
     : addProviderStep();
   return `<div class="app set-app add-app theme-${theme}"${accent}>
     <header class="set-head">

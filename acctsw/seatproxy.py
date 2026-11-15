@@ -889,7 +889,7 @@ def _pump(a: socket.socket, b: socket.socket, idle: float | None = None) -> None
             try:
                 data = src.recv(CHUNK)
             except OSError:
-                data = b""    # An abrupt peer close has the same teardown as EOF.
+                return    # A reset ends the whole tunnel; only orderly EOF can half-close.
             if data:
                 peer[src].sendall(data)
                 continue

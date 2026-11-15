@@ -569,6 +569,25 @@ test("add: typed name + token survive a re-render (escaped, controlled)", () => 
   assert.ok(h.includes("sk-x&lt;y"));                          // token reproduced, escaped
 });
 
+test("add: seat names have the same 32 character limit as rename", () => {
+  for (const provider of ["codex", "claude"]) {
+    const h = buildAddSeat(state(), mkAdd({ step: "details", provider }));
+    assert.match(h, /id="add-name"[^>]*maxlength="32"/);
+  }
+});
+
+test("add: done greets the saved seat name, then normalized typed name, then new seat", () => {
+  const add = mkAdd({ step: "connecting", provider: "codex", name: "  Typed   Name  ", loginSeats: [] });
+  const saved = seat({ email: "saved@example.com", status: "active", name: "Actual <Name>" });
+  const snapshot = state({ rev: 1, tools: { codex: { seats: [saved,
+    seat({ email: "other@example.com", name: "Typed Name" })] } } });
+  const out = reduceReply(UI({ screen: "add", add }), { state: snapshot });
+  assert.equal(out.add.step, "done");
+  assert.match(buildAddSeat(out.state, out.add), /welcome, Actual &lt;Name&gt;/);
+  assert.match(buildAddSeat(state(), out.add), /welcome, Typed Name</);
+  assert.match(buildAddSeat(state(), { ...out.add, name: " \t " }), /welcome, new seat</);
+});
+
 test("add: connecting — browser waits for the user, no premature spinner", () => {
   // before "save my seat": waiting on the user, save button live, NO spinner (would read as hung)
   const wait = buildAddSeat({ settings: {} }, mkAdd({ step: "connecting", provider: "codex", method: "browser" }));
@@ -631,17 +650,21 @@ for (const provider of ["codex", "claude"]) {
     const app = keyApp({ setTimeout: () => 1 });
     app.window.AGL.update({ ...stateRev(1), tools: { [provider]: { seats: [] } } });
     app.click({ action: "add", tool: provider });
-    app.input("add-name", "  Example Seat  ");
+    app.input("add-name", "  Example \t\u00a0 Seat  ");
     app.click({ action: "add-cta" });
     assert.equal(app.sent.at(-1).name, "Example Seat");
+    app.click({ action: "add-back" });
+    assert.match(app.root.innerHTML, /id="add-name"[^>]*value="Example Seat"/);
+    app.click({ action: "add-cta" });
     app.window.AGL.closed();
     const waiting = app.root.innerHTML;
     app.window.AGL.update({ ...stateRev(2), tools: { [provider]: { seats: [] } } });
     assert.equal(app.root.innerHTML, waiting);
     app.window.AGL.update({ ...stateRev(3), tools: { [provider]: { seats: [
-      seat({ email: "seat@example.com", status: "active", name: "Example Seat" }),
+      seat({ email: "seat@example.com", status: "active", name: "Saved Seat" }),
     ] } } });
     assert.match(app.root.innerHTML, /your seat's saved/);
+    assert.match(app.root.innerHTML, /welcome, Saved Seat/);
     assert.doesNotMatch(app.root.innerHTML, /data-action="add-save"/);
   });
 }
@@ -673,6 +696,36 @@ test("a poll completes reauthentication of the requested seat and schedules this
   assert.equal(out.add.step, "done"); assert.equal(out.render, true); assert.equal(out.closeFlow, add);
   assert.equal(reduceReply({ ...ui, state: out.state, lastRev: out.lastRev }, res).closeFlow, null);
 });
+
+for (const provider of ["codex", "claude"]) {
+  test(`sign in again for ${provider} completes only on a fresher expiry for the requested signed-in active seat`, () => {
+    const email = "target@example.com";
+    const expiry = "2026-11-15T12:00:00Z";
+    const before = seat({ email, status: "active", signed_out: false,
+      signin_expiring: true, signin_expires_at: expiry });
+    const refreshed = { ...before, signin_expiring: false, signin_expires_at: "2026-11-16T12:00:00Z" };
+    const nextState = (next) => state({ rev: 2, tools: { [provider]: { seats: [next] } } });
+    const flow = (named = true) => mkAdd({ step: "connecting", provider,
+      ...(named ? { email } : {}), loginSeats: [before] });
+    for (const next of [before, { ...before, signin_expires_at: "2026-11-14T12:00:00Z" },
+      { ...before, signin_expires_at: "invalid" }, { ...before, signin_expires_at: null },
+      { ...refreshed, email: "unrelated@example.com" },
+      { ...refreshed, status: "ready", active: false }, { ...refreshed, signed_out: true },
+      { ...refreshed, needs_login: true, usage: { error: "unauthorized" } }]) {
+      const out = reduceReply(UI({ screen: "add", add: flow() }), { state: nextState(next) });
+      assert.equal(out.add.step, "connecting"); assert.equal(out.render, false);
+      assert.equal(out.closeFlow, null);
+    }
+    // Background usage/keep-warm activity must never complete the generic add flow.
+    const generic = reduceReply(UI({ screen: "add", add: flow(false) }), { state: nextState(refreshed) });
+    assert.equal(generic.add.step, "connecting"); assert.equal(generic.closeFlow, null);
+    const add = flow();
+    const res = { state: nextState(refreshed) };
+    const out = reduceReply(UI({ screen: "add", add }), res);
+    assert.equal(out.add.step, "done"); assert.equal(out.render, true); assert.equal(out.closeFlow, add);
+    assert.equal(reduceReply({ ...out, screen: "add" }, res).closeFlow, null);
+  });
+}
 
 test("settings describes only the native open and shut door states", () => {
   const html = buildSettings(state());

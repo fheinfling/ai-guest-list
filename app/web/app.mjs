@@ -476,7 +476,7 @@ document.addEventListener("click", (e) => {
     case "add-back": addBack(); break;
     case "add-cancel": screen = "main"; add = null; render(); break;   // add=null drops any pending op
     case "add-cta": {
-      const name = add.name.trim();
+      const name = add.name = normalizeSeatName(add.name);
       // Only a codex "token" paste installs an auth.json in-app; browser sign-in (both providers)
       // launches the official flow in Terminal and waits on the user.
       if (addUsesPaste(add)) {
@@ -496,13 +496,13 @@ document.addEventListener("click", (e) => {
     case "add-save": {         // connecting-step CTA (browser path) → the proven snapshot handshake
       if (add.pending) break;                  // a snapshot is already in flight — don't double-send
       add.pending = true; render();            // re-render disables the button (addConnectingStep)
-      const name = add.name.trim();
+      const name = add.name = normalizeSeatName(add.name);
       send("snapshot", { tool: add.provider, ...(name ? { name } : {}) });
       break;
     }
     case "add-import": {       // one-tap: register the codex account already signed in on this Mac
       if (add.pending) break;
-      const name = add.name.trim();
+      const name = add.name = normalizeSeatName(add.name);
       // in-app save (like paste): pending + importing → saving spinner, no "save my seat" handshake.
       add.pending = true; add.importing = true; add.step = "connecting"; render();
       send("import_current", { tool: add.provider, ...(name ? { name } : {}) });

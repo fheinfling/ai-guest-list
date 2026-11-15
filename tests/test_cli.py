@@ -50,6 +50,30 @@ def test_switch_unknown_returns_error(isolated):
     assert cli.main(["switch", "codex", "ghost@x.com"]) == cli.EXIT_ERR
 
 
+@pytest.mark.parametrize("error_type,code,message", [
+    (cli.AcctswError, cli.EXIT_ERR, "acctsw: sign-in failed"),
+    (KeyboardInterrupt, 130, "acctsw: interrupted — stopping."),
+])
+@pytest.mark.parametrize("with_notes", [False, True])
+def test_signin_prints_cleanup_notes(isolated, monkeypatch, capsys,
+                                    error_type, code, message, with_notes):
+    error = error_type("sign-in failed")
+    notes = ["could not remove the temporary sign-in Keychain item",
+             "could not remove the temporary sign-in home"] if with_notes else []
+    for note in notes:
+        error.add_note(note)
+
+    def signin(ctx, ns):
+        assert ctx is isolated
+        raise error
+
+    monkeypatch.setitem(cli.HANDLERS, "signin", signin)
+    assert cli.main(["signin", "claude"]) == code
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.strip().splitlines() == [message, *[f"acctsw: also: {n}" for n in notes]]
+
+
 def test_cli_install_uninstall_dry_run(isolated, tmp_path, monkeypatch):
     """CLI install/uninstall wiring — dry-run must touch nothing on disk."""
     import acctsw.install as inst

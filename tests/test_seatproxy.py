@@ -238,21 +238,31 @@ class _PumpSocket:
 
 @pytest.mark.parametrize("error", [BrokenPipeError, ConnectionResetError, SP.ssl.SSLError, OSError])
 @pytest.mark.parametrize("tls", [False, True])
-def test_pump_recv_oserror_is_eof(monkeypatch, error, tls):
+def test_pump_recv_oserror_ends_tunnel(monkeypatch, error, tls):
     class TLS(_PumpSocket):
         def pending(self):
             return 0
     monkeypatch.setattr(SP.ssl, "SSLSocket", TLS)
-    monkeypatch.setattr(SP.select, "select", lambda readers, *args: ([readers[0]], [], []))
+    monkeypatch.setattr(SP.select, "select", lambda readers, *args: (list(readers), [], []))
     source = (TLS if tls else _PumpSocket)([error("peer closed")])
-    other = _PumpSocket([b"last reply", b""])
-    SP._pump(source, other)
-    if tls:
-        assert source.sent == []
-        assert source.shutdowns == other.shutdowns == []
-    else:
-        assert source.sent == [b"last reply"]
-        assert source.shutdowns == other.shutdowns == [socket.SHUT_WR]
+    unread = AssertionError("must not read the other peer after a reset")
+    other = _PumpSocket([unread])
+    errors = []
+
+    def pump():
+        try:
+            SP._pump(source, other, idle=None)
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=pump, daemon=True)
+    thread.start()
+    thread.join(timeout=1)
+    assert not thread.is_alive(), "reset left the tunnel waiting on the other peer"
+    assert errors == [], "pump thread crashed"
+    assert other.reads == [unread]
+    assert source.sent == other.sent == []
+    assert source.shutdowns == other.shutdowns == []
 
 
 @pytest.mark.parametrize("error", [TypeError, ValueError, RuntimeError])

@@ -98,7 +98,6 @@ def sample_payload() -> dict:
             "responses_verified": True, "created_at": iso(t),
         }}
         s.data["moved_note"] = "auto-moved Codex · Work → Personal — Work's resting"
-        s.data["last_switch_at"] = iso(t)
         s.settings().update({"theme": "light", "auto_switch": True,
                              "notify": True, "restart_app": False,
                              "engine_restart": True, "key_fallback": False,

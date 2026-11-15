@@ -152,7 +152,7 @@ def build_states(base: dict, catalog: dict) -> list[dict]:
             seat["usage5h"] = 100
             seat["limited_until"] = _iso(96)
     trouble["counts"] = {"resting": 4, "ready": 0}
-    trouble["door"], trouble["dot"] = "shut", "amber"
+    trouble["door"] = "shut"
     trouble["keys"][0]["responses_verified"] = False
     trouble["supervision"] = {"wrappers": True, "block": False, "on_path": False, "active": False}
     add("trouble", "nothing ready", "every seat resting, unproven key, supervision off",
@@ -465,9 +465,16 @@ def main():
             states = gallery_states()
             if args.compare_ref:
                 with tempfile.TemporaryDirectory(prefix="agl-layout-before-") as directory:
-                    for file in ("index.html", "styles.css", "bundle.js"):
+                    fonts = subprocess.check_output(
+                        ["git", "ls-tree", "-r", "--name-only", args.compare_ref, "--", "app/web/fonts/"],
+                        cwd=ROOT, text=True,
+                    ).splitlines()
+                    files = ["index.html", "styles.css", "bundle.js", *[str(Path(p).relative_to("app/web")) for p in fonts]]
+                    for file in files:
                         source = subprocess.check_output(["git", "show", f"{args.compare_ref}:app/web/{file}"], cwd=ROOT)
-                        (Path(directory) / file).write_bytes(source)
+                        target = Path(directory) / file
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_bytes(source)
                     run_states(browser, states, Path(directory))
                 print(f"Before ({args.compare_ref}): {passed} passed, {failed} failed")
                 baseline_failed = failed

@@ -1,0 +1,106 @@
+[
+  {
+    "label": "CLI hides cleanup notes on an expected error",
+    "file": "acctsw/cli.py",
+    "old": "        for note in getattr(e, \"__notes__\", ()):\n            print(f\"acctsw: also: {note}\", file=sys.stderr)\n        return EXIT_ERR",
+    "new": "        return EXIT_ERR",
+    "test": [
+      "tests/test_cli.py::test_signin_prints_cleanup_notes"
+    ]
+  },
+  {
+    "label": "CLI hides cleanup notes on interruption",
+    "file": "acctsw/cli.py",
+    "old": "        for note in getattr(e, \"__notes__\", ()):\n            print(f\"acctsw: also: {note}\", file=sys.stderr)\n        return 130",
+    "new": "        return 130",
+    "test": [
+      "tests/test_cli.py::test_signin_prints_cleanup_notes"
+    ]
+  },
+  {
+    "label": "a recv reset becomes a half close",
+    "file": "acctsw/seatproxy.py",
+    "old": "return    # A reset ends the whole tunnel; only orderly EOF can half-close.",
+    "new": "data = b\"\"",
+    "test": [
+      "tests/test_seatproxy.py::test_pump_recv_oserror_ends_tunnel"
+    ]
+  },
+  {
+    "label": "add name loses its length limit",
+    "file": "app/web/render.mjs",
+    "old": "class=\"add-input\" maxlength=\"32\"",
+    "new": "class=\"add-input\"",
+    "cmd": [
+      "node",
+      "--test",
+      "--test-name-pattern=seat names have the same",
+      "app/web/render.test.mjs"
+    ]
+  },
+  {
+    "label": "add name no longer collapses whitespace",
+    "file": "app/web/app.mjs",
+    "old": "case \"add-cta\": {\n      const name = add.name = normalizeSeatName(add.name);",
+    "new": "case \"add-cta\": {\n      const name = add.name.trim();",
+    "cmd": [
+      "sh",
+      "-c",
+      "python3 scripts/build-web.py && node --test --test-name-pattern=\"browser sign-in for\" app/web/render.test.mjs"
+    ]
+  },
+  {
+    "label": "welcome ignores the actual saved name",
+    "file": "app/web/render.mjs",
+    "old": "normalizeSeatName(saved?.name || add.name || \"\")",
+    "new": "normalizeSeatName(add.name || \"\")",
+    "cmd": [
+      "node",
+      "--test",
+      "--test-name-pattern=done greets",
+      "app/web/render.test.mjs"
+    ]
+  },
+  {
+    "label": "sign in again ignores a newer expiry",
+    "file": "app/web/render.mjs",
+    "old": "|| (add.email && Date.parse(seat.signin_expires_at) > Date.parse(before.signin_expires_at))",
+    "new": "|| false",
+    "cmd": [
+      "node",
+      "--test",
+      "--test-name-pattern=sign in again for",
+      "app/web/render.test.mjs"
+    ]
+  },
+  {
+    "label": "generic add mistakes a refreshed expiry for a new login",
+    "file": "app/web/render.mjs",
+    "old": "|| (add.email && Date.parse(seat.signin_expires_at) > Date.parse(before.signin_expires_at))",
+    "new": "|| (Date.parse(seat.signin_expires_at) > Date.parse(before.signin_expires_at))",
+    "cmd": [
+      "node",
+      "--test",
+      "--test-name-pattern=sign in again for",
+      "app/web/render.test.mjs"
+    ]
+  },
+  {
+    "label": "shell node guards lose their TAP reporter",
+    "file": "scripts/mutate.py",
+    "old": "cmd[2] = re.sub(r\"(?<![\\w-])(node\\s+--test)(?=\\s|$)([^;&|]*)\", tap, cmd[2])",
+    "new": "cmd[2] = cmd[2]",
+    "test": [
+      "tests/test_mutate.py::test_node_runner_reports_no_test_when_pattern_matches_nothing"
+    ]
+  },
+  {
+    "label": "layout reference omits bundled fonts",
+    "file": "scripts/check-layout.py",
+    "old": "files = [\"index.html\", \"styles.css\", \"bundle.js\", *[str(Path(p).relative_to(\"app/web\")) for p in fonts]]",
+    "new": "files = [\"index.html\", \"styles.css\", \"bundle.js\"]",
+    "test": [
+      "tests/test_mutate.py::test_check_layout_compare_ref_stages_the_refs_fonts"
+    ]
+  }
+]

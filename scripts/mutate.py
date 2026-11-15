@@ -71,6 +71,12 @@ def _prepare_cmd(entry: dict) -> list[str]:
         cmd = [a for a in entry["cmd"] if not a.startswith("--test-reporter")]
         if len(cmd) >= 2 and Path(cmd[0]).name == "node" and "--test" in cmd:
             cmd.insert(cmd.index("--test") + 1, "--test-reporter=tap")
+        elif len(cmd) >= 3 and Path(cmd[0]).name == "sh" and cmd[1] == "-c":
+            def tap(match):
+                args = re.sub(r"\s+--test-reporter(?:=\S+|\s+\S+)", "", match[2])
+                return match[1] + " --test-reporter=tap" + args
+
+            cmd[2] = re.sub(r"(?<![\w-])(node\s+--test)(?=\s|$)([^;&|]*)", tap, cmd[2])
         return cmd
     return [PY, "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider", "-p", "no:warnings",
             *entry["test"]]

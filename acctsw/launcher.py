@@ -1541,7 +1541,6 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         """Persist a seat hop and prepare its private home. Caller holds ctx.locked()."""
         switch(ctx, state, tool, email, sync=False, mirror=(tool != "claude"), save=False)
         _activate_home(email)
-        state.data["last_switch_at"] = iso(now())
         state.save()
 
     claude_home_warnings = set()
@@ -2333,7 +2332,6 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     if not _spend_crossing(st, frm, target):
                         return REFUSED
                     switch(ctx, st, tool, target, sync=False, mirror=False, save=False)
-                    st.data["last_switch_at"] = iso(now())
                     st.save()
             except Exception:
                 logging.getLogger(__name__).info("in-place hop to %s failed", target,
@@ -3102,7 +3100,6 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     st = ctx.load_state()
                     if st.get_seat(tool, to) is not None and st.active(tool) != to:
                         switch(ctx, st, tool, to, sync=False, mirror=False, save=False)
-                        st.data["last_switch_at"] = iso(now())
                         st.save()
                 if to != launch_email:
                     inplace["hops"] += 1   # a third seat, chosen by the swap: still a hop
