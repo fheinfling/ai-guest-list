@@ -27,8 +27,8 @@ window.AGL = {
     res = typeof res === "string" ? JSON.parse(res) : res;
     // All the async-correlation logic lives in the pure reduceReply() (unit-tested); this just
     // applies its decisions to the module state + DOM. The add sub-view holds unsaved typed input,
-    // so a pure state push (the 180s poll) updates `state` but the reducer returns render=false —
-    // no DOM swap, no focus/caret theft.
+    // so a pure state push updates `state` without a DOM swap or focus/caret theft, except when
+    // a completed browser sign-in advances the connecting step to done.
     const out = reduceReply({ screen, add, lastRev, state }, res);
     const inKeyFlow = screen === "add-key";
     if (inKeyFlow || screen === "paid-key") out.screen = screen; // keep the current input/confirmation
@@ -485,10 +485,11 @@ document.addEventListener("click", (e) => {
         add.pending = true; add.step = "connecting"; render();   // paste in flight → saving spinner
         send("paste", { tool: add.provider, blob, ...(name ? { name } : {}) });
       } else {
-        // launch the browser sign-in and wait on the USER to finish + tap "save my seat" — not a
-        // saving spinner yet (that's add.pending, set on save).
+        // The isolated engine saves automatically. Remember the starting seats so a poll can
+        // recognize the new login without replacing inputs while the user is still signing in.
+        add.loginSeats = (state.tools?.[add.provider]?.seats || []).map((seat) => ({ ...seat }));
         add.step = "connecting"; render();
-        send("login", { tool: add.provider, method: add.method, ...(add.email ? { email: add.email } : {}) });
+        send("login", { tool: add.provider, method: add.method, ...(name ? { name } : {}), ...(add.email ? { email: add.email } : {}) });
       }
       break;
     }
@@ -530,7 +531,7 @@ function addBack() {
   // flight, back is a no-op; the reply advances to done. Backing out only makes sense before saving.
   if (add?.pending) return;
   if (add?.step === "details") add.step = "provider";
-  else if (add?.step === "connecting") add.step = "details";   // abandon an un-saved login
+  else if (add?.step === "connecting") add.step = "details";   // Terminal sign-in can still finish
   else { screen = "main"; add = null; }        // provider or done → leave the flow
   render();
 }

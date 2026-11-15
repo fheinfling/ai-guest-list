@@ -59,6 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
     signin = sub.add_parser("signin", help="sign in privately and select the identified seat")
     _add_tool_arg(signin)
     signin.add_argument("--seat", help="require this account for sign in again")
+    signin.add_argument("--name", help="name the saved subscription seat")
     rm = sub.add_parser("remove", help="remove (sign out) a seat")
     _add_tool_arg(rm)
     rm.add_argument("email", help="account email to remove")
@@ -210,7 +211,7 @@ def _cmd_add(ctx: Context, ns) -> int:
 
 def _cmd_signin(ctx: Context, ns) -> int:
     from .authflows import signin
-    return signin(ctx, ns.tool, seat=ns.seat)
+    return signin(ctx, ns.tool, seat=ns.seat, name=ns.name)
 
 
 def _cmd_rename(ctx: Context, ns) -> int:

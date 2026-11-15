@@ -12,6 +12,28 @@ def call(name, receiver, argument):
     getattr(menubar.AGLDelegate, name).callable(receiver, argument)
 
 
+def test_login_worker_passes_the_popover_name_to_the_terminal(ctx, monkeypatch):
+    from app import terminal
+    launches = []
+    monkeypatch.setattr(terminal, "prepare_then_login", lambda *args, **kwargs: launches.append((args, kwargs)))
+    receiver = SimpleNamespace(ctx=ctx, loginNudge_=lambda _: None,
+        performSelectorOnMainThread_withObject_waitUntilDone_=lambda *args: None)
+    call("loginBg_", receiver, {"tool": "claude", "name": "Example Seat", "email": "seat@example.com"})
+    assert launches == [((ctx, "claude"), {"seat": "seat@example.com", "name": "Example Seat"})]
+
+
+@pytest.mark.parametrize("provider", [*menubar.KEY_PRICING_URLS, "unknown", "https://api.example.com"])
+def test_pricing_opens_only_the_native_provider_allowlist(monkeypatch, provider):
+    opened = []
+    monkeypatch.setattr(menubar, "NSWorkspace", SimpleNamespace(sharedWorkspace=lambda:
+        SimpleNamespace(openURL_=opened.append)))
+    monkeypatch.setattr(menubar, "NSURL", SimpleNamespace(URLWithString_=lambda value: value))
+    message = SimpleNamespace(body=lambda: {"action": "key_pricing", "provider": provider,
+                                           "url": "https://api.example.com"})
+    menubar.AGLDelegate.userContentController_didReceiveScriptMessage_.callable(SimpleNamespace(), None, message)
+    assert opened == ([menubar.KEY_PRICING_URLS[provider]] if provider in menubar.KEY_PRICING_URLS else [])
+
+
 def test_overlapping_polls_keep_one_targeted_followup():
     dispatched = []
     applied = []

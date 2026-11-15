@@ -9,29 +9,7 @@ const TOOL_META = {
   claude: { label: "Claude", plan: "CLAUDE CODE", accent: "var(--claude)" },     // coral
 };
 
-// menu-bar aggregate dot (spec §9): rose=needs a hello · gold=just switched · amber=a seat
-// resting · green=everyone fresh.
-const DOT_COPY = {
-  hello: { label: "needs a hello" }, switched: { label: "just switched you" },
-  amber: { label: "a seat's resting" }, green: { label: "everyone's fresh" },
-};
-
-function dotState(state) {
-  const key = state?.dot || dotKey(state);
-  return { key, ...DOT_COPY[key] };
-}
-
-function dotKey(state) {
-  const seats = ["codex", "claude"].flatMap((t) => state?.tools?.[t]?.seats || []);
-  if (seats.some((s) => (s.status || "") === "needs-login")) return "hello";
-  if (state?.recently_switched) return "switched";
-  // Mirror acctsw.web_dot (shared golden fixtures): a terminal cannot free quota, so use status
-  // just like the header counts.
-  if (seats.some((s) => ["resting", "queued"].includes(s.status))) return "amber";
-  return "green";
-}
-
-// Door open/shut — mirror of acctsw.web_dot.door_for (golden fixture keeps them in lockstep).
+// Door open/shut — the shared golden fixture keeps this fallback aligned with the engine.
 function doorKey(state) {
   if (state?.door === "open" || state?.door === "shut") return state.door;
   const seats = ["codex", "claude"].flatMap((t) => state?.tools?.[t]?.seats || []);
@@ -101,12 +79,6 @@ function pct(seat, win) {
   const v = win === "5h" ? seat?.usage5h : seat?.usageWeek;
   const raw = v != null ? v : (seat?.usage?.windows?.[win]?.used_pct);
   return typeof raw === "number" ? Math.max(0, Math.min(100, raw)) : null;
-}
-
-function creditLeft(seat) {
-  if (seat?.usage_unknown) return null;
-  const used = ["5h", "weekly"].map((w) => pct(seat, w)).filter((v) => v !== null);
-  return used.length ? Math.round(100 - Math.max(...used)) : null;
 }
 
 function fmtCountdown(iso, now = Date.now()) {
@@ -331,7 +303,15 @@ function reduceReply(ui, res) {
   // login the user abandoned (possibly for the other provider) must not steer the flow they restarted.
   // (res.tool may be absent on a generic failure; then fall back to "current flow".)
   const forThisFlow = inAdd && res.add_op && (res.tool == null || res.tool === add.provider);
-  if (res.added && forThisFlow && add.pending) { // OUR paste/snapshot/import succeeded → celebrate then done
+  // Official sign-in captures and activates the seat itself, even with the popover closed.
+  // Accept only a current snapshot and a newly signed-in active seat of this flow's provider.
+  const browserSaved = inAdd && add.step === "connecting" && !addUsesPaste(add) && !add.importing
+    && add.loginSeats && res.state === state && (state.tools?.[add.provider]?.seats || []).some((seat) => {
+      if (!isActive(seat) || signedOut(seat) || signinNeeded(seat) || (add.email && seat.email !== add.email)) return false;
+      const before = add.loginSeats.find((s) => s.email === seat.email);
+      return !before || signedOut(before) || signinNeeded(before);
+    });
+  if ((res.added && forThisFlow && add.pending) || browserSaved) {
     add.pending = false; add.importing = false; add.step = "done";
     addChanged = true; closeFlow = add;        // caller schedules the auto-close, scoped to this flow
   }
@@ -440,16 +420,15 @@ function addDetailsStep(add, state) {
 }
 
 function addConnectingStep(add) {
-  // A browser sign-in first WAITS for the user to finish in the browser and tap "save my seat"; only
-  // then (add.pending) is a snapshot in flight. A codex auth.json paste is always actively saving.
-  // Spinner + "saving…" copy show only when something is really in
-  // flight — a lone spinner while we wait on the user would read as "hung".
+  // Browser sign-in saves automatically in the engine. Keep the manual snapshot as a fallback;
+  // add.pending means that snapshot is in flight. A codex auth.json paste is actively saving too.
+  // Show a spinner only for those in-app saves while the browser waits on the user.
   const terminalFlow = !addUsesPaste(add) && !add.importing;  // a browser sign-in waits on the user
   const saving = !terminalFlow || add.pending;
   const title = saving ? "saving your seat…" : "we opened your browser…";
   const sub = saving ? "tucking it away safely 💛" : "say hi over there and you're on the list 💛";
   const spin = saving ? `<div class="add-spin"></div>` : "";
-  // The "save my seat" handshake is only for the browser flow; a paste/import is already saving.
+  // The optional snapshot is only for the browser flow; a paste/import is already saving.
   const cta = terminalFlow
     ? `<button class="add-cta" data-action="add-save"${add.pending ? " disabled" : ""}>save my seat 💛</button>`
     : "";
@@ -540,7 +519,7 @@ function buildSettings(state) {
     </section><section class="set-sec"><h2 class="set-label">appearance</h2>
       ${segBlock("theme", "", "set_theme", theme, THEME_OPTS)}
       <div class="set-legend"><p>in your menu bar</p><div>${doorMark({door:"open"})}<span>a model is free</span></div><div>${doorMark({door:"shut"})}<span>every seat is resting</span></div>
-      <p>gold: just switched you</p><p>rose: sign-in needed</p></div>
+      </div>
     </section><p class="set-ver">ai guest list ${esc(version + newer)}</p></div></div>`;
 }
 
@@ -925,14 +904,14 @@ function pinnedSessions(state) {
 // Key providers mirror providers.py's harness gate: chat-only catalogs are not usable seats.
 // No price table lives here. Every amount comes from a bridge price envelope.
 const KEY_PROVIDERS = {
-  openai: { name: "openai", harness: "codex", pricing: "https://openai.com/api/pricing/" },
-  anthropic: { name: "anthropic", harness: "claude", pricing: "https://www.anthropic.com/pricing" },
-  openrouter: { name: "openrouter", harness: "codex", priced: true, pricing: "https://openrouter.ai/models" },
-  langdock: { name: "langdock (openai models)", harness: "codex", regional: true, pricing: "https://www.langdock.com/pricing" },
-  langdock_anthropic: { name: "langdock (claude models)", harness: "claude", regional: true, pricing: "https://www.langdock.com/pricing" },
-  deepseek: { name: "deepseek", harness: "codex", pricing: "https://api-docs.deepseek.com/quick_start/pricing" },
-  xai: { name: "xai", harness: "codex", priced: true, pricing: "https://docs.x.ai/docs/models" },
-  groq: { name: "groq", harness: "codex", unverified: true, pricing: "https://groq.com/pricing" },
+  openai: { name: "openai", harness: "codex", pricing: true },
+  anthropic: { name: "anthropic", harness: "claude", pricing: true },
+  openrouter: { name: "openrouter", harness: "codex", priced: true, pricing: true },
+  langdock: { name: "langdock (openai models)", harness: "codex", regional: true, pricing: true },
+  langdock_anthropic: { name: "langdock (claude models)", harness: "claude", regional: true, pricing: true },
+  deepseek: { name: "deepseek", harness: "codex", pricing: true },
+  xai: { name: "xai", harness: "codex", priced: true, pricing: true },
+  groq: { name: "groq", harness: "codex", unverified: true, pricing: true },
   openai_compatible: { name: "openai-compatible", harness: "codex", unverified: true },
 };
 
@@ -1190,8 +1169,8 @@ window.AGL = {
     res = typeof res === "string" ? JSON.parse(res) : res;
     // All the async-correlation logic lives in the pure reduceReply() (unit-tested); this just
     // applies its decisions to the module state + DOM. The add sub-view holds unsaved typed input,
-    // so a pure state push (the 180s poll) updates `state` but the reducer returns render=false —
-    // no DOM swap, no focus/caret theft.
+    // so a pure state push updates `state` without a DOM swap or focus/caret theft, except when
+    // a completed browser sign-in advances the connecting step to done.
     const out = reduceReply({ screen, add, lastRev, state }, res);
     const inKeyFlow = screen === "add-key";
     if (inKeyFlow || screen === "paid-key") out.screen = screen; // keep the current input/confirmation
@@ -1648,10 +1627,11 @@ document.addEventListener("click", (e) => {
         add.pending = true; add.step = "connecting"; render();   // paste in flight → saving spinner
         send("paste", { tool: add.provider, blob, ...(name ? { name } : {}) });
       } else {
-        // launch the browser sign-in and wait on the USER to finish + tap "save my seat" — not a
-        // saving spinner yet (that's add.pending, set on save).
+        // The isolated engine saves automatically. Remember the starting seats so a poll can
+        // recognize the new login without replacing inputs while the user is still signing in.
+        add.loginSeats = (state.tools?.[add.provider]?.seats || []).map((seat) => ({ ...seat }));
         add.step = "connecting"; render();
-        send("login", { tool: add.provider, method: add.method, ...(add.email ? { email: add.email } : {}) });
+        send("login", { tool: add.provider, method: add.method, ...(name ? { name } : {}), ...(add.email ? { email: add.email } : {}) });
       }
       break;
     }
@@ -1693,7 +1673,7 @@ function addBack() {
   // flight, back is a no-op; the reply advances to done. Backing out only makes sense before saving.
   if (add?.pending) return;
   if (add?.step === "details") add.step = "provider";
-  else if (add?.step === "connecting") add.step = "details";   // abandon an un-saved login
+  else if (add?.step === "connecting") add.step = "details";   // Terminal sign-in can still finish
   else { screen = "main"; add = null; }        // provider or done → leave the flow
   render();
 }

@@ -89,7 +89,8 @@ def open_in_terminal(command: str) -> None:
                 pass
 
 
-def resolve_login_command(ctx: Context, tool: str, *, seat: str | None = None) -> str:
+def resolve_login_command(ctx: Context, tool: str, *, seat: str | None = None,
+                          name: str | None = None) -> str:
     """Launch this installation's isolated sign-in, bypassing stale installed wrappers."""
     from acctsw.bridge import LOGIN_SUBCMD
     if tool not in TOOLS:
@@ -98,11 +99,13 @@ def resolve_login_command(ctx: Context, tool: str, *, seat: str | None = None) -
     args = [*engine, *LOGIN_SUBCMD[tool]]
     if seat:
         args.extend(["--seat", seat])
+    if name is not None:
+        args.append(f"--name={name}")
     return shell_quote(args)
 
 
 def prepare_then_login(ctx: Context, tool: str, command: str | None = None, *,
-                       seat: str | None = None) -> None:
+                       seat: str | None = None, name: str | None = None) -> None:
     """Preserve outgoing stock rotations, then launch isolated sign-in in this app's engine.
 
     ``command`` defaults to the resolved absolute-path login command (see ``resolve_login_command``);
@@ -117,7 +120,7 @@ def prepare_then_login(ctx: Context, tool: str, command: str | None = None, *,
     if tool not in TOOLS:
         raise ValueError(f"unknown tool: {tool}")
     if command is None:
-        command = resolve_login_command(ctx, tool, seat=seat)
+        command = resolve_login_command(ctx, tool, seat=seat, name=name)
     live_identity = identity_mod.claude_live_identity(ctx) if tool == "claude" else None
     with ctx.locked():
         state = ctx.load_state()

@@ -315,7 +315,7 @@ def test_native_signin_passes_requested_seat_to_terminal(ctx, monkeypatch):
     receiver = SimpleNamespace(ctx=ctx, loginNudge_=lambda _: None,
         performSelectorOnMainThread_withObject_waitUntilDone_=lambda *a: None)
     native(receiver, {"tool": "claude", "email": B})
-    assert launched == [((ctx, "claude"), {"seat": B})]
+    assert launched == [((ctx, "claude"), {"seat": B, "name": None})]
 
 
 @pytest.mark.parametrize("stored", ["{}", "[]", "null", "broken", '{"claudeAiOauth":{"refreshToken":3}}'])

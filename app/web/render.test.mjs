@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
-  buildHTML, dotState, dotKey, doorKey, doorMark, creditLeft, pct, fmtCountdown, needsHello,
+  buildHTML, doorKey, doorMark, pct, fmtCountdown, needsHello,
   signedOut, isActive, signinExpiring, usable, resetIsPast, switchNeedsConfirmation, seatIdentity, headerVerdict, seatWindows,
   buildSettings, buildAddSeat, reduceReply, supervisionBanner, engineBanner, fmtUsageAge, fmtSessionAge, updateClockText,
 } from "./render.mjs";
@@ -26,16 +26,6 @@ function state(over = {}) {
     ...over,
   };
 }
-
-test("dotKey golden parity with python fixture", () => {
-  const path = fileURLToPath(new URL("../../tests/fixtures/dot_cases.json", import.meta.url));
-  for (const c of JSON.parse(readFileSync(path, "utf8"))) assert.equal(dotKey(c.state), c.expected, c.name);
-});
-
-test("dotState reads bridge-provided state.dot", () => {
-  assert.equal(dotState({ dot: "amber" }).key, "amber");
-  assert.equal(dotState({ dot: "hello" }).label, "needs a hello");
-});
 
 test("doorKey golden parity with python fixture", () => {
   const path = fileURLToPath(new URL("../../tests/fixtures/door_cases.json", import.meta.url));
@@ -63,9 +53,8 @@ test("needsHello detects needs-login status", () => {
   assert.equal(needsHello(seat({ status: "active", usage: { error: "unauthorized" } })), true);
 });
 
-test("pct + creditLeft from usage5h/usageWeek", () => {
+test("pct clamps usage5h readings", () => {
   assert.equal(pct(seat({ usage5h: 120 }), "5h"), 100);
-  assert.equal(creditLeft(seat({ usage5h: 70, usageWeek: 40 })), 30);
 });
 
 test("fmtCountdown", () => {
@@ -603,6 +592,60 @@ test("reduceReply: a poll while on the add screen does NOT render (keeps typed i
   assert.equal(o.render, false);           // swallow — no DOM swap
   assert.equal(o.state.rev, 2);            // but state IS updated silently
   assert.equal(o.add.name, "Wo");          // typed input untouched
+});
+
+for (const provider of ["codex", "claude"]) {
+  test(`browser sign-in for ${provider} forwards the name and completes on a poll after closing`, () => {
+    const app = keyApp({ setTimeout: () => 1 });
+    app.window.AGL.update({ ...stateRev(1), tools: { [provider]: { seats: [] } } });
+    app.click({ action: "add", tool: provider });
+    app.input("add-name", "  Example Seat  ");
+    app.click({ action: "add-cta" });
+    assert.equal(app.sent.at(-1).name, "Example Seat");
+    app.window.AGL.closed();
+    const waiting = app.root.innerHTML;
+    app.window.AGL.update({ ...stateRev(2), tools: { [provider]: { seats: [] } } });
+    assert.equal(app.root.innerHTML, waiting);
+    app.window.AGL.update({ ...stateRev(3), tools: { [provider]: { seats: [
+      seat({ email: "seat@example.com", status: "active", name: "Example Seat" }),
+    ] } } });
+    assert.match(app.root.innerHTML, /your seat's saved/);
+    assert.doesNotMatch(app.root.innerHTML, /data-action="add-save"/);
+  });
+}
+
+test("browser completion polls ignore old, other-tool, inactive, signed-out and unrelated seats", () => {
+  const before = seat({ email: "old@example.com", status: "active" });
+  const addFlow = () => mkAdd({ step: "connecting", provider: "codex", loginSeats: [before] });
+  const snapshot = (seats, tool = "codex", rev = 3) => ({ ...stateRev(rev), tools: { [tool]: { seats } } });
+  for (const next of [snapshot([before]), snapshot([seat({ status: "active" })], "claude"),
+    snapshot([seat({ status: "ready" })]), snapshot([seat({ status: "active", signed_out: true })]),
+    snapshot([seat({ status: "active" })], "codex", 1)]) {
+    const out = reduceReply(UI({ screen: "add", add: addFlow(), lastRev: 2,
+      state: snapshot([seat({ status: "active" })], "codex", 2) }), { state: next });
+    assert.equal(out.add.step, "connecting"); assert.equal(out.render, false);
+  }
+  const add = addFlow(); add.email = "target@example.com";
+  assert.equal(reduceReply(UI({ screen: "add", add }), {
+    state: snapshot([seat({ status: "active", email: "unrelated@example.com" })]),
+  }).add.step, "connecting");
+});
+
+test("a poll completes reauthentication of the requested seat and schedules this flow's close once", () => {
+  const email = "seat@example.com";
+  const add = mkAdd({ step: "connecting", provider: "claude", email,
+    loginSeats: [seat({ email, status: "needs-login", signed_out: true })] });
+  const res = { state: { ...stateRev(2), tools: { claude: { seats: [seat({ email, status: "active" })] } } } };
+  const ui = UI({ screen: "add", add });
+  const out = reduceReply(ui, res);
+  assert.equal(out.add.step, "done"); assert.equal(out.render, true); assert.equal(out.closeFlow, add);
+  assert.equal(reduceReply({ ...ui, state: out.state, lastRev: out.lastRev }, res).closeFlow, null);
+});
+
+test("settings describes only the native open and shut door states", () => {
+  const html = buildSettings(state());
+  assert.match(html, /door--open/); assert.match(html, /door--shut/);
+  assert.doesNotMatch(html, /gold:|rose:|just switched you/);
 });
 
 test("reduceReply: stale snapshot (lower rev) is ignored", () => {
@@ -1687,10 +1730,13 @@ test("consent answers share size and weight, with no asymmetric CSS overrides", 
       assert.ok(buttons.every((b) => !/style=|autofocus|tabindex/.test(b)));
     }
   }
-  assert.match(css, /\.k-acts, \.equal-choices\s*\{[^}]*grid-template-columns:minmax\(0,1fr\) minmax\(0,1fr\)/);
-  const shared = css.match(/\.choice, \.k-acts button\s*\{([^}]+)\}/)[1];
-  for (const rule of ["min-height:48px", "width:100%", "padding:10px", "font-size:.95rem", "font-weight:650"]) {
-    assert.ok(shared.includes(rule), rule);
+  for (const selector of [".k-acts", ".equal-choices", ".choice", ".k-acts button"]) {
+    const declarations = [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+      .filter((m) => m[1].trim().split(/,\s*/).includes(selector)).map((m) => m[2]).join(" ");
+    const rules = selector === ".k-acts" || selector === ".equal-choices"
+      ? ["grid-template-columns:minmax(0,1fr) minmax(0,1fr)"]
+      : ["min-height:48px", "width:100%", "padding:10px", "font-size:.95rem", "font-weight:650"];
+    for (const rule of rules) assert.ok(declarations.includes(rule), `${selector}: ${rule}`);
   }
   // A later override targeting either answer, its position or an action would defeat the shared rule.
   const selectors = [...css.matchAll(/([^{}]+)\{[^{}]*\}/g)].map((m) => m[1])
@@ -1840,7 +1886,6 @@ test("toast remains outside root and uses textContent and theme tokens; there is
   assert.equal(classes.has("celebrate"), true);
   callbacks.find((c) => c.ms === 600).fn();
   assert.equal(classes.has("celebrate"), false);
-  assert.match(css, /@keyframes pulse/);
   assert.match(css, /transition:transform \.15s/);
   assert.match(css, /prefers-reduced-motion:reduce[\s\S]*animation:none !important/);
   callbacks.find((c) => c.ms === 3000).fn();
