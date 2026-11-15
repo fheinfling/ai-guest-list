@@ -1000,14 +1000,18 @@ class _NoDelaySocket(socket.socket):
 # runs the same through ``start()``; it skips where binding a port is not allowed.
 
 def _can_bind() -> str | None:
-    s = socket.socket()
     try:
-        s.bind(("127.0.0.1", 0))
+        with socket.socket() as server, socket.socket() as client:
+            server.settimeout(1)
+            client.settimeout(1)
+            server.bind(("127.0.0.1", 0))
+            server.listen(1)
+            client.connect(server.getsockname())
+            accepted, _ = server.accept()
+            accepted.close()
         return None
     except OSError as e:
-        return f"binding 127.0.0.1 is not allowed here ({e})"
-    finally:
-        s.close()
+        return f"listening/connecting on 127.0.0.1 is not allowed here ({e})"
 
 
 _NO_BIND = _can_bind()
@@ -1574,34 +1578,57 @@ def test_tcp_blind_tunnel_to_another_host(loopback_only, session_ca):
     echo = socket.socket()
     echo.bind(("127.0.0.1", 0))
     echo.listen(1)
+    echo.settimeout(0.1)
     received = []
+    stopping = threading.Event()
 
     def serve():
-        c, _ = echo.accept()
-        with c:
-            while data := c.recv(65536):
-                received.append(data)
-                c.sendall(data)
-    threading.Thread(target=serve, daemon=True).start()
+        try:
+            while not stopping.is_set():
+                try:
+                    c, _ = echo.accept()
+                    break
+                except socket.timeout:
+                    continue
+            else:
+                return
+            with c:
+                c.settimeout(0.1)
+                while not stopping.is_set():
+                    try:
+                        data = c.recv(65536)
+                    except socket.timeout:
+                        continue
+                    if not data:
+                        break
+                    received.append(data)
+                    c.sendall(data)
+        except OSError:
+            if not stopping.is_set():
+                raise
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
     proxy = SeatProxy(lambda hit: None, ca=session_ca)
-    proxy.bind(B)
-    u = urlsplit(proxy.start())
     try:
-        sock = _REAL_CREATE_CONNECTION((u.hostname, u.port), timeout=10)
-        cred = base64.b64encode(f"{unquote(u.username)}:{unquote(u.password)}".encode()).decode()
-        target = f"127.0.0.1:{echo.getsockname()[1]}"
-        sock.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n"
-                     f"Proxy-Authorization: Basic {cred}\r\n\r\n".encode())
-        head = b""
-        while b"\r\n\r\n" not in head:
-            head += sock.recv(1)
-        assert head.startswith(b"HTTP/1.1 200 ")
-        payload = b"\x16\x03\x01 not decrypted " + CLIENT_TOKEN.encode()
-        assert _echo(sock, payload) == payload
-        sock.close()
+        proxy.bind(B)
+        u = urlsplit(proxy.start())
+        with _REAL_CREATE_CONNECTION((u.hostname, u.port), timeout=10) as sock:
+            cred = base64.b64encode(f"{unquote(u.username)}:{unquote(u.password)}".encode()).decode()
+            target = f"127.0.0.1:{echo.getsockname()[1]}"
+            sock.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n"
+                         f"Proxy-Authorization: Basic {cred}\r\n\r\n".encode())
+            head = b""
+            while b"\r\n\r\n" not in head:
+                head += sock.recv(1)
+            assert head.startswith(b"HTTP/1.1 200 ")
+            payload = b"\x16\x03\x01 not decrypted " + CLIENT_TOKEN.encode()
+            assert _echo(sock, payload) == payload
     finally:
-        proxy.stop()
+        stopping.set()
         echo.close()
+        proxy.stop()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
     assert b"".join(received) == payload
 
 

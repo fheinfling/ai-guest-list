@@ -497,14 +497,31 @@ def short_home(monkeypatch):
         targets = base / 's'
         targets.mkdir()
         monkeypatch.setattr(codexhome, 'TMP_DAEMONS', targets)
+        _require_unix_connections(targets / 'probe')
         yield home, targets
+
+
+def _require_unix_connections(target):
+    try:
+        with socket.socket(socket.AF_UNIX) as server, socket.socket(socket.AF_UNIX) as client:
+            server.settimeout(1)
+            client.settimeout(1)
+            server.bind(str(target))
+            server.listen(1)
+            client.connect(str(target))
+            accepted, _ = server.accept()
+            accepted.close()
+    except OSError:
+        pytest.skip('execution sandbox denies AF_UNIX listen/connect')
+    finally:
+        target.unlink(missing_ok=True)
 
 
 def _socket(home, target, *, listen=False):
     server = socket.socket(socket.AF_UNIX)
     try:
         server.bind(str(target))
-    except PermissionError:
+    except OSError:
         server.close()
         pytest.skip('execution sandbox denies AF_UNIX bind')
     if listen:

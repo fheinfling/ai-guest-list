@@ -62,7 +62,7 @@ jobs:
       - name: Run tests
         run: |
           . .venv/bin/activate
-          python -m pytest -q --cov=acctsw --cov-report=xml
+          python -m pytest -q --cov=acctsw --cov=app --cov-report=xml
           node --test app/web/*.test.mjs
 
       - name: Build native app for this architecture

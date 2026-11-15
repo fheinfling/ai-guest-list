@@ -305,12 +305,13 @@ def test_signin_claude_reads_raw_item_and_profile_outside_lock(ctx, fakes, monke
 
 
 def test_native_signin_passes_requested_seat_to_terminal(ctx, monkeypatch):
-    from app import terminal
-    from tests.test_claude_sync_timer import callback
+    from app import menubar, terminal
+    if menubar.objc is None:
+        pytest.skip("native callbacks require PyObjC")
     launched = []
     monkeypatch.setattr(terminal, "prepare_then_login", lambda *a, **k: launched.append((a, k)))
-    native = callback("loginBg_", {"objc": SimpleNamespace(selector=lambda v, **k: v)})
-    receiver = SimpleNamespace(ctx=ctx, loginNudge_=object(),
+    native = menubar.AGLDelegate.loginBg_.callable
+    receiver = SimpleNamespace(ctx=ctx, loginNudge_=lambda _: None,
         performSelectorOnMainThread_withObject_waitUntilDone_=lambda *a: None)
     native(receiver, {"tool": "claude", "email": B})
     assert launched == [((ctx, "claude"), {"seat": B})]

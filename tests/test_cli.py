@@ -169,3 +169,94 @@ def test_daemons_text_reports_partial_inspection(isolated, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert 'process inspection: partial (1 records incomplete)' in out
     assert 'unavailable' not in out
+
+
+@pytest.mark.parametrize("tool", [None, "codex", "claude"])
+@pytest.mark.parametrize("as_json", [False, True])
+def test_usage_refresh_output(isolated, monkeypatch, capsys, tool, as_json):
+    from acctsw import usage
+    state = isolated.load_state()
+    state.upsert_seat("codex", "ready@example.com")
+    state.upsert_seat("codex", "resting@example.com")
+    state.upsert_seat("claude", "claude@example.com")
+    state.set_limited_until("codex", "resting@example.com", "2099-01-01T00:00:00Z")
+    state.save()
+    agents, refreshed = [], []
+
+    def user_agent(binary):
+        assert not isolated._store_lock_held()
+        agents.append(binary)
+        return "claude-code/fake"
+
+    def refresh(ctx, current, **kwargs):
+        assert ctx is isolated and ctx._store_lock_held()
+        refreshed.append(kwargs)
+        current.set_usage("codex", "ready@example.com", {
+            "windows": {"5h": {"used_pct": 12.6}, "weekly": {"used_pct": 42}}})
+        return {"updated": 1}
+
+    monkeypatch.setattr(usage, "claude_user_agent", user_agent)
+    monkeypatch.setattr(usage, "refresh", refresh)
+    args = ["usage", "refresh"]
+    if tool:
+        args += ["--tool", tool]
+    if as_json:
+        args += ["--json"]
+    assert cli.main(args) == cli.EXIT_OK
+    assert agents == ([] if tool == "codex" else [isolated.claude_bin])
+    assert refreshed == [{"tool": tool, "user_agent": (
+        cli.P.CLAUDE_USER_AGENT_FALLBACK if tool == "codex" else "claude-code/fake")}]
+    out = capsys.readouterr().out
+    if as_json:
+        result = json.loads(out)
+        assert result["refresh"] == {"updated": 1}
+        seat = result["status"]["tools"]["codex"]["seats"][0]
+        assert seat["usage"]["windows"]["5h"]["used_pct"] == 12.6
+    else:
+        if tool in (None, "codex"):
+            assert "codex:\n" in out
+            assert "ready@example.com: 5h 13%, weekly 42%  [ok]" in out
+            assert "resting@example.com: 5h —, weekly —  [resting]" in out
+        else:
+            assert "codex:" not in out
+        if tool in (None, "claude"):
+            assert "claude:\n  claude@example.com: 5h —, weekly —  [ok]" in out
+        else:
+            assert "claude:" not in out
+
+
+def test_status_text_shows_active_resting_ready_and_empty_tool(isolated, capsys):
+    state = isolated.load_state()
+    for email in ("active@example.com", "resting@example.com", "ready@example.com"):
+        state.upsert_seat("codex", email)
+    state.set_active("codex", "active@example.com")
+    state.set_limited_until("codex", "active@example.com", "2099-01-01T00:00:00Z")
+    state.set_limited_until("codex", "resting@example.com", "2099-01-01T00:00:00Z")
+    state.save()
+    assert cli.main(["status"]) == cli.EXIT_OK
+    assert capsys.readouterr().out.splitlines() == [
+        "codex: active=active@example.com", "  [active] active@example.com",
+        "  [ready] ready@example.com", "  [resting] resting@example.com", "claude: active=—"]
+
+
+@pytest.mark.parametrize("signals", [[], [321]])
+def test_daemons_fix_text_reports_maintenance(isolated, monkeypatch, capsys, signals):
+    from acctsw import codexhome
+    calls = []
+    def report(ctx, *, fix):
+        calls.append((ctx, fix))
+        return {"seats": [{"address": "seat@example.com", "home_id": "seat-home",
+                           "state": "stale", "packages_bytes": 10, "heal": "healed",
+                           "gc": "cleaned", "bytes_freed": 20}],
+                "process_inspection": "complete", "orphan_pids": [],
+                "wedged_supervisors": signals, "signalled_supervisors": signals,
+                "reaper": "ok", "reaped_pids": signals}
+    monkeypatch.setattr(codexhome, "daemon_report", report)
+    assert cli.main(["daemons", "--fix"]) == cli.EXIT_OK
+    assert calls == [(isolated, True)]
+    pids = "321" if signals else "none"
+    assert capsys.readouterr().out.splitlines() == [
+        "seat@example.com  seat-home  stale  packages=10 bytes",
+        "  heal=healed  gc=cleaned  freed=20 bytes", "process inspection: complete",
+        "orphan pids: none", f"wedged supervisors: {pids}",
+        f"signalled supervisors: {pids}", "reaper: ok", f"reaped pids: {pids}"]

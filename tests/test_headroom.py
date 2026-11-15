@@ -509,6 +509,63 @@ def test_stop_proxy_reports_confirmed_gone_for_a_dead_pid(ctx):
     assert not hr._proxy_pidfile(ctx.data_dir).exists()
 
 
+@pytest.mark.parametrize("exit_after", ["term", "kill", "never", "foreign"])
+def test_stop_proxy_signal_escalation(ctx, monkeypatch, exit_after):
+    import signal
+    import time
+    pid = 424242
+    pidfile = hr._proxy_pidfile(ctx.data_dir)
+    pidfile.write_text(str(pid))
+    signals, sleeps, checks = [], [], []
+    def alive(candidate):
+        assert candidate == pid
+        return not ((exit_after == "term" and signal.SIGTERM in signals)
+                    or (exit_after == "kill" and signal.SIGKILL in signals))
+    def identity(candidate):
+        assert candidate == pid
+        checks.append(len(signals))
+        return not (exit_after == "foreign" and signal.SIGKILL in signals)
+    monkeypatch.setattr(hr, "_pid_alive", alive)
+    monkeypatch.setattr(hr, "_pid_is_proxy", identity)
+    monkeypatch.setattr(hr.os, "kill", lambda candidate, sig: signals.append(sig)
+                        if candidate == pid else pytest.fail("unexpected PID"))
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+    assert hr.stop_proxy(ctx.data_dir) is (exit_after != "never")
+    expected = [signal.SIGTERM] if exit_after == "term" else [signal.SIGTERM, signal.SIGKILL]
+    assert signals == expected
+    assert sleeps == [0.3] * len(expected)
+    assert checks == ([0, 0] if exit_after == "term" else
+                      [0, 0, 1] if exit_after == "kill" else [0, 0, 1, 2])
+    assert pidfile.exists() is (exit_after == "never")
+
+
+@pytest.mark.parametrize("identity", [None, False])
+def test_stop_proxy_rechecks_identity_before_escalating(ctx, monkeypatch, identity):
+    import signal
+    pidfile = hr._proxy_pidfile(ctx.data_dir)
+    pidfile.write_text("424242")
+    identities = iter([True, True, identity])
+    monkeypatch.setattr(hr, "_pid_alive", lambda _: True)
+    monkeypatch.setattr(hr, "_pid_is_proxy", lambda _: next(identities))
+    signals = []
+    assert hr.stop_proxy(ctx.data_dir, kill=lambda pid, sig: signals.append((pid, sig)),
+                         sleep=lambda _: None) is False
+    assert signals == [(424242, signal.SIGTERM)]
+    assert pidfile.exists()
+
+
+def test_stop_proxy_retains_tracking_if_signal_fails(ctx, monkeypatch):
+    pidfile = hr._proxy_pidfile(ctx.data_dir)
+    pidfile.write_text("424242")
+    monkeypatch.setattr(hr, "_pid_alive", lambda _: True)
+    monkeypatch.setattr(hr, "_pid_is_proxy", lambda _: True)
+    def denied(pid, sig):
+        raise PermissionError("denied")
+    assert hr.stop_proxy(ctx.data_dir, kill=denied,
+                         sleep=lambda _: pytest.fail("no signal was delivered")) is False
+    assert pidfile.exists()
+
+
 def test_legacy_present_detects_injection(routed):
     assert hr._any_injected() is True
     assert hr.legacy_present(routed) is True
