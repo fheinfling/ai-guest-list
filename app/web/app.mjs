@@ -21,73 +21,104 @@ function send(action, payload = {}) {
   }
 }
 
+// This surface can stay alive for days. Keep the last resort independent of all render helpers,
+// state, and theme CSS; never insert error text into the DOM or attach state/input to diagnostics.
+const reportedClientErrors = new Set();
+let clientFailed = false, clientRendered = false;
+function clientError(error, location = "") {
+  let message = "unknown client error", stack = "";
+  try {
+    message = String(error?.message || error || message).slice(0, 1024);
+    stack = String(error?.stack || "").slice(0, 2048);
+  } catch (_) { /* even a rejected value with throwing getters must leave a usable menu */ }
+  root.innerHTML = '<div role="alert" style="padding:24px;min-height:172px;background:#fff;color:#222;font:14px system-ui">'
+    + '<p>something went wrong drawing this — reopen the menu</p>'
+    + '<button type="button" data-action="reload">reload</button></div>';
+  overlay.innerHTML = "";
+  if (!clientFailed) send("client_health", { ok: false });
+  clientFailed = true;
+  if (!reportedClientErrors.has(message)) {
+    reportedClientErrors.add(message);
+    send("client_error", { message, stack, location: String(location).slice(0, 512) });
+  }
+  send("resize", { height: 220 });
+}
+window.addEventListener("error", (event) => clientError(event.error || event.message,
+  `${event.filename || ""}:${event.lineno || 0}:${event.colno || 0}`));
+window.addEventListener("unhandledrejection", (event) => clientError(event.reason));
+
 // Python → JS: the shell calls window.AGL.result(result) after every action.
 window.AGL = {
   result(res) {
-    res = typeof res === "string" ? JSON.parse(res) : res;
-    // All the async-correlation logic lives in the pure reduceReply() (unit-tested); this just
-    // applies its decisions to the module state + DOM. The add sub-view holds unsaved typed input,
-    // so a pure state push updates `state` without a DOM swap or focus/caret theft, except when
-    // a completed browser sign-in advances the connecting step to done.
-    const out = reduceReply({ screen, add, lastRev, state }, res);
-    const inKeyFlow = screen === "add-key";
-    if (inKeyFlow || screen === "paid-key") out.screen = screen; // keep the current input/confirmation
-    screen = out.screen; add = out.add; lastRev = out.lastRev; state = out.state;
-    // The click is answered once the engine reports progress (or failure) in a newer snapshot.
-    if (installSentAt !== null && (lastRev > installSentAt || res.error || !updateCanInstall(state.update))) {
-      installSentAt = null; out.render = true;
-    }
-    const keyChanged = reduceKeyReply(keyFlow, res);
-    let nameChanged = false;
-    if (res.rename_request_id) {
-      for (const [key, edit] of nameEdits) {
-        if (edit.pending !== res.rename_request_id) continue;
-        nameChanged = true;
-        if (res.ok) {
-          const saved = { saved: true };
-          nameEdits.set(key, saved);
-          setTimeout(() => {
-            if (nameEdits.get(key) === saved) { nameEdits.delete(key); render(); }
-          }, 1600);
-        } else {
-          edit.pending = null;
-          edit.error = res.error || "Couldn't save that name. Try again.";
+    try {
+      res = typeof res === "string" ? JSON.parse(res) : res;
+      // All the async-correlation logic lives in the pure reduceReply() (unit-tested); this just
+      // applies its decisions to the module state + DOM. The add sub-view holds unsaved typed input,
+      // so a pure state push updates `state` without a DOM swap or focus/caret theft, except when
+      // a completed browser sign-in advances the connecting step to done.
+      const out = reduceReply({ screen, add, lastRev, state }, res);
+      const inKeyFlow = screen === "add-key";
+      if (inKeyFlow || screen === "paid-key") out.screen = screen; // keep the current input/confirmation
+      screen = out.screen; add = out.add; lastRev = out.lastRev; state = out.state;
+      // The click is answered once the engine reports progress (or failure) in a newer snapshot.
+      if (installSentAt !== null && (lastRev > installSentAt || res.error || !updateCanInstall(state.update))) {
+        installSentAt = null; out.render = true;
+      }
+      const keyChanged = reduceKeyReply(keyFlow, res);
+      let nameChanged = false;
+      if (res.rename_request_id) {
+        for (const [key, edit] of nameEdits) {
+          if (edit.pending !== res.rename_request_id) continue;
+          nameChanged = true;
+          if (res.ok) {
+            const saved = { saved: true };
+            nameEdits.set(key, saved);
+            setTimeout(() => {
+              if (nameEdits.get(key) === saved) { nameEdits.delete(key); render(); }
+            }, 1600);
+          } else {
+            edit.pending = null;
+            edit.error = res.error || "Couldn't save that name. Try again.";
+          }
         }
       }
-    }
-    let paidChanged = false, paidHandled = false, confirmation = null;
-    if (paidTerminal && res.key_action === "key_terminal" && res.key_target_id === paidTerminal.id) {
-      paidTerminal.pending = false;
-      if (res.ok) confirmation = `opened a new terminal on ${paidTerminal.label}`;
-      if (res.code === "paid_use_disabled") {
-        screen = "paid-key"; paidTerminal.error = null;
-        paidHandled = true; paidChanged = true;
-      } else if (screen === "paid-key") {
-        if (res.ok) { screen = "main"; paidTerminal = null; }
-        else paidTerminal.error = res.error || "couldn't open that terminal — try again";
-        paidHandled = true; paidChanged = true;
-      } else paidTerminal = null;
-    }
-    if (res.key_action === "answer_key_switch") answering.delete(res.key_target_id);
-    if (res.key_action === "key_prove") proving.delete(res.key_target_id);
-    if (nameChanged || paidChanged || keyChanged || (out.render && !inKeyFlow)) render();
-    else refreshKeyPrompts(); // surface consent without replacing inputs or stealing focus
-    if (out.flash && !res.rename_request_id && !res.key_request_id && !paidHandled) flash(out.flash);
-    if (res.key_action === "key_validate" && res.ok) flash(res.validation?.operation_permitted
-      ? "key check passed — this checks account access only" : "key check wasn't permitted — check access with your provider");
-    if (confirmation) flash(confirmation);
-    if (out.celebrate) {
-      celebrate();
-      if (!out.flash) flash(state.moved_note || "seat switched");
-    }
-    if (out.closeFlow) setTimeout(() => {      // auto-close this flow's "done" screen; scoped by
-      if (screen === "add" && add === out.closeFlow && add.step === "done") {   // object identity so
-        screen = "main"; add = null; render();  // a stale timer can't close a later add.
+      let paidChanged = false, paidHandled = false, confirmation = null;
+      if (paidTerminal && res.key_action === "key_terminal" && res.key_target_id === paidTerminal.id) {
+        paidTerminal.pending = false;
+        if (res.ok) confirmation = `opened a new terminal on ${paidTerminal.label}`;
+        if (res.code === "paid_use_disabled") {
+          screen = "paid-key"; paidTerminal.error = null;
+          paidHandled = true; paidChanged = true;
+        } else if (screen === "paid-key") {
+          if (res.ok) { screen = "main"; paidTerminal = null; }
+          else paidTerminal.error = res.error || "couldn't open that terminal — try again";
+          paidHandled = true; paidChanged = true;
+        } else paidTerminal = null;
       }
-    }, 1600);
+      if (res.key_action === "answer_key_switch") answering.delete(res.key_target_id);
+      if (res.key_action === "key_prove") proving.delete(res.key_target_id);
+      if (clientFailed || nameChanged || paidChanged || keyChanged || (out.render && !inKeyFlow)) render();
+      else refreshKeyPrompts(); // surface consent without replacing inputs or stealing focus
+      if (out.flash && !res.rename_request_id && !res.key_request_id && !paidHandled) flash(out.flash);
+      if (res.key_action === "key_validate" && res.ok) flash(res.validation?.operation_permitted
+        ? "key check passed — this checks account access only" : "key check wasn't permitted — check access with your provider");
+      if (confirmation) flash(confirmation);
+      if (out.celebrate) {
+        celebrate();
+        if (!out.flash) flash(state.moved_note || "seat switched");
+      }
+      if (out.closeFlow) setTimeout(() => {      // auto-close this flow's "done" screen; scoped by
+        if (screen === "add" && add === out.closeFlow && add.step === "done") {   // object identity so
+          screen = "main"; add = null; render();  // a stale timer can't close a later add.
+        }
+      }, 1600);
+    } catch (error) { clientError(error); }
   },
   // legacy single-arg state push (kept for the poll path / older callers)
-  update(next) { this.result({ state: typeof next === "string" ? JSON.parse(next) : next }); },
+  update(next) {
+    try { this.result({ state: typeof next === "string" ? JSON.parse(next) : next }); }
+    catch (error) { clientError(error); }
+  },
   // Native popover lifecycle: tick cached countdowns only while this surface is actually visible.
   // This never asks the bridge for data and never touches lastRev.
   setVisible(visible) { setPopoverVisible(Boolean(visible)); },
@@ -233,6 +264,16 @@ function resetTransientUI() {
 
 function render() {
   if (composingName) return; // Keep the live IME input until its complete value can be stored.
+  try {
+    renderContent();
+    if (!clientRendered || clientFailed) {
+      clientRendered = true; clientFailed = false;
+      send("client_health", { ok: true });
+    }
+  } catch (error) { clientError(error); }
+}
+
+function renderContent() {
   if (screen !== renderedScreen) openMenu = null;
   if (screen !== "main" || (pendingSwitch &&
       !switchNeedsConfirmation(state, pendingSwitch.tool, pendingSwitch.email))) pendingSwitch = null;
@@ -345,6 +386,7 @@ document.addEventListener("click", (e) => {
   if (el.disabled) return;
   if (action !== "menu" && openMenu) { openMenu = null; paintMenus(); }
   switch (action) {
+    case "reload": send("reload"); break;
     case "menu":
       openMenu = openMenu === el.dataset.menu ? null : el.dataset.menu;
       paintMenus(true); break;

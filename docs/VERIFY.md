@@ -116,6 +116,7 @@ produce a signal, since healthy accounts report it.
 bash scripts/run-app.sh        # builds and opens a development .app with the real app icon
 ```
 - Popover shows seats, "on the floor", 5h/weekly bars + reset timers, switch, add-a-seat, toggles.
+- Find web-process termination, reload-limit and redacted client errors with `log show --predicate 'process == "AI Guest List"' --last 1d --info --debug | grep '\[agl web\]'`.
 - Menubar door is open when a signed-in seat is ready or active, and shut when all seats are unavailable;
   with no seats it stays open (`web_dot.door_for`, `menubar.DOOR_SYMBOL`).
 - Quit any previously running copy first. The development bundle uses the existing icon and app

@@ -1121,19 +1121,20 @@ test("key settings default to opt-in fallback and confirmation, with clear spend
 
 // Exercise the shipped glue with a tiny DOM boundary. No provider, native app or third-party DOM.
 function keyApp(options = {}) {
-  const handlers = {}, sent = [];
+  const handlers = {}, windowHandlers = {}, sent = [];
   const root = options.root || { innerHTML: "", querySelector: () => null, querySelectorAll: () => [], firstElementChild: null };
   const document = { getElementById: () => root, body: { appendChild() {} },
     createElement: options.createElement || (() => ({ innerHTML: "", firstElementChild: { textContent: "" }, querySelector: () => null })), addEventListener: (name, fn) => { handlers[name] = fn; },
     hidden: true, hasFocus: () => false };
-  const window = { webkit: { messageHandlers: { agl: { postMessage: (msg) => sent.push(msg) } } }, addEventListener() {},
+  const window = { webkit: { messageHandlers: { agl: { postMessage: (msg) => sent.push(msg) } } },
+    addEventListener: (name, fn) => { windowHandlers[name] = fn; },
     requestAnimationFrame: options.requestAnimationFrame, matchMedia: () => options.motion || { matches: true, addEventListener() {} } };
   runInNewContext(readFileSync(new URL("./bundle.js", import.meta.url), "utf8"),
     { document, window, console, setTimeout: options.setTimeout || setTimeout,
       setInterval: options.setInterval || setInterval, clearInterval, clearTimeout, URL, confirm: options.confirm || (() => true), ResizeObserver: options.ResizeObserver });
   const click = (dataset) => handlers.click({ target: { closest: (selector) => selector === "[data-action]" ? { dataset } : null }, preventDefault() {} });
   const input = (id, value) => handlers.input({ target: { id, value } });
-  return { window, root, sent, click, input, handlers, document };
+  return { window, root, sent, click, input, handlers, windowHandlers, document };
 }
 
 test("endpoint proof is click-only and duplicate clicks remain blocked across polls", () => {
@@ -3584,4 +3585,90 @@ test("an opened signed-out seat explains signing in instead of showing usage", (
     assert.match(html, /<dt>status<\/dt><dd>signed out; sign in to see usage<\/dd>/);
     assert.doesNotMatch(html, /% left|no reading yet/);
   }
+});
+
+function throwingRenderState(message = "synthetic drawing failure") {
+  // Fail inside buildHTML, before it can assign root.innerHTML. Keep the input state inert
+  // everywhere else so this exercises the render boundary, not a reducer failure.
+  return { rev: 1, settings: { get theme() { throw new Error(message); } }, tools: {} };
+}
+
+test("blank recovery: throwing render shows fallback, reports once, then a good update recovers", () => {
+  const app = keyApp();
+  app.root.innerHTML = ""; // reproduce the empty surface seen in the field
+  assert.doesNotThrow(() => app.window.AGL.result({ state: throwingRenderState() }));
+  assert.match(app.root.innerHTML, /role="alert"/);
+  assert.match(app.root.innerHTML, /something went wrong drawing this — reopen the menu/);
+  assert.match(app.root.innerHTML, /data-action="reload"/);
+  assert.doesNotMatch(app.root.innerHTML, /synthetic drawing failure/);
+  let errors = app.sent.filter((msg) => msg.action === "client_error");
+  assert.equal(errors.length, 1);
+  assert.equal(errors[0].message, "synthetic drawing failure");
+  assert.match(errors[0].stack, /Error: synthetic drawing failure/);
+  app.window.AGL.result({ state: throwingRenderState() });
+  assert.equal(app.sent.filter((msg) => msg.action === "client_error").length, 1);
+  app.click({ action: "reload" });
+  assert.equal(app.sent.filter((msg) => msg.action === "reload").length, 1);
+  app.window.AGL.result({ state: state({ rev: 2 }) });
+  assert.match(app.root.innerHTML, /class="app /);
+  assert.doesNotMatch(app.root.innerHTML, /role="alert"|something went wrong/);
+  assert.equal(app.sent.at(-1).action, "client_health");
+  assert.equal(app.sent.at(-1).ok, true);
+  // Once recovered, an identical error must mark native unhealthy again without re-logging.
+  app.window.AGL.result({ state: { ...throwingRenderState(), rev: 3 } });
+  assert.equal(app.sent.filter((msg) => msg.action === "client_error").length, 1);
+  assert.equal(app.sent.filter((msg) => msg.action === "client_health" && !msg.ok).length, 2);
+  app.window.AGL.result({ state: { ...throwingRenderState("different drawing failure"), rev: 4 } });
+  assert.equal(app.sent.filter((msg) => msg.action === "client_error").length, 2);
+});
+
+test("blank recovery: a partial DOM swap failure uses the independent fallback", () => {
+  let fail = false;
+  const root = { innerHTML: "", firstElementChild: null,
+    querySelector: (selector) => {
+      if (fail && selector === ".key-prompts") throw new Error("post-swap failure");
+      return null;
+    }, querySelectorAll: () => [] };
+  const app = keyApp({ root });
+  fail = true;
+  app.window.AGL.update(state({ rev: 1 }));
+  assert.match(root.innerHTML, /something went wrong/);
+  assert.equal(app.sent.filter((msg) => msg.action === "client_error").length, 1);
+  fail = false;
+  app.window.AGL.update(state({ rev: 2 }));
+  assert.match(root.innerHTML, /class="app /);
+  assert.doesNotMatch(root.innerHTML, /role="alert"/);
+});
+
+test("blank recovery: global errors and rejections are bounded, deduplicated and recoverable", () => {
+  const app = keyApp();
+  const message = "global failure " + "x".repeat(4000);
+  const error = new Error(message);
+  error.stack = "stack " + "s".repeat(4000);
+  app.windowHandlers.error({ error, filename: "bundle.js", lineno: 42, colno: 7 });
+  app.windowHandlers.unhandledrejection({ reason: error });
+  const errors = app.sent.filter((msg) => msg.action === "client_error");
+  assert.equal(errors.length, 1);
+  assert.equal(errors[0].message.length, 1024);
+  assert.equal(errors[0].stack.length, 2048);
+  assert.equal(errors[0].location, "bundle.js:42:7");
+  assert.deepEqual(Object.keys(errors[0]).sort(), ["action", "location", "message", "stack"]);
+  assert.match(app.root.innerHTML, /data-action="reload"/);
+  app.window.AGL.result({ state: state({ rev: 1 }) });
+  assert.doesNotMatch(app.root.innerHTML, /role="alert"/);
+  app.windowHandlers.error({ message: "error without an Error object", filename: "bundle.js" });
+  app.windowHandlers.unhandledrejection({ reason: "plain rejection" });
+  assert.equal(app.sent.filter((msg) => msg.action === "client_error").length, 3);
+  assert.match(app.root.innerHTML, /role="alert"/);
+});
+
+test("blank recovery: malformed native replies show a fallback and the next update recovers", () => {
+  const app = keyApp();
+  app.window.AGL.result("not json");
+  assert.match(app.root.innerHTML, /role="alert"/);
+  assert.equal(app.sent.filter((msg) => msg.action === "client_error").length, 1);
+  app.window.AGL.update("not json");
+  assert.equal(app.sent.filter((msg) => msg.action === "client_error").length, 1);
+  app.window.AGL.update(state({ rev: 1 }));
+  assert.doesNotMatch(app.root.innerHTML, /role="alert"/);
 });
