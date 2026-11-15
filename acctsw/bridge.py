@@ -619,16 +619,6 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
                 state.save()
             return {"ok": True, "state": snapshot_state(ctx)}
 
-        if action == "set_strategy":
-            val = message.get("value")
-            if val not in ("soonest_back", "most_headroom"):
-                return {"ok": False, "error": f"bad strategy: {val}"}
-            with ctx.locked():
-                state = ctx.load_state()
-                state.set_setting("strategy", val)
-                state.save()
-            return {"ok": True, "state": snapshot_state(ctx)}
-
         if action in ("approve_crossing", "deny_crossing"):
             tool, a, b = message["tool"], message["from"], message["to"]
             if tool not in TOOLS or not isinstance(a, str) or not isinstance(b, str) or a == b:

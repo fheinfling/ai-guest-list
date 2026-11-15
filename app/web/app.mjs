@@ -520,7 +520,6 @@ document.addEventListener("click", (e) => {
     case "supervision-on": send("toggle", { key: "supervise_shell", value: true }); break;
     case "engine-adopt": send("adopt_engine"); break;
     case "set_theme": send("set_theme", { value }); break;
-    case "set_strategy": send("set_strategy", { value }); break;
     case "quit": send("quit"); break;
   }
 });

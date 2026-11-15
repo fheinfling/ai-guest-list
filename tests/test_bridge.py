@@ -466,9 +466,15 @@ def test_snapshot_omits_retired_dot_fields_and_keeps_door(ctx):
     assert "recently_switched" not in r["state"]
 
 
-def test_set_strategy(ctx):
-    assert bridge.handle(ctx, {"action": "set_strategy", "value": "most_headroom"})["state"]["settings"]["strategy"] == "most_headroom"
-    assert bridge.handle(ctx, {"action": "set_strategy", "value": "bogus"})["ok"] is False
+@pytest.mark.parametrize("value", ["most_headroom", "soonest_back", "bogus"])
+def test_set_strategy_is_unknown_and_does_not_write_state(ctx, value):
+    ctx.load_state().save()
+    before = ctx.state_file.read_bytes()
+    result = bridge.handle(ctx, {"action": "set_strategy", "value": value})
+    assert result == {"ok": False, "error": "unknown action: set_strategy"}
+    assert ctx.state_file.read_bytes() == before
+    assert "strategy" not in json.loads(ctx.state_file.read_text())["settings"]
+    assert "strategy" not in ctx.load_state().settings()
 
 
 def test_switch_sets_last_on_floor(ctx):

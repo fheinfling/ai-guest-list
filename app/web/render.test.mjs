@@ -17,7 +17,7 @@ function seat(over = {}) {
 }
 function state(over = {}) {
   return {
-    settings: { theme: "light", auto_switch: true, strategy: "soonest_back" },
+    settings: { theme: "light", auto_switch: true },
     counts: { resting: 1, ready: 2 },
     tools: {
       codex: { active: null, plan_label: "CHATGPT BUSINESS", seats: [] },
@@ -410,10 +410,42 @@ test("supervision banner is absent when active or explicitly opted out", () => {
 });
 
 test("settings wires its actions", () => {
-  const set = buildSettings({ settings: { theme: "light", strategy: "soonest_back", notify: true } });
-  assert.match(set, /data-action="set_strategy"[^>]*data-value="most_headroom"/);
+  const set = buildSettings({ settings: { theme: "light", notify: true } });
   assert.match(set, /data-action="set_theme"[^>]*data-value="dark"/);
   assert.match(set, /data-key="supervise_shell"/);
+});
+
+for (const [view, build] of [["settings", buildSettings], ["popover", buildHTML]]) {
+  test(`${view} omits the retired seat strategy even with legacy settings`, () => {
+    for (const strategy of [undefined, "soonest_back", "most_headroom"]) {
+      for (const auto_switch of [false, true]) {
+        const settings = { theme: "light", auto_switch };
+        if (strategy !== undefined) settings.strategy = strategy;
+        assert.doesNotMatch(build(state({ settings })), /set_strategy|next seat|most headroom|soonest back/i);
+      }
+    }
+  });
+}
+
+test("footer describes automatic switching regardless of legacy strategy", () => {
+  for (const strategy of [undefined, "soonest_back", "most_headroom"]) {
+    for (const auto_switch of [false, true]) {
+      const settings = { auto_switch };
+      if (strategy !== undefined) settings.strategy = strategy;
+      const html = buildHTML(state({ settings }));
+      const status = html.match(/class="footer-status"[^>]*>([^<]*)<\/span>/)[1];
+      assert.equal(status, auto_switch ? "auto-switch on, moves when a seat runs out" : "auto-switch off, you switch by hand");
+    }
+  }
+});
+
+test("retired set_strategy actions are not dispatched", () => {
+  const app = keyApp();
+  const before = app.sent.length;
+  for (const value of ["soonest_back", "most_headroom"]) {
+    app.handlers.click({ target: { closest: (q) => q === "[data-action]" ? { tagName: "BUTTON", dataset: { action: "set_strategy", value } } : null } });
+    assert.equal(app.sent.length, before);
+  }
 });
 
 test("header ＋ opens the provider step (no hardcoded tool)", () => {
@@ -423,7 +455,7 @@ test("header ＋ opens the provider step (no hardcoded tool)", () => {
 });
 
 test("settings is a pushed sub-view, not a modal (spec §9.1)", () => {
-  const set = buildSettings({ settings: { theme: "light", strategy: "soonest_back" } });
+  const set = buildSettings({ settings: { theme: "light" } });
   // no dimming modal backdrop/sheet — it renders in place as the popover surface
   assert.doesNotMatch(set, /class="backdrop"/);
   assert.doesNotMatch(set, /class="sheet/);
@@ -573,7 +605,7 @@ test("add: done greets the seat, escapes, falls back to 'new seat'", () => {
 test("buildHTML has no retired Headroom surface", () => {
   const html = buildHTML(state({}));
   assert.doesNotMatch(html, /COMPRESSES CONTEXT|save-credit|headroom_install|fewer tokens/i);
-  const set = buildSettings({ settings: { theme: "light", strategy: "soonest_back" } });
+  const set = buildSettings({ settings: { theme: "light" } });
   assert.doesNotMatch(set, /set_savings_level|>headroom</);
 });
 
@@ -2137,10 +2169,10 @@ assert.doesNotMatch(rosterOf(html), /data-action="switch"|all good/);
 import { crossingRequests } from "./render.mjs";
 
 test("settings offers the in-place switch toggle, on unless turned off", () => {
-  const on = buildSettings({ settings: { theme: "light", strategy: "soonest_back" } });
+  const on = buildSettings({ settings: { theme: "light" } });
   assert.match(on, /switch seats without restarting claude/);
   assert.match(on, /data-action="toggle" data-key="in_place_switch" checked/);
-  const off = buildSettings({ settings: { theme: "light", strategy: "soonest_back", in_place_switch: false } });
+  const off = buildSettings({ settings: { theme: "light", in_place_switch: false } });
   assert.match(off, /data-key="in_place_switch" >/);
 });
 
@@ -2233,10 +2265,10 @@ test("settings offers automatic business/personal switching, off by default", ()
 import { tierRequests } from "./render.mjs";
 
 test("settings offers the cross-tier toggle, off by default", () => {
-  const off = buildSettings({ settings: { theme: "light", strategy: "soonest_back" } });
+  const off = buildSettings({ settings: { theme: "light" } });
   assert.match(off, /switch without restarting across plan tiers/);
   assert.match(off, /data-key="in_place_cross_tier" >/);
-  const on = buildSettings({ settings: { theme: "light", strategy: "soonest_back", in_place_cross_tier: true } });
+  const on = buildSettings({ settings: { theme: "light", in_place_cross_tier: true } });
   assert.match(on, /data-action="toggle" data-key="in_place_cross_tier" checked/);
 });
 
@@ -2569,8 +2601,8 @@ test("footer keeps only the live status line and the main view has no drawer", (
   assert.doesNotMatch(html, /guest-drawer|seat-options/);
   assert.doesNotMatch(css, /guest-drawer|drawer-handle|drawer-content|footer-options/);
   assert.doesNotMatch(readFileSync(new URL("./app.mjs", import.meta.url), "utf8"), /guest-drawer|seat-options|moveDrawer|drawerMotion/);
-  assert.match(footer, /auto-switch on, soonest back first/);
-  assert.match(buildHTML({ ...snapshot, settings: { auto_switch: true, strategy: "most_headroom" } }), /auto-switch on, most headroom first/);
+  assert.match(footer, /auto-switch on, moves when a seat runs out/);
+  assert.match(buildHTML({ ...snapshot, settings: { auto_switch: false } }), /auto-switch off, you switch by hand/);
   const app = keyApp();
   for (const checked of [false, true]) {
     app.handlers.change({ target: { closest: () => ({ dataset: { key: "auto_switch" }, checked }) } });
@@ -2850,7 +2882,7 @@ test("footer confirmations use text, survive a poll and restore the live status"
   assert.doesNotMatch(app.root.innerHTML, /<img src=x>/);
   app.window.AGL.update({ ...snapshot, rev: 2 }); assert.equal(status.textContent, '<img src=x> switched');
   timers.find((t) => t.ms === 3000).fn();
-  assert.match(app.root.innerHTML, /role="status" aria-live="polite">auto-switch on, soonest back first/);
+  assert.match(app.root.innerHTML, /role="status" aria-live="polite">auto-switch on, moves when a seat runs out/);
   app.window.AGL.result({ ok: true, celebrate: true, state: { ...snapshot, rev: 3, moved_note: "codex is on personal now" } });
   assert.equal(status.textContent, "codex is on personal now");
 });

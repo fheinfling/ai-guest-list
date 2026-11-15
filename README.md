@@ -77,8 +77,8 @@ connect through the official tools.
 - **Parked seats stay ready.** Shortly before a parked Claude seat's sign-in token lapses, the app
   lets Claude Code renew it (`claude mcp list` in that seat's home — no model call), so the seat can
   take over in place at any time. Setting: **keep parked claude seats signed in**.
-- **Pick the smartest seat.** All seats resting? It chooses the one that unlocks soonest (or the one
-  with the most headroom, your call).
+- **Stays put while a seat works.** It keeps the current seat until that seat runs out, then moves
+  to the next available one. If all seats are resting, it picks the one that unlocks soonest.
 - **Non-destructive & reversible.** A factory-image backup makes uninstall a clean restore.
 
 ## Features
