@@ -10,9 +10,9 @@ bash scripts/smoke.sh          # full python suite + node UI tests (PY=python3 i
 acctsw install --dry-run       # prints every action, changes nothing
 ```
 
-## Read-only live probes (safe)
+## Live identity & usage probes
 - Identity: engine reads the live Codex email from the auth.json JWT and the live Claude email
-  from `claude auth status` — verified.
+  from `GET /api/oauth/profile` (`acctsw/identity.py`).
 - Usage endpoints: Codex `wham/usage` (`rate_limit.{primary,secondary}_window`) and Claude
   `oauth/usage` (`five_hour`/`seven_day`) parse correctly against the real APIs — verified. The Codex
   reader also keeps the endpoint's *authoritative* flags, which is what auto-switch trusts:
@@ -22,7 +22,8 @@ acctsw usage refresh --tool codex --json \
 ```
   On a depleted workspace expect `allowed: false` and a non-empty `reached_type` (e.g.
   `workspace_member_credits_depleted`) *with null windows* — percentages alone are blind there.
-  (Touches no credentials; only the usage cache is refreshed.)
+  (Refreshes the usage cache and may recover eligible expired Codex credentials in their private
+  seat snapshots; it does not write the shared Codex credential mirror.)
 
 ## Install (non-destructive, reversible)
 ```sh
@@ -34,10 +35,10 @@ acctsw status --json           # active account + cached usage
 
 ## Add your second seat
 ```sh
-codex logout && codex login    # sign into account #2 (or use the app's "add a seat")
-acctsw add codex               # snapshots account #2
+acctsw signin codex            # official login in an isolated temp home; saves + selects seat #2
 acctsw list                    # both seats listed
 ```
+(Or click **＋** in the menubar popover; use `acctsw signin claude` for a second Claude seat.)
 
 ## Switch + continuity (the headline)
 ```sh
@@ -49,13 +50,23 @@ cx                             # supervised codex; on a real usage limit it auto
 - Continuity dry-run (no real limit): start `cx`, do one turn, Ctrl-C, `acctsw switch codex <other>`,
   then `codex resume --last` → same conversation continues under the other seat.
 
-### A — a manual switch never kills a live session
+### A — a manual switch moves a live session to the chosen seat
 ```sh
 mkdir -p ~/gl-check && cd ~/gl-check && cx   # terminal 1: supervised codex, do one turn, leave it running
-acctsw switch codex <other-seat-email>       # terminal 2, while it is still running
+acctsw switch codex <other-seat-email>       # terminal 2 (or click the seat in the popover)
 ```
-Terminal 1 keeps working on its current seat. Exactly one notification — *"still running on `<seat>`;
-your new seat applies to the next session"* — and the new seat takes effect on the next `cx`.
+The supervisor notices the request on its ~2 s tick (`TICK_INTERVAL_S`), then stops the child with
+about five seconds of save grace before escalating if needed; restarting adds the tool's startup
+time. It prints `codex: switching to <seat>, resuming your work`. A manual switch captures the
+rollout's thread ID only when the attachment is unambiguous and resumes with `codex resume <id>`;
+without a captured ID it uses `codex resume --last`. A business ↔ personal move, or one involving
+an unknown seat kind, asks for approval before moving the live session unless already permitted.
+For a supervised Claude session (`cl`), `acctsw switch claude <other-seat-email>` can swap the seat
+**in place** through the per-session local proxy without restarting. Across known different tiers,
+an in-place move requires `in_place_cross_tier` or approval for that tier pair; otherwise the hop
+can restart the child and ask whether future hops between those tiers may go in place.
+Business/personal approval is separate. When in-place switching is turned off in settings, a manual
+switch leaves the running `cl` session on its current seat and applies the new seat to the next session.
 
 ### B — a seat rested by another process makes the running session hop
 The field bug: the menubar's usage poll rests seat A while a supervised session is on it. Rest it the
@@ -72,7 +83,9 @@ with ctx.locked():                      # same cross-process lock every engine w
     st.save()
 PY
 ```
-Within ~2 s the running session hops to seat B, relaunches with `codex resume --last`, and notifies.
+On its ~2 s tick the running session can decide to hop to an eligible seat B, subject to the
+crossing guards and the shutdown grace described in A. It notifies and relaunches with
+`codex resume --last`, or by ID if a previous manual switch captured one in this supervisor.
 Then hand the seat back (same block, `None` instead of a timestamp — and no `source`):
 ```sh
 python3 - <<'PY'
@@ -127,12 +140,13 @@ acctsw uninstall --purge       # also deletes the store + all our keychain items
 ```
 
 ## Known gaps to confirm live (tracked)
-- Real limit-message strings: `launcher.LIMIT_PATTERNS` is now a **fallback only** — a banner match
-  merely triggers a usage check, a fresh structured "healthy" reading dismisses it, and the hard
-  banner acts alone only when no rollout file is attached. (Codex CLI 0.153.4 reworded the
-  out-of-credits banner and the old trusted match stopped firing; that is why the banners were
-  demoted.) Claude has no structured source yet, so its patterns still carry weight — confirm/extend
-  them against the actual Claude limit output on a real cap.
+- Real limit-message strings: `launcher.LIMIT_PATTERNS` remains a **hint/fallback** — ordinary
+  limit-banner matches trigger a usage check, and a fresh structured "healthy" reading dismisses
+  them. The separate Codex hard-limit banner fallback is vetoed only when this child's rollout is
+  attached unambiguously. (Codex CLI 0.153.4 reworded the out-of-credits banner and the old trusted
+  match stopped firing; that is why the banners were demoted.) Claude uses per-session proxy
+  `Hit` records and usage probes; project transcript JSONL is read for resume IDs only. Its
+  `HARD_LIMIT_PATTERNS` list is currently empty. Confirm/extend Claude patterns on a real cap.
 - Codex SQLite error 14 ("unable to open database file") from a mixed database/sidecar family is
   now healed automatically on the next `cx` launch with no other supervised codex session running:
   `ls -la ~/.account-switcher/codex-homes/<seat>/` (the by-address symlink into `ch/<id>`) must show
@@ -147,8 +161,13 @@ acctsw uninstall --purge       # also deletes the store + all our keychain items
   interactive `cx` launch dies with "app server did not become ready … path must be shorter than
   SUN_LEN" (`--no-daemon` still runs). Check with
   `python3 -c "from acctsw import codexhome as c; print(c.daemon_socket_fits(c.home_dir('<seat>')))"`.
-- Resume-by-id: currently `codex resume --last` / `claude --continue` (MVP); capture the session id
-  at spawn to resume by id if you run multiple concurrent sessions.
+- Resume-by-id: Claude pins fresh sessions with `--session-id <uuid>` and resumes by ID via
+  `claude --resume <id>` (when not switching in place via the local seat proxy). Codex captures the
+  rollout `session_meta.id` and resumes by ID (`codex exec resume <id>` for `codex exec`, and
+  `codex resume <id>` for interactive manual switches, idle engine self-restarts, and key-seat
+  handoffs), subject to the corresponding attachment/resume guards. Automatic subscription
+  limit/auth hops in interactive `cx` use `codex resume --last` until an ID is captured; after a
+  manual switch sets `resume_thread`, later automatic hops in that supervisor also resume by ID.
 - The Headroom "save credit" proxy is gone; only the one-time `cleanup_legacy` migration remains
   (see the migration check above). Confirm on a machine that had it enabled that a plain `codex` and
   `claude` run directly (no `model_provider = "headroom"` / loopback `ANTHROPIC_BASE_URL` left in
@@ -193,7 +212,9 @@ acctsw uninstall --purge       # also deletes the store + all our keychain items
    rescue/reaping still use records with readable argv. Unavailable topology defers all three.
 
 The reviewer already verified that ordinary SIGKILL of a managed daemon respawns with stock 0.157.0,
-including after a `current` flip to 0.157.1. That is no longer an open root-cause question. Remaining
+including after a `current` flip to 0.157.1. That is no longer an open root-cause question.
+Root cause of the original wedge: the supervisor's `_terminate` waited in `waitpid` without draining
+the PTY master while the exiting TUI/daemon blocked writing to the tty, leaving `daemon.pid` pointing
+at an exiting (`SZOMB` / `P_WEXIT`) process that `kill(pid, 0)` still reported as alive. Remaining
 integration checks are actual wedged-seat recovery, Codex's startup-lock compatibility, and two-home
-authentication isolation/update safety before considering package sharing. See
-[root-cause findings](ISSUES-codex-0.157-daemon.md#resolution-and-root-cause-findings).
+authentication isolation/update safety before considering package sharing.

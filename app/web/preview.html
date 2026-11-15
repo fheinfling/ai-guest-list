@@ -10,26 +10,114 @@
   <div id="root"></div>
   <script src="bundle.js"></script>
   <script>
-    const iso = (m) => new Date(Date.now() + m*60000).toISOString();
-    window.AGL.result({ state: {
-      settings: { theme: "light", auto_switch: true, headroom: true, strategy: "soonest_back" },
-      headroom_available: true, headroom_savings: 68, recently_switched: false,
-      moved_note: "auto-moved Codex · Work → Personal — Work's resting 💛",
-      counts: { resting: 1, ready: 3 }, dot: "amber",
-      tools: {
-        codex: { active: "personal@studio.dev", plan_label: "CHATGPT BUSINESS", seats: [
-          { email:"work@studio.dev", name:"Work", plan:"Business", status:"resting", active:false,
-            limited:true, limited_until:iso(101), usage5h:100, usageWeek:80, credit:0 },
-          { email:"personal@studio.dev", name:"Personal", plan:"Business", status:"active", active:true,
-            limited:false, usage5h:38, usageWeek:22, credit:62, last_on_floor:iso(-120) },
-        ]},
-        claude: { active:"studio@studio.dev", plan_label:"CLAUDE CODE", seats: [
-          { email:"studio@studio.dev", name:"Studio", plan:"Max", status:"active", active:true,
-            limited:false, usage5h:20, usageWeek:12 },
-          { email:"personal@me.dev", name:"Personal", plan:"Pro", status:"ready", active:false,
-            limited:false, usage5h:5, usageWeek:3 },
-        ]},
+    const iso = (m) => new Date(Date.now() + m * 60000).toISOString();
+    const usage = (p5, m5, pWeek) => ({
+      ok: true,
+      error: null,
+      error_streak: 0,
+      fetched_at: iso(0),
+      limit_reached: null,
+      windows: {
+        "5h": { used_pct: p5, resets_at: iso(m5) },
+        "weekly": { used_pct: pWeek, resets_at: iso(3 * 1440) },
       },
+    });
+    const seat = (email, name, plan, kind, status, active, p5, m5, pWeek, limitedUntil = null) => ({
+      email,
+      name,
+      custom_name: name,
+      plan,
+      kind,
+      status,
+      active,
+      limited: Boolean(limitedUntil),
+      limited_until: limitedUntil,
+      needs_login: false,
+      entitlement_revoked: false,
+      signed_out: false,
+      signin_expires_at: null,
+      signin_expiring: false,
+      in_session: false,
+      session_started_at: null,
+      usage_fetched_at: iso(0),
+      usage_stale: false,
+      usage_age_s: 0,
+      usage_unknown: false,
+      usage5h: p5,
+      usageWeek: pWeek,
+      usage: usage(p5, m5, pWeek),
+      added_at: iso(-1440),
+      last_on_floor: active ? iso(-120) : null,
+      account_id: `acct:${email}`,
+      workspace_id: null,
+      shared_account: false,
+      shared_account_with: [],
+      shared_workspace_with: [],
+    });
+    window.AGL.result({ state: {
+      settings: {
+        theme: "light",
+        auto_switch: true,
+        notify: true,
+        restart_app: false,
+        supervise_shell: true,
+        strategy: "most_headroom",
+        confirm_key_switch: true,
+        key_fallback: false,
+        in_place_switch: true,
+        keep_warm: true,
+        crossing_auto: false,
+        in_place_cross_tier: false,
+        engine_restart: true,
+      },
+      counts: { resting: 1, ready: 3 },
+      warnings: [],
+      recently_switched: false,
+      dot: "amber",
+      door: "open",
+      app: { version: "1.9.1", build: "dev" },
+      update: null,
+      supervision: { wrappers: true, block: true, on_path: true, active: true },
+      codex_live_unregistered: null,
+      tools: {
+        codex: {
+          active: "personal@studio.example",
+          plan_label: "CHATGPT BUSINESS",
+          seats: [
+            seat("personal@studio.example", "Personal", "Business", "business", "active", true, 38, 180, 21),
+            seat("work@studio.example", "Work", "Business", "business", "resting", false, 100, 101, 74, iso(101)),
+          ],
+          selection: { email: "personal@studio.example", available: true, all_limited: false, unlocks_at: null },
+        },
+        claude: {
+          active: "studio@studio.example",
+          plan_label: "CLAUDE CODE",
+          seats: [
+            seat("studio@studio.example", "Studio", "Max", "personal", "active", true, 20, 240, 16),
+            seat("personal@me.example", "Personal", "Pro", "personal", "ready", false, 5, 300, 4),
+          ],
+          selection: { email: "studio@studio.example", available: true, all_limited: false, unlocks_at: null },
+        },
+      },
+      keys: [
+        {
+          id: "sample-openai-key",
+          label: "Late-night",
+          provider: "openai",
+          harness: "codex",
+          model: "gpt-5.4",
+          fingerprint: "demo",
+          responses_verified: true,
+          created_at: iso(-1440),
+        },
+      ],
+      running_key_seats: [],
+      pinned_sessions: [],
+      engine_warnings: [],
+      pending_key_switches: [],
+      pending_crossings: [],
+      pending_tier_requests: [],
+      rev: 1,
     }});
   </script>
 </body>

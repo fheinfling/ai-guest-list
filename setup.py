@@ -45,7 +45,7 @@ def _shippable(f: str) -> bool:
                       the shipped app hits "COMPRESSES CONTEXT" and reads as a contaminated build.
       _*              scratch (scripts/screenshots.py writes app/web/_shot.{html,js} while it runs;
                       a build racing it would ship them).
-      preview.html    dev preview page — referenced by nothing.
+      preview.html    standalone browser preview page (not loaded by WKWebView).
       package.json    node test-runner config (`node --test`).
       *.mjs           the ES sources bundle.js is BUILT from. WKWebView can't load module scripts
                       over file://, which is why bundle.js exists; the sources are never fetched.
