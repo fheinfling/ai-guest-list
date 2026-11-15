@@ -27,6 +27,7 @@ def signin(ctx: Context, tool: str, *, seat: str | None = None, args=()) -> int:
     """
     home = None
     service = None
+    primary = None
     try:
         ctx.ensure_dirs()
         home = Path(tempfile.mkdtemp(prefix="signin-", dir=ctx.data_dir.absolute()))
@@ -67,25 +68,40 @@ def signin(ctx: Context, tool: str, *, seat: str | None = None, args=()) -> int:
             switch(ctx, state, tool, owner, sync=False)
         print(f"✓ seat saved — {tool}:{saved['email']} (now on the floor)")
         return 0
-    except AcctswError:
+    except AcctswError as e:
+        primary = e
         raise
     except Exception:
         # CLI/Keychain/filesystem exceptions can contain credentials; expose only our own text.
-        raise AcctswError("sign-in failed — please try again") from None
+        primary = AcctswError("sign-in failed — please try again")
+        raise primary from None
+    except BaseException as e:
+        primary = e
+        raise
     finally:
+        cleanup_errors = []
         try:
             if service is not None:
                 ctx.keychain.delete(service, ctx.cred["claude"].account)
                 if ctx.keychain.get_raw(service, ctx.cred["claude"].account) is not None:
                     raise AcctswError("temporary sign-in Keychain item is still present")
         except Exception:
-            raise AcctswError("could not remove the temporary sign-in Keychain item") from None
+            cleanup_errors.append("could not remove the temporary sign-in Keychain item")
         finally:
             if home is not None:
                 try:
                     shutil.rmtree(home)
                 except Exception:
-                    raise AcctswError("could not remove the temporary sign-in home") from None
+                    cleanup_errors.append("could not remove the temporary sign-in home")
+        if cleanup_errors:
+            if primary is not None:
+                for message in cleanup_errors:
+                    primary.add_note(message)
+            else:
+                error = AcctswError(cleanup_errors[0])
+                for message in cleanup_errors[1:]:
+                    error.add_note(message)
+                raise error from None
 
 
 def _refresh_token(blob: str) -> str | None:

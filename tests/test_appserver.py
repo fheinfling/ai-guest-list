@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from queue import Queue
 import socket
 import subprocess
@@ -308,6 +309,32 @@ def test_shutdown_closes_stdin_then_terminates_group_and_is_idempotent(ctx):
     assert child.stops == [child.pid]
     assert child.returncode == -15
     assert child.stdout.closed and not client._reader.is_alive()
+
+
+@pytest.mark.parametrize("stubborn", [False, True])
+def test_shutdown_closes_real_stdout_pipe_after_reader_exits(ctx, stubborn):
+    child = FakeChild(stubborn=stubborn)
+    read_fd, write_fd = os.pipe()
+    child.stdout = os.fdopen(read_fd, encoding="utf-8")
+    writer = os.fdopen(write_fd, "w", encoding="utf-8")
+
+    def finish(code):
+        child.returncode = code
+        writer.close()
+
+    child.finish = finish
+    client = child.client(ctx)
+    try:
+        client.close()
+        client.close()
+        assert child.stdout.closed and child.stdin.closed
+        assert not client._reader.is_alive()
+        # Popen creates no stderr pipe to leak or drain.
+        assert child.spawn_calls[0][1]["stderr"] == subprocess.DEVNULL
+    finally:
+        writer.close()
+        client._reader.join(timeout=1)
+        child.stdout.close()
 
 
 def test_lifecycle_guards_and_optional_resume_overrides(ctx):
