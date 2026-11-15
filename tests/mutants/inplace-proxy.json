@@ -491,8 +491,8 @@
  {
   "label": "proxy r3: an answered upgrade does not reset upstream_failures",
   "file": "acctsw/seatproxy.py",
-  "old": "            self._upstream_result(True)\n            self._log(\"upgrade\"",
-  "new": "            self._log(\"upgrade\"",
+  "old": "                self._upstream_result(True)\n                self._log(\"upgrade\"",
+  "new": "                self._log(\"upgrade\"",
   "test": [
    "tests/test_seatproxy.py::test_websocket_upgrade_is_relayed_verbatim_and_spliced"
   ]
