@@ -105,8 +105,7 @@ class FakeChild:
                            timeout=0.5, **kwargs)
 
 
-@pytest.mark.parametrize("resume", [False, True])
-def test_handshake_thread_turn_and_launch_contract(ctx, resume):
+def test_handshake_turn_and_launch_contract(ctx):
     def script(child, msg):
         if "id" in msg:
             child.reply(msg, {"thread": {"id": "existing-thread"}})
@@ -115,21 +114,13 @@ def test_handshake_thread_turn_and_launch_contract(ctx, resume):
     env = {"CODEX_HOME": "/fake/private-home"}
     with child.client(ctx, env=env, cwd=ctx.data_dir) as client:
         client.initialize()
-        if resume:
-            result = client.resume_thread("existing-thread", model="chosen-model", model_provider="langdock_eu")
-        else:
-            result = client.start_thread(model="chosen-model", model_provider="langdock_eu")
-        client.start_turn(result["thread"]["id"], "Continue the task")
+        client.start_turn("existing-thread", "Continue the task")
     assert [m["method"] for m in child.sent] == ["initialize", "initialized",
-                                                "thread/resume" if resume else "thread/start", "turn/start"]
+                                                "turn/start"]
     assert child.sent[0]["params"] == {"clientInfo": {"name": "acctsw", "version": "1"}}
     assert "id" not in child.sent[1]
     assert all("jsonrpc" not in m for m in child.sent)
-    params = {"model": "chosen-model", "modelProvider": "langdock_eu"}
-    if resume:
-        params["threadId"] = "existing-thread"
-    assert child.sent[2]["params"] == params
-    assert child.sent[3]["params"] == {"threadId": "existing-thread",
+    assert child.sent[2]["params"] == {"threadId": "existing-thread",
                                        "input": [{"type": "text", "text": "Continue the task"}]}
     argv, options = child.spawn_calls[0]
     assert argv == [ctx.codex_bin, "app-server"]
@@ -310,16 +301,16 @@ def test_shutdown_closes_stdin_then_terminates_group_and_is_idempotent(ctx):
     assert child.stdout.closed and not client._reader.is_alive()
 
 
-def test_lifecycle_guards_and_optional_resume_overrides(ctx):
+def test_lifecycle_guards(ctx):
     child = FakeChild(lambda child, msg: child.reply(msg, {}) if "id" in msg else None)
     with child.client(ctx) as client:
         with pytest.raises(ValueError, match="Initialize"):
-            client.start_thread()
+            client.start_turn("thread", "Continue the task")
         client.initialize()
         with pytest.raises(ValueError, match="already initialized"):
             client.initialize()
-        client.resume_thread("thread")
-        assert child.sent[-1]["params"] == {"threadId": "thread"}
+        client.start_turn("thread", "Continue the task")
+        assert child.sent[-1]["method"] == "turn/start"
     with pytest.raises(RuntimeError, match="closed"):
         client.request("test", {})
 

@@ -1,17 +1,16 @@
-"""Tests for the native shell's pure helpers: dot selection + sync-back-before-login."""
+"""Tests for the native shell's pure helpers: door selection + sync-back-before-login."""
 import json
 from pathlib import Path
 
 from acctsw import accounts as acct
 from acctsw import install as inst
-from acctsw.web_dot import dot_for, door_for
+from acctsw.web_dot import door_for
 from app.menubar import (bootstrap_supervision, usage_poll_interval,
                          USAGE_POLL_OPEN_SECONDS, USAGE_POLL_HIDDEN_SECONDS,
                          request_codex_restart, launch_codex_desktop, usage_poll_scope)
 from app import terminal
 from tests.conftest import make_codex_blob
 
-FIXTURE = Path(__file__).parent / "fixtures" / "dot_cases.json"
 DOOR_FIXTURE = Path(__file__).parent / "fixtures" / "door_cases.json"
 
 
@@ -139,13 +138,6 @@ def test_bootstrap_failure_is_reported_without_raising(ctx, monkeypatch):
     assert "rc is read-only" in result["error"]
     assert notices and "needs attention" in notices[0][0]
     assert "rc is read-only" in notices[0][1]
-
-
-def test_dot_for_golden_fixture():
-    """The SAME fixture is asserted by the node UI tests → python/JS dot logic can't drift."""
-    cases = json.loads(FIXTURE.read_text())
-    for c in cases:
-        assert dot_for(c["state"]) == c["expected"], c["name"]
 
 
 def test_door_for_golden_fixture():

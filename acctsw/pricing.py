@@ -125,26 +125,6 @@ class Model:
             return self.rate(rate.same_as or "", long_context=long_context, _seen=_seen | {name})
         return rate.value if rate.status == "known" else None
 
-    @property
-    def prices_complete(self) -> bool:
-        """Whether every price dimension is known, not a prerequisite for running or metering.
-
-        An individual response may use only known dimensions or report its monetary cost.
-        """
-        if self.reasoning_included_in_output is None or not self.currency:
-            return False
-        if self.long_context_rates and self.long_context_threshold is None:
-            return False
-        for long in (False, True) if self.long_context_rates else (False,):
-            rates = {**self.rates, **self.long_context_rates} if long else self.rates
-            for name in RATE_NAMES:
-                rate = rates.get(name, Rate())
-                if rate.status != "not_applicable" and self.rate(name, long_context=long) is None:
-                    return False
-            if any(self.rate(name, long_context=long) is None for name in ("input", "output")):
-                return False
-        return True
-
 
 def _input_price(model: Model) -> Decimal | None:
     # The picker names USD/Mtok explicitly; unknown currencies cannot share that ordering.
@@ -310,16 +290,6 @@ def parse_catalog(provider: Provider, text: str, *, wire_api: WireAPI | None = N
                       long_context_threshold=threshold, long_context_rates=long_rates)
         models.append(model)
     return models
-
-
-def parse_langdock_agent_catalog(text: str) -> list[dict[str, Any]]:
-    """Agent discovery is separate from completion discovery; created is milliseconds here."""
-    data = json.loads(text, parse_float=Decimal)
-    rows = data.get("data") if isinstance(data, dict) else None
-    if not isinstance(rows, list):
-        raise ValueError("Unexpected Langdock agent catalog envelope")
-    return [{**row, "created": decimal(row["created"]) / 1000}
-            for row in rows if isinstance(row, dict) and "created" in row]
 
 
 @dataclass(frozen=True)

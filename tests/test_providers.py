@@ -105,9 +105,9 @@ def test_undocumented_wire_pairs_are_unknown(provider):
 def test_429_does_not_imply_retry():
     for provider in ("openai", "anthropic", "langdock", "openai_compatible"):
         assert P.PROVIDERS[provider].money_may_be_gone_on_429
-    assert not P.is_retryable("openai", 429, {"error": {"code": "insufficient_quota"}})
-    assert not P.is_retryable("anthropic", 429, {"error": {"type": "rate_limit_error"}})
-    assert P.is_retryable("openai", 429, {"error": {"code": "rate_limit_exceeded"}})
+    assert P.classify_error("openai", 429, {"error": {"code": "insufficient_quota"}}) == "insufficient_quota"
+    assert P.classify_error("anthropic", 429, {"error": {"type": "rate_limit_error"}}) == "unknown"
+    assert P.classify_error("openai", 429, {"error": {"code": "rate_limit_exceeded"}}) == "rate_limited"
 
 
 def test_langdock_401_is_status_evidence_and_never_message_text():
@@ -125,7 +125,6 @@ def test_langdock_401_is_status_evidence_and_never_message_text():
     # 429 stays unclaimed: for this provider it could be throttling or exhausted money.
     for body in ('{"message": "slow down"}', '{"message": "out of credits"}', "{}"):
         assert P.classify_error("langdock", 429, body) == "unknown", body
-        assert not P.is_retryable("langdock", 429, body)
     # An unreadable body is weaker evidence than a readable one; the parse guard wins.
     assert P.classify_error("langdock", 401, "not json at all") == "unknown"
     # And a bare-message 401 must NOT start classifying for providers that do send fields.

@@ -152,12 +152,6 @@ def _scan(data: bytes) -> tuple[list[tuple[str, bytes]], bytes]:
     return tokens, b""
 
 
-def visible_input(data: bytes) -> bytes:
-    """``data`` without terminal escape sequences; pasted text between its markers stays."""
-    tokens, _ = _scan(data)
-    return b"".join(chunk for kind, chunk in tokens if kind == "text")
-
-
 # Slash commands known to stay in the same conversation. Anything else (/resume, /clear, /new, /fork,
 # a skill we've never heard of) may have moved this session somewhere its id no longer describes.
 _SAME_CONVERSATION = frozenset({

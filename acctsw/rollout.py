@@ -68,7 +68,7 @@ def sessions_roots(ctx, email: str | None) -> list[Path]:
 
     Both, because a per-account home symlinks ``sessions`` to the shared dir — but only usually:
     an un-migrated or hand-edited home may have a real directory of its own. Resolved so the two
-    collapse to one entry when the symlink is in place. Deliberately NOT ``paths.CODEX_SESSIONS``:
+    collapse to one entry when the symlink is in place. Deliberately NOT ``paths.CODEX_HOME``:
     that module-level constant ignores the Context and would point tests at the developer's
     real ~/.codex.
     """

@@ -492,11 +492,9 @@ def test_temp_keychain_cleanup_failure_still_removes_home(ctx, fakes, monkeypatc
         delete(service, ctx.cred["claude"].account)
 
 
-def test_bridge_and_terminal_preserve_requested_seat(ctx, monkeypatch):
+def test_terminal_preserves_requested_seat(ctx, monkeypatch):
     import shlex
-    from acctsw import bridge
     from app import terminal
-    assert shlex.split(bridge.login_command("claude", seat=B)) == ["acctsw", "signin", "claude", "--seat", B]
     opened = []
     monkeypatch.setattr(terminal, "checked_engine_command", lambda *a: ["/fake/app engine"])
     monkeypatch.setattr(terminal, "open_in_terminal", opened.append)

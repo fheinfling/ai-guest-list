@@ -352,7 +352,7 @@ def test_snapshot_surfaces_an_unreadable_rc_to_the_ui(ctx):
     assert supervision["error"].startswith(f"couldn't read {rc}: ")
     assert "Permission denied" in supervision["error"]
     assert supervision["block"] is False and supervision["active"] is False
-    assert state["dot"] and "tools" in state          # the rest of the payload is intact
+    assert state["door"] and "tools" in state          # the rest of the payload is intact
 
 
 def test_switch_action(ctx):
@@ -380,14 +380,6 @@ def test_add_action_is_gone(ctx):
     # `add` was the modal's round-trip for a login plan; the sub-view resolves everything client-side.
     r = bridge.handle(ctx, {"action": "add", "tool": "claude"})
     assert r["ok"] is False and "unknown action" in r["error"]
-
-
-def test_login_command():
-    # both tools' only Terminal path is the browser sign-in; method is reserved but unused
-    assert bridge.login_command("codex") == "acctsw signin codex"
-    assert bridge.login_command("codex", "token") == "acctsw signin codex"
-    assert bridge.login_command("claude") == "acctsw signin claude"
-    assert bridge.login_command("claude", "token") == "acctsw signin claude"
 
 
 def test_snapshot_after_login_adds_seat(ctx):
@@ -466,11 +458,12 @@ def test_set_theme(ctx):
     assert bridge.handle(ctx, {"action": "set_theme", "value": "bogus"})["ok"] is False
 
 
-def test_state_includes_dot_and_recently_switched(ctx):
-    _add(ctx, "a@x.com")
+def test_snapshot_omits_retired_dot_fields_and_keeps_door(ctx):
+    _add(ctx, "seat@example.com")
     r = bridge.handle(ctx, {"action": "status"})
-    assert r["state"]["dot"] in {"green", "amber", "hello", "switched"}
-    assert r["state"]["recently_switched"] is False
+    assert r["state"]["door"] == "open"
+    assert "dot" not in r["state"]
+    assert "recently_switched" not in r["state"]
 
 
 def test_set_strategy(ctx):
@@ -478,12 +471,10 @@ def test_set_strategy(ctx):
     assert bridge.handle(ctx, {"action": "set_strategy", "value": "bogus"})["ok"] is False
 
 
-def test_switch_sets_recently_switched_dot(ctx):
+def test_switch_sets_last_on_floor(ctx):
     _add(ctx, "a@x.com")
     _add(ctx, "b@x.com")
     r = bridge.handle(ctx, {"action": "switch", "tool": "codex", "email": "a@x.com"})
-    assert r["state"]["recently_switched"] is True
-    assert r["state"]["dot"] == "switched"
     seat = next(s for s in r["state"]["tools"]["codex"]["seats"] if s["email"] == "a@x.com")
     assert seat["last_on_floor"] is not None
 
@@ -502,11 +493,6 @@ def test_paste_rejects_claude_explicitly(ctx):
         ctx, {"action": "paste", "tool": "claude", "blob": make_claude_blob()}
     )
     assert r["ok"] is False and "codex-only" in r["error"]
-
-
-def test_is_native_routing():
-    assert bridge.is_native("quit") and bridge.is_native("login") and bridge.is_native("settings")
-    assert not bridge.is_native("switch") and not bridge.is_native("status")
 
 
 def test_no_headroom_surface_in_snapshot(ctx):

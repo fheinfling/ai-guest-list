@@ -63,10 +63,6 @@ class ExecJob:
     cwd: str | None                      # the last -C/--cd value, as given
     blocker: str | None                  # why this job cannot be resumed elsewhere, else None
 
-    @property
-    def resumable(self) -> bool:
-        return self.blocker is None
-
     def resume_argv(self, exe: str, thread: str | None, *, drop_model: bool = False,
                     extra: list | tuple = ()) -> list:
         """The relaunch: same options, ``resume <thread> CONTINUE_PROMPT``. Never --last, never TUI.

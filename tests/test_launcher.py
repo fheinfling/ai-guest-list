@@ -11,7 +11,8 @@ import pytest
 
 from acctsw import accounts as acct
 from acctsw import launcher as L
-from acctsw.launcher import (NoSeats, build_cmd, resume_cmd, detect_limit, detect_auth_dead,
+from acctsw import identity as identity_mod
+from acctsw.launcher import (NoSeats, build_cmd, resume_cmd, detect_event,
                              detect_hard_limit, handle_limit, handle_auth_dead, run)
 from acctsw.util import now, iso
 from datetime import timedelta
@@ -31,21 +32,21 @@ from acctsw import paths as P
     # Real banners whose committal wording varies — must still be caught (recall over the exact token)
     "usage limit exceeded", "you've reached your usage limit",
 ])
-def test_detect_limit_positive(text):
-    assert detect_limit("codex", text) or detect_limit("claude", text)
+def test_detect_event_limit_positive(text):
+    assert detect_event("codex", text) == "limit" or detect_event("claude", text) == "limit"
 
 
 @pytest.mark.parametrize("text", [
     "5-hour limit reached", "5-hour limit · resets 8pm", "weekly limit · resets Monday",
 ])
-def test_detect_limit_claude_window_banners(text):
+def test_detect_event_limit_claude_window_banners(text):
     """Claude's own window-limit banners are caught even when they omit "reached" (e.g. a status
     line that only says "resets") — the corroboration guard vetoes any false positive."""
-    assert detect_limit("claude", text)
+    assert detect_event("claude", text) == "limit"
 
 
-def test_detect_limit_negative():
-    assert not detect_limit("codex", "compiling project, running tests, all green")
+def test_detect_event_limit_negative():
+    assert detect_event("codex", "compiling project, running tests, all green") != "limit"
 
 
 @pytest.mark.parametrize("benign", [
@@ -57,9 +58,9 @@ def test_detect_limit_negative():
     "all claude seats are resting; soonest unlocks at 17:57",
     "2 MCP servers need authentication · run /mcp",
 ])
-def test_detect_limit_no_false_positive_on_benign(benign):
-    assert not detect_limit("codex", benign)
-    assert not detect_limit("claude", benign)
+def test_detect_event_limit_no_false_positive_on_benign(benign):
+    assert detect_event("codex", benign) != "limit"
+    assert detect_event("claude", benign) != "limit"
 
 
 @pytest.mark.parametrize("text", [
@@ -67,27 +68,26 @@ def test_detect_limit_no_false_positive_on_benign(benign):
     "API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited",
     "Rate limited — this is not your usage limit, please retry",
 ])
-def test_detect_limit_ignores_server_throttle(text):
+def test_detect_event_limit_ignores_server_throttle(text):
     """A server-side throttle that explicitly disclaims the usage limit must never read as one —
     otherwise a transient overload wrongly rests/switches a seat (the false-positive class this guards)."""
-    assert not detect_limit("codex", text)
-    assert not detect_limit("claude", text)
-    from acctsw.launcher import detect_event
+    assert detect_event("codex", text) != "limit"
+    assert detect_event("claude", text) != "limit"
     assert detect_event("claude", text) is None
 
 
-def test_detect_limit_claude_ignores_codex_credit_narration():
+def test_detect_event_limit_claude_ignores_codex_credit_narration():
     """A Claude session narrating about Codex credits ("out of credits") must NOT read as a Claude
     limit — Claude Code never emits that wording as a banner. This is the exact string that kept
     killing live Claude sessions."""
     narration = "the routed Codex workspace is out of credits"
-    assert not detect_limit("claude", narration)
-    assert detect_limit("codex", narration)  # still a real signal for an actual codex session
+    assert detect_event("claude", narration) != "limit"
+    assert detect_event("codex", narration) == "limit"  # still a real signal for an actual codex session
 
 
-def test_detect_limit_ignores_ansi_codes():
+def test_detect_event_limit_ignores_ansi_codes():
     colored = "\x1b[31musage\x1b[0m \x1b[1mlimit\x1b[0m reached"
-    assert detect_limit("codex", colored)
+    assert detect_event("codex", colored) == "limit"
 
 
 def test_detect_hard_limit_matches_codex_workspace_credits_banner():
@@ -457,7 +457,7 @@ def test_run_claude_no_switch_skips_identity_cli(ctx, monkeypatch):
     def unexpected_identity(_ctx):
         raise AssertionError("no-switch Claude launch resolved live identity")
 
-    monkeypatch.setattr(L.identity_mod, "claude_live_identity", unexpected_identity)
+    monkeypatch.setattr(identity_mod, "claude_live_identity", unexpected_identity)
     spawn = FakeSpawn([(b"all good, done\n", 0)])
 
     assert run(ctx, "claude", [], spawn=spawn, get=fake_get({})) == 0
@@ -475,7 +475,7 @@ def test_run_claude_hop_leaves_stock_identity_alone(ctx, monkeypatch):
 
     def resolve_identity(_ctx):
         events.append("identity")
-        return L.identity_mod.ClaudeLiveIdentity(
+        return identity_mod.ClaudeLiveIdentity(
             blob=ctx.cred["claude"].get_live(), email="c1@x.com"
         )
 
@@ -484,7 +484,7 @@ def test_run_claude_hop_leaves_stock_identity_alone(ctx, monkeypatch):
         on_output(b"all good, done\n")
         return 0
 
-    monkeypatch.setattr(L.identity_mod, "claude_live_identity", resolve_identity)
+    monkeypatch.setattr(identity_mod, "claude_live_identity", resolve_identity)
 
     assert run(ctx, "claude", [], spawn=spawn, get=fake_get({})) == 0
     assert events == ["spawn"]
@@ -830,15 +830,15 @@ def test_run_unknown_probes_never_disable_later_limit_detection(ctx, monkeypatch
     "your refresh token was revoked. Please log out and sign in again.",
     "error: refresh token revoked",
 ])
-def test_detect_auth_dead_positive(text):
-    assert detect_auth_dead("codex", text)
+def test_detect_event_auth_dead_positive(text):
+    assert detect_event("codex", text) == "auth"
 
 
-def test_detect_auth_dead_negative_and_not_a_limit():
-    assert not detect_auth_dead("codex", "you've hit your usage limit")
-    assert not detect_limit("codex", "refresh token was revoked")  # auth death isn't a limit
+def test_detect_event_auth_dead_negative_and_not_a_limit():
+    assert detect_event("codex", "you've hit your usage limit") != "auth"
+    assert detect_event("codex", "refresh token was revoked") != "limit"  # auth death isn't a limit
     # tightened patterns must NOT fire on the model merely writing about auth
-    assert not detect_auth_dead("codex", "to fix this, please sign in again via the portal")
+    assert detect_event("codex", "to fix this, please sign in again via the portal") != "auth"
 
 
 def test_handle_limit_honors_auth_failed_exclude(ctx):
@@ -854,7 +854,6 @@ def test_handle_limit_honors_auth_failed_exclude(ctx):
 
 
 def test_detect_event_classifies_in_one_pass():
-    from acctsw.launcher import detect_event
     assert detect_event("codex", "your refresh token was revoked") == "auth"
     assert detect_event("codex", "you've hit your usage limit") == "limit"
     assert detect_event("codex", "all good here") is None
@@ -1646,8 +1645,8 @@ def test_run_claude_exit_syncs_back_rotated_creds(ctx, monkeypatch):
         return 0
 
     monkeypatch.setattr(
-        L.identity_mod, "claude_live_identity",
-        lambda _c, **kw: L.identity_mod.ClaudeLiveIdentity(blob=(ctx.claude_cred(kw["email"]) if kw.get("email") else ctx.cred["claude"]).get_live(),
+        identity_mod, "claude_live_identity",
+        lambda _c, **kw: identity_mod.ClaudeLiveIdentity(blob=(ctx.claude_cred(kw["email"]) if kw.get("email") else ctx.cred["claude"]).get_live(),
                                                      email="solo@x.com" if kw.get("email") else None))
 
     assert run(ctx, "claude", [], spawn=rotate_mid_session, get=fake_get({})) == 0
@@ -1663,7 +1662,7 @@ def test_run_claude_exit_without_rotation_skips_identity_cli(ctx, monkeypatch):
     def unexpected_identity(_ctx):
         raise AssertionError("unrotated Claude exit resolved live identity")
 
-    monkeypatch.setattr(L.identity_mod, "claude_live_identity", unexpected_identity)
+    monkeypatch.setattr(identity_mod, "claude_live_identity", unexpected_identity)
 
     assert run(ctx, "claude", [], spawn=FakeSpawn([(b"done\n", 0)]), get=fake_get({})) == 0
 

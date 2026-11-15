@@ -363,7 +363,6 @@ def _assign_statuses(seats: list[dict[str, Any]]) -> None:
     soonest-to-reset is held as up-next instead of resting.
     """
     usable = [s for s in seats if not s["needs_login"]]
-    resting_usable = [s for s in usable if s["limited"] and not s["active"]]
     all_capped = bool(usable) and all(s["limited"] for s in usable)
     soonest = None
     if all_capped:

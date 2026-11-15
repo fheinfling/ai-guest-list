@@ -33,7 +33,7 @@ def test_relaunch_keeps_every_exec_option_and_drops_prompt_and_images():
     job = X.parse(["exec", "-s", "workspace-write", "--skip-git-repo-check", "-m", "gpt-x",
                    "-c", "model_reasoning_effort=xhigh", "-C", "sub", "--add-dir", "/tmp/s",
                    "-i", "a.png", "b.png", "--json", "-o", "last.txt", "do the thing"])
-    assert job.resumable and job.command == "" and job.cwd == "sub"
+    assert job.blocker is None and job.command == "" and job.cwd == "sub"
     assert job.resume_argv("/bin/codex", THREAD) == [
         "/bin/codex", "exec", "-s", "workspace-write", "--skip-git-repo-check", "-m", "gpt-x",
         "-c", "model_reasoning_effort=xhigh", "-C", "sub", "--add-dir", "/tmp/s", "--json",
@@ -43,7 +43,7 @@ def test_relaunch_keeps_every_exec_option_and_drops_prompt_and_images():
 def test_root_options_and_the_e_alias_and_attached_values():
     job = X.parse(["-m", "root-model", "--config=a=1", "-Cdir", "e", "--model=gpt-x",
                    "-s=read-only", "--image=a.png", "-"])
-    assert job.resumable and job.cwd == "dir"
+    assert job.blocker is None and job.cwd == "dir"
     assert job.resume_argv("codex", THREAD) == [
         "codex", "-m", "root-model", "--config=a=1", "-Cdir", "exec", "--model=gpt-x",
         "-s=read-only", "resume", THREAD, X.CONTINUE_PROMPT]
@@ -56,13 +56,13 @@ def test_root_options_and_the_e_alias_and_attached_values():
 def test_an_exec_resume_keeps_its_thread_and_global_options_after_the_subcommand():
     job = X.parse(["exec", "--skip-git-repo-check", "resume", THREAD, "go on", "--json",
                    "-i", "x.png"])
-    assert job.command == "resume" and job.thread == THREAD and job.resumable
+    assert job.command == "resume" and job.thread == THREAD and job.blocker is None
     assert job.resume_argv("codex", job.thread) == [
         "codex", "exec", "--skip-git-repo-check", "--json", "resume", THREAD, X.CONTINUE_PROMPT]
     last = X.parse(["exec", "resume", "--last", "go on"])
-    assert last.resumable and last.thread is None          # the thread comes from the rollout
+    assert last.blocker is None and last.thread is None          # the thread comes from the rollout
     fork = X.parse(["exec", "fork", THREAD, "branch off"])
-    assert fork.resumable and fork.thread is None          # a fork writes a NEW thread
+    assert fork.blocker is None and fork.thread is None          # a fork writes a NEW thread
 
 
 def test_option_values_follow_clap():
@@ -86,7 +86,7 @@ def test_option_values_follow_clap():
 ])
 def test_jobs_that_cannot_be_resumed_say_why(args, why):
     job = X.parse(args)
-    assert job is not None and not job.resumable and why in job.blocker
+    assert job is not None and job.blocker is not None and why in job.blocker
     with pytest.raises(AcctswError):
         job.resume_argv("codex", THREAD)
 
@@ -101,7 +101,7 @@ def test_interactive_invocations_are_not_exec_jobs(args):
 
 def test_unknown_root_option_after_a_dash_dash_value_still_marks_the_job():
     job = X.parse(["-c", "--", "--unknown", "exec", "--", "p"])
-    assert job is not None and not job.resumable and "--unknown" in job.blocker
+    assert job is not None and job.blocker is not None and "--unknown" in job.blocker
 
 
 def test_a_known_option_missing_its_value_is_named():
@@ -110,7 +110,7 @@ def test_a_known_option_missing_its_value_is_named():
 
 def test_a_prompt_after_double_dash_is_never_a_subcommand():
     job = X.parse(["exec", "--json", "--", "resume", "that old idea"])
-    assert job.command == "" and job.resumable
+    assert job.command == "" and job.blocker is None
     assert job.resume_argv("codex", THREAD)[-3:] == ["resume", THREAD, X.CONTINUE_PROMPT]
 
 

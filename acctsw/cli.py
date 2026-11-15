@@ -282,7 +282,6 @@ def _cmd_daemons(ctx: Context, ns) -> int:
 
 
 def _cmd_switch(ctx: Context, ns) -> int:
-    from . import identity as identity_mod
     if ns.tool == "claude":
         from . import claudehome, claudesync
         claudesync.converge(ctx)

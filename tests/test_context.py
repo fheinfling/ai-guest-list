@@ -62,6 +62,6 @@ def test_external_codex_home_env_remains_a_supported_shared_mirror(tmp_path, mon
 def test_a_custom_codex_home_elsewhere_in_the_store_is_honoured(monkeypatch):
     """Only the two managed seat roots are ours. A home a developer parks somewhere else under
     ~/.account-switcher is their choice, and switching must keep targeting it."""
-    custom = P.APP_SRC_DIR / "dev-codex"
+    custom = P.DATA_DIR / "app" / "dev-codex"
     monkeypatch.setenv("CODEX_HOME", str(custom))
     assert P._canonical_codex_home() == custom

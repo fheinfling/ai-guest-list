@@ -52,7 +52,6 @@ def test_xai_cents_per_100m_and_zero_long_context_fallback():
     assert model.long_context_threshold == 128000
     chat, = P.parse_catalog(get_provider("xai"), body, wire_api="chat")
     assert chat.reasoning_included_in_output is False
-    assert chat.prices_complete
 
 
 def test_openrouter_per_token_strings_and_per_request_fee():
@@ -65,7 +64,6 @@ def test_openrouter_per_token_strings_and_per_request_fee():
     assert model.rate("cached_input") == Decimal("0.3")
     assert model.rate("cache_write") == Decimal("3.75")
     assert model.rate("request") == Decimal("0.001")
-    assert model.prices_complete
 
 
 def test_together_bare_array_preserves_decimal_numbers():
@@ -76,7 +74,6 @@ def test_together_bare_array_preserves_decimal_numbers():
     assert model.rate("output") == Decimal("0.3")
     assert model.rate("cached_input") == Decimal("0.2")
     assert model.reasoning_included_in_output is None
-    assert not model.prices_complete
     with pytest.raises(ValueError):
         P.parse_catalog(get_provider("together"), '{"data":[]}')
 
@@ -97,10 +94,8 @@ def test_cerebras_pins_native_public_feed_not_huggingface(tmp_path):
     assert wrong.rate("input") is None
 
 
-def test_langdock_agent_timestamp_is_milliseconds_and_not_completion_schema():
+def test_langdock_completion_catalog_does_not_infer_creation_time_or_prices():
     body = '{"data":[{"id":"m","name":"Model","created":1750000000123,"region":"eu"}]}'
-    agent, = P.parse_langdock_agent_catalog(body)
-    assert agent["created"] == Decimal("1750000000.123")
     completion, = P.parse_catalog(get_provider("langdock"), body)
     assert completion.created is None
     assert completion.rate("input") is None
@@ -114,7 +109,6 @@ def test_catalogs_normalise_discovery_without_inventing_prices(id):
     model, = P.parse_catalog(p, '{"data":[{"id":"unpriced","display_name":"Unpriced"}]}')
     assert model.provider == id and model.display_name == "Unpriced"
     assert model.rates["input"].status == "unknown"
-    assert not model.prices_complete
 
 
 CONTEXT_FIELDS = [

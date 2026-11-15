@@ -12,6 +12,8 @@ from decimal import Decimal
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
+from .paths import ANTHROPIC_VERSION
+
 WireAPI = Literal["responses", "chat", "messages"]
 ResponsesSupport = Literal["verified", "beta", "unverified", "unsupported"]
 
@@ -23,7 +25,6 @@ class Provider:
     base_url: str
     wire_api: WireAPI
     responses_support: ResponsesSupport
-    usage_adapter: str
     models_endpoint: str
     validation_endpoint: str
     auth_header: str = "Authorization"
@@ -36,13 +37,13 @@ class Provider:
     def headers(self, key: str) -> dict[str, str]:
         headers = {self.auth_header: self.auth_prefix + key}
         if self.wire_api == "messages":
-            headers["anthropic-version"] = "2023-06-01"
+            headers["anthropic-version"] = ANTHROPIC_VERSION
         return headers
 
 
 def _provider(id: str, name: str, base: str, wire: WireAPI,
               support: ResponsesSupport, **kwargs: Any) -> Provider:
-    return Provider(id, name, base, wire, support, id,
+    return Provider(id, name, base, wire, support,
                     kwargs.pop("models_endpoint", base + "/models"),
                     kwargs.pop("validation_endpoint", base + "/models"), **kwargs)
 
@@ -174,8 +175,3 @@ def classify_error(provider: str | Provider, status: int, body: str | dict) -> s
         return "insufficient_quota"
     # In particular, compatible servers do not inherit OpenAI's error vocabulary.
     return "unknown"
-
-
-def is_retryable(provider: str | Provider, status: int, body: str | dict) -> bool:
-    """Only a positively identified transient limit is retryable by this taxonomy."""
-    return classify_error(provider, status, body) == "rate_limited"
