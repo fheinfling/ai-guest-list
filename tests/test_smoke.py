@@ -1,11 +1,21 @@
 """Milestone-1 smoke tests: the package imports and the CLI parser is wired up."""
+import contextlib
+import importlib.util
+import io
 import pathlib
 import re
 import subprocess
 import sys
 
+import pytest
+
 import acctsw
-from acctsw.cli import build_parser
+from acctsw.cli import HANDLERS, build_parser
+
+CORE_COMMANDS = (
+    "install", "uninstall", "path", "add", "signin", "remove", "rename",
+    "list", "status", "daemons", "usage", "switch", "run", "keys",
+)
 
 
 def test_version_constant():
@@ -17,8 +27,23 @@ def test_parser_has_core_commands():
     parser = build_parser()
     # argparse stores subparser choices on the _SubParsersAction.
     sub = next(a for a in parser._actions if a.dest == "command")
-    for cmd in ("install", "uninstall", "add", "remove", "list", "status", "usage", "switch", "run"):
+    for cmd in CORE_COMMANDS:
         assert cmd in sub.choices, f"missing subcommand: {cmd}"
+    assert set(sub.choices) == set(HANDLERS) == set(CORE_COMMANDS)
+    for cmd, subparser in sub.choices.items():
+        buf = io.StringIO()
+        with pytest.raises(SystemExit) as exc, contextlib.redirect_stdout(buf):
+            subparser.parse_args(["--help"])
+        assert exc.value.code == 0
+        assert cmd in buf.getvalue()
+
+
+def test_smoke_bundle_core_commands_match_cli_handlers():
+    root = pathlib.Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location("smoke_bundle", root / "scripts" / "smoke-bundle.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.CORE_COMMANDS == set(HANDLERS)
 
 
 def test_module_runs_as_main():

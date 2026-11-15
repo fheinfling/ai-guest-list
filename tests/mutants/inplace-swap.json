@@ -213,7 +213,7 @@
  {
   "label": "UI switch-now button missing",
   "file": "app/web/render.mjs",
-  "old": "<button class=\"choice\" data-action=\"crossing-answer\" data-scope=\"once\" ${data}>switch now</button>",
+  "old": "<button class=\"row-action\" data-action=\"crossing-answer\" data-scope=\"once\" ${data}>switch now</button>",
   "new": "",
   "cmd": [
    "node",
@@ -224,8 +224,8 @@
  {
   "label": "UI needs-you item not rendered",
   "file": "app/web/render.mjs",
-  "old": "${prompts}${crossingRequests(state)}${tierRequests(state)}${paid",
-  "new": "${prompts}${paid",
+  "old": "${seatIssues(p, openDetails, state, nameEdits)}${crossings}${tiers}",
+  "new": "${seatIssues(p, openDetails, state, nameEdits)}${tiers}",
   "cmd": [
    "node",
    "--test",
@@ -553,8 +553,8 @@
  {
   "label": "v2 env sets ANTHROPIC_BASE_URL",
   "file": "acctsw/seatswap.py",
-  "old": "        out[\"HTTPS_PROXY\"] = out[\"https_proxy\"] = self.proxy_url\n",
-  "new": "        out[\"HTTPS_PROXY\"] = out[\"https_proxy\"] = out[\"ANTHROPIC_BASE_URL\"] = self.proxy_url\n",
+  "old": "        overrides = {\"HTTPS_PROXY\": self.proxy_url, \"https_proxy\": self.proxy_url}\n",
+  "new": "        overrides = {\"HTTPS_PROXY\": self.proxy_url, \"https_proxy\": self.proxy_url, \"ANTHROPIC_BASE_URL\": self.proxy_url}\n",
   "test": [
    "tests/test_seatswap.py::test_env_routes_https_through_the_proxy_and_trusts_the_session_ca"
   ]
@@ -562,8 +562,8 @@
  {
   "label": "v2 env leaves lowercase https_proxy to the user",
   "file": "acctsw/seatswap.py",
-  "old": "        out[\"HTTPS_PROXY\"] = out[\"https_proxy\"] = self.proxy_url\n",
-  "new": "        out[\"HTTPS_PROXY\"] = self.proxy_url\n",
+  "old": "        overrides = {\"HTTPS_PROXY\": self.proxy_url, \"https_proxy\": self.proxy_url}\n",
+  "new": "        overrides = {\"HTTPS_PROXY\": self.proxy_url}\n",
   "test": [
    "tests/test_seatswap.py::test_env_routes_https_through_the_proxy_and_trusts_the_session_ca"
   ]
@@ -571,7 +571,7 @@
  {
   "label": "v2 env without the CA bundle",
   "file": "acctsw/seatswap.py",
-  "old": "            out.update(self.ca.bundle_paths(base))",
+  "old": "            overrides.update(self.ca.bundle_paths(base))",
   "new": "            pass",
   "test": [
    "tests/test_seatswap.py::test_env_routes_https_through_the_proxy_and_trusts_the_session_ca"
@@ -1230,8 +1230,8 @@
  {
   "label": "UI tier question not rendered",
   "file": "app/web/render.mjs",
-  "old": "${crossingRequests(state)}${tierRequests(state)}",
-  "new": "${crossingRequests(state)}",
+  "old": "${seatIssues(p, openDetails, state, nameEdits)}${crossings}${tiers}",
+  "new": "${seatIssues(p, openDetails, state, nameEdits)}${crossings}",
   "cmd": [
    "node",
    "--test",

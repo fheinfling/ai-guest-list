@@ -33,8 +33,8 @@ PORT = 8917
 # The framing measured from the original screenshots: 424 CSS px wide, 24px inset, a 376px card
 # (the real popover width) on a soft blue backdrop, at 2x.
 #
-# In the app the popover is a fixed 376x600 window: `html,body,#root,.app{height:100%}` with
-# `.main-body`/`.set-body` scrolling INSIDE it. A screenshot of that would just be the first 600px
+# In the app the popover is a 376px window capped at 600px with `.body`/`.set-body` scrolling
+# INSIDE it. A screenshot of that would just be the first 600px
 # with the rest cut off, so we let the card grow to its full content height instead — which is what
 # the originals show. This is the only deviation from how the app renders; everything else is the
 # app's own CSS.
@@ -43,8 +43,8 @@ SHOT_CSS = """
   html, body { margin: 0; padding: 0; }
   html, body, #root, #root .app { height: auto !important; max-height: none !important;
                                      overflow: visible !important; }
-  #root .main-body, #root .set-body { flex: none !important; min-height: 0 !important;
-                                      overflow: visible !important; }
+  #root .body, #root .set-body { flex: none !important; min-height: 0 !important;
+                                 overflow: visible !important; }
   body { width: 424px; padding: 24px; box-sizing: border-box;
          background: linear-gradient(180deg,#c3cfe5 0%,#bcc8dd 7%,#bcc8dd 93%,#c7d4ea 100%); }
   #root { width: 376px; margin: 0; }   /* 376 = the real popover width */
@@ -59,51 +59,52 @@ def sample_payload() -> dict:
     from acctsw.context import Context
     from acctsw.util import iso, now
 
-    store = Path(tempfile.mkdtemp()) / "store"
-    ctx = Context.for_test(store)
-    ctx.ensure_dirs()
-    t = now()
+    with tempfile.TemporaryDirectory(prefix="acctsw-shot-") as tmp:
+        store = Path(tmp) / "store"
+        ctx = Context.for_test(store)
+        ctx.ensure_dirs()
+        t = now()
 
-    def usage(p5, resets_in_min, pweek):
-        return {"ok": True, "error": None, "error_streak": 0, "fetched_at": iso(t),
-                "limit_reached": None,
-                "windows": {"5h": {"used_pct": p5,
-                                   "resets_at": iso(t + dt.timedelta(minutes=resets_in_min))},
-                            "weekly": {"used_pct": pweek,
-                                       "resets_at": iso(t + dt.timedelta(days=3))}}}
+        def usage(p5, resets_in_min, pweek):
+            return {"ok": True, "error": None, "error_streak": 0, "fetched_at": iso(t),
+                    "limit_reached": None,
+                    "windows": {"5h": {"used_pct": p5,
+                                       "resets_at": iso(t + dt.timedelta(minutes=resets_in_min))},
+                                "weekly": {"used_pct": pweek,
+                                           "resets_at": iso(t + dt.timedelta(days=3))}}}
 
-    def seat(email, name, plan, u, limited_until=None):
-        return {"email": email, "name": name, "plan": plan, "added_at": iso(t),
-                "last_on_floor": None, "limit_source": None, "limited_until": limited_until,
-                "usage": u, "account_id": f"acct:{email}"}
+        def seat(email, name, plan, u, limited_until=None):
+            return {"email": email, "name": name, "plan": plan, "added_at": iso(t),
+                    "last_on_floor": None, "limit_source": None, "limited_until": limited_until,
+                    "usage": u, "account_id": f"acct:{email}"}
 
-    s = ctx.load_state()
-    # Reserved example domains keep every address unmistakably fictional.
-    s.data["tools"]["codex"] = {"active": "personal@studio.example", "accounts": {
-        "work@studio.example": seat("work@studio.example", "Work", "Business", usage(100, 101, 74),
-                                iso(t + dt.timedelta(minutes=101))),
-        "personal@studio.example": seat("personal@studio.example", "Personal", "Business",
-                                    usage(38, 180, 21)),
-    }}
-    s.data["tools"]["claude"] = {"active": "studio@studio.example", "accounts": {
-        "studio@studio.example": seat("studio@studio.example", "Studio", "Max", usage(20, 240, 16)),
-        "personal@me.example": seat("personal@me.example", "Personal", "Pro", usage(5, 300, 4)),
-    }}
-    # Metadata only: no API key, Keychain write, provider request or real fingerprint.
-    # OpenAI's catalog has no machine-readable prices; the real key card shows no price line.
-    s.data["keys"] = {"sample-openai-key": {
-        "id": "sample-openai-key", "label": "Late-night", "provider": "openai",
-        "harness": "codex", "model": "gpt-5.4", "fingerprint": "demo",
-        "responses_verified": True, "created_at": iso(t),
-    }}
-    s.data["moved_note"] = "auto-moved Codex · Work → Personal — Work's resting"
-    s.data["last_switch_at"] = iso(t)
-    s.settings().update({"theme": "light", "auto_switch": True, "strategy": "most_headroom",
-                         "notify": True, "restart_app": False,
-                         "engine_restart": True, "key_fallback": False,
-                         "confirm_key_switch": True})
-    s.save()
-    payload = bridge.snapshot_state(ctx)
+        s = ctx.load_state()
+        # Reserved example domains keep every address unmistakably fictional.
+        s.data["tools"]["codex"] = {"active": "personal@studio.example", "accounts": {
+            "work@studio.example": seat("work@studio.example", "Work", "Business", usage(100, 101, 74),
+                                    iso(t + dt.timedelta(minutes=101))),
+            "personal@studio.example": seat("personal@studio.example", "Personal", "Business",
+                                        usage(38, 180, 21)),
+        }}
+        s.data["tools"]["claude"] = {"active": "studio@studio.example", "accounts": {
+            "studio@studio.example": seat("studio@studio.example", "Studio", "Max", usage(20, 240, 16)),
+            "personal@me.example": seat("personal@me.example", "Personal", "Pro", usage(5, 300, 4)),
+        }}
+        # Metadata only: no API key, Keychain write, provider request or real fingerprint.
+        # OpenAI's catalog has no machine-readable prices; the real key card shows no price line.
+        s.data["keys"] = {"sample-openai-key": {
+            "id": "sample-openai-key", "label": "Late-night", "provider": "openai",
+            "harness": "codex", "model": "gpt-5.4", "fingerprint": "demo",
+            "responses_verified": True, "created_at": iso(t),
+        }}
+        s.data["moved_note"] = "auto-moved Codex · Work → Personal — Work's resting"
+        s.data["last_switch_at"] = iso(t)
+        s.settings().update({"theme": "light", "auto_switch": True, "strategy": "most_headroom",
+                             "notify": True, "restart_app": False,
+                             "engine_restart": True, "key_fallback": False,
+                             "confirm_key_switch": True})
+        s.save()
+        payload = bridge.snapshot_state(ctx)
     # The shell-wiring probe is host-global even with Context.for_test. Show a sample completed
     # setup, without carrying this machine's rc path or installation status into the screenshot.
     payload["supervision"] = {"wrappers": True, "block": True, "on_path": True, "active": True}

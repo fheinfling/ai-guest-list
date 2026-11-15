@@ -357,8 +357,8 @@
   {
     "label": "limited seat duplicates its reset in an inline issue",
     "file": "app/web/render.mjs",
-    "old": "    const error = usageIssue(p.tool, seat);",
-    "new": "    if (limitedSeat(seat)) issues.push(`limited; ${returnTime(seat)}`);\n    const error = usageIssue(p.tool, seat);",
+    "old": "    const error = usageIssue(seat);",
+    "new": "    if (limitedSeat(seat)) issues.push(`limited; ${backText(seat)}`);\n    const error = usageIssue(seat);",
     "cmd": [
       "node",
       "--test",
@@ -392,8 +392,8 @@
   {
     "label": "visible identity loses the plan",
     "file": "app/web/render.mjs",
-    "old": "const parts = [name, kind, plan].filter(",
-    "new": "const parts = [name, kind].filter(",
+    "old": "return [...new Set([kind, plan].filter(Boolean))];",
+    "new": "return [...new Set([kind].filter(Boolean))];",
     "cmd": [
       "node",
       "--test",
@@ -504,8 +504,8 @@
   {
     "label": "engine problem disappears from the main view",
     "file": "app/web/render.mjs",
-    "old": "const problems = engineBanner(state) + supervisionBanner(state);",
-    "new": "const problems = supervisionBanner(state);",
+    "old": "const problems = engineBanner(state) + supervisionBanner(state)",
+    "new": "const problems = supervisionBanner(state)",
     "cmd": [
       "node",
       "--test",
@@ -516,8 +516,8 @@
   {
     "label": "supervision problem disappears from the main view",
     "file": "app/web/render.mjs",
-    "old": "const problems = engineBanner(state) + supervisionBanner(state);",
-    "new": "const problems = engineBanner(state);",
+    "old": "const problems = engineBanner(state) + supervisionBanner(state)",
+    "new": "const problems = engineBanner(state)",
     "cmd": [
       "node",
       "--test",
@@ -552,7 +552,7 @@
   {
     "label": "engine problems no longer count in the chip",
     "file": "app/web/render.mjs",
-    "old": "+ engineWarnings(state).length + Number(Boolean(supervisionProblem(state)))",
+    "old": "+ engineWarnings(state).filter(hardWarning).length + Number(Boolean(supervisionProblem(state)))",
     "new": "+ 0 + Number(Boolean(supervisionProblem(state)))",
     "cmd": [
       "node",
@@ -564,8 +564,8 @@
   {
     "label": "supervision problems no longer count in the chip",
     "file": "app/web/render.mjs",
-    "old": "+ engineWarnings(state).length + Number(Boolean(supervisionProblem(state)))",
-    "new": "+ engineWarnings(state).length + 0",
+    "old": "+ engineWarnings(state).filter(hardWarning).length + Number(Boolean(supervisionProblem(state)))",
+    "new": "+ engineWarnings(state).filter(hardWarning).length + 0",
     "cmd": [
       "node",
       "--test",
@@ -588,8 +588,8 @@
   {
     "label": "expanded seat details lose usage grouping",
     "file": "app/web/render.mjs",
-    "old": "rows = detailGroup(\"usage\", rows +",
-    "new": "rows = detailGroup(\"readings\", rows +",
+    "old": "detailGroup(\"usage\", rows +",
+    "new": "detailGroup(\"readings\", rows +",
     "cmd": [
       "node",
       "--test",
