@@ -19,6 +19,16 @@ from pathlib import Path
 
 from setuptools import setup
 
+
+def _scrub_ssl_cert_env() -> None:
+    """Make py2app's ssl recipe package the interpreter's OpenSSL defaults."""
+    removed = [name for name in ("SSL_CERT_FILE", "SSL_CERT_DIR") if name in os.environ]
+    for name in removed:
+        del os.environ[name]
+    if removed:
+        print(f"py2app: ignoring inherited {', '.join(removed)}; using OpenSSL defaults")
+
+
 APP = ["app/menubar.py"]
 
 # Single source of truth for the marketing version (acctsw/__init__.py); the build number is the
@@ -92,6 +102,7 @@ OPTIONS = {
     },
 }
 
+_scrub_ssl_cert_env()
 setup(
     name="AI Guest List",
     app=APP,

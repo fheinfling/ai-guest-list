@@ -153,6 +153,95 @@ def test_nested_zip_extension_fails_closed_and_probe_may_consume_stream(tmp_path
     assert bundle.archive_machos(path, "outer") == ["outer!nested!native"]
 
 
+def eocd_constant():
+    # A plausible first central header keeps is_zipfile() true even on Python 3.14,
+    # whose probe checks more than 3.13's EOCD-only probe. The directory is invalid.
+    prefix = b"\xa7\r\r\nbytecode constants"
+    central = b"PK\x01\x02" + bytes(42) + b"not a directory"
+    return prefix + central + struct.pack("<4s4H2LH", b"PK\x05\x06", 0, 0, 1, 1,
+                                         len(central), len(prefix), 0)
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["loose-file", "archive-member"])
+def test_eocd_constant_is_not_an_archive(tmp_path, nested):
+    data = eocd_constant()
+    assert zipfile.is_zipfile(io.BytesIO(data))
+    with pytest.raises(zipfile.BadZipFile):
+        zipfile.ZipFile(io.BytesIO(data))
+    app = tmp_path / "AI Guest List.app"
+    app.mkdir()
+    if nested:
+        archive = app / "python313.zip"
+        write_zip(archive, {"zipimport.pyc": data, "plain.pyc": b"python bytecode"})
+        assert bundle.archive_machos(archive, "stdlib") == []
+    else:
+        (app / "zipimport.pyc").write_bytes(data)
+    bundle.scan_bundle(app)
+
+
+def test_macho_with_eocd_constant_is_still_found(tmp_path):
+    archive = tmp_path / "python313.zip"
+    write_zip(archive, {"zipimport.pyc": eocd_constant(), "native": thin(6) + eocd_constant()})
+    assert bundle.archive_machos(archive, "stdlib") == ["stdlib!native"]
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["loose-file", "archive-member"])
+@pytest.mark.parametrize("native", [False, True], ids=["python", "macho"])
+def test_zip_appended_to_other_bytes_is_inspected(tmp_path, nested, native):
+    payload = io.BytesIO(b"leading bytes")
+    payload.seek(0, 2)
+    write_zip(payload, {"payload": thin(6) if native else b"python bytecode"})
+    app = tmp_path / "AI Guest List.app"
+    app.mkdir()
+    if nested:
+        path = app / "python313.zip"
+        write_zip(path, {"appended": payload.getvalue()})
+        expected = "python313.zip!appended!payload"
+        assert bundle.archive_machos(path, path.name) == ([expected] if native else [])
+    else:
+        (app / "appended").write_bytes(payload.getvalue())
+        expected = "appended!payload"
+    if native:
+        with pytest.raises(ValueError, match=expected):
+            bundle.scan_bundle(app)
+    else:
+        bundle.scan_bundle(app)
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["loose-file", "archive-member"])
+@pytest.mark.parametrize(("name", "data"), [
+    ("broken.ZIP", b"not a zip"),
+    ("broken.zip", eocd_constant()),
+    *[("broken", magic + b"not a zip") for magic in sorted(bundle.ZIP_MAGICS)],
+])
+def test_corrupt_explicit_zip_still_fails(tmp_path, nested, name, data):
+    app = tmp_path / "AI Guest List.app"
+    app.mkdir()
+    if nested:
+        path = app / "python313.zip"
+        write_zip(path, {name: data})
+        with pytest.raises(zipfile.BadZipFile):
+            bundle.archive_machos(path, "stdlib")
+    else:
+        (app / name).write_bytes(data)
+    with pytest.raises(zipfile.BadZipFile):
+        bundle.scan_bundle(app)
+
+
+def test_corrupt_zip_inside_appended_zip_still_fails(tmp_path):
+    payload = io.BytesIO(b"leading bytes")
+    payload.seek(0, 2)
+    write_zip(payload, {"broken.zip": b"not a zip"})
+    app = tmp_path / "AI Guest List.app"
+    app.mkdir()
+    path = app / "appended"
+    path.write_bytes(payload.getvalue())
+    with pytest.raises(zipfile.BadZipFile):
+        bundle.archive_machos(path, "appended")
+    with pytest.raises(zipfile.BadZipFile):
+        bundle.scan_bundle(app)
+
+
 def test_empty_and_backslash_archives_refused(tmp_path):
     path = tmp_path / "input.zip"
     for members in ({}, {"AI Guest List.app/bad\\name": b"x"}):
