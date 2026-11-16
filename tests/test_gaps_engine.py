@@ -327,16 +327,53 @@ def test_approve_crossing_refuses_an_unknown_scope_but_deny_ignores_scope(ctx):
 
 
 @pytest.mark.crossings
-@pytest.mark.parametrize("gone", ["from", "to"])
-@pytest.mark.parametrize("action", ["approve_crossing", "deny_crossing"])
-def test_crossing_actions_refuse_a_seat_that_left_the_list(ctx, action, gone):
+def test_approving_a_move_to_a_seat_that_left_the_list_is_refused(ctx):
     _two_plans(ctx)
-    message = {"action": action, "tool": "codex", "from": "a@x.com", "to": "b@x.com"}
-    message[gone] = "ghost@x.com"
     rev = ctx.load_state().data["rev"]
-    result = bridge.handle(ctx, message)
+    result = bridge.handle(ctx, {"action": "approve_crossing", "tool": "codex",
+                                 "from": "a@x.com", "to": "ghost@x.com"})
     assert result["ok"] is False and result["error"] == "that seat is no longer on the list"
-    assert "state" in result and ctx.load_state().data["rev"] == rev
+    assert "state" in result and ctx.load_state().data["rev"] == rev and _approvals(ctx) == {}
+
+
+def _ask(ctx, a, b, sid="s1"):
+    with ctx.locked():
+        st = ctx.load_state()
+        seatkind.request(st, "codex", a, b, session_id=sid)
+        st.save()
+
+
+@pytest.mark.crossings
+def test_a_session_whose_seat_was_removed_can_still_be_moved(ctx):
+    """Field report: the running session's seat was removed; its "move the other running session?"
+    prompt then refused both answers because the FROM seat was gone, so it could never close."""
+    _two_plans(ctx)
+    _ask(ctx, "a@x.com", "b@x.com")
+    with ctx.locked():
+        st = ctx.load_state()
+        st.remove_seat("codex", "a@x.com")
+        st.save()
+    assert [r["from"] for r in bridge.handle(ctx, {"action": "status"})["state"]["pending_crossings"]] \
+        == ["a@x.com"]
+    result = bridge.handle(ctx, {"action": "approve_crossing", "tool": "codex",
+                                 "from": "a@x.com", "to": "b@x.com", "scope": "once"})
+    assert result["ok"] is True and result["state"]["pending_crossings"] == []
+    with ctx.locked():
+        assert seatkind.consume(ctx.load_state(), "codex", "a@x.com", "b@x.com")
+
+
+@pytest.mark.crossings
+@pytest.mark.parametrize("gone", ["from", "to"])
+def test_not_now_always_closes_the_question(ctx, gone):
+    _two_plans(ctx)
+    _ask(ctx, "a@x.com", "b@x.com")
+    with ctx.locked():
+        st = ctx.load_state()
+        st.remove_seat("codex", "a@x.com" if gone == "from" else "b@x.com")
+        st.save()
+    result = bridge.handle(ctx, {"action": "deny_crossing", "tool": "codex",
+                                 "from": "a@x.com", "to": "b@x.com"})
+    assert result["ok"] is True and result["state"]["pending_crossings"] == []
 
 
 @pytest.mark.crossings

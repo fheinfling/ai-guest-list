@@ -102,5 +102,74 @@
     "test": [
       "tests/test_mutate.py::test_check_layout_compare_ref_stages_the_refs_fonts"
     ]
+  },
+  {
+    "label": "packaging inherits the supervised session CA overrides",
+    "file": "setup.py",
+    "old": "_scrub_ssl_cert_env()\nsetup(",
+    "new": "setup(",
+    "test": [
+      "tests/test_setup_build.py::test_setup_scrubs_ssl_overrides_before_packaging"
+    ]
+  },
+  {
+    "label": "EOCD constants are mistaken for loadable archives",
+    "file": "scripts/release-bundle.py",
+    "old": "except zipfile.BadZipFile:\n        # Bytecode (notably Python 3.13's zipimport.pyc) can contain EOCD constants.\n        return False",
+    "new": "except zipfile.BadZipFile:\n        raise",
+    "test": [
+      "tests/test_release_bundle_edges.py::test_eocd_constant_is_not_an_archive"
+    ]
+  },
+  {
+    "label": "valid appended archives bypass native code inspection",
+    "file": "scripts/release-bundle.py",
+    "old": "with zipfile.ZipFile(source):\n            return True",
+    "new": "with zipfile.ZipFile(source):\n            return False",
+    "test": [
+      "tests/test_release_bundle_edges.py::test_zip_appended_to_other_bytes_is_inspected"
+    ]
+  },
+  {
+    "label": "corrupt explicit zip headers and names are silently skipped",
+    "file": "scripts/release-bundle.py",
+    "old": "if magic in ZIP_MAGICS or name.lower().endswith(\".zip\"):\n        return True",
+    "new": "if False:\n        return True",
+    "test": [
+      "tests/test_release_bundle_edges.py::test_corrupt_explicit_zip_still_fails"
+    ]
+  },
+  {
+    "label": "a removed FROM seat blocks answering the crossing again",
+    "file": "acctsw/bridge.py",
+    "old": "if action == \"approve_crossing\" and b not in state.accounts(tool):",
+    "new": "if a not in state.accounts(tool) or b not in state.accounts(tool):",
+    "test": [
+      "tests/test_gaps_engine.py::test_a_session_whose_seat_was_removed_can_still_be_moved",
+      "tests/test_gaps_engine.py::test_not_now_always_closes_the_question",
+      "tests/test_gaps_engine.py::test_approving_a_move_to_a_seat_that_left_the_list_is_refused"
+    ]
+  },
+  {
+    "label": "not now is refused when the destination left the list",
+    "file": "acctsw/bridge.py",
+    "old": "if action == \"approve_crossing\" and b not in state.accounts(tool):",
+    "new": "if b not in state.accounts(tool):",
+    "test": [
+      "tests/test_gaps_engine.py::test_a_session_whose_seat_was_removed_can_still_be_moved",
+      "tests/test_gaps_engine.py::test_not_now_always_closes_the_question",
+      "tests/test_gaps_engine.py::test_approving_a_move_to_a_seat_that_left_the_list_is_refused"
+    ]
+  },
+  {
+    "label": "approving a move to a removed seat is allowed",
+    "file": "acctsw/bridge.py",
+    "old": "if action == \"approve_crossing\" and b not in state.accounts(tool):",
+    "new": "if False:",
+    "test": [
+      "tests/test_gaps_engine.py::test_a_session_whose_seat_was_removed_can_still_be_moved",
+      "tests/test_gaps_engine.py::test_not_now_always_closes_the_question",
+      "tests/test_gaps_engine.py::test_approving_a_move_to_a_seat_that_left_the_list_is_refused"
+    ]
   }
 ]

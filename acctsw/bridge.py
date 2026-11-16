@@ -627,7 +627,10 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
                 return {"ok": False, "error": f"bad crossing scope: {scope}"}
             with ctx.locked():
                 state = ctx.load_state()
-                if a not in state.accounts(tool) or b not in state.accounts(tool):
+                # Only the destination must still exist. A session whose seat was removed asks to
+                # move on; refusing because "from" is gone left a question nobody could answer.
+                # "not now" just closes the question, so it always works.
+                if action == "approve_crossing" and b not in state.accounts(tool):
                     return {"ok": False, "error": "that seat is no longer on the list",
                             "state": snapshot_state(ctx)}
                 if action == "approve_crossing":
