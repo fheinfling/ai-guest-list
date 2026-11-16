@@ -22,6 +22,20 @@ ZIP_MAGICS = {b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"}
 BUNDLE_SUFFIXES = {".app", ".framework", ".bundle", ".xpc", ".appex", ".plugin"}
 
 
+def is_archive(source, magic: bytes, name: str) -> bool:
+    """Validate EOCD-only probes; ZIP headers and names must still fail closed."""
+    if magic in ZIP_MAGICS or name.lower().endswith(".zip"):
+        return True
+    if not zipfile.is_zipfile(source):
+        return False
+    try:
+        with zipfile.ZipFile(source):
+            return True
+    except zipfile.BadZipFile:
+        # Bytecode (notably Python 3.13's zipimport.pyc) can contain EOCD constants.
+        return False
+
+
 def archive_machos(source, label: str, depth: int = 0) -> list[str]:
     """Find native binaries even in nested zips or entries without native extensions."""
     if depth > 8:
@@ -37,8 +51,7 @@ def archive_machos(source, label: str, depth: int = 0) -> list[str]:
                 stream.seek(0)
                 if magic in MACHO_MAGICS:
                     found.append(name)
-                elif (magic in ZIP_MAGICS or entry.filename.lower().endswith(".zip")
-                      or zipfile.is_zipfile(stream)):
+                elif is_archive(stream, magic, entry.filename):
                     if entry.file_size >= 300_000_000:
                         raise ValueError(f"nested archive too large to inspect: {name}")
                     stream.seek(0)
@@ -98,7 +111,7 @@ def scan_bundle(app: Path) -> None:
         if path.is_file():
             with path.open("rb") as stream:
                 magic = stream.read(4)
-            if magic in ZIP_MAGICS or path.suffix.lower() == ".zip" or zipfile.is_zipfile(path):
+            if is_archive(path, magic, path.name):
                 found.extend(archive_machos(path, str(path)))
                 content.extend(archive_findings(path, str(path)))
             elif PRIVATE_KEY.search(path.read_bytes()):

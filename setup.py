@@ -19,6 +19,16 @@ from pathlib import Path
 
 from setuptools import setup
 
+
+def _scrub_ssl_cert_env() -> None:
+    """Make py2app's ssl recipe package the interpreter's OpenSSL defaults."""
+    removed = [name for name in ("SSL_CERT_FILE", "SSL_CERT_DIR") if name in os.environ]
+    for name in removed:
+        del os.environ[name]
+    if removed:
+        print(f"py2app: ignoring inherited {', '.join(removed)}; using OpenSSL defaults")
+
+
 APP = ["app/menubar.py"]
 
 # Single source of truth for the marketing version (acctsw/__init__.py); the build number is the
@@ -45,7 +55,7 @@ def _shippable(f: str) -> bool:
                       the shipped app hits "COMPRESSES CONTEXT" and reads as a contaminated build.
       _*              scratch (scripts/screenshots.py writes app/web/_shot.{html,js} while it runs;
                       a build racing it would ship them).
-      preview.html    dev preview page — referenced by nothing.
+      preview.html    standalone browser preview page (not loaded by WKWebView).
       package.json    node test-runner config (`node --test`).
       *.mjs           the ES sources bundle.js is BUILT from. WKWebView can't load module scripts
                       over file://, which is why bundle.js exists; the sources are never fetched.
@@ -92,6 +102,7 @@ OPTIONS = {
     },
 }
 
+_scrub_ssl_cert_env()
 setup(
     name="AI Guest List",
     app=APP,

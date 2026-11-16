@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
-  buildHTML, dotState, dotKey, doorKey, doorMark, creditLeft, pct, fmtCountdown, needsHello,
+  buildHTML, doorKey, doorMark, pct, fmtCountdown, needsHello,
   signedOut, isActive, signinExpiring, usable, resetIsPast, switchNeedsConfirmation, seatIdentity, headerVerdict, seatWindows,
   buildSettings, buildAddSeat, reduceReply, supervisionBanner, engineBanner, fmtUsageAge, fmtSessionAge, updateClockText,
 } from "./render.mjs";
@@ -17,7 +17,7 @@ function seat(over = {}) {
 }
 function state(over = {}) {
   return {
-    settings: { theme: "light", auto_switch: true, strategy: "soonest_back" },
+    settings: { theme: "light", auto_switch: true },
     counts: { resting: 1, ready: 2 },
     tools: {
       codex: { active: null, plan_label: "CHATGPT BUSINESS", seats: [] },
@@ -26,16 +26,6 @@ function state(over = {}) {
     ...over,
   };
 }
-
-test("dotKey golden parity with python fixture", () => {
-  const path = fileURLToPath(new URL("../../tests/fixtures/dot_cases.json", import.meta.url));
-  for (const c of JSON.parse(readFileSync(path, "utf8"))) assert.equal(dotKey(c.state), c.expected, c.name);
-});
-
-test("dotState reads bridge-provided state.dot", () => {
-  assert.equal(dotState({ dot: "amber" }).key, "amber");
-  assert.equal(dotState({ dot: "hello" }).label, "needs a hello");
-});
 
 test("doorKey golden parity with python fixture", () => {
   const path = fileURLToPath(new URL("../../tests/fixtures/door_cases.json", import.meta.url));
@@ -63,9 +53,8 @@ test("needsHello detects needs-login status", () => {
   assert.equal(needsHello(seat({ status: "active", usage: { error: "unauthorized" } })), true);
 });
 
-test("pct + creditLeft from usage5h/usageWeek", () => {
+test("pct clamps usage5h readings", () => {
   assert.equal(pct(seat({ usage5h: 120 }), "5h"), 100);
-  assert.equal(creditLeft(seat({ usage5h: 70, usageWeek: 40 })), 30);
 });
 
 test("fmtCountdown", () => {
@@ -421,10 +410,42 @@ test("supervision banner is absent when active or explicitly opted out", () => {
 });
 
 test("settings wires its actions", () => {
-  const set = buildSettings({ settings: { theme: "light", strategy: "soonest_back", notify: true } });
-  assert.match(set, /data-action="set_strategy"[^>]*data-value="most_headroom"/);
+  const set = buildSettings({ settings: { theme: "light", notify: true } });
   assert.match(set, /data-action="set_theme"[^>]*data-value="dark"/);
   assert.match(set, /data-key="supervise_shell"/);
+});
+
+for (const [view, build] of [["settings", buildSettings], ["popover", buildHTML]]) {
+  test(`${view} omits the retired seat strategy even with legacy settings`, () => {
+    for (const strategy of [undefined, "soonest_back", "most_headroom"]) {
+      for (const auto_switch of [false, true]) {
+        const settings = { theme: "light", auto_switch };
+        if (strategy !== undefined) settings.strategy = strategy;
+        assert.doesNotMatch(build(state({ settings })), /set_strategy|next seat|most headroom|soonest back/i);
+      }
+    }
+  });
+}
+
+test("footer describes automatic switching regardless of legacy strategy", () => {
+  for (const strategy of [undefined, "soonest_back", "most_headroom"]) {
+    for (const auto_switch of [false, true]) {
+      const settings = { auto_switch };
+      if (strategy !== undefined) settings.strategy = strategy;
+      const html = buildHTML(state({ settings }));
+      const status = html.match(/class="footer-status"[^>]*>([^<]*)<\/span>/)[1];
+      assert.equal(status, auto_switch ? "auto-switch on, moves when a seat runs out" : "auto-switch off, you switch by hand");
+    }
+  }
+});
+
+test("retired set_strategy actions are not dispatched", () => {
+  const app = keyApp();
+  const before = app.sent.length;
+  for (const value of ["soonest_back", "most_headroom"]) {
+    app.handlers.click({ target: { closest: (q) => q === "[data-action]" ? { tagName: "BUTTON", dataset: { action: "set_strategy", value } } : null } });
+    assert.equal(app.sent.length, before);
+  }
 });
 
 test("header ＋ opens the provider step (no hardcoded tool)", () => {
@@ -434,7 +455,7 @@ test("header ＋ opens the provider step (no hardcoded tool)", () => {
 });
 
 test("settings is a pushed sub-view, not a modal (spec §9.1)", () => {
-  const set = buildSettings({ settings: { theme: "light", strategy: "soonest_back" } });
+  const set = buildSettings({ settings: { theme: "light" } });
   // no dimming modal backdrop/sheet — it renders in place as the popover surface
   assert.doesNotMatch(set, /class="backdrop"/);
   assert.doesNotMatch(set, /class="sheet/);
@@ -548,6 +569,25 @@ test("add: typed name + token survive a re-render (escaped, controlled)", () => 
   assert.ok(h.includes("sk-x&lt;y"));                          // token reproduced, escaped
 });
 
+test("add: seat names have the same 32 character limit as rename", () => {
+  for (const provider of ["codex", "claude"]) {
+    const h = buildAddSeat(state(), mkAdd({ step: "details", provider }));
+    assert.match(h, /id="add-name"[^>]*maxlength="32"/);
+  }
+});
+
+test("add: done greets the saved seat name, then normalized typed name, then new seat", () => {
+  const add = mkAdd({ step: "connecting", provider: "codex", name: "  Typed   Name  ", loginSeats: [] });
+  const saved = seat({ email: "saved@example.com", status: "active", name: "Actual <Name>" });
+  const snapshot = state({ rev: 1, tools: { codex: { seats: [saved,
+    seat({ email: "other@example.com", name: "Typed Name" })] } } });
+  const out = reduceReply(UI({ screen: "add", add }), { state: snapshot });
+  assert.equal(out.add.step, "done");
+  assert.match(buildAddSeat(out.state, out.add), /welcome, Actual &lt;Name&gt;/);
+  assert.match(buildAddSeat(state(), out.add), /welcome, Typed Name</);
+  assert.match(buildAddSeat(state(), { ...out.add, name: " \t " }), /welcome, new seat</);
+});
+
 test("add: connecting — browser waits for the user, no premature spinner", () => {
   // before "save my seat": waiting on the user, save button live, NO spinner (would read as hung)
   const wait = buildAddSeat({ settings: {} }, mkAdd({ step: "connecting", provider: "codex", method: "browser" }));
@@ -584,7 +624,7 @@ test("add: done greets the seat, escapes, falls back to 'new seat'", () => {
 test("buildHTML has no retired Headroom surface", () => {
   const html = buildHTML(state({}));
   assert.doesNotMatch(html, /COMPRESSES CONTEXT|save-credit|headroom_install|fewer tokens/i);
-  const set = buildSettings({ settings: { theme: "light", strategy: "soonest_back" } });
+  const set = buildSettings({ settings: { theme: "light" } });
   assert.doesNotMatch(set, /set_savings_level|>headroom</);
 });
 
@@ -603,6 +643,130 @@ test("reduceReply: a poll while on the add screen does NOT render (keeps typed i
   assert.equal(o.render, false);           // swallow — no DOM swap
   assert.equal(o.state.rev, 2);            // but state IS updated silently
   assert.equal(o.add.name, "Wo");          // typed input untouched
+});
+
+for (const provider of ["codex", "claude"]) {
+  test(`browser sign-in for ${provider} forwards the name and completes on a poll after closing`, () => {
+    const app = keyApp({ setTimeout: () => 1 });
+    app.window.AGL.update({ ...stateRev(1), tools: { [provider]: { seats: [] } } });
+    app.click({ action: "add", tool: provider });
+    app.input("add-name", "  Example \t\u00a0 Seat  ");
+    app.click({ action: "add-cta" });
+    assert.equal(app.sent.at(-1).name, "Example Seat");
+    app.click({ action: "add-back" });
+    assert.match(app.root.innerHTML, /id="add-name"[^>]*value="Example Seat"/);
+    app.click({ action: "add-cta" });
+    app.window.AGL.closed();
+    const waiting = app.root.innerHTML;
+    app.window.AGL.update({ ...stateRev(2), tools: { [provider]: { seats: [] } } });
+    assert.equal(app.root.innerHTML, waiting);
+    app.window.AGL.update({ ...stateRev(3), tools: { [provider]: { seats: [
+      seat({ email: "seat@example.com", status: "active", name: "Saved Seat" }),
+    ] } } });
+    assert.match(app.root.innerHTML, /your seat's saved/);
+    assert.match(app.root.innerHTML, /welcome, Saved Seat/);
+    assert.doesNotMatch(app.root.innerHTML, /data-action="add-save"/);
+  });
+}
+
+test("browser completion polls ignore old, other-tool, inactive, signed-out and unrelated seats", () => {
+  const before = seat({ email: "old@example.com", status: "active" });
+  const addFlow = () => mkAdd({ step: "connecting", provider: "codex", loginSeats: [before] });
+  const snapshot = (seats, tool = "codex", rev = 3) => ({ ...stateRev(rev), tools: { [tool]: { seats } } });
+  for (const next of [snapshot([before]), snapshot([seat({ status: "active" })], "claude"),
+    snapshot([seat({ status: "ready" })]), snapshot([seat({ status: "active", signed_out: true })]),
+    snapshot([seat({ status: "active" })], "codex", 1)]) {
+    const out = reduceReply(UI({ screen: "add", add: addFlow(), lastRev: 2,
+      state: snapshot([seat({ status: "active" })], "codex", 2) }), { state: next });
+    assert.equal(out.add.step, "connecting"); assert.equal(out.render, false);
+  }
+  const add = addFlow(); add.email = "target@example.com";
+  assert.equal(reduceReply(UI({ screen: "add", add }), {
+    state: snapshot([seat({ status: "active", email: "unrelated@example.com" })]),
+  }).add.step, "connecting");
+});
+
+for (const provider of ["codex", "claude"]) {
+  test(`generic browser sign-in for ${provider} ignores a recovered transient 401`, () => {
+    const before = seat({ status: "active", active: true, signed_out: false,
+      needs_login: true, usage: { error: "unauthorized" } });
+    const recovered = { ...before, needs_login: false, usage: { error: null } };
+    const add = mkAdd({ step: "connecting", provider, loginSeats: [before] });
+    const res = { state: { ...stateRev(2), tools: { [provider]: { seats: [recovered] } } } };
+    const out = reduceReply(UI({ screen: "add", add }), res);
+    assert.equal(out.add.step, "connecting");
+    assert.equal(out.add.savedEmail, undefined);
+    assert.equal(out.render, false);
+    assert.equal(out.closeFlow, null);
+    // Explicit reauthentication of this seat still accepts recovery without a new expiry.
+    const targeted = mkAdd({ ...add, email: before.email });
+    const targetedOut = reduceReply(UI({ screen: "add", add: targeted }), res);
+    assert.equal(targetedOut.add.step, "done");
+    assert.equal(targetedOut.closeFlow, targeted);
+  });
+
+  for (const prior of ["new", "signed out"]) {
+    test(`generic browser sign-in for ${provider} completes for a ${prior} seat`, () => {
+      const saved = seat({ status: "active", active: true, signed_out: false, needs_login: false });
+      const loginSeats = prior === "new" ? []
+        : [{ ...saved, status: "needs-login", signed_out: true, needs_login: true }];
+      const add = mkAdd({ step: "connecting", provider, loginSeats });
+      const res = { state: { ...stateRev(2), tools: { [provider]: { seats: [saved] } } } };
+      const out = reduceReply(UI({ screen: "add", add }), res);
+      assert.equal(out.add.step, "done");
+      assert.equal(out.add.savedEmail, saved.email);
+      assert.equal(out.render, true);
+      assert.equal(out.closeFlow, add);
+      assert.equal(reduceReply(out, res).closeFlow, null);
+    });
+  }
+}
+
+test("a poll completes reauthentication of the requested seat and schedules this flow's close once", () => {
+  const email = "seat@example.com";
+  const add = mkAdd({ step: "connecting", provider: "claude", email,
+    loginSeats: [seat({ email, status: "needs-login", signed_out: true })] });
+  const res = { state: { ...stateRev(2), tools: { claude: { seats: [seat({ email, status: "active" })] } } } };
+  const ui = UI({ screen: "add", add });
+  const out = reduceReply(ui, res);
+  assert.equal(out.add.step, "done"); assert.equal(out.render, true); assert.equal(out.closeFlow, add);
+  assert.equal(reduceReply({ ...ui, state: out.state, lastRev: out.lastRev }, res).closeFlow, null);
+});
+
+for (const provider of ["codex", "claude"]) {
+  test(`sign in again for ${provider} completes only on a fresher expiry for the requested signed-in active seat`, () => {
+    const email = "target@example.com";
+    const expiry = "2026-11-15T12:00:00Z";
+    const before = seat({ email, status: "active", signed_out: false,
+      signin_expiring: true, signin_expires_at: expiry });
+    const refreshed = { ...before, signin_expiring: false, signin_expires_at: "2026-11-16T12:00:00Z" };
+    const nextState = (next) => state({ rev: 2, tools: { [provider]: { seats: [next] } } });
+    const flow = (named = true) => mkAdd({ step: "connecting", provider,
+      ...(named ? { email } : {}), loginSeats: [before] });
+    for (const next of [before, { ...before, signin_expires_at: "2026-11-14T12:00:00Z" },
+      { ...before, signin_expires_at: "invalid" }, { ...before, signin_expires_at: null },
+      { ...refreshed, email: "unrelated@example.com" },
+      { ...refreshed, status: "ready", active: false }, { ...refreshed, signed_out: true },
+      { ...refreshed, needs_login: true, usage: { error: "unauthorized" } }]) {
+      const out = reduceReply(UI({ screen: "add", add: flow() }), { state: nextState(next) });
+      assert.equal(out.add.step, "connecting"); assert.equal(out.render, false);
+      assert.equal(out.closeFlow, null);
+    }
+    // Background usage/keep-warm activity must never complete the generic add flow.
+    const generic = reduceReply(UI({ screen: "add", add: flow(false) }), { state: nextState(refreshed) });
+    assert.equal(generic.add.step, "connecting"); assert.equal(generic.closeFlow, null);
+    const add = flow();
+    const res = { state: nextState(refreshed) };
+    const out = reduceReply(UI({ screen: "add", add }), res);
+    assert.equal(out.add.step, "done"); assert.equal(out.render, true); assert.equal(out.closeFlow, add);
+    assert.equal(reduceReply({ ...out, screen: "add" }, res).closeFlow, null);
+  });
+}
+
+test("settings describes only the native open and shut door states", () => {
+  const html = buildSettings(state());
+  assert.match(html, /door--open/); assert.match(html, /door--shut/);
+  assert.doesNotMatch(html, /gold:|rose:|just switched you/);
 });
 
 test("reduceReply: stale snapshot (lower rev) is ignored", () => {
@@ -993,19 +1157,20 @@ test("key settings default to opt-in fallback and confirmation, with clear spend
 
 // Exercise the shipped glue with a tiny DOM boundary. No provider, native app or third-party DOM.
 function keyApp(options = {}) {
-  const handlers = {}, sent = [];
+  const handlers = {}, windowHandlers = {}, sent = [];
   const root = options.root || { innerHTML: "", querySelector: () => null, querySelectorAll: () => [], firstElementChild: null };
   const document = { getElementById: () => root, body: { appendChild() {} },
     createElement: options.createElement || (() => ({ innerHTML: "", firstElementChild: { textContent: "" }, querySelector: () => null })), addEventListener: (name, fn) => { handlers[name] = fn; },
     hidden: true, hasFocus: () => false };
-  const window = { webkit: { messageHandlers: { agl: { postMessage: (msg) => sent.push(msg) } } }, addEventListener() {},
+  const window = { webkit: { messageHandlers: { agl: { postMessage: (msg) => sent.push(msg) } } },
+    addEventListener: (name, fn) => { windowHandlers[name] = fn; },
     requestAnimationFrame: options.requestAnimationFrame, matchMedia: () => options.motion || { matches: true, addEventListener() {} } };
   runInNewContext(readFileSync(new URL("./bundle.js", import.meta.url), "utf8"),
     { document, window, console, setTimeout: options.setTimeout || setTimeout,
       setInterval: options.setInterval || setInterval, clearInterval, clearTimeout, URL, confirm: options.confirm || (() => true), ResizeObserver: options.ResizeObserver });
   const click = (dataset) => handlers.click({ target: { closest: (selector) => selector === "[data-action]" ? { dataset } : null }, preventDefault() {} });
   const input = (id, value) => handlers.input({ target: { id, value } });
-  return { window, root, sent, click, input, handlers, document };
+  return { window, root, sent, click, input, handlers, windowHandlers, document };
 }
 
 test("endpoint proof is click-only and duplicate clicks remain blocked across polls", () => {
@@ -1687,10 +1852,13 @@ test("consent answers share size and weight, with no asymmetric CSS overrides", 
       assert.ok(buttons.every((b) => !/style=|autofocus|tabindex/.test(b)));
     }
   }
-  assert.match(css, /\.k-acts, \.equal-choices\s*\{[^}]*grid-template-columns:minmax\(0,1fr\) minmax\(0,1fr\)/);
-  const shared = css.match(/\.choice, \.k-acts button\s*\{([^}]+)\}/)[1];
-  for (const rule of ["min-height:48px", "width:100%", "padding:10px", "font-size:.95rem", "font-weight:650"]) {
-    assert.ok(shared.includes(rule), rule);
+  for (const selector of [".k-acts", ".equal-choices", ".choice", ".k-acts button"]) {
+    const declarations = [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+      .filter((m) => m[1].trim().split(/,\s*/).includes(selector)).map((m) => m[2]).join(" ");
+    const rules = selector === ".k-acts" || selector === ".equal-choices"
+      ? ["grid-template-columns:minmax(0,1fr) minmax(0,1fr)"]
+      : ["min-height:48px", "width:100%", "padding:10px", "font-size:.95rem", "font-weight:650"];
+    for (const rule of rules) assert.ok(declarations.includes(rule), `${selector}: ${rule}`);
   }
   // A later override targeting either answer, its position or an action would defeat the shared rule.
   const selectors = [...css.matchAll(/([^{}]+)\{[^{}]*\}/g)].map((m) => m[1])
@@ -1840,7 +2008,6 @@ test("toast remains outside root and uses textContent and theme tokens; there is
   assert.equal(classes.has("celebrate"), true);
   callbacks.find((c) => c.ms === 600).fn();
   assert.equal(classes.has("celebrate"), false);
-  assert.match(css, /@keyframes pulse/);
   assert.match(css, /transition:transform \.15s/);
   assert.match(css, /prefers-reduced-motion:reduce[\s\S]*animation:none !important/);
   callbacks.find((c) => c.ms === 3000).fn();
@@ -2092,10 +2259,10 @@ assert.doesNotMatch(rosterOf(html), /data-action="switch"|all good/);
 import { crossingRequests } from "./render.mjs";
 
 test("settings offers the in-place switch toggle, on unless turned off", () => {
-  const on = buildSettings({ settings: { theme: "light", strategy: "soonest_back" } });
+  const on = buildSettings({ settings: { theme: "light" } });
   assert.match(on, /switch seats without restarting claude/);
   assert.match(on, /data-action="toggle" data-key="in_place_switch" checked/);
-  const off = buildSettings({ settings: { theme: "light", strategy: "soonest_back", in_place_switch: false } });
+  const off = buildSettings({ settings: { theme: "light", in_place_switch: false } });
   assert.match(off, /data-key="in_place_switch" >/);
 });
 
@@ -2188,10 +2355,10 @@ test("settings offers automatic business/personal switching, off by default", ()
 import { tierRequests } from "./render.mjs";
 
 test("settings offers the cross-tier toggle, off by default", () => {
-  const off = buildSettings({ settings: { theme: "light", strategy: "soonest_back" } });
+  const off = buildSettings({ settings: { theme: "light" } });
   assert.match(off, /switch without restarting across plan tiers/);
   assert.match(off, /data-key="in_place_cross_tier" >/);
-  const on = buildSettings({ settings: { theme: "light", strategy: "soonest_back", in_place_cross_tier: true } });
+  const on = buildSettings({ settings: { theme: "light", in_place_cross_tier: true } });
   assert.match(on, /data-action="toggle" data-key="in_place_cross_tier" checked/);
 });
 
@@ -2524,8 +2691,8 @@ test("footer keeps only the live status line and the main view has no drawer", (
   assert.doesNotMatch(html, /guest-drawer|seat-options/);
   assert.doesNotMatch(css, /guest-drawer|drawer-handle|drawer-content|footer-options/);
   assert.doesNotMatch(readFileSync(new URL("./app.mjs", import.meta.url), "utf8"), /guest-drawer|seat-options|moveDrawer|drawerMotion/);
-  assert.match(footer, /auto-switch on, soonest back first/);
-  assert.match(buildHTML({ ...snapshot, settings: { auto_switch: true, strategy: "most_headroom" } }), /auto-switch on, most headroom first/);
+  assert.match(footer, /auto-switch on, moves when a seat runs out/);
+  assert.match(buildHTML({ ...snapshot, settings: { auto_switch: false } }), /auto-switch off, you switch by hand/);
   const app = keyApp();
   for (const checked of [false, true]) {
     app.handlers.change({ target: { closest: () => ({ dataset: { key: "auto_switch" }, checked }) } });
@@ -2805,7 +2972,7 @@ test("footer confirmations use text, survive a poll and restore the live status"
   assert.doesNotMatch(app.root.innerHTML, /<img src=x>/);
   app.window.AGL.update({ ...snapshot, rev: 2 }); assert.equal(status.textContent, '<img src=x> switched');
   timers.find((t) => t.ms === 3000).fn();
-  assert.match(app.root.innerHTML, /role="status" aria-live="polite">auto-switch on, soonest back first/);
+  assert.match(app.root.innerHTML, /role="status" aria-live="polite">auto-switch on, moves when a seat runs out/);
   app.window.AGL.result({ ok: true, celebrate: true, state: { ...snapshot, rev: 3, moved_note: "codex is on personal now" } });
   assert.equal(status.textContent, "codex is on personal now");
 });
@@ -3443,4 +3610,126 @@ test("instant name validation shares the engine's Unicode caseless and whitespac
   snapshot.tools.claude.seats[0].name = "ı";
   group = nameGroup(buildHTML(snapshot, null, new Set(), new Map([[renameKey(), { value: "I" }]])));
   assert.doesNotMatch(saveTag(group), /disabled/); // Dotless i is a distinct name.
+});
+
+test("an opened signed-out seat explains signing in instead of showing usage", () => {
+  for (const tool of ["codex", "claude"]) {
+    const email = `out@${tool}.example`;
+    const s = seat({ status: "needs-login", signed_out: true, email });
+    const html = buildHTML(state({ tools: { [tool]: { seats: [s] } } }), null,
+      new Set([JSON.stringify([tool, email])]));
+    assert.match(html, /<dt>status<\/dt><dd>signed out; sign in to see usage<\/dd>/);
+    assert.doesNotMatch(html, /% left|no reading yet/);
+  }
+});
+
+function throwingRenderState(message = "synthetic drawing failure") {
+  // Fail inside buildHTML, before it can assign root.innerHTML. Keep the input state inert
+  // everywhere else so this exercises the render boundary, not a reducer failure.
+  return { rev: 1, settings: { get theme() { throw new Error(message); } }, tools: {} };
+}
+
+for (const recovery of ["update", "closed"]) {
+  test(`blank recovery: ${recovery} restores the content height after a client error`, () => {
+    const frames = [];
+    const root = { innerHTML: "", firstElementChild: { scrollHeight: 316 },
+      querySelector: () => null, querySelectorAll: () => [] };
+    const app = keyApp({ root,
+      requestAnimationFrame: (fn) => { frames.push(fn); return frames.length; } });
+    const flush = () => { while (frames.length) frames.shift()(); };
+    const heights = () => app.sent.filter((msg) => msg.action === "resize").map((msg) => msg.height);
+    flush();
+    assert.deepEqual(heights(), [316]);
+    app.windowHandlers.error({ error: new Error("synthetic drawing failure") });
+    assert.match(root.innerHTML, /role="alert"/);
+    assert.deepEqual(heights(), [316, 220]);
+    if (recovery === "update") {
+      app.window.AGL.update(state({ rev: 2 }));
+      flush();
+    } else app.window.AGL.closed(); // must resize immediately, even while frames are suspended
+    assert.doesNotMatch(root.innerHTML, /role="alert"/);
+    assert.deepEqual(heights(), [316, 220, 316]);
+    flush();
+    assert.deepEqual(heights(), [316, 220, 316], "unchanged height stays quiet after recovery");
+  });
+}
+
+test("blank recovery: throwing render shows fallback, reports once, then a good update recovers", () => {
+  const app = keyApp();
+  app.root.innerHTML = ""; // reproduce the empty surface seen in the field
+  assert.doesNotThrow(() => app.window.AGL.result({ state: throwingRenderState() }));
+  assert.match(app.root.innerHTML, /role="alert"/);
+  assert.match(app.root.innerHTML, /something went wrong drawing this — reopen the menu/);
+  assert.match(app.root.innerHTML, /data-action="reload"/);
+  assert.doesNotMatch(app.root.innerHTML, /synthetic drawing failure/);
+  let errors = app.sent.filter((msg) => msg.action === "client_error");
+  assert.equal(errors.length, 1);
+  assert.equal(errors[0].message, "synthetic drawing failure");
+  assert.match(errors[0].stack, /Error: synthetic drawing failure/);
+  app.window.AGL.result({ state: throwingRenderState() });
+  assert.equal(app.sent.filter((msg) => msg.action === "client_error").length, 1);
+  app.click({ action: "reload" });
+  assert.equal(app.sent.filter((msg) => msg.action === "reload").length, 1);
+  app.window.AGL.result({ state: state({ rev: 2 }) });
+  assert.match(app.root.innerHTML, /class="app /);
+  assert.doesNotMatch(app.root.innerHTML, /role="alert"|something went wrong/);
+  assert.equal(app.sent.at(-1).action, "client_health");
+  assert.equal(app.sent.at(-1).ok, true);
+  // Once recovered, an identical error must mark native unhealthy again without re-logging.
+  app.window.AGL.result({ state: { ...throwingRenderState(), rev: 3 } });
+  assert.equal(app.sent.filter((msg) => msg.action === "client_error").length, 1);
+  assert.equal(app.sent.filter((msg) => msg.action === "client_health" && !msg.ok).length, 2);
+  app.window.AGL.result({ state: { ...throwingRenderState("different drawing failure"), rev: 4 } });
+  assert.equal(app.sent.filter((msg) => msg.action === "client_error").length, 2);
+});
+
+test("blank recovery: a partial DOM swap failure uses the independent fallback", () => {
+  let fail = false;
+  const root = { innerHTML: "", firstElementChild: null,
+    querySelector: (selector) => {
+      if (fail && selector === ".key-prompts") throw new Error("post-swap failure");
+      return null;
+    }, querySelectorAll: () => [] };
+  const app = keyApp({ root });
+  fail = true;
+  app.window.AGL.update(state({ rev: 1 }));
+  assert.match(root.innerHTML, /something went wrong/);
+  assert.equal(app.sent.filter((msg) => msg.action === "client_error").length, 1);
+  fail = false;
+  app.window.AGL.update(state({ rev: 2 }));
+  assert.match(root.innerHTML, /class="app /);
+  assert.doesNotMatch(root.innerHTML, /role="alert"/);
+});
+
+test("blank recovery: global errors and rejections are bounded, deduplicated and recoverable", () => {
+  const app = keyApp();
+  const message = "global failure " + "x".repeat(4000);
+  const error = new Error(message);
+  error.stack = "stack " + "s".repeat(4000);
+  app.windowHandlers.error({ error, filename: "bundle.js", lineno: 42, colno: 7 });
+  app.windowHandlers.unhandledrejection({ reason: error });
+  const errors = app.sent.filter((msg) => msg.action === "client_error");
+  assert.equal(errors.length, 1);
+  assert.equal(errors[0].message.length, 1024);
+  assert.equal(errors[0].stack.length, 2048);
+  assert.equal(errors[0].location, "bundle.js:42:7");
+  assert.deepEqual(Object.keys(errors[0]).sort(), ["action", "location", "message", "stack"]);
+  assert.match(app.root.innerHTML, /data-action="reload"/);
+  app.window.AGL.result({ state: state({ rev: 1 }) });
+  assert.doesNotMatch(app.root.innerHTML, /role="alert"/);
+  app.windowHandlers.error({ message: "error without an Error object", filename: "bundle.js" });
+  app.windowHandlers.unhandledrejection({ reason: "plain rejection" });
+  assert.equal(app.sent.filter((msg) => msg.action === "client_error").length, 3);
+  assert.match(app.root.innerHTML, /role="alert"/);
+});
+
+test("blank recovery: malformed native replies show a fallback and the next update recovers", () => {
+  const app = keyApp();
+  app.window.AGL.result("not json");
+  assert.match(app.root.innerHTML, /role="alert"/);
+  assert.equal(app.sent.filter((msg) => msg.action === "client_error").length, 1);
+  app.window.AGL.update("not json");
+  assert.equal(app.sent.filter((msg) => msg.action === "client_error").length, 1);
+  app.window.AGL.update(state({ rev: 1 }));
+  assert.doesNotMatch(app.root.innerHTML, /role="alert"/);
 });

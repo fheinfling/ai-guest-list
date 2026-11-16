@@ -13,8 +13,6 @@ HOME = Path.home()
 DATA_DIR = HOME / ".account-switcher"
 STATE_FILE = DATA_DIR / "state.json"
 BACKUP_DIR = DATA_DIR / "backups"
-BACKUP_MANIFEST = BACKUP_DIR / "manifest.json"
-APP_SRC_DIR = DATA_DIR / "app"
 # Per-account Codex homes (each a CODEX_HOME with its own auth.json; shared state symlinked to the
 # real ~/.codex). Isolation so codex maintains each account's token lifecycle independently.
 # Two letters, and a hashed directory per seat, because a CODEX_HOME must stay short enough for the
@@ -66,10 +64,8 @@ def _canonical_codex_home() -> Path:
 # Codex normally stores the active account here (and may honour an external $CODEX_HOME).
 CODEX_HOME = _canonical_codex_home()
 CODEX_AUTH = CODEX_HOME / "auth.json"
-CODEX_SESSIONS = CODEX_HOME / "sessions"
 
-# Claude stores the active account in the macOS Keychain under this generic-password service.
-CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials"
+
 def _canonical_claude_home() -> Path:
     inherited = os.environ.get("CLAUDE_CONFIG_DIR")
     candidate = Path(inherited) if inherited else HOME / ".claude"
@@ -83,7 +79,6 @@ CLAUDE_CONFIG_DIR = _canonical_claude_home()
 
 # --- usage endpoints (see docs/PLAN.md for header requirements) ------------------------------
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
-CODEX_ACCOUNTS_URL = "https://chatgpt.com/backend-api/accounts"
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 CLAUDE_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 # Required Claude headers — without these the endpoint returns 401 / aggressive 429s.
@@ -102,9 +97,3 @@ CODEX_ACCOUNT_ID_HEADER = "ChatGPT-Account-Id"
 # never turn an Anthropic 429 into a retry storm.
 USAGE_ACTIVE_REFRESH_SECONDS = 30
 USAGE_MIN_REFRESH_SECONDS = 150  # parked seats / error-backoff base (~2.5 min)
-
-
-def ensure_data_dirs() -> None:
-    """Create the store directories if missing (0700)."""
-    DATA_DIR.mkdir(mode=0o700, exist_ok=True)
-    BACKUP_DIR.mkdir(mode=0o700, exist_ok=True)

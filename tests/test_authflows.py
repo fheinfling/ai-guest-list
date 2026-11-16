@@ -1,6 +1,7 @@
 """Isolated browser logins and local-only wrapper logout; no real CLI, HTTP or Keychain."""
 import json
 from pathlib import Path
+import traceback
 from types import SimpleNamespace
 
 import pytest
@@ -305,15 +306,16 @@ def test_signin_claude_reads_raw_item_and_profile_outside_lock(ctx, fakes, monke
 
 
 def test_native_signin_passes_requested_seat_to_terminal(ctx, monkeypatch):
-    from app import terminal
-    from tests.test_claude_sync_timer import callback
+    from app import menubar, terminal
+    if menubar.objc is None:
+        pytest.skip("native callbacks require PyObjC")
     launched = []
     monkeypatch.setattr(terminal, "prepare_then_login", lambda *a, **k: launched.append((a, k)))
-    native = callback("loginBg_", {"objc": SimpleNamespace(selector=lambda v, **k: v)})
-    receiver = SimpleNamespace(ctx=ctx, loginNudge_=object(),
+    native = menubar.AGLDelegate.loginBg_.callable
+    receiver = SimpleNamespace(ctx=ctx, loginNudge_=lambda _: None,
         performSelectorOnMainThread_withObject_waitUntilDone_=lambda *a: None)
     native(receiver, {"tool": "claude", "email": B})
-    assert launched == [((ctx, "claude"), {"seat": B})]
+    assert launched == [((ctx, "claude"), {"seat": B, "name": None})]
 
 
 @pytest.mark.parametrize("stored", ["{}", "[]", "null", "broken", '{"claudeAiOauth":{"refreshToken":3}}'])
@@ -492,11 +494,94 @@ def test_temp_keychain_cleanup_failure_still_removes_home(ctx, fakes, monkeypatc
         delete(service, ctx.cred["claude"].account)
 
 
-def test_bridge_and_terminal_preserve_requested_seat(ctx, monkeypatch):
+@pytest.fixture
+def signin_cleanup(ctx, fakes, monkeypatch):
+    from acctsw import authflows
+    failures, attempts = set(), []
+    delete, rmtree = ctx.keychain.delete, authflows.shutil.rmtree
+    fakes.owner = "signed-in@example.com"
+    fakes.login_blob = blob("claude", fakes.owner)
+
+    def remove_item(service, account):
+        if service in fakes.services:
+            attempts.append("keychain")
+            if "keychain" in failures:
+                raise RuntimeError("fake-keychain-credential")
+        return delete(service, account)
+
+    def remove_home(path, *args, **kwargs):
+        if path in fakes.homes:
+            attempts.append("home")
+            if "home" in failures:
+                raise RuntimeError("fake-home-credential")
+        return rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(ctx.keychain, "delete", remove_item)
+    monkeypatch.setattr(authflows.shutil, "rmtree", remove_home)
+    yield failures, attempts
+    for service in fakes.services:
+        delete(service, ctx.cred["claude"].account)
+    for home in fakes.homes:
+        if home.exists():
+            rmtree(home)
+
+
+_CLEANUP_FAILURES = [
+    ({"keychain"}, ["could not remove the temporary sign-in Keychain item"]),
+    ({"home"}, ["could not remove the temporary sign-in home"]),
+    ({"keychain", "home"}, ["could not remove the temporary sign-in Keychain item",
+                            "could not remove the temporary sign-in home"]),
+]
+
+
+@pytest.mark.parametrize("failures,messages", _CLEANUP_FAILURES)
+@pytest.mark.parametrize("primary", ["mismatch", "unexpected", "interrupt"])
+def test_signin_preserves_primary_error_when_cleanup_fails(ctx, fakes, signin_cleanup,
+                                                         failures, messages, primary):
+    from acctsw import authflows
+    from acctsw.errors import AcctswError
+    fail, attempts = signin_cleanup
+    fail.update(failures)
+    if primary != "mismatch":
+        fakes.fail = RuntimeError if primary == "unexpected" else KeyboardInterrupt
+    error_type = KeyboardInterrupt if primary == "interrupt" else AcctswError
+    with pytest.raises(error_type) as caught:
+        authflows.signin(ctx, "claude", seat="expected@example.com")
+    assert attempts == ["keychain", "home"]
+    assert caught.value.__notes__ == messages
+    if primary == "mismatch":
+        assert str(caught.value).startswith("signed into signed-in@example.com, not expected@example.com;")
+        assert ctx.load_state().accounts("claude") == {}
+    elif primary == "unexpected":
+        assert str(caught.value) == "sign-in failed — please try again"
+        assert caught.value.__cause__ is None and caught.value.__suppress_context__
+    if primary != "interrupt":
+        rendered = "".join(traceback.format_exception(caught.value))
+        for secret in ("fake-keychain-credential", "fake-home-credential", "fake-private-diagnostic"):
+            assert secret not in rendered
+
+
+@pytest.mark.parametrize("failures,messages", _CLEANUP_FAILURES)
+def test_signin_reports_cleanup_failure_after_success(ctx, fakes, signin_cleanup, failures, messages):
+    from acctsw import authflows
+    from acctsw.errors import AcctswError
+    fail, attempts = signin_cleanup
+    fail.update(failures)
+    with pytest.raises(AcctswError) as caught:
+        authflows.signin(ctx, "claude")
+    assert attempts == ["keychain", "home"]
+    assert str(caught.value) == messages[0]
+    assert getattr(caught.value, "__notes__", []) == messages[1:]
+    assert ctx.load_state().active("claude") == "signed-in@example.com"
+    assert caught.value.__cause__ is None and caught.value.__suppress_context__
+    rendered = "".join(traceback.format_exception(caught.value))
+    assert "fake-keychain-credential" not in rendered
+    assert "fake-home-credential" not in rendered
+
+
+def test_terminal_preserves_requested_seat(ctx, monkeypatch):
     import shlex
-    from acctsw import bridge
     from app import terminal
-    assert shlex.split(bridge.login_command("claude", seat=B)) == ["acctsw", "signin", "claude", "--seat", B]
     opened = []
     monkeypatch.setattr(terminal, "checked_engine_command", lambda *a: ["/fake/app engine"])
     monkeypatch.setattr(terminal, "open_in_terminal", opened.append)

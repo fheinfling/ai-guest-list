@@ -1,6 +1,7 @@
 """The mutation harness never leaves a mutant in the tree it checks, however its run ends."""
 import importlib.util
 import json
+import shlex
 import shutil
 import subprocess
 import sys
@@ -64,3 +65,159 @@ def test_a_guard_that_hangs_is_a_timeout_not_a_verdict(repo):
     harness.TIMEOUT_S = 1
     assert harness._run(_entry("import time; time.sleep(30)"))[0] == "TIMEOUT"
     assert (repo / "pkg" / "mod.py").read_text() == SOURCE
+
+
+@pytest.mark.parametrize("shell", [False, True])
+def test_node_runner_reports_no_test_when_pattern_matches_nothing(repo, shell):
+    (repo / "pkg" / "mod.mjs").write_text("export const answer = 42;\n")
+    (repo / "pkg" / "mod.test.mjs").write_text(
+        'import test from "node:test";\n'
+        'import assert from "node:assert/strict";\n'
+        'import { answer } from "./mod.mjs";\n'
+        'test("guards answer", () => { assert.equal(answer, 42); });\n'
+        'test("always green", () => { assert.equal(1, 1); });\n'
+    )
+    harness = _harness(repo)
+
+    def command(pattern):
+        cmd = ["node", "--test", "--test-reporter=spec",
+               f"--test-name-pattern={pattern}", "pkg/mod.test.mjs"]
+        return ["sh", "-c", "true && " + shlex.join(cmd)] if shell else cmd
+
+    unmatched = {
+        "label": "missing pattern",
+        "file": "pkg/mod.mjs",
+        "old": "42",
+        "new": "43",
+        "cmd": command("does not match anything"),
+    }
+    prepared = harness._prepare_cmd(unmatched)
+    assert harness._run(unmatched) == ("NO-TEST", "the selection matched nothing")
+    assert "--test-reporter=tap" in (prepared[2] if shell else prepared)
+    assert "--test-reporter=spec" not in (prepared[2] if shell else prepared)
+
+    guarded = {**unmatched, "label": "matching failing test",
+               "cmd": command("guards answer")}
+    assert harness._run(guarded) == ("GUARDED", "")
+
+    survived = {**unmatched, "label": "matching passing test",
+                "cmd": command("always green")}
+    assert harness._run(survived) == ("SURVIVED", "guard stayed green")
+
+
+def test_every_mutant_spec_matches_its_target_file_once(repo):
+    real_root = SCRIPT.parent.parent
+    harness = _harness(repo)
+
+    missing = {"label": "stale", "file": "pkg/mod.py", "old": "999", "new": "0", "cmd": ["true"]}
+    assert harness._run(missing) == ("NO-OP", "'old' occurs 0x in pkg/mod.py")
+
+    specs = sorted((real_root / "tests" / "mutants").glob("*.json"))
+    assert specs
+    stale = []
+    for spec in specs:
+        for idx, entry in enumerate(json.loads(spec.read_text())):
+            noop = harness._check_target(entry, real_root)
+            if noop is not None:
+                stale.append(f"{spec.name}#{idx} ({entry['label']}): {noop[1]}")
+    assert stale == []
+
+
+def test_mutate_diff_uses_portable_tempdir_defaults():
+    diff_script = SCRIPT.parent / "mutate_diff.py"
+    spec = importlib.util.spec_from_file_location("mutate_diff_under_test", diff_script)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert "/tmp/claude-" not in str(mod.KNOWN_BASELINE)
+    assert mod.KNOWN_BASELINE.parent == mod.DEFAULT_TMP
+    source = diff_script.read_text()
+    assert "/tmp/claude-" not in source
+
+
+def test_screenshots_shot_css_targets_current_body_scroll_containers():
+    shot_script = SCRIPT.parent / "screenshots.py"
+    spec = importlib.util.spec_from_file_location("screenshots_under_test", shot_script)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert "#root .body, #root .set-body" in mod.SHOT_CSS
+    assert ".main-body" not in mod.SHOT_CSS
+
+
+def test_check_layout_is_self_contained_and_targets_current_ui(tmp_path):
+    layout_script = SCRIPT.parent / "check-layout.py"
+    assert not (SCRIPT.parent / "design-gallery.py").exists()
+    spec = importlib.util.spec_from_file_location("check_layout_under_test", layout_script)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    states = mod.gallery_states()
+    ids = [entry["id"] for entry in states]
+    assert ids == [
+        "main", "spending", "asking", "asking-unpriced", "trouble",
+        "settings", "models", "models-unpriced", "long-identities",
+        "spending-overflow", "trouble-overflow",
+    ]
+    assert ".body, .set-body:not(.picker-body), .model-list, .key-prompts:not(:empty)" in mod.MEASURE
+    assert ".roster" not in mod.MEASURE
+    assert ".guest-drawer" not in layout_script.read_text()
+    assert "r.width >= 28 && r.height >= 26 - tolerance" in mod.MEASURE
+
+    res = subprocess.run(
+        [sys.executable, str(layout_script)],
+        env={"PATH": "", "AGL_CHROME": str(tmp_path / "no-such-chrome")},
+        capture_output=True, text=True, timeout=30,
+    )
+    assert res.returncode == 2
+    assert "ERROR:" in res.stderr
+
+
+def test_check_layout_compare_ref_stages_the_refs_fonts(tmp_path, monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    layout_script = SCRIPT.parent / "check-layout.py"
+    spec = importlib.util.spec_from_file_location("check_layout_fonts", layout_script)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    # The ref has different fonts from the worktree, including a nested licence file.
+    expected = {"fonts/ref-only.woff2": b"reference font", "fonts/nested/OFL.txt": b"reference licence"}
+    ref_files = {"index.html": b"reference html", "styles.css": b"reference css",
+                 "bundle.js": b"reference js", **expected}
+
+    def git_output(cmd, **kwargs):
+        if cmd[:2] == ["git", "ls-tree"]:
+            assert "font-ref" in cmd and "app/web/fonts/" in cmd
+            return "".join(f"app/web/{name}\n" for name in expected)
+        assert cmd[:2] == ["git", "show"]
+        return ref_files[cmd[2].removeprefix("font-ref:app/web/")]
+
+    monkeypatch.setattr(mod.subprocess, "check_output", git_output)
+    staged = {}
+    temporary_directory = mod.tempfile.TemporaryDirectory
+    monkeypatch.setattr(mod.tempfile, "TemporaryDirectory",
+                        lambda **kw: temporary_directory(dir=tmp_path, **kw))
+
+    def new_context(**kwargs):
+        directories = list(tmp_path.glob("agl-layout-before-*"))
+        if directories:
+            directory, = directories
+            staged.update({str(p.relative_to(directory)): p.read_bytes()
+                           for p in directory.rglob("*") if p.is_file()})
+        return MagicMock()
+
+    browser = MagicMock()
+    browser.new_context.side_effect = new_context
+    playwright = SimpleNamespace(chromium=SimpleNamespace(launch=lambda **kw: browser))
+    monkeypatch.setitem(sys.modules, "playwright.sync_api",
+                        SimpleNamespace(sync_playwright=lambda: nullcontext(playwright)))
+    monkeypatch.setenv("AGL_CHROME", sys.executable)
+    monkeypatch.setattr(sys, "argv", [str(layout_script), "--compare-ref", "font-ref"])
+    monkeypatch.setattr(mod, "gallery_states", lambda: [])
+    # An empty gallery deliberately reports that the reference reproduced no failures.
+    assert mod.main() == 1
+    staged_fonts = {name: data for name, data in staged.items() if name.startswith("fonts/")}
+    assert staged_fonts.keys() == expected.keys()
+    for name, data in expected.items():
+        assert staged_fonts[name] == data, name
+    assert staged == ref_files

@@ -1,0 +1,63 @@
+[
+  {
+    "label": "dead web content process is left blank",
+    "file": "app/menubar.py",
+    "old": "            NSLog(\"[agl web] web content process terminated\")\n            self._reloadWebPage()",
+    "new": "            NSLog(\"[agl web] web content process terminated\")",
+    "test": [
+      "tests/test_native_blank.py::test_termination_logs_and_reloads_the_local_page"
+    ]
+  },
+  {
+    "label": "web recovery reload budget is ignored",
+    "file": "app/menubar.py",
+    "old": "            if len(self._web_reload_times) >= WEB_RELOAD_LIMIT:",
+    "new": "            if False:",
+    "test": [
+      "tests/test_native_blank.py::test_reload_loop_guard_applies_to_termination_reopen_and_button"
+    ]
+  },
+  {
+    "label": "render failure erases the fallback",
+    "file": "app/web/app.mjs",
+    "old": "  root.innerHTML = '<div role=\"alert\" style=\"padding:24px;min-height:172px;background:#fff;color:#222;font:14px system-ui\">'\n    + '<p>something went wrong drawing this \u2014 reopen the menu</p>'\n    + '<button type=\"button\" data-action=\"reload\">reload</button></div>';",
+    "new": "  root.innerHTML = \"\";",
+    "cmd": [
+      "sh",
+      "-c",
+      "python3 scripts/build-web.py && node --test --test-name-pattern=\"blank recovery: throwing render\" app/web/render.test.mjs"
+    ]
+  },
+  {
+    "label": "client error resize leaves the cached height stale",
+    "file": "app/web/app.mjs",
+    "old": "  lastHeight = 220;\n  send(\"resize\", { height: 220 });",
+    "new": "  send(\"resize\", { height: 220 });",
+    "cmd": [
+      "sh",
+      "-c",
+      "python3 scripts/build-web.py && node --test --test-name-pattern=\"restores the content height after a client error\" app/web/render.test.mjs"
+    ]
+  },
+  {
+    "label": "generic add completes on a recovered transient 401",
+    "file": "app/web/render.mjs",
+    "old": "      return !before || signedOut(before) || (add.email && signinNeeded(before))\n        || (add.email && Date.parse(seat.signin_expires_at) > Date.parse(before.signin_expires_at));",
+    "new": "      return !before || signedOut(before) || signinNeeded(before)\n        || (add.email && Date.parse(seat.signin_expires_at) > Date.parse(before.signin_expires_at));",
+    "cmd": [
+      "node",
+      "--test",
+      "--test-name-pattern=generic browser sign-in",
+      "app/web/render.test.mjs"
+    ]
+  },
+  {
+    "label": "refused reload gives the fallback no retry feedback",
+    "file": "app/menubar.py",
+    "old": "                if self.webview:\n                    # The renderer may be broken; update only the independent fallback's text.\n                    self.webview.evaluateJavaScript_completionHandler_(\n                        '(() => { const text = document.querySelector(\\'#root [role=\"alert\"] p\\'); '\n                        'if (text) text.textContent = \"still not drawing \u2014 try again in a minute\"; })();',\n                        None)\n",
+    "new": "",
+    "test": [
+      "tests/test_native_blank.py::test_reload_limit_tells_the_fallback_when_to_retry"
+    ]
+  }
+]

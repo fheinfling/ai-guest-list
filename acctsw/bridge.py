@@ -35,7 +35,7 @@ from .switch import sync_back
 from .switch import switch as do_switch
 from .util import now, iso, parse_iso
 from .util import redact_key as _redact_key
-from .web_dot import dot_for, door_for
+from .web_dot import door_for
 
 # Settings the UI may toggle (boolean only) — a whitelist so a stray key can't clobber e.g. theme.
 TOGGLE_KEYS = {
@@ -72,16 +72,6 @@ def _start_keep_warm(ctx: Context) -> None:
 KEY_ACTIONS = {"key_add", "key_remove", "key_validate", "key_prove", "models_list", "answer_key_switch",
                "key_terminal", "end_pinned_session"}
 
-# Actions handled entirely by the native shell (app quit / run the chosen login in Terminal).
-# Everything else goes through the bridge; the shell then acts on result fields (login/command).
-NATIVE_ACTIONS = {"quit", "login", "settings"}
-
-SWITCH_FRESH_SECONDS = 8  # how long the "just switched you" dot lingers
-
-
-def is_native(action: str | None) -> bool:
-    return action in NATIVE_ACTIONS
-
 
 def _codex_live_unregistered(ctx: Context, state) -> dict[str, Any] | None:
     """The codex account currently signed in on this Mac (``~/.codex/auth.json``) that ISN'T a seat yet.
@@ -105,9 +95,6 @@ def snapshot_state(ctx: Context) -> dict[str, Any]:
     state = ctx.load_state()
     data = acct.status(ctx, state)
     data["moved_note"] = state.data.get("moved_note")
-    last = parse_iso(state.data.get("last_switch_at"))
-    data["recently_switched"] = bool(last and (now() - last).total_seconds() < SWITCH_FRESH_SECONDS)
-    data["dot"] = dot_for(data)  # single source of truth for the dot (JS + native both read this)
     data["door"] = door_for(data)  # shut/open door icon — same state feeds native glyph + web header
     data["app"] = {"version": __version__, "build": build_number()}  # shown in the settings sheet
     from . import updater
@@ -485,7 +472,6 @@ def _auto_switch_after_usage(ctx: Context, summary: dict[str, Any], *,
             try:
                 do_switch(ctx, state, tool, candidate, sync=(tool != "claude"),
                           live_identity=live_identity)
-                state.data["last_switch_at"] = iso(now())
                 state.save()
             except (AcctswError, OSError) as exc:
                 return {"status": "failed", "tool": tool, "from": active, "to": candidate,
@@ -510,15 +496,6 @@ def _take_signin_notices(ctx: Context) -> list[dict[str, str]]:
         if changed:
             state.save()
     return notices if state.settings().get("notify", True) else []
-
-
-def login_command(tool: str, method: str = "browser", *, seat: str | None = None) -> str:
-    """Logical isolated sign-in command; Terminal resolves this installation's engine absolutely."""
-    import shlex
-    args = ["acctsw", *LOGIN_SUBCMD[tool]]
-    if seat:
-        args.extend(["--seat", seat])
-    return shlex.join(args)
 
 
 def handle(ctx: Context, message: dict) -> dict[str, Any]:
@@ -641,16 +618,6 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
                 state.save()
             return {"ok": True, "state": snapshot_state(ctx)}
 
-        if action == "set_strategy":
-            val = message.get("value")
-            if val not in ("soonest_back", "most_headroom"):
-                return {"ok": False, "error": f"bad strategy: {val}"}
-            with ctx.locked():
-                state = ctx.load_state()
-                state.set_setting("strategy", val)
-                state.save()
-            return {"ok": True, "state": snapshot_state(ctx)}
-
         if action in ("approve_crossing", "deny_crossing"):
             tool, a, b = message["tool"], message["from"], message["to"]
             if tool not in TOOLS or not isinstance(a, str) or not isinstance(b, str) or a == b:
@@ -660,7 +627,10 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
                 return {"ok": False, "error": f"bad crossing scope: {scope}"}
             with ctx.locked():
                 state = ctx.load_state()
-                if a not in state.accounts(tool) or b not in state.accounts(tool):
+                # Only the destination must still exist. A session whose seat was removed asks to
+                # move on; refusing because "from" is gone left a question nobody could answer.
+                # "not now" just closes the question, so it always works.
+                if action == "approve_crossing" and b not in state.accounts(tool):
                     return {"ok": False, "error": "that seat is no longer on the list",
                             "state": snapshot_state(ctx)}
                 if action == "approve_crossing":
@@ -710,7 +680,6 @@ def handle(ctx: Context, message: dict) -> dict[str, Any]:
                 do_switch(ctx, state, tool, message["email"], manual=True,
                           confirmed_crossing=message.get("confirmed_crossing") is True,
                           live_identity=live_identity)
-                state.data["last_switch_at"] = iso(now())
                 state.save()
             return {"ok": True, "celebrate": True, "state": snapshot_state(ctx)}
 

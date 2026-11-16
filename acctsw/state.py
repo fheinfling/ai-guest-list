@@ -106,7 +106,6 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "notify": True,           # "tell me when it switches"
     "restart_app": False,     # "restart the Codex app after a swap"
     "supervise_shell": True,  # wire terminal codex/claude through the supervised cx/cl launchers
-    "strategy": "soonest_back",  # "soonest_back" | "most_headroom"
     "theme": "light",         # the design default
     "confirm_key_switch": True,  # consent for each hop onto metered API usage
     "key_fallback": False,    # metered seats must be explicitly opted into

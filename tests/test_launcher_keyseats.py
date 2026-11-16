@@ -102,7 +102,7 @@ class Child:
 def forbid_credentials(ctx, monkeypatch):
     spies = [Mock(side_effect=AssertionError("key path touched OAuth")) for _ in range(4)]
     monkeypatch.setattr(L, "switch", spies[0])
-    monkeypatch.setattr(L, "sync_back", spies[1])
+    monkeypatch.setattr("acctsw.switch.sync_back", spies[1])
     monkeypatch.setattr(ctx, "set_live", spies[2])
     monkeypatch.setattr(ctx, "snapshot_set", spies[3])
     return spies

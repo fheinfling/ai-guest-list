@@ -24,7 +24,10 @@ from pathlib import Path
 
 
 DEFAULT_BUNDLE = Path("dist/AI Guest List.app")
-CORE_COMMANDS = {"install", "uninstall", "add", "remove", "list", "status", "usage", "switch", "run", "keys"}
+CORE_COMMANDS = {
+    "install", "uninstall", "path", "add", "signin", "remove", "rename",
+    "list", "status", "daemons", "usage", "switch", "run", "keys",
+}
 KEY_COMMANDS = {"add", "list", "remove", "prove", "models"}
 
 _GENERATE = r"""
@@ -47,7 +50,7 @@ import json
 import ssl
 import acctsw
 from acctsw import paths
-from acctsw.cli import build_parser
+from acctsw.cli import HANDLERS, build_parser
 from acctsw.usage import Usage, _confirmed_healthy, parse_codex
 
 parser = build_parser()
@@ -79,6 +82,8 @@ print(json.dumps({
     "cert_store_stats": verify_context.cert_store_stats(),
     "canonical_codex_home": str(paths.CODEX_HOME),
     "commands": sorted(subcommands),
+    "handlers": sorted(HANDLERS),
+    "help_ok": all(bool(subcommands[cmd].format_help()) for cmd in subcommands),
     "key_commands": sorted(key_commands),
     "five_hour_pct": windows["5h"].used_pct,
     "weekly_pct": windows["weekly"].used_pct,
@@ -282,6 +287,9 @@ def smoke(bundle_arg: Path) -> None:
                f"private inherited CODEX_HOME became canonical: {probe['canonical_codex_home']!r}")
         _check(CORE_COMMANDS <= set(probe["commands"]),
                f"packaged CLI is missing commands: {sorted(CORE_COMMANDS - set(probe['commands']))}")
+        _check(set(probe["commands"]) == set(probe["handlers"]),
+               f"packaged CLI commands/HANDLERS mismatch: {sorted(set(probe['commands']) ^ set(probe['handlers']))}")
+        _check(probe["help_ok"] is True, "packaged CLI subcommand help failed")
         _check(KEY_COMMANDS <= set(probe["key_commands"]),
                f"packaged CLI is missing keys commands: {sorted(KEY_COMMANDS - set(probe['key_commands']))}")
         _check(probe["five_hour_pct"] is None and probe["weekly_pct"] == 3.0 and probe["healthy"] is True,

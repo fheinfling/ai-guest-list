@@ -10,13 +10,21 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
 
-from acctsw import bridge, keyseats, pricing, providers
+from acctsw import bridge, keyprove, keyseats, pricing, providers
 
 APP_MJS = Path(__file__).resolve().parent.parent / "app" / "web" / "app.mjs"
+
+
+@pytest.fixture(autouse=True)
+def no_subprocesses(monkeypatch):
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("UI contract tests must not spawn subprocesses")
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
 
 
 def _actions_the_ui_correlates() -> set[str]:
@@ -49,6 +57,11 @@ def test_the_ui_never_waits_on_an_action_the_bridge_cannot_name(ctx):
 @pytest.mark.parametrize("action", sorted(_actions_the_ui_correlates()))
 def test_each_correlated_action_round_trips_its_name(ctx, seat, action, monkeypatch):
     monkeypatch.setattr(pricing, "_default_get", lambda *a, **k: (200, '{"data":[]}'))
+    proofs = []
+    def prove(context, id):
+        proofs.append((context, id))
+        return {"outcome": "proven"}
+    monkeypatch.setattr(keyprove, "prove", prove)
     message = {"action": action, "id": seat["id"]}
     if action == "answer_key_switch":
         message["approved"] = False
@@ -56,3 +69,4 @@ def test_each_correlated_action_round_trips_its_name(ctx, seat, action, monkeypa
     # It may legitimately fail (no pending confirmation, wrong harness). What it may never do is
     # come back anonymous, because then the UI cannot tell whose reply it is.
     assert result.get("key_action") == action, f"{action} reply is unattributable: {json.dumps(result, default=str)[:160]}"
+    assert proofs == ([(ctx, seat["id"])] if action == "key_prove" else [])

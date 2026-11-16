@@ -311,7 +311,7 @@ def test_watcher_attach_scan_is_rate_limited(tmp_path, monkeypatch):
 
 def test_sessions_roots_uses_context_not_module_paths(ctx, tmp_path, monkeypatch):
     sentinel = Path("/sentinel/never-read/sessions")
-    monkeypatch.setattr(P, "CODEX_SESSIONS", sentinel)
+    monkeypatch.setattr(P, "CODEX_HOME", sentinel.parent)
     roots = rollout.sessions_roots(ctx, "a@x.com")
     assert roots
     assert sentinel not in roots

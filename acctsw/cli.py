@@ -59,6 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
     signin = sub.add_parser("signin", help="sign in privately and select the identified seat")
     _add_tool_arg(signin)
     signin.add_argument("--seat", help="require this account for sign in again")
+    signin.add_argument("--name", help="name the saved subscription seat")
     rm = sub.add_parser("remove", help="remove (sign out) a seat")
     _add_tool_arg(rm)
     rm.add_argument("email", help="account email to remove")
@@ -210,7 +211,7 @@ def _cmd_add(ctx: Context, ns) -> int:
 
 def _cmd_signin(ctx: Context, ns) -> int:
     from .authflows import signin
-    return signin(ctx, ns.tool, seat=ns.seat)
+    return signin(ctx, ns.tool, seat=ns.seat, name=ns.name)
 
 
 def _cmd_rename(ctx: Context, ns) -> int:
@@ -282,7 +283,6 @@ def _cmd_daemons(ctx: Context, ns) -> int:
 
 
 def _cmd_switch(ctx: Context, ns) -> int:
-    from . import identity as identity_mod
     if ns.tool == "claude":
         from . import claudehome, claudesync
         claudesync.converge(ctx)
@@ -513,11 +513,15 @@ def main(argv: list[str] | None = None) -> int:
         return handler(ctx, ns)
     except AcctswError as e:
         print(f"acctsw: {e}", file=sys.stderr)
+        for note in getattr(e, "__notes__", ()):
+            print(f"acctsw: also: {note}", file=sys.stderr)
         return EXIT_ERR
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as e:
         # E.g. Ctrl-C during the all-seats-resting wait: a clean one-liner, not a traceback.
         # (run()'s finally has already synced creds back while the interrupt propagated.)
         print("\nacctsw: interrupted — stopping.", file=sys.stderr)
+        for note in getattr(e, "__notes__", ()):
+            print(f"acctsw: also: {note}", file=sys.stderr)
         return 130
 
 

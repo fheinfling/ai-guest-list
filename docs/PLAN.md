@@ -1,284 +1,170 @@
-# Plan: Lean menubar app + auto-switch engine for Codex & Claude accounts
+# Architecture & Design: ai guest list
 
-## Context
-You run multiple paid agent subscriptions — **two Codex (ChatGPT) business/team accounts now,
-Claude accounts soon**. You want to **automatically switch** between accounts of the same tool
-when one hits its usage limit, **continue the in-progress work** on the new account, and when all
-accounts are limited, pick the one that **unlocks soonest**. On top of that you want a **lean,
-minimal macOS menubar app** for manual control: switch accounts (Codex/Claude), show each
-account's limits, and add (login) / remove (logout) accounts — kept minimal but with **some fun &
-love personality**. Everything must run on this Mac **without messing up the existing setup**
-(stock `codex`/`claude` and the desktop apps keep working; fully reversible).
-
-We chose to **build custom** rather than adopt an existing tool, because (a) no off-the-shelf tool
-meets both "continue the same work after switching" *and* "pick the soonest-unlocking account",
-and (b) for something touching business OAuth tokens, owning 100% of the code beats trusting a
-young low-star third-party app. The design below distills the proven mechanics from the three best
-existing projects so we reuse battle-tested patterns without reinventing or trusting them.
-
-> **Design locked.** A design sample defines the menubar UI:
-> **"ai guest list"** — a warm guest-list/club theme (seats = accounts, "on the floor" = active,
-> "add a seat" = login, "no browser dance"). Full spec in the Menubar section below.
->
-> **~~Headroom is integrated as a toggleable usage-saver.~~ Retired.** The plan called for a
-> "save credit" toggle routing agents through the [headroom-ai](https://pypi.org/project/headroom-ai/)
-> context-compression proxy. It shipped, was measured on real workloads, and saved ~1–3%
-> cache-adjusted — a guardrail against runaway outputs, not a money-saver — so it was **removed**.
-> The switcher alone is what keeps sessions going. See
-> [`SECURITY-headroom.md`](SECURITY-headroom.md) for the measurements and the retired sections below.
+> **Current architecture reference** (kept at `docs/PLAN.md` so existing links resolve).
+> Ground truth lives in `acctsw/` (the Python engine) and `app/` (the macOS menubar app).
 
 ---
 
-## Architecture (two layers, one shared store)
+## 1. Overview & Design Invariants
 
+**ai guest list** is a macOS menubar app and CLI supervisor that manages multiple **OpenAI Codex** (`codex` CLI and `Codex.app`) and **Anthropic Claude Code** (`claude` CLI) subscription accounts ("seats"), plus optional pay-per-token **API-key seats** (BYOK). When an active subscription seat hits a usage limit or authentication failure—or when the user manually picks another seat—the supervisor can move the session to an eligible target seat and continue the conversation, subject to the guards below.
+
+### Core invariants
+
+1. **Zero modification of stock binaries.** Stock `codex`, `claude`, and `Codex.app` are never patched, renamed, or replaced on disk. The managed shell block (`# >>> ai guest list (acctsw) >>>`) puts `~/.local/bin` first on `PATH` and, with shell supervision enabled, adds `alias codex=cx` and `alias claude=cl`. The installed wrappers are `acctsw`, `cx`, and `cl`. The block goes in `~/.zshrc` for zsh; for bash, `~/.bash_profile` unless only `~/.bashrc` already exists; otherwise `~/.profile` (`acctsw/install.py`). When the menubar app is not running, ordinary work invocations through `cx` / `cl` exec the stock binary directly (explicit `--key` pins stay supervised while the app is closed).
+2. **Secrets stay in Keychain and tool-native stores.** Codex subscription credentials are real `0600` files at `ch/<hash>/auth.json`; Claude snapshots, API keys, and factory credential backups are stored in the macOS Keychain. `state.json` stores non-secret metadata, usage readings, settings, and 4-character API-key fingerprints. State saves use atomic temp-file + `os.replace` with mode `0600`; an `fcntl.flock` store lock (`.lock`) protects state read-modify-write transactions, not every credential or filesystem write. The lockfile uses the process's default umask.
+3. **Structured signals first, banners as hints and fallback.** Limit detection uses Codex rollout JSONL (`token_count` and `task_complete.error.codex_error_info`), Claude per-session proxy responses, official usage API responses, and shared state. Terminal banner regexes remain hints that trigger probes, with specific fallback paths; an unambiguously attached Codex rollout vetoes the hard-limit banner fallback (`acctsw/launcher.py`). Claude transcripts supply resume IDs, not limit signals.
+4. **Reversible installation.** First-time setup (`acctsw install`) captures a one-time factory backup of any pre-existing stock credentials into the Keychain (`__factory__:codex`, `__factory__:claude`) and records non-secret hashes in `~/.account-switcher/backups/manifest.json`. Running `acctsw uninstall` restores the original identity, preferring its freshest credentials over the factory backup, and removes the shell block.
+
+---
+
+## 2. Store & Credential Layout
+
+### macOS Keychain
+
+| Service | Account key | Contents |
+|---|---|---|
+| `"acct-switcher"` | `claude:<email>` | Snapshot of Claude OAuth JSON (`claudeAiOauth`) for a Claude subscription seat |
+| `"acct-switcher"` | `key:<id>` | Raw API key secret for a BYOK key seat (`acctsw/keyseats.py`) |
+| `"acct-switcher"` | `__factory__:codex` | Pre-install factory backup of stock `~/.codex/auth.json` (`acctsw/install.py`) |
+| `"acct-switcher"` | `__factory__:claude` | Pre-install factory backup of stock `"Claude Code-credentials"` (`acctsw/install.py`) |
+| `"Claude Code-credentials"` | macOS username | Default stock Claude Code login (mirrored to the active seat unless locally logged out) |
+| `"Claude Code-credentials-<8-hex>"` | macOS username | Per-seat Claude home login (`sha256(NFC(clh_path))[:8]`, `acctsw/claudehome.py`) |
+
+### Filesystem (`~/.account-switcher/`, mode `0700`)
+
+```text
+~/.account-switcher/
+├── state.json                 # 0600: version 1 state (tools, seats, keys metadata, settings, prompts)
+├── .lock                      # default umask: fcntl.flock for state read-modify-write transactions
+├── pricing.json               # 0600: cached provider model catalogs (sanitized with redact_key)
+├── backups/
+│   └── manifest.json          # 0600: non-secret SHA-256 + email manifest for __factory__:<tool> backups
+├── ch/<8-hex-sha256>/         # 0700: short-path homes (keeps Unix domain sockets under 104-byte SUN_LEN)
+│   ├── (subscription Codex)   #   real auth.json + private app-server daemon dirs; symlinks to ~/.codex
+│   └── (BYOK key / pin home)  #   isolated CODEX_HOME or CLAUDE_CONFIG_DIR; NO symlinks to shared homes
+├── codex-homes/<email>        # by-address symlink into ch/<hash>/
+├── clh/<8-hex-sha256>/        # 0700: per-seat Claude homes (CLAUDE_CONFIG_DIR)
+│   ├── .claude.json           #   per-seat identity/caches + 3-way merged shared preferences
+│   └── projects, skills, ...  #   symlinks to shared ~/.claude/<entry>
+├── session-<tool>-<pid>.json   # 0600: live supervised session records
+├── session-<tool>.json         # 0600: legacy session record
+├── thread-<tool>-<pid>.json    # 0600: claimed thread ID
+├── updates/                   # 0700: staging directory for in-app updates
+├── update.json                # updater status
+├── update-ack                 # startup acknowledgement containing the running version
+└── update-helper.log          # detached update helper output
 ```
-acctsw (engine, Python 3, stdlib + `security` CLI)        ← all credential/usage/switch logic
-   └── used by both the CLI wrappers and the menubar app
-menubar app (lean, minimal, fun)                          ← thin UI over the engine
-shared store:
-   Keychain service "acct-switcher": codex:<email> / claude:<email>  → credential blobs
-   ~/.account-switcher/state.json   → non-secret: active acct + cached usage + limited_until
-   ~/.account-switcher/backups/     → factory image of original creds (for clean restore)
+
+### Per-seat homes (`ch/` and `clh/`)
+
+- **Codex subscription homes (`acctsw/codexhome.py`):** Each Codex seat gets `~/.account-switcher/ch/<8-hex>` (hash of normalized email). Its `auth.json` is a real `0600` file. `app-server-control/`, `app-server-daemon/`, `app-server-startup.lock`, and `packages/` stay private to the seat so concurrent seats never share a background daemon or overwrite each other's tokens. Shared history, sessions, and `config.toml` are symlinked to `~/.codex`.
+- **Claude subscription homes (`acctsw/claudehome.py`, `acctsw/claudesync.py`):** Each Claude seat runs with `CLAUDE_CONFIG_DIR=~/.account-switcher/clh/<8-hex>`. Because Claude Code derives its Keychain service name from `CLAUDE_CONFIG_DIR`, each seat gets its own `"Claude Code-credentials-<8-hex>"` Keychain item and never logs out another seat. Shared directories (`projects`, `skills`, `agents`, `plugins`, `commands`, `hooks`, `tasks`, `todos`, `plans`, `file-history`, `session-env`, `shell-snapshots`, `debug`, `ide`) are symlinked to `~/.claude`, while `.claude.json` performs a locked 3-way merge of shared preference keys (`SHARED_CONFIG` and `SHARED_PROJECT_CONFIG`) with `~/.claude.json` while keeping account identity and policy caches private. `claudesync.py` reconciles OAuth token refreshes across the per-seat Keychain item, the `acct-switcher` snapshot, and (for the active seat) the stock Keychain item.
+- **BYOK key homes (`acctsw/keyhome.py`):** Key sessions use `~/.account-switcher/ch/<8-hex>` derived from `key:<harness>:<seat_id>` (or `key:<harness>:<seat_id>:<pin>` for dedicated terminal pins). Key homes contain **no symlinks** to `~/.codex` or `~/.claude`. To prevent the harness from persisting the child's API-key environment variable to disk or leaking it to tool subprocesses:
+  - Codex key homes write a private `config.toml` with `shell_snapshot = false` and `shell_environment_policy` (`inherit = "all"`, `ignore_default_excludes = false`, `exclude = [<env_key>]`, where `<env_key>` is the provider's key variable), and disable analytics and otel exporters.
+  - Claude key homes write a private `settings.json` containing only `{"skipWebFetchPreflight": true}` and set `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` and `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` in the child's environment.
+
+---
+
+## 3. Sign-In, Logout Protection & Warm-Up
+
+- **Sync-back before mirror changes (`acctsw/switch.py`, `app/terminal.py`):** Because OAuth refresh tokens are single-use, before switching seats or launching a new sign-in that will change the stock credential mirror, the currently-active seat is always synced back (`switch.sync_back` / `app.terminal.prepare_then_login`) so any rotated refresh token is captured first.
+- **Isolated sign-in (`acctsw/authflows.py`):** `acctsw signin <tool> [--seat EMAIL] [--name NAME]` (and the popover's **add a seat** / **sign in again** actions) runs `codex login` or `claude auth login` inside a temporary directory (`CODEX_HOME` or `CLAUDE_CONFIG_DIR`), reads the resulting credential, identifies the owner (`id_token` JWT claims for Codex; `GET /api/oauth/profile` for Claude), saves the seat snapshot, switches the floor to that seat, and deletes the temporary home and temporary Keychain item. Existing seats are never logged out during sign-in.
+- **Safe logout (`authflows.safe_logout`):** Running `codex logout` or `claude auth logout` through the shell wrapper checks whether the stock login belongs to a registered seat. If so, it removes only the local stock credential and sets `stock_logged_out = True` in `state.json` without calling the provider's token-revocation endpoint. Passing `--revoke` runs the upstream revoking logout.
+- **Parked Claude seat warm-up (`claudehome.keep_warm`):** When `keep_warm` is enabled (default), background polling checks eligible parked Claude seats whose OAuth token expires within 30 minutes (hardcoded in `acctsw/claudehome.py`) and runs `claude mcp list` inside that seat's `clh/` home so Claude Code can refresh the token without making a model call.
+
+---
+
+## 4. Usage Polling & Limit Detection
+
+### Official usage endpoints (`acctsw/usage.py`)
+
+- **Codex:** `GET https://chatgpt.com/backend-api/wham/usage` with the seat's bearer token and `ChatGPT-Account-Id`. Reads `rate_limit.primary_window` (5h) and `secondary_window` (weekly) `used_percent`, `limit_reached`, and `reset_at`. For eligible seats, polling can refresh an expired access-token JWT via `POST https://auth.openai.com/oauth/token` when a refresh token exists, the seat is not the stock `~/.codex` login, and no supervised session is running on it. Recovery writes only the seat's private snapshot, not the shared `~/.codex/auth.json` mirror; neither a `401` nor the age of `last_refresh` is the trigger.
+- **Claude:** `GET https://api.anthropic.com/api/oauth/usage` with `anthropic-beta: oauth-2025-04-20`. Reads `five_hour` and `seven_day` `utilization` and `resets_at`.
+- **Polling cadence (`app/menubar.py`, `acctsw/paths.py`):** While the popover is open, the active seat refreshes every 30s (`USAGE_POLL_OPEN_SECONDS`); when closed, background polling runs every 180s (`USAGE_POLL_HIDDEN_SECONDS`, with a 150s floor for parked seats). Readings store `used_pct` internally and render in the UI as **% left** (`100 - used_pct`).
+
+### Live session limit signals (`acctsw/rollout.py`, `acctsw/launcher.py`)
+
+1. **Codex rollout watcher (`RolloutWatcher`):** Finds a rollout under `~/.codex/sessions/` by comparing file mtimes before and after spawning and matching `session_meta.cwd`. Ambiguous matches are tracked as such; a single changed file with a different cwd is a provisional fallback. It classifies `token_count.rate_limits.primary` / `secondary` windows whose `used_percent >= LIMIT_PCT` (`100.0`), a non-empty `rate_limit_reached_type`, `spend_control_reached`, and `task_complete.error.codex_error_info` equal to `usage_limit_exceeded` or `rate_limit_exceeded`.
+2. **Claude per-session proxy:** Emits `Hit` records for HTTP `401` (auth) and `429` with `anthropic-ratelimit-unified-status: rejected` (usage limit) in `acctsw/seatproxy.py`. Other `429` responses are treated as transient. `~/.claude/projects/*/*.jsonl` is read for resume session IDs, not limit detection.
+3. **Shared state poll (`_tick_state`):** Every ~2s, the supervisor checks for state changes, including a current seat rested with `limited_until` and `limit_source` of `usage` / `hard`, or a user-initiated `manual_switch`.
+
+---
+
+## 5. Switching, Session Continuity & Guards
+
+### Claude Code: in-place proxy switching (`acctsw/seatproxy.py`, `acctsw/sessionca.py`, `acctsw/seatswap.py`)
+
+When `in_place_switch` is enabled (default), `cl` starts a loopback HTTPS proxy (`127.0.0.1:0`) gated by a per-session random Basic `Proxy-Authorization` secret (`acctsw:<secret>`) and an ephemeral EC P-256 certificate authority (`SessionCA`) constrained by `basicConstraints=critical,CA:TRUE,pathlen:0` and `nameConstraints=critical,permitted;DNS.0=api.anthropic.com`. The CA certificate is trusted only by the child process via environment variables (`NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, etc.) in a `0700` temp directory, and private key files (`ca.key`, `leaf.key`) are unlinked immediately after loading into the in-memory `ssl.SSLContext`.
+
+For `POST /v1/messages` and `POST /v1/messages/count_tokens` carrying Claude Code OAuth bearer headers, `SeatProxy` injects the currently bound seat's OAuth access token; all other hosts use a blind byte tunnel. For an eligible, approved limit or manual switch, the supervisor can swap the bound seat in memory (`seatswap.py`) so the live Claude Code session moves without restarting. If in-place switching cannot serve an approved limit or crossing hop, it can fall back to terminating the child and resuming with `claude --resume <session-uuid>` when the session can be identified. (If `in_place_switch` is turned off in settings, a manual switch leaves a running Claude session on its current seat and applies the new choice to the next session.)
+
+### Codex CLI & `codex exec`: restart + resume (`acctsw/launcher.py`, `acctsw/codexexec.py`)
+
+- **Interactive `cx`:** Runs in a supervised PTY with `CODEX_HOME` pointed at the seat's `ch/<hash>` directory. For an approved rate-limit/auth hop or manual switch (`acctsw switch codex <email>` or clicking another seat row in the popover), `_terminate` sends `SIGTERM`, then `SIGKILL` if needed, to the child's process group, including the app-server daemon it started, while draining shutdown output. It allows about five seconds for session saving before escalation. Manual switches capture the rollout thread ID only when the attachment is unambiguous; respawns then use `codex resume <thread_id>`, including later automatic hops in that supervisor. Before an ID is captured, automatic subscription hops use `codex resume --last`. Engine restarts and key handoffs also use a captured ID when their guards permit.
+- **Unattended `codex exec` (`acctsw/codexexec.py`):** Runs over pipes (`pipe_spawn`, no PTY), claims its rollout `session_meta.id` via `session.claim_thread`, and on limit restarts with `codex exec resume <thread_id>`.
+- **Codex desktop app (`Codex.app`):** Reads `~/.codex/auth.json`. When the menubar poll detects a confirmed limit on the active Codex seat, it swaps `~/.codex/auth.json` to the next healthy seat; if `restart_app` is enabled, it gracefully quits and relaunches `Codex.app`.
+
+### Seat selection & crossing guards (`acctsw/selection.py`, `acctsw/seatkind.py`, `acctsw/seattier.py`)
+
+- **Selection (`selection.choose`):** Selection filters caller exclusions, unapproved crossings, seats with `auth_error`, usage `forbidden`, or `signin.signed_out`; it keeps the active seat if available, otherwise takes the first available seat in store order. If all eligible seats are resting, it returns the one with the earliest `limited_until` and reports that unlock time. There is no stored selection preference.
+- **Business ↔ Personal guard (`seatkind.py`):** Crossing between a business plan (`business`, `team`, `enterprise`, `edu`, `education`) and a personal plan (`plus`, `pro`, `max`, `free`), or moving when either kind is unknown, requires approval and can raise a `pending_crossings` prompt in the popover unless `crossing_auto` is enabled or that direction is already approved. Returning to a session's home seat is exempt. A manual click does not bypass this session guard.
+- **Cross-tier in-place guard (`seattier.py`):** Moving a running Claude session in place across known different plan tiers (e.g. Max ↔ Pro/Team) prompts in the popover (`pending_tier_requests`) or falls back to restart unless `in_place_cross_tier` is enabled or that tier pair is already approved.
+
+### Idle engine self-restart (`acctsw/enginerestart.py`)
+
+The supervisor checks the store's newer writer stamp (`enginerestart.newer_writer`) and confirms that `~/.local/bin/acctsw` resolves to a newer engine (`enginerestart.target_engine`). For a session that can safely restart, it waits for 65 minutes without user input, child output, or Claude proxy activity (`RESTART_QUIET_S = 3900.0`), with no unsent draft (`InputTracker`) or descendant tool processes (`has_late_descendants`). Once the app is running and the remaining resume guards pass, `acctsw/cli.py` uses `os.execvpe` to become `~/.local/bin/acctsw run <tool> …` with the captured resume arguments. Controlled by setting `engine_restart` (default `True`).
+
+---
+
+## 6. BYOK Key Seats (`acctsw/keyseats.py`, `acctsw/providers.py`, `acctsw/pricing.py`, `acctsw/handoff.py`)
+
+- **Providers & harnesses:** Supports `openai`, `anthropic`, `openrouter`, `langdock` (`eu`/`us`/`global` on both OpenAI Responses and Anthropic Messages routes), and custom endpoints. OpenAI/Responses-route keys drive `codex`; Anthropic-route keys drive `claude`.
+- **Catalog & pricing (`pricing.py`, `keyprove.py`):** Fetches model catalogs from the provider (`fetch_catalog`), sanitizes text with `redact_key` before caching to `pricing.json`, and offers an explicit paid Responses compatibility check (`keyprove.prove`). Proof does not gate fallback: `selection.choose_key` checks `last_validation.error` for `invalid_key` / `insufficient_quota` alongside the fallback, harness, subscription, and pin gates. Adding an endpoint whose Responses support is unverified requires `acctsw keys add --allow-unverified`.
+- **Consent & modes:**
+  - **Automatic fallback (`key_fallback`):** Off by default. When enabled and all eligible subscription seats for a harness are resting (or no subscriptions are saved), a supervised session can offer a configured key seat (`pending_key_switches` when `confirm_key_switch` is `True`, showing model and price estimate in the popover). `handoff.py` holds the paid-use consent records.
+  - **Dedicated terminal pin (`--key <id|label>`):** `cx --key <seat>` / `cl --key <seat>` (or **use in new terminal** in the popover) runs a single terminal on a dedicated isolated home (`ch/<hash>`, with the pin included in the hashed identity) without changing the active subscription floor. After a pinned child flushes, `keyhome.publish_resume` copies only conversation rollouts/transcripts into the shared tool home so work can continue on a subscription seat with `codex resume <id>` or `claude --resume <id>`.
+
+---
+
+## 7. Menubar App & Web UI (`app/menubar.py`, `app/web/render.mjs`, `app/web/app.mjs`)
+
+- **Native shell (`app/menubar.py`):** `pyobjc` `NSStatusItem` with an SF Symbol door icon (`door.left.hand.open` / `door.left.hand.closed`, with emoji fallback) and an `NSPopover` (`376px` wide, dynamically sized between `220px` and `600px` via the web view's `resize` action). Hosts a locked-down `WKWebView` loading local `app/web/index.html`, `styles.css`, and `bundle.js` (built from `render.mjs` + `app.mjs` via `scripts/build-web.py`), communicating over `window.webkit.messageHandlers.agl`.
+- **Now-next UI (`now-next` in `app/web/render.mjs`):**
+  - **Header:** Brand title, status chip (`all good`, `all limited`, `renew soon`, `N needs you`), `+` add-seat menu, and `...` (`more`) menu (auto-switch toggle, check for updates, settings, quit).
+  - **Warm field (`.field`):** Follows the active banners (in-app update banner, engine/supervision warnings, business/personal crossing approvals, tier approvals, paid-key confirmations, active paid sessions) and contains one `.tool` answer block per configured tool showing the active seat (`on now`), its tighter quota window `% left` bar, reset countdown, secondary window `%`, and the `then` next-seat line.
+  - **Solid sheet (`.sheet`):** Compact rows for all other subscription seats and BYOK key seats. Clicking a row switches to that seat; toggling `details` reveals inline rename, both quota window bars, sign-in expiry status, re-auth/sign-out/remove actions, and key compatibility proof actions.
+  - **Settings view:** Grouped into **switching**, **paid keys**, and **appearance** (theme picker + menu-bar door icon legend + version/build footer).
+
+---
+
+## 8. CLI Reference (`acctsw/cli.py`)
+
+```text
+acctsw install                         # set up store, capture factory backups, import current stock logins
+acctsw path                            # put ~/.local/bin first on PATH; alias codex=cx, claude=cl
+                                      # rc selection follows §1: zsh, bash profile/bashrc, or profile
+acctsw uninstall [--purge]             # restore factory credentials and remove shell integration
+acctsw signin <codex|claude> [--seat EMAIL] [--name NAME]  # official browser login in an isolated temp home
+acctsw add <codex|claude>              # snapshot the current stock credential as a seat
+acctsw remove <codex|claude> <email>   # delete a seat snapshot and its per-seat home
+acctsw rename <codex|claude> <email> <name>  # set or clear ("") a seat's display name
+acctsw list [--json]                   # seat markers, names, and emails; optional JSON output
+acctsw status [--json]                 # full engine status
+acctsw usage refresh [--tool codex|claude] [--json]  # refresh usage for all seats or one tool
+acctsw switch <codex|claude> <email>   # select a seat; live moves are subject to the guards above
+acctsw run <codex|claude> [--key <id|label>] [--] [args...]  # supervised session (backing cx / cl)
+acctsw keys {add,list,remove,prove,models} ...               # manage BYOK API-key seats
+acctsw daemons [--fix] [--json]        # inspect or clean up orphaned Codex app-server daemons
 ```
 
-### Engine `acctsw` (the source of truth)
-Subcommands (also the menubar's backend, callable with `--json`):
-- `install` / `uninstall [--purge] [--dry-run]` — see Install/Uninstall below.
-- `add <tool>` — run the official login, snapshot resulting creds → keychain `<tool>:<email>`
-  (identity from Codex JWT email / `claude auth status`).
-- `remove <tool> <email>` — delete that keychain snapshot (and live creds if it's active).
-- `list` / `status [--json]` — accounts, active one, cached usage %, reset countdowns.
-- `usage refresh [--tool] [--json]` — fetch live usage (cached, backoff-aware) for the menubar.
-- `switch <tool> <email>` — the swap primitive (below). Used by menubar + auto-switch.
-- `run codex|claude [args…]` — supervised launcher with auto-switch + resume (below).
-- CLI aliases `cx` = `acctsw run codex`, `cl` = `acctsw run claude` (stock **binaries** in
-  `~/.local/bin` are never renamed/shadowed — `cx`/`cl` are added alongside, the real `codex`/
-  `claude` are untouched on disk).
-- **Zero-touch shell aliasing (opt-in, reversible):** for the "it just works" path, install can also
-  add shell *aliases* `codex=cx` / `claude=cl` so a plain `codex`/`claude` is supervised
-  (auto-switch + resume). This is a reversible shell alias, not a binary rename, and the app is the
-  master switch: when it's closed, `cx`/`cl` `exec` the stock tool, so aliased `codex`/`claude`
-  behave exactly like stock. The managed rc block is delimited by begin/end markers and removed by
-  `acctsw uninstall`.
-
-### Swap primitive (`switch`)
-1. **Sync-back first** (longevity-critical — Codex/Claude rotate refresh tokens): copy the
-   *current live* creds of the outgoing account back into its keychain snapshot.
-2. Install chosen blob into the canonical location **atomically** (temp + `rename()`, preserve `0600`):
-   - Codex → `~/.codex/auth.json`; Claude → `security add-generic-password -U -s "Claude Code-credentials"`.
-3. Update `state.json.active`.
-
-### Account selection logic (used by `run` and at launch)
-Available = `limited_until` null/past. Prefer current active if available; else first available.
-If **all limited** → pick **min(reset)** and report `"all limited; <email> unlocks in Xm (HH:MM)"`,
-launch anyway (works the moment it resets). "Unlock soonest" uses cached usage reset timestamps.
-
-### Supervised launcher (`run`, the core auto-switch + continuity)
-1. Select account, swap creds.
-2. Spawn the tool under a **PTY** (stdlib `pty`) so the TUI stays interactive while we tee output.
-3. **Attach to Codex's own session log** (`acctsw/rollout.py`): mtime-snapshot
-   `<CODEX_HOME>/sessions/**/rollout-*.jsonl` before spawn, diff after, confirm the match via
-   `session_meta.cwd` — a *resumed* thread keeps appending to its **original** dated file, so never
-   trust the date in the path. (Claude: `--continue`/session id; no structured source yet.)
-4. **Tick every ~2 s while the child runs** (cheap, no network) and decide on **structured** signals,
-   in this authority order:
-   1. **Rollout events** — `task_complete` with `error.codex_error_info == "usage_limit_exceeded"`;
-      `token_count` with `rate_limits.rate_limit_reached_type` set (e.g.
-      `workspace_member_credits_depleted`), `spend_control_reached`, or a window at 100%.
-      `credits.has_credits:false` is **not** a signal — healthy seats report it.
-   2. **Usage-endpoint flags** (`acctsw/usage.py`) — `rate_limit.allowed`, `rate_limit_reached_type`,
-      `spend_control.reached`, `plan_type`, `reset_after_seconds`: authoritative where percentages
-      are blind (credits-depleted returns *null* windows).
-   3. **Engine state** — a seat rested by **any** process (menubar poll, another launcher;
-      `limit_source` `usage`/`hard`, never our own weak `reactive` guess) makes the **running**
-      session hop and resume.
-   4. **stdout banners — hint/fallback only** — a match merely *triggers* a usage check, a fresh
-      structured "healthy" reading dismisses it, and the hard banner acts alone only when no session
-      log is attached.
-
-   Then: set `limited_until`, swap, **relaunch with resume** (`codex resume --last` /
-   `claude --resume`). Before a **hard** (credits/spend) hop the landing seat is pre-flighted with a
-   fresh usage fetch, so a workspace-wide outage can't ping-pong. Unchanged invariant: never abort a
-   live session without a confirmed limit **and** a free landing seat **and** switch budget; a manual
-   GUI switch of the active seat never kills a healthy run (one notice: *"still running on `<seat>`;
-   your new seat applies to the next session"*).
-5. On exit: sync-back refreshed creds, persist state.
-   *(Claude has no structured log to read yet — it relies on banners + the usage endpoint — but the
-   tick's state check (c) applies to it just the same.)*
-   *(For Claude, optionally install Claude Code hooks `Stop`/`PostToolUseFailure` for cleaner triggers.)*
-
 ---
 
-## Menubar app — design locked
+## 9. In-App Updater (`acctsw/updater.py`)
 
-The shipping web UI is **v15-roster**, built on v10-ambient's colour fields and rounded system
-type. A `pyobjc` `NSStatusItem` hosts a fixed **376×600 WKWebView**. `app/web/render.mjs` renders
-bridge state; `app.mjs` dispatches existing actions; `bundle.js` is generated by
-`scripts/build-web.py`. The Python engine owns account state, switching and spending consent.
+The menubar app checks `https://github.com/fheinfling/ai-guest-list/releases/latest/download/latest.json` automatically (requests throttled to once per 20 hours) and on demand via **… → check for updates**. When a newer version is available and the user clicks **update**:
 
-**Everyday glance:** a verdict comes first, followed by one open roster row per subscription and
-saved key. Active subscriptions lead across both tools, with heavier names and figures and the
-word “active.” Shared **5-hour left** and **weekly left** headings label remaining percentages,
-never consumption. Missing or unreported readings say **unknown**; stale figures say **last known**.
-Subscription identity is tool, seat and supplied plan, with no invented model. Key rows show the
-literal model when supplied, plus **paid per token / no app spend cap**.
-
-**Visual system:** `ui-rounded` with platform fallbacks; tabular numbers; no remote resources.
-Mint means ready, gold resting, coral spending, violet consent. Codex mint `#46c2a8` and Claude
-coral `#e0795a` retain distinct tool names and square/circular markers. Light uses deep green ink;
-dark uses warm-glow ink. The icon's faceted disco ball forms the open-room background. When
-`doorKey()` is `shut` on the non-spending, non-consent glance, the large, quiet cream door and gold
-knob replace it. Artwork is decorative and behind content. Both themes retain visible keyboard
-focus and reduced-motion support; the document stays fixed while internal bodies scroll.
-
-**Navigation and detail:** the header ＋ opens the subscription/API-key chooser; the adjacent
-menu holds settings and quit. The bottom **seat options** disclosure opens a scrolling sheet of
-native seat disclosures with quota provenance, window resets, switch/sign-in actions, key checks
-and removal. History comes last. Background polls preserve disclosure state by seat identity and
-menu purpose, restoring the open drawer before its scroll position. Navigation starts fresh.
-
-**Spending and consent:** running paid sessions have one visible section above the drawer, with
-an end button per pinned terminal and an explicit stop-all control. Sent turns may still bill.
-Consent leads with the decision, names the key and literal model, and makes prices secondary.
-Missing prices are stated plainly. Decline and approve use the same size, weight and shape;
-nothing is preselected, the real expiry is shown, and Escape declines. Paid use remains opt-in.
-The UI does not estimate session cost or claim an app spend cap.
-
-**Pushed views:** settings separates **switching**, **paid keys** and **appearance**, with brief
-row subtitles and longer explanations below each section. Auto-switch lives here. Subscription
-setup retains Codex browser sign-in, auth.json paste and existing-login import; Claude uses browser
-sign-in. Key setup retains provider/region/endpoint inputs, explicit unverified-endpoint consent,
-model selection and review. Model search stays pinned and keeps focus/caret as results change;
-free models are hidden behind a reversible checkbox, with catalog provenance shown once.
-Prices come from the supplied catalog and keep the shared CLI/web formatting contract.
-
-## ~~Headroom integration ("save credit" toggle)~~ — retired
-Planned, built, measured, removed. The toggle routed agents through a local Headroom
-context-compression proxy to stretch each seat's credit. On real traffic the saving was ~1–3%
-cache-adjusted (the 10.8% raw reduction was mostly shrinking tokens already billed at the 0.1×
-cached rate), and it cost a hundreds-of-MB ML install, a runtime `rtk` download, an unauditable
-native blob, a babysat version pin, and invasive edits to `~/.codex/config.toml` /
-`~/.claude/settings.json`. Not worth its fragility.
-
-What remains is `acctsw/headroom.py`'s idempotent `cleanup_legacy()`: on the next app launch or
-`cx`/`cl` run it strips leftover routing (restoring the snapshotted original config when present),
-stops an orphaned proxy by PID file, and deletes the managed venv. Full measurements and the
-migration path: [`SECURITY-headroom.md`](SECURITY-headroom.md).
-
----
-
-## Install & uninstall (both guaranteed non-breaking)
-- **`acctsw install`** — idempotent/additive: preflight (binaries, `security`, Python, PATH); create
-  `~/.account-switcher/{backups}` + empty `state.json`; **snapshot current live creds verbatim** into
-  `backups/` with a sha256 manifest; register the currently-logged-in account as the first switchable
-  account; install `acctsw`/`cx`/`cl` into `~/.local/bin` (**stock `codex`/`claude` binaries never
-  renamed/shadowed**); print summary + uninstall command. By default it does NOT edit the shell rc —
-  it WARNS if `~/.local/bin` isn't on PATH. Shell wiring (PATH + `codex`/`claude` aliases) is opt-in
-  via `acctsw install --path` / `acctsw path`, OR done once automatically on first menubar-app launch
-  (the app is the install) — both write only a marked, reversible block and surface a notification.
-- **`acctsw uninstall [--purge] [--dry-run]`** — sync-back active creds, then **restore**
-  `~/.codex/auth.json` and the Claude keychain item from `backups/` (verified vs manifest); remove
-  `acctsw`/`cx`/`cl` + menubar app; remove our managed rc block (the begin/end-delimited block we
-  added — only ours). Default keeps `~/.account-switcher/` for later reinstall; `--purge` also
-  deletes it and the `acct-switcher` keychain items → system exactly as before.
-- **Break-safety (both directions):** atomic `rename()` writes, every overwrite preceded by a
-  verified backup, rc edits confined to one reversible marked block (opt-in or first-launch, with a
-  notification) and removed by uninstall, stock CLI **binaries** never renamed/shadowed (shell
-  aliases are reversible and transparent when the app is closed), `--dry-run` prints all actions
-  without doing them, two accounts never active at once (sequential).
-
-## Files to create
-- `~/.local/bin/acctsw` — engine (Python 3, stdlib only). `~/.local/bin/{cx,cl}` — 1-line wrappers.
-- **Menubar app "ai guest list"**: `pyobjc` `NSStatusItem` + `WKWebView` popover loading the
-  cleaned-up `ai guest list` HTML/CSS (Hanken Grotesk + Space Mono bundled), JS↔Python bridge to
-  `acctsw`. Packaged to a `.app` (e.g. `py2app`). Source under `~/.account-switcher/app/`.
-- `~/.account-switcher/` (state + backups) at install; keychain items at `add`.
-- No existing file modified except, at switch time, the two canonical credential locations the
-  official tools already own.
-
-## Edge cases & safeguards
-- **Refresh-token rotation** → mandatory sync-back before every swap and on exit.
-- **Claude usage endpoint 429s** → cache, sparse polling, exponential backoff; degrade to
-  reactive-only detection if throttled. **Don't assume 7d** — use the returned reset timestamp.
-- **Limit message wording changes** (Codex CLI 0.153.4 reworded the out-of-credits banner) → the
-  regexes are a hint/fallback only; the trusted signals are the rollout events and the usage flags.
-  Launch-time selection works regardless.
-- **Two seats, one account** → seats are fingerprinted by the ChatGPT *user* id, so one person
-  signed in twice (Gmail `+alias`) is warned as one quota, while Team/Business members of one
-  workspace stay separate seats with their own 5h/weekly windows (only credits pool there, and
-  the launcher's hard-limit landing pre-flight already proves the landing seat).
-- **auth.json race during refresh** → atomic swap only between child runs.
-- **GUI apps** → the menubar's usage poll switches a confirmed-limited active seat only after a
-  fresh check proves another same-tool seat has headroom. Manual switching uses the same credential
-  primitive. The Codex restart setting gracefully quits and reopens an already-running desktop app;
-  continuing its existing thread may require sending a message. Terminal supervisors resume their
-  own sessions. The app does not force-quit a desktop app that refuses to exit.
-- **Usage freshness** → show both 5h and weekly windows, resets, and last-success age on every seat.
-  While the popover is open, active seats refresh every 30 seconds; background and inactive seats
-  keep a three-minute cadence. Backoff takes priority over that target. Network fetches run outside
-  the state lock, with identity checks before committing results; overlapping polls are coalesced.
-
-## Verification (end-to-end)
-
-CI runs the isolated engine and native callback tests on macOS 14/15/26, including Intel and Apple
-silicon, with Python 3.11 and 3.13. Intel and Apple-silicon jobs also build the standalone app and
-verify its executable architecture. Tests inject provider responses, Keychain contents, app
-identities, and process identities; no developer account or Codex installation is required. Actual
-process inspection is a separate integration test and skips where the host prohibits it. GitHub's
-hosted runners do not cover macOS 12/13, so those advertised minimum versions still require manual
-release verification. Desktop restart resolves Codex by bundle identifier rather than display name
-or installation directory.
-
-1. `acctsw install` (dry-run first) → backups + manifest written, stock `codex`/`claude` unaffected.
-2. `acctsw add codex` ×2 → `acctsw list` shows both emails (cross-check via JWT / `claude auth status`).
-3. `acctsw usage refresh --json` → real 5h/weekly % + reset times for each account (Codex `wham/usage`,
-   Claude `oauth/usage` with required headers). Menubar shows them.
-4. **Switch**: `acctsw switch codex <b>` → `codex login status` + JWT confirm B; switch back → A;
-   Codex.app reflects active account after restart.
-5. **Continuity dry-run** (no real limit): start `cx`, one turn, note rollout uuid; `Ctrl-C`;
-   `acctsw switch codex <b>`; `codex resume <uuid>` → same conversation continues under B.
-6. **Limit path**: use isolated test accounts and injected usage responses to exercise 100%,
-   provider out flags, no healthy spare, disabled auto-switch, and concurrent terminal handoff.
-   Verify a 97% reading alone does not move the account. On a naturally occurring live limit,
-   confirm the destination identity and session continuation; do not edit the live store to force it.
-7. **Legacy Headroom cleanup**: on a machine that had "save credit" on, the next app launch or
-   `cx`/`cl` run leaves no `model_provider = "headroom"` in `~/.codex/config.toml` and no loopback
-   `ANTHROPIC_BASE_URL` in `~/.claude/settings.json`; plain `codex`/`claude` reach the provider
-   directly. Cleanup never changes account state.
-8. **App**: "ai guest list" popover renders the design (fonts/colors/themes), dot reflects state
-   (fresh/resting/needs-hello), switch + add-a-seat + auto-switch drive the engine; notifications
-   fire on auto-switch.
-9. `acctsw uninstall` → `~/.codex/auth.json` + Claude keychain match `backups/` originals;
-   `--purge` leaves no trace (app, engine, state, keychain items all gone).
-
----
-
-## Implementation invariants (review-driven; honor in later milestones)
-- **Add-a-seat orchestration (M4/M6) MUST `sync_back(active)` BEFORE invoking the official login.**
-  The official `codex login` / `claude auth login` overwrites the live creds, so the previously
-  active seat's (possibly rotated) tokens must be snapshotted first or they are lost. `add()` runs
-  *after* login and cannot recover them.
-- **Unattended switching (M4 launcher) uses the Codex live-vs-active guard** in `switch.sync_back`
-  (skip sync-back when live creds belong to a different account than `state.active`).
-- **Per-account Codex homes hold exactly one real file, `auth.json`** (plus whatever the seat's own
-  app-server daemon keeps, and any parked `.orphaned-*` copy). Everything else in
-  `~/.account-switcher/ch/<id>/` is a symlink into the shared `~/.codex`, which stays the
-  source of truth for config and sessions. **SQLite sidecars (`-wal`/`-shm`/`-journal`) are never
-  linked** — SQLite resolves a symlinked database and writes them beside the real file, while a real
-  database next to linked sidecars fails every open with error 14. Real files a supervised child
-  created in a home are **promoted** into `~/.codex` on the next launch with no live codex session
-  (moving files under a running child is not worth the risk); a copy whose name `~/.codex` already
-  has is **parked** as `<name>.orphaned-<stamp>` — never deleted, never linked again.
-- **A home is named by hash and its root is two letters** because codex 0.157+ binds its app-server
-  daemon at `<CODEX_HOME>/app-server-control/app-server-control.sock` and connects to that literal
-  resolved path, which macOS caps at 104 bytes (`SUN_LEN`) — the old
-  `codex-homes/<address>` layout blew that budget and broke every launch. `codex-homes/<address>`
-  survives as a **by-address symlink** into `ch/<id>` (the index, and what a pre-1.0.2 child still
-  resolves through). **The daemon's runtime state is per-seat** — `app-server-control/` and
-  `app-server-daemon/` are never linked in from `~/.codex` and never promoted out to it, since one
-  daemon serves exactly one account's credentials.
-- **All timestamps are tz-aware** (`parse_iso` coerces naive→UTC) so selection comparisons never
-  raise.
-- **Real usage shapes (verified live):** Claude `oauth/usage` → `five_hour`/`seven_day`
-  `{utilization, resets_at}`. Codex `wham/usage` → `rate_limit.{primary,secondary}_window`
-  `{used_percent, reset_at(epoch)}` plus `rate_limit.limit_reached`.
+1. Using the checked manifest, the release zip is downloaded over HTTPS from allowlisted GitHub hosts (`github.com`, `release-assets.githubusercontent.com`, `objects.githubusercontent.com`) into `~/.account-switcher/updates/` (`0700`). The manifest is stored with updater status in `~/.account-switcher/update.json`.
+2. The zip's byte size and SHA-256 digest are verified against `latest.json`. Before extraction, member names are checked for traversal, absolute paths, and unexpected top-level entries, with entry-count and unpacked-size caps. After `ditto` extraction, `_check_layout` rejects links escaping the app and special files; symlinks contained within the app are allowed.
+3. The extracted `AI Guest List.app` is verified with `/usr/bin/codesign --verify --deep --strict -R` against the bundled designated requirement (`Contents/Resources/update-requirement.txt`), assessed with `/usr/sbin/spctl --assess --type execute`, and checked via `Info.plist`.
+4. A detached helper copies the staged app to `.<App>.app.new-<pid>` beside the running bundle and re-verifies it with `codesign`. It moves the current bundle to `.<App>.previous-<pid>.app`, replaces the bundle at its existing location, and launches it. That location must be writable and outside App Translocation. The helper rolls back if the new app fails to launch or `~/.account-switcher/update-ack` does not contain the new version within the acknowledgement wait.

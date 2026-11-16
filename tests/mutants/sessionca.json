@@ -65,8 +65,8 @@
  {
   "label": "validity too long",
   "file": "acctsw/sessionca.py",
-  "old": "_DAYS = 2",
-  "new": "_DAYS = 30",
+  "old": "_DAYS = 397",
+  "new": "_DAYS = 825",
   "test": [
    "tests/test_sessionca.py::test_ca_properties"
   ]

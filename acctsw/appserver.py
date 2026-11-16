@@ -335,25 +335,6 @@ class AppServer:
         if not self._initialized:
             raise ValueError("Initialize app-server before starting or resuming work")
 
-    def start_thread(self, *, model: str | None = None, model_provider: str | None = None) -> Any:
-        self._ready()
-        return self.request("thread/start", self._overrides(model, model_provider))
-
-    def resume_thread(self, thread_id: str, *, model: str | None = None,
-                      model_provider: str | None = None) -> Any:
-        self._ready()
-        return self.request("thread/resume", {"threadId": thread_id,
-                            **self._overrides(model, model_provider)})
-
-    @staticmethod
-    def _overrides(model: str | None, provider: str | None) -> dict:
-        params = {}
-        if model is not None:
-            params["model"] = model
-        if provider is not None:
-            params["modelProvider"] = provider
-        return params
-
     def start_turn(self, thread_id: str, text: str) -> Any:
         self._ready()
         return self.request("turn/start", {"threadId": thread_id,

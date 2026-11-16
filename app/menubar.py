@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import importlib
 import importlib.util
 import subprocess
@@ -53,7 +54,7 @@ try:
                         NSUserNotification, NSUserNotificationCenter, NSImage, NSWorkspace,
                         NSMenu, NSMenuItem, NSEventModifierFlagCommand, NSEventModifierFlagShift)
     from WebKit import WKWebView, WKWebViewConfiguration, WKUserContentController
-    from Foundation import NSObject, NSURL, NSTimer, NSMakeRect, NSMakeSize, NSBundle
+    from Foundation import NSObject, NSURL, NSTimer, NSMakeRect, NSMakeSize, NSBundle, NSLog
 except ImportError:  # allows importing this module's pure helpers without pyobjc installed
     objc = None
 
@@ -128,6 +129,34 @@ def resize_popover(popover, value, make_size):
 
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
+WEB_RELOAD_LIMIT = 3
+WEB_RELOAD_WINDOW_S = 60.0
+CLIENT_ERROR_LIMIT = 1024
+
+
+def _client_error_message(value):
+    """Bound untrusted diagnostics; never read state or Keychain to produce a log line.
+
+    Discard quoted values (JS often embeds input in TypeErrors), addresses, URLs, credential
+    assignments and token-shaped strings. Stack/source text is deliberately not logged.
+    """
+    if not isinstance(value, str):
+        return "unknown client error"
+    # Bound the input work and drop any token cut by that bound, then scrub before the log cap.
+    text = value[:8192]
+    if len(value) > len(text) and not value[len(text)].isspace():
+        text = re.sub(r"\S+$", "", text)
+    text = re.sub(r"(['\"`]).*?(?:\1|$)", "[redacted]", text, flags=re.S)
+    text = re.sub(r"\S*@\S*", "[redacted]", text)
+    text = re.sub(r"(?:https?|file)://\S+", "[redacted]", text, flags=re.I)
+    text = re.sub(r"\b(?:bearer\s+|[a-z_]*(?:key|secret|token|password|authorization)[a-z_]*\s*[:=]\s*)\S+",
+                  "[redacted]", text, flags=re.I)
+    text = re.sub(r"\beyJ[\w-]*\.[\w-]+\.[\w-]+", "[redacted]", text)
+    text = re.sub(r"\b(?:sk-|gh[pousr]_|xox[baprs]-)[\w-]*|[\w+/=-]{24,}",
+                  "[redacted]", text)
+    return " ".join(text.split())[:CLIENT_ERROR_LIMIT]
+
+
 # The open popover is the one place where a person is actively making a decision from the
 # numbers, so keep its cache moving promptly.  Hidden polling stays deliberately slower: both
 # usage endpoints throttle hard and the engine applies its own per-seat backoff as a second guard.
@@ -149,6 +178,7 @@ KEY_PRICING_URLS = {
     "anthropic": "https://www.anthropic.com/pricing",
     "openrouter": "https://openrouter.ai/models",
     "langdock": "https://www.langdock.com/pricing",
+    "langdock_anthropic": "https://www.langdock.com/pricing",
     "deepseek": "https://api-docs.deepseek.com/quick_start/pricing",
     "xai": "https://docs.x.ai/docs/models",
     "groq": "https://groq.com/pricing",
@@ -364,6 +394,8 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
             self.statusItem = None
             self.popover = None
             self.webview = None
+            self._web_failed = False
+            self._web_reload_times = []
             self._state_timer = None
             self._usage_timer = None
             self._usage_interval = None
@@ -476,9 +508,8 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
             ucc.addScriptMessageHandler_name_(self, "agl")
             cfg.setUserContentController_(ucc)
             self.webview = WKWebView.alloc().initWithFrame_configuration_(NSMakeRect(0, 0, 376, 220), cfg)
-            self.webview.loadFileURL_allowingReadAccessToURL_(
-                NSURL.fileURLWithPath_(str(WEB_DIR / "index.html")),
-                NSURL.fileURLWithPath_(str(WEB_DIR)))
+            self.webview.setNavigationDelegate_(self)
+            self._loadWebPage()
             vc = NSViewController.alloc().init()
             vc.setView_(self.webview)
             self.popover = NSPopover.alloc().init()
@@ -486,6 +517,36 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
             self.popover.setContentViewController_(vc)
             self.popover.setContentSize_(NSMakeSize(376, 220))  # match the 376px popover width
             self.popover.setBehavior_(1)  # NSPopoverBehaviorTransient
+
+        @objc.python_method
+        def _loadWebPage(self):
+            self.webview.loadFileURL_allowingReadAccessToURL_(
+                NSURL.fileURLWithPath_(str(WEB_DIR / "index.html")),
+                NSURL.fileURLWithPath_(str(WEB_DIR)))
+
+        @objc.python_method
+        def _reloadWebPage(self):
+            at = time.monotonic()
+            self._web_reload_times = [t for t in self._web_reload_times
+                                      if at - t < WEB_RELOAD_WINDOW_S]
+            if len(self._web_reload_times) >= WEB_RELOAD_LIMIT:
+                NSLog("[agl web] reload limit reached; leaving page for later retry")
+                if self.webview:
+                    # The renderer may be broken; update only the independent fallback's text.
+                    self.webview.evaluateJavaScript_completionHandler_(
+                        '(() => { const text = document.querySelector(\'#root [role="alert"] p\'); '
+                        'if (text) text.textContent = "still not drawing — try again in a minute"; })();',
+                        None)
+                return
+            self._web_reload_times.append(at)
+            self._loadWebPage()
+            # Keep _web_failed until JS confirms a successful render. didFinishNavigation alone
+            # says nothing about whether the page drew; every load sends ready for fresh state.
+
+        def webViewWebContentProcessDidTerminate_(self, webview):
+            self._web_failed = True
+            NSLog("[agl web] web content process terminated")
+            self._reloadWebPage()
 
         @objc.python_method
         def _setUsagePollInterval(self, interval):
@@ -510,6 +571,8 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
                 self._setWebVisible(False)
                 self.popover.performClose_(sender)
             else:
+                if getattr(self, "_web_failed", False):
+                    self._reloadWebPage()
                 btn = self.statusItem.button()
                 self.popover.showRelativeToRect_ofView_preferredEdge_(btn.bounds(), btn, 1)
                 self._setWebVisible(True)
@@ -533,12 +596,6 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
             self._state_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
                 STATE_POLL_SECONDS, self, objc.selector(self.pollState_, signature=b"v@:@"), None, True)
             self.pollState_(None)
-
-        @objc.python_method
-        def _stopStateTimer(self):
-            if self._state_timer is not None:
-                self._state_timer.invalidate()
-                self._state_timer = None
 
         @objc.python_method
         def _stateSignature(self):
@@ -684,7 +741,7 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
                 # prepare_then_login resolves this app's engine and launches isolated sign-in
                 # via `open` — no AppleEvents/Automation permission.
                 from app.terminal import prepare_then_login
-                prepare_then_login(self.ctx, tool, seat=msg.get("email"))
+                prepare_then_login(self.ctx, tool, seat=msg.get("email"), name=msg.get("name"))
             except Exception as e:
                 _log_exception(e)
                 # Launch failed. If a NEWER login for this tool has since superseded us (op identity),
@@ -708,7 +765,7 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
                 objc.selector(self.loginNudge_, signature=b"v@:@"), None, False)
 
         def loginNudge_(self, _arg):
-            self._notify("finish signing in", "then tap ‘save my seat’ 🎟️")
+            self._notify("finish signing in", "your seat will be saved automatically 🎟️")
 
         def addBg_(self, msg):
             # `paste`/`snapshot` verify creds against the provider (Claude shells out / hits the
@@ -866,14 +923,27 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
                 _log_exception(exc)
                 return
             action = msg.get("action")
+            if action == "client_error":
+                self._web_failed = True
+                NSLog("[agl web] client_error: %@", _client_error_message(msg.get("message")))
+                return
+            if action == "client_health":
+                self._web_failed = msg.get("ok") is not True
+                # A reloaded hidden webview starts with no countdown timer. Restore visibility
+                # after it can receive JS, including recovery while the popover is still open.
+                if not self._web_failed:
+                    self._setWebVisible(bool(self.popover and self.popover.isShown()))
+                return
+            if action == "reload":
+                self._web_failed = True
+                self._reloadWebPage()
+                return
             if action == "resize":
                 resize_popover(self.popover, msg.get("height"), NSMakeSize)
                 return
             if action == "quit":
                 NSApplication.sharedApplication().terminate_(self)
                 return
-            if action == "settings":
-                return  # reserved
             if action == "key_pricing":
                 url = KEY_PRICING_URLS.get(msg.get("provider"))
                 if url:

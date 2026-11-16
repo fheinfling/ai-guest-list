@@ -6,29 +6,7 @@ export const TOOL_META = {
   claude: { label: "Claude", plan: "CLAUDE CODE", accent: "var(--claude)" },     // coral
 };
 
-// menu-bar aggregate dot (spec §9): rose=needs a hello · gold=just switched · amber=a seat
-// resting · green=everyone fresh.
-const DOT_COPY = {
-  hello: { label: "needs a hello" }, switched: { label: "just switched you" },
-  amber: { label: "a seat's resting" }, green: { label: "everyone's fresh" },
-};
-
-export function dotState(state) {
-  const key = state?.dot || dotKey(state);
-  return { key, ...DOT_COPY[key] };
-}
-
-export function dotKey(state) {
-  const seats = ["codex", "claude"].flatMap((t) => state?.tools?.[t]?.seats || []);
-  if (seats.some((s) => (s.status || "") === "needs-login")) return "hello";
-  if (state?.recently_switched) return "switched";
-  // Mirror acctsw.web_dot (shared golden fixtures): a terminal cannot free quota, so use status
-  // just like the header counts.
-  if (seats.some((s) => ["resting", "queued"].includes(s.status))) return "amber";
-  return "green";
-}
-
-// Door open/shut — mirror of acctsw.web_dot.door_for (golden fixture keeps them in lockstep).
+// Door open/shut — the shared golden fixture keeps this fallback aligned with the engine.
 export function doorKey(state) {
   if (state?.door === "open" || state?.door === "shut") return state.door;
   const seats = ["codex", "claude"].flatMap((t) => state?.tools?.[t]?.seats || []);
@@ -98,12 +76,6 @@ export function pct(seat, win) {
   const v = win === "5h" ? seat?.usage5h : seat?.usageWeek;
   const raw = v != null ? v : (seat?.usage?.windows?.[win]?.used_pct);
   return typeof raw === "number" ? Math.max(0, Math.min(100, raw)) : null;
-}
-
-export function creditLeft(seat) {
-  if (seat?.usage_unknown) return null;
-  const used = ["5h", "weekly"].map((w) => pct(seat, w)).filter((v) => v !== null);
-  return used.length ? Math.round(100 - Math.max(...used)) : null;
 }
 
 export function fmtCountdown(iso, now = Date.now()) {
@@ -328,7 +300,18 @@ export function reduceReply(ui, res) {
   // login the user abandoned (possibly for the other provider) must not steer the flow they restarted.
   // (res.tool may be absent on a generic failure; then fall back to "current flow".)
   const forThisFlow = inAdd && res.add_op && (res.tool == null || res.tool === add.provider);
-  if (res.added && forThisFlow && add.pending) { // OUR paste/snapshot/import succeeded → celebrate then done
+  // Official sign-in captures and activates the seat itself, even with the popover closed.
+  // Accept only a current snapshot and a newly signed-in active seat of this flow's provider.
+  const browserSaved = inAdd && add.step === "connecting" && !addUsesPaste(add) && !add.importing
+    && add.loginSeats && res.state === state && (state.tools?.[add.provider]?.seats || []).find((seat) => {
+      if (!isActive(seat) || signedOut(seat) || signinNeeded(seat) || (add.email && seat.email !== add.email)) return false;
+      const before = add.loginSeats.find((s) => s.email === seat.email);
+      // A transient 401 can clear on the current seat while a generic add is still signing in.
+      return !before || signedOut(before) || (add.email && signinNeeded(before))
+        || (add.email && Date.parse(seat.signin_expires_at) > Date.parse(before.signin_expires_at));
+    });
+  if ((res.added && forThisFlow && add.pending) || browserSaved) {
+    add.savedEmail = browserSaved?.email || res.added;
     add.pending = false; add.importing = false; add.step = "done";
     addChanged = true; closeFlow = add;        // caller schedules the auto-close, scoped to this flow
   }
@@ -429,7 +412,7 @@ function addDetailsStep(add, state) {
     <section class="set-sec">
       <span class="set-label">name this seat</span>
       <div class="set-card">
-        <input id="add-name" aria-label="seat name" class="add-input" placeholder="Work, Personal, Late-night" value="${esc(add.name)}">
+        <input id="add-name" aria-label="seat name" class="add-input" maxlength="32" placeholder="Work, Personal, Late-night" value="${esc(add.name)}">
       </div>
     </section>
     ${methodSection}
@@ -437,16 +420,15 @@ function addDetailsStep(add, state) {
 }
 
 function addConnectingStep(add) {
-  // A browser sign-in first WAITS for the user to finish in the browser and tap "save my seat"; only
-  // then (add.pending) is a snapshot in flight. A codex auth.json paste is always actively saving.
-  // Spinner + "saving…" copy show only when something is really in
-  // flight — a lone spinner while we wait on the user would read as "hung".
+  // Browser sign-in saves automatically in the engine. Keep the manual snapshot as a fallback;
+  // add.pending means that snapshot is in flight. A codex auth.json paste is actively saving too.
+  // Show a spinner only for those in-app saves while the browser waits on the user.
   const terminalFlow = !addUsesPaste(add) && !add.importing;  // a browser sign-in waits on the user
   const saving = !terminalFlow || add.pending;
   const title = saving ? "saving your seat…" : "we opened your browser…";
   const sub = saving ? "tucking it away safely 💛" : "say hi over there and you're on the list 💛";
   const spin = saving ? `<div class="add-spin"></div>` : "";
-  // The "save my seat" handshake is only for the browser flow; a paste/import is already saving.
+  // The optional snapshot is only for the browser flow; a paste/import is already saving.
   const cta = terminalFlow
     ? `<button class="add-cta" data-action="add-save"${add.pending ? " disabled" : ""}>save my seat 💛</button>`
     : "";
@@ -454,9 +436,11 @@ function addConnectingStep(add) {
     <div class="add-h">${title}</div><div class="add-sub">${sub}</div>${cta}</div>`;
 }
 
-function addDoneStep(add) {
+function addDoneStep(add, state) {
+  const saved = state?.tools?.[add.provider]?.seats?.find((seat) => seat.email === (add.savedEmail || add.email));
+  const name = normalizeSeatName(saved?.name || add.name || "") || "new seat";
   return `<div class="add-center add-center--done"><div class="add-heart">💛</div>
-    <div class="add-welcome">welcome, ${esc(add.name.trim() || "new seat")}</div>
+    <div class="add-welcome">welcome, ${esc(name)}</div>
     <div class="add-sub">your seat's saved — i'll keep it warm</div></div>`;
 }
 
@@ -470,7 +454,7 @@ export function buildAddSeat(state, add) {
     ? `<button class="add-cancel" data-action="add-cancel">cancel</button>` : "";
   const body = step === "details" ? addDetailsStep(add, state)
     : step === "connecting" ? addConnectingStep(add)
-    : step === "done" ? addDoneStep(add)
+    : step === "done" ? addDoneStep(add, state)
     : addProviderStep();
   return `<div class="app set-app add-app theme-${theme}"${accent}>
     <header class="set-head">
@@ -485,10 +469,6 @@ export function buildAddSeat(state, add) {
 // Settings sub-view building blocks (spec §9.1): grouped iOS-style cards, every row a subtitle,
 // segmented controls full-width on their own line. Friendly labels are display-only — data-value
 // carries the real persisted value the bridge validates.
-const STRATEGY_OPTS = [
-  { v: "most_headroom", label: "most headroom" },
-  { v: "soonest_back", label: "soonest back" },
-];
 const THEME_OPTS = [{ v: "light", label: "light" }, { v: "dark", label: "dark" }];
 
 // A toggle row: title and subtitle, explicit on/off text, and a 38×24 switch.
@@ -512,14 +492,12 @@ function segBlock(label, hint, action, current, options) {
 export function buildSettings(state) {
   const s = state?.settings || {};
   const theme = s.theme === "dark" ? "dark" : "light";
-  const strat = s.strategy === "most_headroom" ? "most_headroom" : "soonest_back";
   const app = state?.app;
   const version = app ? `v${app.version}${app.build && app.build !== "dev" ? ` · build ${app.build}` : ""}` : "";
   const newer = state?.update?.version ? ` · ${state.update.version} available` : "";
   return `<div class="app set-app theme-${theme}"><header class="set-head"><button class="set-back" data-action="settings-back" aria-label="back">‹</button><span class="set-title">settings</span><button class="set-done" data-action="settings-back">done</button></header>
     <div class="set-body"><section class="set-sec"><h1 class="set-label">switching</h1>
       ${toggleRow("auto_switch", "auto-switch", "move when a seat runs out", s.auto_switch)}
-      ${segBlock("choose the next seat", "", "set_strategy", strat, STRATEGY_OPTS)}
       ${toggleRow("supervise_shell", "supervise terminals", "include codex and claude commands", s.supervise_shell !== false)}
       ${toggleRow("engine_restart", "restart idle sessions after an update", "same terminal, the conversation resumes", s.engine_restart !== false)}
       ${toggleRow("notify", "notify when switched", "show which seat is ready", s.notify)}
@@ -537,7 +515,7 @@ export function buildSettings(state) {
     </section><section class="set-sec"><h2 class="set-label">appearance</h2>
       ${segBlock("theme", "", "set_theme", theme, THEME_OPTS)}
       <div class="set-legend"><p>in your menu bar</p><div>${doorMark({door:"open"})}<span>a model is free</span></div><div>${doorMark({door:"shut"})}<span>every seat is resting</span></div>
-      <p>gold: just switched you</p><p>rose: sign-in needed</p></div>
+      </div>
     </section><p class="set-ver">ai guest list ${esc(version + newer)}</p></div></div>`;
 }
 
@@ -888,13 +866,12 @@ export function buildHTML(state, pendingSwitch = null, openDetails = new Set(), 
   const tools = [...new Set(["codex", "claude", ...(state.keys || []).map((k) => k.harness || "codex"), ...(state.pending_crossings || []).map((r) => r.tool), ...(state.pending_tier_requests || []).map((r) => r.tool)])];
   const plans = tools.map((tool) => toolPlan(tool, state)).filter((p) => p.seats.length || p.keys.length || (state.pending_crossings || []).some((r) => r.tool === p.tool) || (state.pending_tier_requests || []).some((r) => r.tool === p.tool));
   const emptyWithoutWelcome = !seats.length && !state?.keys?.length && (plans.length || asking);
-  const strategy = state?.settings?.strategy === "most_headroom" ? "most headroom first" : "soonest back first";
   return `<div class="app ambient-app now-next theme-${theme} mood-${mood}">
     <header class="top"><span class="brand">${appIcon()}</span>${headerVerdict(state)}<div class="top-actions">
       <div class="header-menu"><button class="ibtn" data-action="menu" data-menu="add" aria-label="add a subscription seat or API key" aria-haspopup="menu" aria-expanded="false">${ICON.plus}</button><nav class="menu" role="menu" aria-label="add" hidden><button role="menuitem" data-action="add" data-tool="codex">codex seat <span class="sub">sign in</span></button><button role="menuitem" data-action="add" data-tool="claude">claude seat <span class="sub">sign in</span></button><hr><button role="menuitem" data-action="key-start">api key <span class="sub">paid</span></button><button role="menuitem" data-action="add">a subscription seat</button></nav></div>
-      <div class="header-menu"><button class="ibtn" data-action="menu" data-menu="more" aria-label="app menu" aria-haspopup="menu" aria-expanded="false">${ICON.more}</button><nav class="menu" role="menu" aria-label="more" hidden><button role="menuitemcheckbox" aria-checked="${!!state?.settings?.auto_switch}" data-action="toggle" data-key="auto_switch">auto-switch <span class="sub">${state?.settings?.auto_switch ? "on" : "off"}</span></button><button role="menuitem" data-action="set_strategy" data-value="${state?.settings?.strategy === "most_headroom" ? "soonest_back" : "most_headroom"}">next seat <span class="sub">${strategy.replace(" first", "")}</span></button><hr><button role="menuitem" data-action="update-check">check for updates</button><button role="menuitem" data-action="settings">settings…</button><button role="menuitem" data-action="quit">quit</button></nav></div></div></header>
+      <div class="header-menu"><button class="ibtn" data-action="menu" data-menu="more" aria-label="app menu" aria-haspopup="menu" aria-expanded="false">${ICON.more}</button><nav class="menu" role="menu" aria-label="more" hidden><button role="menuitemcheckbox" aria-checked="${!!state?.settings?.auto_switch}" data-action="toggle" data-key="auto_switch">auto-switch <span class="sub">${state?.settings?.auto_switch ? "on" : "off"}</span></button><hr><button role="menuitem" data-action="update-check">check for updates</button><button role="menuitem" data-action="settings">settings…</button><button role="menuitem" data-action="quit">quit</button></nav></div></div></header>
     <div class="body" aria-label="seat availability" tabindex="0"><div class="content">${problems ? `<div class="app-problems">${problems}</div>` : ""}${update ? `<div class="app-notes">${update}</div>` : ""}${prompts}${paid ? paidUseControl(state) : ""}${plans.length ? `<div class="field">${plans.map((p) => toolBlock(p, state, pendingSwitch, openDetails, nameEdits)).join("")}</div><div class="sheet">${plans.map((p) => listRows(p, state, openDetails, nameEdits)).join("")}</div>` : !asking ? `<div class="field welcome"><p class="welcome-title">no seats yet</p><p>use ＋ above to add a subscription or API key.</p><button class="act act--strong" data-action="add">add a seat</button></div>` : ""}${emptyWithoutWelcome ? `<p class="empty">use ＋ above to add a subscription or API key.</p>` : ""}</div></div>
-    <footer class="foot">${ICON.switch}<span class="footer-status" role="status" aria-live="polite">${state?.settings?.auto_switch ? `auto-switch on, ${strategy}` : "auto-switch off, you switch by hand"}</span></footer></div>`;
+    <footer class="foot">${ICON.switch}<span class="footer-status" role="status" aria-live="polite">${state?.settings?.auto_switch ? "auto-switch on, moves when a seat runs out" : "auto-switch off, you switch by hand"}</span></footer></div>`;
 }
 
 function paidUseControl(state) {
@@ -922,14 +899,14 @@ export function pinnedSessions(state) {
 // Key providers mirror providers.py's harness gate: chat-only catalogs are not usable seats.
 // No price table lives here. Every amount comes from a bridge price envelope.
 export const KEY_PROVIDERS = {
-  openai: { name: "openai", harness: "codex", pricing: "https://openai.com/api/pricing/" },
-  anthropic: { name: "anthropic", harness: "claude", pricing: "https://www.anthropic.com/pricing" },
-  openrouter: { name: "openrouter", harness: "codex", priced: true, pricing: "https://openrouter.ai/models" },
-  langdock: { name: "langdock (openai models)", harness: "codex", regional: true, pricing: "https://www.langdock.com/pricing" },
-  langdock_anthropic: { name: "langdock (claude models)", harness: "claude", regional: true, pricing: "https://www.langdock.com/pricing" },
-  deepseek: { name: "deepseek", harness: "codex", pricing: "https://api-docs.deepseek.com/quick_start/pricing" },
-  xai: { name: "xai", harness: "codex", priced: true, pricing: "https://docs.x.ai/docs/models" },
-  groq: { name: "groq", harness: "codex", unverified: true, pricing: "https://groq.com/pricing" },
+  openai: { name: "openai", harness: "codex", pricing: true },
+  anthropic: { name: "anthropic", harness: "claude", pricing: true },
+  openrouter: { name: "openrouter", harness: "codex", priced: true, pricing: true },
+  langdock: { name: "langdock (openai models)", harness: "codex", regional: true, pricing: true },
+  langdock_anthropic: { name: "langdock (claude models)", harness: "claude", regional: true, pricing: true },
+  deepseek: { name: "deepseek", harness: "codex", pricing: true },
+  xai: { name: "xai", harness: "codex", priced: true, pricing: true },
+  groq: { name: "groq", harness: "codex", unverified: true, pricing: true },
   openai_compatible: { name: "openai-compatible", harness: "codex", unverified: true },
 };
 

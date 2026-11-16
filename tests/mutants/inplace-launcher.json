@@ -306,8 +306,8 @@
   {
     "label": "integration: SeatSwap.env does not point the child at the proxy",
     "file": "acctsw/seatswap.py",
-    "old": "        out[\"HTTPS_PROXY\"] = out[\"https_proxy\"] = self.proxy_url\n",
-    "new": "",
+    "old": "        overrides = {\"HTTPS_PROXY\": self.proxy_url, \"https_proxy\": self.proxy_url}\n",
+    "new": "        overrides = {}\n",
     "test": [
       "tests/test_inplace_integration.py::test_limit_moves_the_live_child_to_a_same_kind_seat"
     ]
@@ -531,8 +531,8 @@
   {
     "label": "round2 N2: a decision raising from the state tick unwinds the spawn",
     "file": "acctsw/launcher.py",
-    "old": "                return _guarded(_tick_state) or _guarded(_tick_recover)",
-    "new": "                return _tick_state() or _guarded(_tick_recover)",
+    "old": "                return (_guarded(_tick_state) or _guarded(_tick_recover)",
+    "new": "                return (_tick_state() or _guarded(_tick_recover)",
     "test": [
       "tests/test_launcher_inplace.py::test_a_decision_that_raises_never_unwinds_the_child"
     ]
@@ -724,7 +724,7 @@
   {
     "label": "tls: a rejection restarts the child even though its traffic went through",
     "file": "acctsw/launcher.py",
-    "old": "                        and (why == \"upstream\" or not _swapcall(\"proxy_used\", default=False))):",
+    "old": "                        and (why == \"upstream\" or expired\n                             or not _swapcall(\"proxy_used\", default=False))):",
     "new": "                        and True):",
     "test": [
       "tests/test_launcher_inplace.py::test_a_rejected_certificate_after_traffic_only_stops_the_hops"
@@ -823,8 +823,8 @@
   {
     "label": "B2(a): the restart notice blames a tool again",
     "file": "acctsw/launcher.py",
-    "old": "                       + (\"Claude Code didn't accept the session certificate\"",
-    "new": "                       + (\"a tool in it didn't accept the switch's certificate\"",
+    "old": "                           else \"Claude Code didn't accept the session certificate\")",
+    "new": "                           else \"a tool in it didn't accept the switch's certificate\")",
     "test": [
       "tests/test_launcher_inplace.py::test_a_brand_new_session_whose_certificate_is_rejected_starts_over_as_launched"
     ]
@@ -832,7 +832,7 @@
   {
     "label": "W1: a rejection after a good handshake still restarts the child",
     "file": "acctsw/launcher.py",
-    "old": "                    other_tool = (_swapcall(\"intercepts_ok\", default=0) or 0) > 0\n",
+    "old": "                    other_tool = not expired and (_swapcall(\"intercepts_ok\", default=0) or 0) > 0\n",
     "new": "                    other_tool = False\n",
     "test": [
       "tests/test_launcher_inplace.py::test_a_rejection_after_a_good_handshake_is_another_tool_and_never_restarts"
@@ -896,8 +896,8 @@
   {
     "label": "W3: an unreachable API after messages went through only stops the hops",
     "file": "acctsw/launcher.py",
-    "old": "                        and (why == \"upstream\" or not _swapcall(\"proxy_used\", default=False))):",
-    "new": "                        and not _swapcall(\"proxy_used\", default=False)):",
+    "old": "                        and (why == \"upstream\" or expired\n                             or not _swapcall(\"proxy_used\", default=False))):",
+    "new": "                        and (expired or not _swapcall(\"proxy_used\", default=False))):",
     "test": [
       "tests/test_launcher_inplace.py::test_an_unreachable_api_restarts_once_even_after_messages_went_through"
     ]

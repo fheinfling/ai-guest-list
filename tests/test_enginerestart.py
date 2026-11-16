@@ -12,7 +12,6 @@ from acctsw.enginerestart import (
     newer_writer,
     restart_args,
     target_engine,
-    visible_input,
 )
 
 THREAD = "7383292b-d447-4279-b899-1634d45286dd"
@@ -30,48 +29,47 @@ def test_engine_restart_carries_argv():
     assert exc.argv == argv and exc.argv is not argv
 
 
-# --- visible_input ------------------------------------------------------------------------------
+# --- the production input scanner ---------------------------------------------------------------
 
-@pytest.mark.parametrize("seq", [
-    b"\x1b[I", b"\x1b[O",                  # focus
-    b"\x1b[A", b"\x1b[1;5C", b"\x1b[3~",   # arrows, modified arrows, delete
-    b"\x1b[<35;86;2M", b"\x1b[<0;1;1m",    # SGR mouse
-    b"\x1b[M !!",                          # legacy mouse
-    b"\x1b[32;5;5M",                       # urxvt mouse
-    b"\x1bOA", b"\x1bOP",                  # SS3
-    b"\x1b]11;rgb:0/0/0\x07",              # OSC, BEL
-    b"\x1b]11;rgb:0/0/0\x1b\\",            # OSC, ST
-    b"\x1bP>|xterm\x1b\\",                 # DCS
-    b"\x1bb",                              # Alt+b
-    b"\x1b\r",                             # Alt+Enter
-    b"\x1b",                               # lone Esc
+@pytest.mark.parametrize("seq,kind", [
+    (b"\x1b[I", "passive"), (b"\x1b[O", "passive"),
+    (b"\x1b[A", "typed"), (b"\x1b[1;5C", "typed"), (b"\x1b[3~", "typed"),
+    (b"\x1b[<35;86;2M", "passive"), (b"\x1b[<0;1;1m", "passive"),
+    (b"\x1b[M !!", "passive"), (b"\x1b[32;5;5M", "passive"),
+    (b"\x1bOA", "typed"), (b"\x1bOP", "typed"),
+    (b"\x1b]11;rgb:0/0/0\x07", "passive"), (b"\x1b]11;rgb:0/0/0\x1b\\", "passive"),
+    (b"\x1bP>|xterm\x1b\\", "passive"),
+    (b"\x1bb", "typed"), (b"\x1b\r", "typed"),
 ])
-def test_visible_input_strips_sequences(seq):
-    assert visible_input(seq) == b""
-    assert visible_input(b"a" + seq) == b"a"
+def test_scan_classifies_sequences(seq, kind):
+    assert er._scan(seq) == ([(kind, seq)], b"")
+    assert er._scan(b"a" + seq) == ([("text", b"a"), (kind, seq)], b"")
 
 
-def test_visible_input_keeps_text_around_sequences():
-    assert visible_input(b"a\x1b[Ib\x1bOAc\x1b]0;x\x07d\r") == b"abcd\r"
+def test_scan_keeps_text_around_sequences():
+    assert er._scan(b"a\x1b[Ib\x1bOAc\x1b]0;x\x07d\r") == ([
+        ("text", b"a"), ("passive", b"\x1b[I"), ("text", b"b"), ("typed", b"\x1bOA"),
+        ("text", b"c"), ("passive", b"\x1b]0;x\x07"), ("text", b"d\r")], b"")
 
 
-def test_visible_input_keeps_pasted_text_but_not_markers():
-    assert visible_input(b"\x1b[200~pasted\ntext\x1b[201~") == b"pasted\ntext"
+def test_scan_marks_pasted_text():
+    assert er._scan(b"\x1b[200~pasted\ntext\x1b[201~") == ([
+        ("paste_on", b"\x1b[200~"), ("text", b"pasted\ntext"),
+        ("paste_off", b"\x1b[201~")], b"")
 
 
-def test_visible_input_keeps_controls_and_utf8():
-    assert visible_input(b"\x7f\x03") == b"\x7f\x03"
-    assert visible_input("é".encode()) == "é".encode()
+@pytest.mark.parametrize("data", [b"\x7f\x03", "é".encode()])
+def test_scan_keeps_controls_and_utf8(data):
+    assert er._scan(data) == ([("text", data)], b"")
 
 
-def test_visible_input_drops_a_cut_off_sequence():
-    assert visible_input(b"a\x1b[<35;8") == b"a"
-    assert visible_input(b"a\x1b]0;tit") == b"a"
-    assert visible_input(b"a\x1b[M !") == b"a"
+@pytest.mark.parametrize("seq", [b"\x1b[<35;8", b"\x1b]0;tit", b"\x1b[M !", b"\x1b"])
+def test_scan_preserves_a_cut_off_sequence_for_the_next_read(seq):
+    assert er._scan(b"a" + seq) == ([("text", b"a")], seq)
 
 
-def test_visible_input_empty():
-    assert visible_input(b"") == b""
+def test_scan_empty():
+    assert er._scan(b"") == ([], b"")
 
 
 # --- InputTracker -------------------------------------------------------------------------------

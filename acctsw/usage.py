@@ -86,10 +86,6 @@ class Usage:
                         for k, w in self.windows.items()},
         }
 
-    def soonest_reset(self) -> str | None:
-        resets = [w.resets_at for w in self.windows.values() if w.resets_at]
-        return min(resets) if resets else None
-
 
 @dataclass(frozen=True)
 class UsageFetchJob:

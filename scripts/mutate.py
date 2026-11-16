@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -47,15 +48,52 @@ SKIP = shutil.ignore_patterns(".venv", ".git", ".wt", "node_modules", "__pycache
                               ".pytest_cache", ".playwright-mcp")
 
 
-def _run(entry: dict) -> tuple[str, str]:
-    original = (ROOT / entry["file"]).read_text()
-    if original.count(entry["old"]) != 1:
-        return "NO-OP", f"'old' occurs {original.count(entry['old'])}x in {entry['file']}"
+def _check_target(entry: dict, root: Path = ROOT) -> tuple[str, str] | None:
+    original = (root / entry["file"]).read_text()
+    count = original.count(entry["old"])
+    if count != 1:
+        return "NO-OP", f"'old' occurs {count}x in {entry['file']}"
+    return None
+
+
+def _no_tests_ran(returncode: int, out: str) -> bool:
+    if returncode == 5 or "no tests ran" in out:
+        return True
+    if not re.search(r"(?m)^TAP version \d+$", out):
+        return False
+    passed = [int(n) for n in re.findall(r"(?m)^# pass (\d+)$", out)]
+    failed = [int(n) for n in re.findall(r"(?m)^# fail (\d+)$", out)]
+    if not (passed and failed):
+        return False
+    # Node 20 reports unselected tests as skipped (pass 0, fail 0). Node 22+ instead reports a file
+    # that ran no tests as one passing pseudo-test named after the file, right after its empty plan:
+    # "1..0" / "# Subtest: x.test.mjs" / "ok N - x.test.mjs". Those wrappers are not tests.
+    empty_files = len(re.findall(r"(?m)^1\.\.0\n# Subtest: ", out))
+    return sum(passed) + sum(failed) - empty_files <= 0
+
+
+def _prepare_cmd(entry: dict) -> list[str]:
     if "cmd" in entry:
-        cmd = entry["cmd"]
-    else:
-        cmd = [PY, "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider", "-p", "no:warnings",
-               *entry["test"]]
+        cmd = [a for a in entry["cmd"] if not a.startswith("--test-reporter")]
+        if len(cmd) >= 2 and Path(cmd[0]).name == "node" and "--test" in cmd:
+            cmd.insert(cmd.index("--test") + 1, "--test-reporter=tap")
+        elif len(cmd) >= 3 and Path(cmd[0]).name == "sh" and cmd[1] == "-c":
+            def tap(match):
+                args = re.sub(r"\s+--test-reporter(?:=\S+|\s+\S+)", "", match[2])
+                return match[1] + " --test-reporter=tap" + args
+
+            cmd[2] = re.sub(r"(?<![\w-])(node\s+--test)(?=\s|$)([^;&|]*)", tap, cmd[2])
+        return cmd
+    return [PY, "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider", "-p", "no:warnings",
+            *entry["test"]]
+
+
+def _run(entry: dict) -> tuple[str, str]:
+    noop = _check_target(entry, ROOT)
+    if noop is not None:
+        return noop
+    original = (ROOT / entry["file"]).read_text()
+    cmd = _prepare_cmd(entry)
     with tempfile.TemporaryDirectory(prefix="mutate-") as tmp:
         tree = Path(tmp) / "tree"
         shutil.copytree(ROOT, tree, ignore=SKIP, symlinks=True)
@@ -70,7 +108,7 @@ def _run(entry: dict) -> tuple[str, str]:
         except subprocess.TimeoutExpired:
             return "TIMEOUT", f"guard ran past {TIMEOUT_S}s"
     out = res.stdout + res.stderr
-    if res.returncode == 5 or "no tests ran" in out:
+    if _no_tests_ran(res.returncode, out):
         return "NO-TEST", "the selection matched nothing"
     if res.returncode != 0 and any(m in out for m in INVALID_MARKERS):
         return "INVALID", "mutant does not load"

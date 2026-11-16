@@ -42,8 +42,9 @@ It's two thin pieces over your stock tools:
 - a **menubar app** showing live usage + a one-glance status, and
 - supervised `cx` / `cl` launchers that wrap stock `codex` / `claude` and do the hop for you.
 
-Your stock `codex` / `claude` and their desktop apps keep working **untouched**. Saved credentials
-stay in the **macOS Keychain** and the official tools’ credential stores.
+Your stock `codex` / `claude` and their desktop apps keep working **untouched**. Claude seat snapshots,
+API keys and factory credential backups stay in the **macOS Keychain**. Codex seat snapshots are
+`0600` files at `~/.account-switcher/ch/<hash>/auth.json`; the official tools also keep their live logins.
 Each Claude account keeps its own login, so sessions on different accounts no longer log each
 other out. Plain `claude` follows the account you select in the app.
 The app talks directly to providers for sign-in, usage and model information; your coding sessions
@@ -77,8 +78,8 @@ connect through the official tools.
 - **Parked seats stay ready.** Shortly before a parked Claude seat's sign-in token lapses, the app
   lets Claude Code renew it (`claude mcp list` in that seat's home — no model call), so the seat can
   take over in place at any time. Setting: **keep parked claude seats signed in**.
-- **Pick the smartest seat.** All seats resting? It chooses the one that unlocks soonest (or the one
-  with the most headroom, your call).
+- **Stays put while a seat works.** It keeps the current seat until that seat runs out, then moves
+  to the next available one. If all seats are resting, it picks the one that unlocks soonest.
 - **Non-destructive & reversible.** A factory-image backup makes uninstall a clean restore.
 
 ## Features
@@ -114,7 +115,8 @@ connect through the official tools.
   with "restart idle sessions after an update" in settings; running sessions follow within a minute.
 - **Add / remove seats** — official browser sign-in, plus a no-browser path for Codex (paste an
   `auth.json`). Claude is browser sign-in only: a `claude setup-token` is an env-var token, not the
-  Keychain login the switcher reads. Credentials live only in the Keychain / the tools' own stores.
+  Keychain login the switcher reads. Claude snapshots live in the Keychain; Codex snapshots are
+  `0600` files at `~/.account-switcher/ch/<hash>/auth.json`.
 - **Rename subscription seats** — click a seat name, edit **Name**, and save; leave it blank to show the email's local part.
 - **Pay-per-token key seats** — an API key becomes a seat too, for when every subscription is
   resting or when you want one terminal on a specific model. Paid use is off by default,
@@ -179,8 +181,8 @@ seats**.
 > Releases from **1.4.0** on are Developer ID signed and notarized, with the notarization ticket
 > stapled to the app. Open them normally; no `xattr` command or “Open Anyway” workaround is needed.
 > For older builds, macOS may require **System Settings → Privacy & Security → Open Anyway**.
-> Upgrade with `brew upgrade --cask ai-guest-list` or download the latest zip. This version has no
-> in-app updater.
+> Update in-app from the popover (**… → check for updates**, or click **update** on the release
+> banner), with `brew upgrade --cask --greedy ai-guest-list`, or by downloading the latest zip.
 
 Releases after 1.5.0 are signed on CI and carry a provenance attestation. To check that a zip was
 built and signed by this repo's release workflow:
@@ -189,11 +191,16 @@ built and signed by this repo's release workflow:
 gh attestation verify AI-Guest-List-vX.Y.Z.zip --repo fheinfling/ai-guest-list
 ```
 
-**Upgrading:** `brew upgrade --cask ai-guest-list` replaces the app on disk, but a menubar app that
-is already running keeps the engine it started with. **Quit it from the menubar and open it again**
-after upgrading, so the terminal and the app agree on how the store is laid out. Terminal sessions
-are separate: those that can restart themselves move to the new engine once idle, and the rest keep
-their engine until you restart them.
+**Upgrading:** The built-in in-app updater checks GitHub Releases in the background (and on demand
+via **… → check for updates**); clicking **update** checks the zip's size and SHA-256 against
+`latest.json`, verifies the extracted app bundle against the bundled Developer ID requirement and
+Gatekeeper, swaps the app in place (rolling back automatically if the new build does not acknowledge
+startup), and relaunches the menubar app.
+Because the Homebrew cask sets `auto_updates true`, pass `--greedy` when upgrading through Homebrew
+(`brew upgrade --cask --greedy ai-guest-list`); if you upgrade on disk outside the app, **quit it
+from the menubar and open it again** so the running process picks up the new version. Terminal
+sessions are separate: those that can restart themselves move to the new engine once idle, and the
+rest keep their engine until you restart them.
 
 **From source (CLI engine):**
 ```sh
@@ -269,8 +276,9 @@ Build the app locally with `pip install -e ".[build]" && python scripts/build-we
 
 ## Safety & security
 
-Credentials are only ever moved between the Keychain and the locations the official tools already read
-— nothing is proxied off-device or committed to git. Writes are atomic and `0o600`.
+Claude seat snapshots, API keys and factory credential backups are stored in the Keychain.
+Codex seat snapshots are `0600` files at `~/.account-switcher/ch/<hash>/auth.json`, written atomically.
+The switcher also reads and updates the official tools' live credential stores.
 
 **API keys.** A pasted key goes to the Keychain and nowhere else; the store keeps the provider, the
 model and the last four characters. It reaches the agent through that child's environment — never a

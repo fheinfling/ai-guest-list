@@ -419,8 +419,8 @@
  {
   "label": "proxy r3: unsupported_certificate / access_denied alerts are not a reject",
   "file": "acctsw/seatproxy.py",
-  "old": "                         \"UNSUPPORTED_CERTIFICATE\", \"ACCESS_DENIED\"})",
-  "new": "                         })",
+  "old": "                         \"UNSUPPORTED_CERTIFICATE\", \"ACCESS_DENIED\", \"CERTIFICATE_EXPIRED\"})",
+  "new": "                         \"CERTIFICATE_EXPIRED\"})",
   "test": [
    "tests/test_seatproxy.py::test_certificate_alerts_are_a_tls_reject"
   ]
@@ -428,8 +428,8 @@
  {
   "label": "proxy r3: a certificate alert is only logged, never reported",
   "file": "acctsw/seatproxy.py",
-  "old": "return self._tls_reject(reason)\n        # Plain HTTP",
-  "new": "pass\n        # Plain HTTP",
+  "old": "return self._tls_reject(reason)\n        if eof and self._ca_expired():",
+  "new": "pass\n        if eof and self._ca_expired():",
   "test": [
    "tests/test_seatproxy.py::test_certificate_alerts_are_a_tls_reject"
   ]
@@ -491,8 +491,8 @@
  {
   "label": "proxy r3: an answered upgrade does not reset upstream_failures",
   "file": "acctsw/seatproxy.py",
-  "old": "            self._upstream_result(True)\n            self._log(\"upgrade\"",
-  "new": "            self._log(\"upgrade\"",
+  "old": "                self._upstream_result(True)\n                self._log(\"upgrade\"",
+  "new": "                self._log(\"upgrade\"",
   "test": [
    "tests/test_seatproxy.py::test_websocket_upgrade_is_relayed_verbatim_and_spliced"
   ]

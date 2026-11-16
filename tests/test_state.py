@@ -68,6 +68,24 @@ def test_load_merges_new_default_settings(tmp_path):
     assert s.data["keys"] == {}
 
 
+def test_legacy_strategy_loads_but_fresh_settings_omit_it(tmp_path):
+    path = tmp_path / "legacy.json"
+    path.write_text(json.dumps({"settings": {"strategy": "most_headroom", "auto_switch": False,
+                                             "theme": "dark"}}))
+    before = path.read_bytes()
+    legacy = State.load(path)
+    # Loading preserves unknown saved settings without migrating or rewriting the file.
+    assert legacy.settings()["strategy"] == "most_headroom"
+    assert legacy.settings()["auto_switch"] is False
+    assert legacy.settings()["theme"] == "dark"
+    assert legacy.settings()["notify"] is True
+    assert legacy.accounts("codex") == {}
+    assert path.read_bytes() == before
+    assert "strategy" not in State.load(tmp_path / "fresh.json").settings()
+    assert "strategy" not in State(path=tmp_path / "direct.json").settings()
+    assert "strategy" not in DEFAULT_SETTINGS
+
+
 def test_key_defaults_preserve_existing_and_future_fields_without_saving(tmp_path):
     p = tmp_path / "state.json"
     data = {"rev": 17, "keys": {"id": {"model": "m", "future_field": 42}},

@@ -33,12 +33,18 @@ def name_clash(state: State, tool: str, email: str, name: str) -> tuple[str, dic
     return None
 
 
-def validated_name(state: State, tool: str, email: str, name: str) -> str:
+def normalized_name(name: str) -> str:
+    """The stored form of a seat name; raises for what no seat could ever be called."""
     if not isinstance(name, str):
         raise AcctswError("Name must be text.")
     name = " ".join(name.split())
     if len(name) > 32:
         raise AcctswError("Keep it to 32 characters.")
+    return name
+
+
+def validated_name(state: State, tool: str, email: str, name: str) -> str:
+    name = normalized_name(name)
     current = state.get_seat(tool, email)
     # A case-only edit of an existing duplicate must not make that old duplicate a new blocker.
     if current and name.casefold() == effective_name(current).casefold():
@@ -363,7 +369,6 @@ def _assign_statuses(seats: list[dict[str, Any]]) -> None:
     soonest-to-reset is held as up-next instead of resting.
     """
     usable = [s for s in seats if not s["needs_login"]]
-    resting_usable = [s for s in usable if s["limited"] and not s["active"]]
     all_capped = bool(usable) and all(s["limited"] for s in usable)
     soonest = None
     if all_capped:

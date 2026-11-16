@@ -40,7 +40,6 @@ import re
 import select
 import shutil
 import signal
-import struct
 import sys
 import termios
 import threading
@@ -53,7 +52,6 @@ from typing import Callable
 from uuid import uuid4
 
 from . import codexexec, handoff, keyhome, keyseats, pricing, providers
-from . import identity as identity_mod
 from . import rollout
 from . import session as session_mod
 from . import usage as usage_mod
@@ -63,7 +61,7 @@ from .errors import AcctswError
 from .procenv import harden_env
 from .selection import Selection, choose, choose_key, pinned_key_eligible
 from .session import active_session, clear_session, mark_session
-from .switch import switch, sync_back
+from .switch import switch
 from .util import iso, now, parse_iso
 
 # A spawn function: (argv, on_output, on_tick=None, *, env=None) -> exit_status.
@@ -217,9 +215,8 @@ _HARD_LIMIT_RE = {
 }
 
 
-# Classification on ALREADY-ANSI-stripped text — the single source of truth for the limit veto and
-# the pattern scans, so detect_limit/detect_auth_dead (the public probes) and detect_event (the hot
-# per-chunk path) can never drift apart. Callers own the one _ANSI.sub so no strip is done twice.
+# Classification on ALREADY-ANSI-stripped text; detect_event owns the one _ANSI.sub so no strip
+# is done twice on the hot per-chunk path.
 def _is_limit(tool: str, clean: str) -> bool:
     if _NOT_A_LIMIT.search(clean):
         return False  # server throttle explicitly disclaims the usage limit → not a limit banner
@@ -228,19 +225,6 @@ def _is_limit(tool: str, clean: str) -> bool:
 
 def _is_auth_dead(tool: str, clean: str) -> bool:
     return any(rx.search(clean) for rx in _AUTH_RE[tool])
-
-
-def detect_limit(tool: str, text: str) -> bool:
-    """True if ``text`` (a rolling buffer of recent output) looks like a usage-limit message.
-
-    ANSI escape codes are stripped first so a TUI's color codes can't split a phrase.
-    """
-    return _is_limit(tool, _ANSI.sub("", text))
-
-
-def detect_auth_dead(tool: str, text: str) -> bool:
-    """True if recent output says the seat's credentials are dead (revoked / signed out)."""
-    return _is_auth_dead(tool, _ANSI.sub("", text))
 
 
 def detect_refresh_revoked(tool: str, text: str) -> bool:
@@ -1557,7 +1541,6 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         """Persist a seat hop and prepare its private home. Caller holds ctx.locked()."""
         switch(ctx, state, tool, email, sync=False, mirror=(tool != "claude"), save=False)
         _activate_home(email)
-        state.data["last_switch_at"] = iso(now())
         state.save()
 
     claude_home_warnings = set()
@@ -2349,7 +2332,6 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     if not _spend_crossing(st, frm, target):
                         return REFUSED
                     switch(ctx, st, tool, target, sync=False, mirror=False, save=False)
-                    st.data["last_switch_at"] = iso(now())
                     st.save()
             except Exception:
                 logging.getLogger(__name__).info("in-place hop to %s failed", target,
@@ -3118,7 +3100,6 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     st = ctx.load_state()
                     if st.get_seat(tool, to) is not None and st.active(tool) != to:
                         switch(ctx, st, tool, to, sync=False, mirror=False, save=False)
-                        st.data["last_switch_at"] = iso(now())
                         st.save()
                 if to != launch_email:
                     inplace["hops"] += 1   # a third seat, chosen by the swap: still a hop

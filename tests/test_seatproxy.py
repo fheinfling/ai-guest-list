@@ -214,6 +214,114 @@ def parse(raw: bytes, method: str = "POST") -> Parsed:
     return Parsed(resp, resp.read(), raw)
 
 
+class _PumpSocket:
+    def __init__(self, reads):
+        self.reads = list(reads)
+        self.sent = []
+        self.shutdowns = []
+
+    def settimeout(self, timeout):
+        pass
+
+    def recv(self, size):
+        value = self.reads.pop(0)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    def sendall(self, data):
+        self.sent.append(data)
+
+    def shutdown(self, how):
+        self.shutdowns.append(how)
+
+
+@pytest.mark.parametrize("error", [BrokenPipeError, ConnectionResetError, SP.ssl.SSLError, OSError])
+@pytest.mark.parametrize("tls", [False, True])
+def test_pump_recv_oserror_ends_tunnel(monkeypatch, error, tls):
+    class TLS(_PumpSocket):
+        def pending(self):
+            return 0
+    monkeypatch.setattr(SP.ssl, "SSLSocket", TLS)
+    monkeypatch.setattr(SP.select, "select", lambda readers, *args: (list(readers), [], []))
+    source = (TLS if tls else _PumpSocket)([error("peer closed")])
+    unread = AssertionError("must not read the other peer after a reset")
+    other = _PumpSocket([unread])
+    errors = []
+
+    def pump():
+        try:
+            SP._pump(source, other, idle=None)
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=pump, daemon=True)
+    thread.start()
+    thread.join(timeout=1)
+    assert not thread.is_alive(), "reset left the tunnel waiting on the other peer"
+    assert errors == [], "pump thread crashed"
+    assert other.reads == [unread]
+    assert source.sent == other.sent == []
+    assert source.shutdowns == other.shutdowns == []
+
+
+@pytest.mark.parametrize("error", [TypeError, ValueError, RuntimeError])
+def test_pump_does_not_hide_programming_errors(monkeypatch, error):
+    monkeypatch.setattr(SP.select, "select", lambda readers, *args: ([readers[0]], [], []))
+    with pytest.raises(error, match="programming error"):
+        SP._pump(_PumpSocket([error("programming error")]), _PumpSocket([]))
+
+
+@pytest.mark.parametrize("answer", ["switch", "refuse", "bad-head", "broken-relay"])
+def test_upgrade_closes_response_without_closing_tunnel(monkeypatch, answer):
+    proxy = SeatProxy(lambda hit: None)
+    responses, files = [], []
+    response = http.client.HTTPResponse
+
+    def tracked_response(*args, **kwargs):
+        resp = response(*args, **kwargs)
+        responses.append(resp)    # Keep it alive: GC must not be responsible for cleanup.
+        files.append(resp.fp)
+        return resp
+
+    monkeypatch.setattr(SP.http.client, "HTTPResponse", tracked_response)
+    upstream, remote = socket.socketpair()
+    with upstream, remote:
+        upstream.settimeout(1)
+        remote.settimeout(1)
+        monkeypatch.setattr(proxy._transport, "open_upstream", lambda: upstream)
+        if answer == "switch":
+            remote.sendall(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n"
+                           b"Upgrade: websocket\r\n\r\nfirst frame")
+        elif answer == "bad-head":
+            remote.sendall(b"invalid response\r\n")
+        else:
+            remote.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 3\r\n\r\nbad")
+
+        def pump(client, far):
+            assert far is upstream and far._io_refs == 0
+            assert files[0].closed and responses[0].closed
+            assert far.recv(11) == b"first frame"
+            far.sendall(b"tunnel reply")
+
+        monkeypatch.setattr(SP, "_pump", pump)
+        if answer == "broken-relay":
+            def broken_relay(*args):
+                raise ConnectionResetError("peer closed")
+            monkeypatch.setattr(proxy, "_relay", broken_relay)
+            with pytest.raises(ConnectionResetError):
+                proxy.upgrade("GET", "/ws", {}, None, Wire())
+        else:
+            wire = Wire()
+            proxy.upgrade("GET", "/ws", {}, None, wire)
+            status = {"switch": b"101", "refuse": b"403", "bad-head": b"502"}[answer]
+            assert wire.getvalue().startswith(b"HTTP/1.1 " + status)
+        assert responses[0].closed and files[0].closed
+        assert upstream._io_refs == 0 and upstream.fileno() == -1
+        if answer == "switch":
+            assert remote.recv(4096).endswith(b"tunnel reply")
+
+
 def rules(h: Harness, **by_seat) -> None:
     """``rules(h, a=429, b=401)``: answer seat A's token with 429, seat B's with 401."""
     seats = {"a": A, "b": B, "c": C, "client": Seat("", CLIENT_TOKEN)}
@@ -1000,14 +1108,18 @@ class _NoDelaySocket(socket.socket):
 # runs the same through ``start()``; it skips where binding a port is not allowed.
 
 def _can_bind() -> str | None:
-    s = socket.socket()
     try:
-        s.bind(("127.0.0.1", 0))
+        with socket.socket() as server, socket.socket() as client:
+            server.settimeout(1)
+            client.settimeout(1)
+            server.bind(("127.0.0.1", 0))
+            server.listen(1)
+            client.connect(server.getsockname())
+            accepted, _ = server.accept()
+            accepted.close()
         return None
     except OSError as e:
-        return f"binding 127.0.0.1 is not allowed here ({e})"
-    finally:
-        s.close()
+        return f"listening/connecting on 127.0.0.1 is not allowed here ({e})"
 
 
 _NO_BIND = _can_bind()
@@ -1574,34 +1686,57 @@ def test_tcp_blind_tunnel_to_another_host(loopback_only, session_ca):
     echo = socket.socket()
     echo.bind(("127.0.0.1", 0))
     echo.listen(1)
+    echo.settimeout(0.1)
     received = []
+    stopping = threading.Event()
 
     def serve():
-        c, _ = echo.accept()
-        with c:
-            while data := c.recv(65536):
-                received.append(data)
-                c.sendall(data)
-    threading.Thread(target=serve, daemon=True).start()
+        try:
+            while not stopping.is_set():
+                try:
+                    c, _ = echo.accept()
+                    break
+                except socket.timeout:
+                    continue
+            else:
+                return
+            with c:
+                c.settimeout(0.1)
+                while not stopping.is_set():
+                    try:
+                        data = c.recv(65536)
+                    except socket.timeout:
+                        continue
+                    if not data:
+                        break
+                    received.append(data)
+                    c.sendall(data)
+        except OSError:
+            if not stopping.is_set():
+                raise
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
     proxy = SeatProxy(lambda hit: None, ca=session_ca)
-    proxy.bind(B)
-    u = urlsplit(proxy.start())
     try:
-        sock = _REAL_CREATE_CONNECTION((u.hostname, u.port), timeout=10)
-        cred = base64.b64encode(f"{unquote(u.username)}:{unquote(u.password)}".encode()).decode()
-        target = f"127.0.0.1:{echo.getsockname()[1]}"
-        sock.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n"
-                     f"Proxy-Authorization: Basic {cred}\r\n\r\n".encode())
-        head = b""
-        while b"\r\n\r\n" not in head:
-            head += sock.recv(1)
-        assert head.startswith(b"HTTP/1.1 200 ")
-        payload = b"\x16\x03\x01 not decrypted " + CLIENT_TOKEN.encode()
-        assert _echo(sock, payload) == payload
-        sock.close()
+        proxy.bind(B)
+        u = urlsplit(proxy.start())
+        with _REAL_CREATE_CONNECTION((u.hostname, u.port), timeout=10) as sock:
+            cred = base64.b64encode(f"{unquote(u.username)}:{unquote(u.password)}".encode()).decode()
+            target = f"127.0.0.1:{echo.getsockname()[1]}"
+            sock.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n"
+                         f"Proxy-Authorization: Basic {cred}\r\n\r\n".encode())
+            head = b""
+            while b"\r\n\r\n" not in head:
+                head += sock.recv(1)
+            assert head.startswith(b"HTTP/1.1 200 ")
+            payload = b"\x16\x03\x01 not decrypted " + CLIENT_TOKEN.encode()
+            assert _echo(sock, payload) == payload
     finally:
-        proxy.stop()
+        stopping.set()
         echo.close()
+        proxy.stop()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
     assert b"".join(received) == payload
 
 

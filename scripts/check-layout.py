@@ -5,22 +5,24 @@ Run: python3 scripts/check-layout.py
 Before/after: python3 scripts/check-layout.py --compare-ref HEAD
   (Use the commit before these UI changes; reads its web files into a temp dir.)
 Requires: pip install playwright; Google Chrome (or AGL_CHROME=/path/to/chrome).
-No downloads, provider calls, real accounts, or gallery/build writes. Uses the
-gallery's eight states and cached catalogue, plus realistic long identities.
+No downloads, provider calls, real accounts, or gallery/build writes. Uses
+synthesized states from the real engine snapshot plus a self-contained model
+catalogue and realistic long identities.
 The real bundle handles navigation, disclosures and model-picker replies.
 
 Only decorative SVGs and reachable content INSIDE a working vertical scroller
 may exceed the viewport. Scroller frames themselves must fit, and scrolling to
 the end must expose their last content; overflow:hidden cannot hide a failure.
-Roster seat rows have a 72px budget (90px for last-known readings), and compact
-rows have 62px/78px budgets, plus 24px for a row that carries an action on its own
-line, independently of the stylesheet. An unavailable
+Sheet seat rows have a single-line 44px height budget, the content column after
+the 58px tool column aligns across tool blocks and sheet rows, and .row-action
+buttons meet their 28x26px target and 2px focus-ring contract. An unavailable
 browser is an ERROR (exit 2), never a pass.
 """
 from __future__ import annotations
 
-import copy
 import argparse
+import copy
+import datetime as dt
 import functools
 import http.server
 import importlib.util
@@ -28,8 +30,8 @@ import json
 import os
 from pathlib import Path
 import shutil
-import sys
 import subprocess
+import sys
 import tempfile
 import threading
 
@@ -37,23 +39,160 @@ ROOT = Path(__file__).resolve().parent.parent
 WEB = ROOT / "app" / "web"
 
 
+def _iso(minutes: float) -> str:
+    return (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=minutes)).isoformat()
+
+
+def _price_envelope(input_rate: str | None, output_rate: str | None) -> dict:
+    known = input_rate is not None or output_rate is not None
+    return {
+        "status": "known" if known else "unknown",
+        "estimate": True,
+        "currency": "USD",
+        "token_unit": "per_million_tokens",
+        "request_unit": "per_request",
+        "rates": {
+            "input": {"status": "known" if input_rate is not None else "unknown",
+                      "value": input_rate, "same_as": None},
+            "output": {"status": "known" if output_rate is not None else "unknown",
+                       "value": output_rate, "same_as": None},
+            "cached_input": {"status": "unknown", "value": None, "same_as": None},
+            "reasoning": {"status": "unknown", "value": None, "same_as": None},
+            "request": {"status": "unknown", "value": None, "same_as": None},
+        },
+        "age_seconds": 180,
+        "verified_at": _iso(-3),
+        "potentially_stale": False,
+        "source": "live",
+    }
+
+
+def sample_catalog() -> dict:
+    """Self-contained OpenRouter-shaped catalogue with enough rows to scroll .model-list."""
+    entries = [
+        ("anthropic/claude-sonnet-4.5", "Claude Sonnet 4.5", 200000, "3", "15"),
+        ("anthropic/claude-opus-4.1", "Claude Opus 4.1", 200000, "15", "75"),
+        ("anthropic/claude-3.5-haiku", "Claude 3.5 Haiku", 200000, "0.8", "4"),
+        ("openai/gpt-5.4", "GPT-5.4", 400000, "2.5", "10"),
+        ("openai/gpt-5.4-mini", "GPT-5.4 Mini", 400000, "0.25", "2"),
+        ("openai/o4-mini-high", "o4 Mini High", 200000, "1.1", "4.4"),
+        ("google/gemini-2.5-pro", "Gemini 2.5 Pro", 1048576, "1.25", "10"),
+        ("google/gemini-2.5-flash", "Gemini 2.5 Flash", 1048576, "0.15", "0.6"),
+        ("deepseek/deepseek-r1-0528", "DeepSeek R1", 163840, "0.55", "2.19"),
+        ("deepseek/deepseek-chat-v3.1:free", "DeepSeek V3.1 (free)", 128000, "0", "0"),
+        ("meta-llama/llama-4-maverick-17b-128e-instruct", "Llama 4 Maverick", 1000000, "0.18", "0.6"),
+        ("qwen/qwen3-coder-480b-a35b-instruct-fp8", "Qwen3 Coder 480B", 262144, "0.4", "1.6"),
+        ("mistralai/mistral-medium-3.1-long-context-preview", "Mistral Medium 3.1", 131072, "0.4", "2"),
+        ("x-ai/grok-4-fast-reasoning-preview", "Grok 4 Fast", 256000, None, None),
+    ]
+    models = []
+    for model_id, display_name, ctx_win, in_rate, out_rate in entries:
+        item = {"id": model_id, "display_name": display_name, "context_window": ctx_win}
+        if in_rate is not None or out_rate is not None:
+            item["price"] = _price_envelope(in_rate, out_rate)
+        models.append(item)
+    return {
+        "ok": True,
+        "models": models,
+        "sort_key": "input_usd_per_million_tokens",
+        "source": "live",
+        "fetched_at": _iso(-3),
+        "potentially_stale": False,
+    }
+
+
+def build_states(base: dict, catalog: dict) -> list[dict]:
+    """Representative UI states across main, spending, consent, trouble, settings and model picker."""
+    states: list[dict] = []
+
+    def add(id, label, note, screen, state, flow=None):
+        states.append({"id": id, "label": label, "note": note, "screen": screen,
+                       "state": state, "flow": flow})
+
+    add("main", "the glance", "two tools, a resting seat, a key seat", "main", base)
+
+    spending = copy.deepcopy(base)
+    spending["settings"]["key_fallback"] = True
+    spending["pinned_sessions"] = [{
+        "tool": "codex", "pid": 20887, "pin": "pin-1", "email": "key:sample-openai-key",
+        "end_requested": False, "key_seat": spending["keys"][0],
+    }]
+    spending["running_key_seats"] = ["sample-openai-key"]
+    add("spending", "money running", "a pinned paid terminal", "main", spending)
+
+    priced = next(m for m in catalog["models"] if m.get("price", {}).get("status") == "known"
+                  and "claude" in m["id"])
+    asking = copy.deepcopy(base)
+    asking["keys"][0] = {**asking["keys"][0], "provider": "openrouter", "model": priced["id"]}
+    asking["pending_key_switches"] = [{
+        "id": "req-1", "status": "pending", "expires_at": _iso(2), "tool": "codex",
+        "pinned": False,
+        "from_seat": {"id": "work@studio.example", "label": "Work"},
+        "key_seat": asking["keys"][0], "price": priced["price"],
+    }]
+    add("asking", "asking to spend", "consent, priced", "main", asking)
+
+    unpriced = copy.deepcopy(base)
+    unpriced["pending_key_switches"] = [{
+        "id": "req-2", "status": "pending", "expires_at": _iso(2), "tool": "codex",
+        "pinned": True,
+        "from_seat": {"id": "work@studio.example", "label": "Work"},
+        "key_seat": unpriced["keys"][0],
+        "price": _price_envelope(None, None),
+    }]
+    add("asking-unpriced", "asking to spend · no price", "consent without published rate",
+        "main", unpriced)
+
+    trouble = copy.deepcopy(base)
+    for tool in ("codex", "claude"):
+        group = trouble["tools"][tool]
+        group["active"] = None
+        for seat in group["seats"]:
+            seat["status"], seat["active"], seat["limited"] = "resting", False, True
+            seat["usage5h"] = 100
+            seat["limited_until"] = _iso(96)
+    trouble["counts"] = {"resting": 4, "ready": 0}
+    trouble["door"] = "shut"
+    trouble["keys"][0]["responses_verified"] = False
+    trouble["supervision"] = {"wrappers": True, "block": False, "on_path": False, "active": False}
+    add("trouble", "nothing ready", "every seat resting, unproven key, supervision off",
+        "main", trouble)
+
+    add("settings", "settings", "settings sub-view", "settings", base)
+
+    add("models", "pick a model", "priced OpenRouter model picker",
+        "add-key", base,
+        flow={"step": "models", "provider": "openrouter", "label": "Late-night",
+              "modelFilter": "", "catalog": catalog})
+
+    add("models-unpriced", "pick a model · no prices", "unpriced OpenAI model picker",
+        "add-key", base,
+        flow={"step": "models", "provider": "openai", "label": "Late-night", "modelFilter": "",
+              "catalog": {"ok": True, "sort_key": "id", "source": "live",
+                          "fetched_at": _iso(-3), "potentially_stale": False,
+                          "models": [{"id": m, "display_name": None, "context_window": None}
+                                     for m in ("gpt-5.4", "gpt-5.4-mini", "gpt-6-astra",
+                                               "gpt-6-luna", "o5", "o5-mini",
+                                               "text-embedding-3-large")]}})
+    return states
+
+
 def gallery_states():
-    spec = importlib.util.spec_from_file_location("layout_gallery", ROOT / "scripts/design-gallery.py")
-    gallery = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(gallery)
-    # Read the cache explicitly: the gallery's fallback would fetch and write it.
-    catalog = json.loads((ROOT / "design/fixtures/openrouter-catalog.json").read_text())
-    states = gallery.build_states(gallery._screenshots_module().sample_payload(), catalog)
+    spec = importlib.util.spec_from_file_location("agl_screenshots", ROOT / "scripts/screenshots.py")
+    screenshots = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(screenshots)
+    states = build_states(screenshots.sample_payload(), sample_catalog())
     long = copy.deepcopy(states[0])
     long["id"] = "long-identities"
     for tool in long["state"]["tools"].values():
-        for seat in tool["seats"]:
+        for idx, seat in enumerate(tool["seats"]):
             seat["name"] = "Wilhelmina Featherstone +codex / a realistically long account name"
-            seat["plan"] = "Self_Serve_Business_Prolite"
+            seat["kind"] = "business" if idx == 0 else "personal"
+            seat["plan"] = "Business" if idx == 0 else "Self_Serve_Business_Prolite"
     long["state"]["keys"][0].update(label="test / a long API key seat name", model="gpt-6-luna")
     states.append(long)
-    # Enough seats to force the compact roster to scroll in BOTH hero layouts. Include a
-    # stale reading so the compact provenance budget is exercised as well as ordinary rows.
+    # Enough seats to force .body to scroll in both spending and trouble states. Include a
+    # stale reading so the stale reading copy is exercised alongside ordinary rows.
     for source in ("spending", "trouble"):
         overflow = copy.deepcopy(next(entry for entry in states if entry["id"] == source))
         overflow["id"] = source + "-overflow"
@@ -75,7 +214,7 @@ MEASURE = r"""() => {
   const check = (ok, message) => { if (!ok) errors.push(message); };
   const name = el => el.tagName.toLowerCase() + (el.className ? '.' + String(el.className).trim().replaceAll(' ', '.') : '');
   const visible = el => {
-    if (!el.checkVisibility() || el.closest('svg, [hidden]')) return false;
+    if (!el.checkVisibility() || el.closest('svg, [hidden], .sr-only')) return false;
     for (let p = el.parentElement; p; p = p.parentElement) {
       if (p.matches('details:not([open])') && !p.querySelector(':scope > summary')?.contains(el)) return false;
     }
@@ -88,7 +227,7 @@ MEASURE = r"""() => {
     check(el.scrollHeight <= 600 && el.scrollWidth <= 376, `${name(el)} page overflows: ${el.scrollWidth}x${el.scrollHeight}`);
   }
   const elements = [...document.querySelectorAll('#root *')].filter(visible);
-  const intended = '.roster-glance, .roster-compact, .main-body, .ambient-verdict, .set-body:not(.picker-body), .model-list, .key-prompts:not(:empty), .paid-session-list';
+  const intended = '.body, .set-body:not(.picker-body), .model-list, .key-prompts:not(:empty)';
   for (const el of document.querySelectorAll(intended)) {
     if (visible(el)) check(el.scrollHeight <= el.clientHeight + tolerance || scrolls(el),
       `${name(el)} is an intended scroller with unreachable overflow`);
@@ -105,9 +244,20 @@ MEASURE = r"""() => {
     // is the real contract; an aria-hidden ornament that the box clips is not a defect.
     const clips = style.overflowX === 'hidden' || style.overflowX === 'clip';
     const ornament = el.closest('[aria-hidden="true"]') !== null;
+    const delegatesEllipsis = el.matches('.now-seat, .seatname')
+      && [...el.querySelectorAll('.seat-identity, .seat-metadata')].every(
+        child => getComputedStyle(child).textOverflow === 'ellipsis' && getComputedStyle(child).overflowX === 'hidden'
+      );
     if (el.clientWidth && style.display !== 'inline' && style.textOverflow !== 'ellipsis'
-        && !ornament && !clips) {
+        && !ornament && !clips && !delegatesEllipsis) {
       check(el.scrollWidth <= el.clientWidth + tolerance, `${name(el)} horizontal content ${el.scrollWidth} > ${el.clientWidth}`);
+    }
+    if (el.matches('.now, .row')) {
+      const cells = [...el.children].filter(visible);
+      for (let i = 1; i < cells.length; i++) {
+        check(cells[i - 1].getBoundingClientRect().right <= cells[i].getBoundingClientRect().left + tolerance,
+          `${name(el)} children overlap: ${name(cells[i - 1])} and ${name(cells[i])}`);
+      }
     }
     let scroller = el.parentElement;
     while (scroller && !(scrolls(scroller) && scroller.scrollHeight > scroller.clientHeight)) scroller = scroller.parentElement;
@@ -139,32 +289,24 @@ MEASURE = r"""() => {
     }
     el.scrollTop = before;
   }
-  const rows = [...document.querySelectorAll('.roster tbody tr')].filter(row => row.querySelector('th[scope="row"]'));
-  let columns;
+  const rows = [...document.querySelectorAll('.sheet .seat > .row')].filter(visible);
   for (const row of rows) {
     const height = row.getBoundingClientRect().height;
-    // Compact rows use tighter padding and smaller figures, with a 13px body-copy floor.
-    // Their own budgets must not loosen the everyday 72/90px limits. Inline key actions now
-    // fit the same two lines as subscriptions, so there is no longer a special key allowance.
-    const compact = row.closest('.roster-compact');
-    const stale = row.querySelector('.roster-freshness');
-    // A row carrying an action now puts it on its own line beneath the seat's meta — a
-    // deliberate extra line, because crammed beside the name it read badly and the label was
-    // ambiguous. Rows without an action still hold at the original limits.
-    const act = row.querySelector('.row-action') ? 24 : 0;
-    const budget = (compact ? (stale ? 78 : 62) : (stale ? 90 : 72)) + act;
-    check(height <= budget, `roster row ${row.textContent.trim().slice(0, 70)}: ${height.toFixed(1)}px > ${budget}px`);
-    const cells = [...row.querySelectorAll('.roster-value')];
-    if (!cells.length) continue;
-    const positions = cells.map(cell => cell.getBoundingClientRect().right);
-    if (!columns) columns = positions;
-    check(positions.every((v, i) => Math.abs(v - columns[i]) <= tolerance), 'roster window columns do not align across tools');
+    check(height >= 36 && height <= 44, `sheet row ${row.textContent.trim().slice(0, 70)}: ${height.toFixed(1)}px outside 36..44px`);
+  }
+  const contentStarts = [
+    ...[...document.querySelectorAll('.field .tool .now .seatname')].filter(visible),
+    ...rows.map(row => row.querySelector(':scope > .seatname')).filter(Boolean),
+  ].map(el => el.getBoundingClientRect().left);
+  if (contentStarts.length > 1) {
+    check(contentStarts.every(x => Math.abs(x - contentStarts[0]) <= tolerance),
+      `tool/sheet content columns do not align: ${contentStarts.map(x => x.toFixed(1)).join(', ')}`);
   }
   const focused = document.activeElement;
   for (const action of document.querySelectorAll('.row-action')) {
-    if (!visible(action)) continue;
+    if (!visible(action) || action.disabled) continue;
     const r = action.getBoundingClientRect();
-    check(r.width >= 28 && r.height >= 28, `row action target is ${r.width}x${r.height}`);
+    check(r.width >= 28 && r.height >= 26 - tolerance, `row action target is ${r.width}x${r.height}`);
     check(action.tabIndex >= 0, 'row action is not keyboard focusable');
     action.focus({preventScroll: true});
     const ring = getComputedStyle(action);
@@ -172,34 +314,41 @@ MEASURE = r"""() => {
       'row action has no visible keyboard focus ring');
   }
   focused?.focus({preventScroll: true});
-  for (const el of document.querySelectorAll('.roster-compact *')) {
+  for (const el of document.querySelectorAll('.sheet .seat > .row *')) {
+    if (el.closest('.sr-only')) continue;
     if ([...el.childNodes].some(n => n.nodeType === Node.TEXT_NODE && n.textContent.trim())) {
-      check(parseFloat(getComputedStyle(el).fontSize) >= 13, `${name(el)} compact text is below 13px`);
+      check(parseFloat(getComputedStyle(el).fontSize) >= 12, `${name(el)} sheet row text is below 12px`);
     }
   }
   return [...new Set(errors)];
 }"""
 
 
-COMPACT_SCROLL = r"""overflowExpected => {
-  const roster = document.querySelector('.roster-compact');
-  if (!roster) return ['compact roster is missing'];
-  const hero = document.querySelector('.paid-use-control, .ambient-verdict');
-  const handle = document.querySelector('.drawer-handle');
-  const before = [hero, handle].map(el => el.getBoundingClientRect().y);
+BODY_SCROLL = r"""overflowExpected => {
+  const body = document.querySelector('.body');
+  if (!body) return ['main .body scroller is missing'];
+  const top = document.querySelector('.top');
+  const foot = document.querySelector('.foot');
+  if (!top || !foot) return ['popover header or footer is missing'];
+  const before = [top, foot].map(el => el.getBoundingClientRect().y);
   const errors = [];
-  if (overflowExpected && roster.scrollHeight <= roster.clientHeight) errors.push('fixture does not overflow the compact roster');
-  roster.scrollTop = roster.scrollHeight;
-  if (overflowExpected && roster.scrollTop === 0) errors.push('compact roster cannot scroll');
-  const last = roster.querySelector('tbody:last-child tr:last-child').getBoundingClientRect();
-  const bounds = roster.getBoundingClientRect();
-  if (last.top < bounds.top || last.bottom > bounds.bottom) errors.push('last seat is unreachable');
-  [hero, handle].forEach((el, i) => {
-    if (el.getBoundingClientRect().y !== before[i]) errors.push('roster scrolling moved the hero or sheet handle');
+  if (overflowExpected && body.scrollHeight <= body.clientHeight) errors.push('fixture does not overflow .body');
+  body.scrollTop = body.scrollHeight;
+  if (overflowExpected && body.scrollTop === 0) errors.push('.body cannot scroll');
+  const lastSeat = body.querySelector('.sheet .seat:last-child');
+  if (!lastSeat) {
+    errors.push('sheet has no seats');
+  } else {
+    const last = lastSeat.getBoundingClientRect();
+    const bounds = body.getBoundingClientRect();
+    if (last.top < bounds.top - 1 || last.bottom > bounds.bottom + 1) errors.push('last seat is unreachable');
+  }
+  [top, foot].forEach((el, i) => {
+    if (Math.abs(el.getBoundingClientRect().y - before[i]) > 1) errors.push('.body scrolling moved the header or footer');
   });
-  const h = handle.getBoundingClientRect();
-  if (h.top < 0 || h.bottom > 600) errors.push('sheet handle is unreachable');
-  roster.scrollTop = 0;
+  const f = foot.getBoundingClientRect();
+  if (f.top < 0 || f.bottom > 600 + 1) errors.push('footer is outside the viewport');
+  body.scrollTop = 0;
   return errors;
 }"""
 
@@ -213,11 +362,11 @@ def load_state(page, url, entry, theme):
       window.AGL.update(s);
     }""", snapshot)
     if entry["screen"] == "settings":
-        page.locator('.header-menu').last.locator('summary').click()
+        page.locator('[data-action="menu"][data-menu="more"]').click()
         page.locator('[data-action="settings"]').click()
     elif entry["screen"] == "add-key":
         flow = entry["flow"]
-        page.locator('.header-menu').first.locator('summary').click()
+        page.locator('[data-action="menu"][data-menu="add"]').click()
         page.locator('[data-action="key-start"]').click()
         page.locator(f'[data-action="key-provider"][data-provider="{flow["provider"]}"]').click()
         page.locator('#key-label').fill(flow["label"])
@@ -242,6 +391,9 @@ def main():
         return 2
     chrome = os.environ.get("AGL_CHROME") or shutil.which("google-chrome") or shutil.which("chromium")
     chrome = chrome or "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    if not Path(chrome).exists():
+        print(f"ERROR: Chrome/Chromium binary not found at {chrome!r} (set AGL_CHROME)", file=sys.stderr)
+        return 2
     passed = failed = 0
 
     def report(label, errors):
@@ -280,22 +432,24 @@ def main():
                             page.keyboard.press("Tab")
                             errors = page.evaluate(MEASURE)
                             if entry["id"].startswith(("spending", "trouble")):
-                                errors += page.evaluate(COMPACT_SCROLL, entry["id"].endswith("-overflow"))
+                                errors += page.evaluate(BODY_SCROLL, entry["id"].endswith("-overflow"))
                             report(label, errors)
                             if entry["screen"] != "main":
                                 continue
-                            page.locator('.guest-drawer > summary').click()
-                            page.locator('.seat--key .seat-disclosure > summary').first.click()
+                            page.locator('.seat.key-seat [data-action="seat-details"]').first.click()
                             page.keyboard.press("Tab")
                             errors = page.evaluate(MEASURE)
-                            # Browser keyboard focus must bring both formerly clipped actions into view.
+                            body_bounds = page.locator('.body').bounding_box()
+                            # Browser keyboard focus must bring both key-seat management actions into view.
                             for action in ('key-validate', 'key-remove'):
-                                button = page.locator(f'.guest-drawer [data-action="{action}"]').first
+                                button = page.locator(f'.seat.key-seat [data-action="{action}"]').first
                                 button.focus()
                                 bounds = button.bounding_box()
-                                if not bounds or bounds['y'] < 228 or bounds['y'] + bounds['height'] > 601:
+                                if (not bounds or not body_bounds
+                                        or bounds['y'] < body_bounds['y'] - 1
+                                        or bounds['y'] + bounds['height'] > min(601, body_bounds['y'] + body_bounds['height'] + 1)):
                                     errors.append(f'{action} is clipped after focus: {bounds}')
-                            report(label + '/drawer-key-expanded', errors)
+                            report(label + '/key-seat-expanded', errors)
                         except Exception as exc:
                             report(label + '/interaction', [str(exc)])
                 context.close()
@@ -311,9 +465,16 @@ def main():
             states = gallery_states()
             if args.compare_ref:
                 with tempfile.TemporaryDirectory(prefix="agl-layout-before-") as directory:
-                    for file in ("index.html", "styles.css", "bundle.js"):
+                    fonts = subprocess.check_output(
+                        ["git", "ls-tree", "-r", "--name-only", args.compare_ref, "--", "app/web/fonts/"],
+                        cwd=ROOT, text=True,
+                    ).splitlines()
+                    files = ["index.html", "styles.css", "bundle.js", *[str(Path(p).relative_to("app/web")) for p in fonts]]
+                    for file in files:
                         source = subprocess.check_output(["git", "show", f"{args.compare_ref}:app/web/{file}"], cwd=ROOT)
-                        (Path(directory) / file).write_bytes(source)
+                        target = Path(directory) / file
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_bytes(source)
                     run_states(browser, states, Path(directory))
                 print(f"Before ({args.compare_ref}): {passed} passed, {failed} failed")
                 baseline_failed = failed

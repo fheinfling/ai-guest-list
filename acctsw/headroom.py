@@ -314,18 +314,6 @@ def has_backup(store: Path | None = None) -> bool:
     return bool(manifest) if isinstance(manifest, dict) else False
 
 
-_VALID_KINDS = ("file", "symlink", "absent")
-
-# The ONLY files the old routing ever WROTE: `_route_codex` → ~/.codex/config.toml, `_route_claude`
-# → ~/.claude/settings.json. The snapshot, however, captured the wider "files `headroom wrap` may
-# touch" set — AGENTS.md, CLAUDE.md, .mcp.json, settings.local.json. Restoring those is pure
-# regression: routing never modified them, so their CURRENT state is already the correct one.
-# Replaying a months-old snapshot over them silently reverts the user's work, and an entry recorded
-# as "absent" (the file did not exist when save-credit was first enabled) DELETES a CLAUDE.md /
-# AGENTS.md they have written since. Restore is therefore restricted to what we actually broke.
-_ROUTING_OWNED_NAMES = frozenset({"config.toml", "settings.json"})
-
-
 def _snapshot_text(store: Path | None, want: Path) -> str | None:
     """The ORIGINAL text of ``want`` from the snapshot, or None if absent/unusable.
 

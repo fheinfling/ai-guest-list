@@ -477,14 +477,14 @@ def engine_script(*, python: str | None = None, pkg_root: Path | None = None) ->
         # Match py2app's 3.11 boot setup: the deliberately nonexistent directory prevents
         # OpenSSL from consulting a compiled-in host CA directory after loading the bundled PEM.
         ca_dir = shlex.quote(str(resources / "openssl.ca" / "no-such-file"))
-        return (f"#!/bin/sh\n# ai guest list engine\n"
+        return ("#!/bin/sh\n# ai guest list engine\n"
                 + clean_python +
                 f"PYTHONUTF8=1 PYTHONHOME={home} SSL_CERT_FILE={ca_file} SSL_CERT_DIR={ca_dir} "
                 f'exec {py} -P -m acctsw "$@"\n')
     # Source checkout: set PYTHONPATH to ONLY pkg_root — do NOT append "$PYTHONPATH". If this wrapper
     # runs from a shell that inherited py2app's leaked PYTHONPATH (the frozen 3.11 stdlib zip),
     # appending it would shadow the interpreter's stdlib and crash `python -m acctsw`.
-    return (f"#!/bin/sh\n# ai guest list engine\n"
+    return ("#!/bin/sh\n# ai guest list engine\n"
             + clean_python +
             f'PYTHONUTF8=1 PYTHONPATH={pr} exec {py} -P -m acctsw "$@"\n')
 

@@ -33,7 +33,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 PY = os.environ.get("PY") or sys.executable
-KNOWN_BASELINE = Path("/tmp/claude-501/sandbox-baseline-failures.txt")
+DEFAULT_TMP = Path(tempfile.gettempdir())
+KNOWN_BASELINE = DEFAULT_TMP / "sandbox-baseline-failures.txt"
 
 # acctsw/<key>.py -> extra test files on top of tests/test_<key>*.py. Adjust freely.
 TEST_MAP: dict[str, list[str]] = {
@@ -277,8 +278,8 @@ def main() -> int:
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 2)
     ap.add_argument("--timeout", type=int, default=120)
     ap.add_argument("--seed", type=int, default=1)
-    ap.add_argument("--out", default="/tmp/claude-501/mutate-diff-results.json")
-    ap.add_argument("--survivors", default="/tmp/claude-501/mutate-diff-survivors.txt")
+    ap.add_argument("--out", default=str(DEFAULT_TMP / "mutate-diff-results.json"))
+    ap.add_argument("--survivors", default=str(DEFAULT_TMP / "mutate-diff-survivors.txt"))
     a = ap.parse_args()
 
     t0 = time.time()
@@ -333,8 +334,10 @@ def main() -> int:
 
     rows = [{"file": m.file, "line": m.line, "op": m.op, "old": m.old, "new": m.new, "verdict": v}
             for m, v in sorted(results, key=lambda r: (r[0].file, r[0].line, r[0].start))]
-    Path(a.out).write_text(json.dumps({"seconds": round(time.time() - t0, 1), "results": rows},
-                                      indent=1))
+    out_path = Path(a.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps({"seconds": round(time.time() - t0, 1), "results": rows},
+                                   indent=1))
     surv = []
     print()
     for rel in plan:
@@ -346,7 +349,9 @@ def main() -> int:
               f"timeout {c['TIMEOUT']}  invalid {c['INVALID']}")
         surv += [f"{r['file']}:{r['line']}  {r['op']}  {r['old']} → {r['new']}"
                  for r in rs if r["verdict"] in ("SURVIVED", "TIMEOUT") ]
-    Path(a.survivors).write_text("\n".join(surv) + "\n")
+    surv_path = Path(a.survivors)
+    surv_path.parent.mkdir(parents=True, exist_ok=True)
+    surv_path.write_text("\n".join(surv) + "\n")
     print(f"\n{len(surv)} survivors/timeouts -> {a.survivors}; total {time.time() - t0:.0f}s")
     return 0
 
