@@ -165,6 +165,11 @@ function contentHeight() {
   const content = root.querySelector(".content");
   let height = (root.querySelector(".top, .set-head")?.offsetHeight || 0)
     + (content?.scrollHeight || body.scrollHeight) + (root.querySelector(".foot")?.offsetHeight || 0);
+  // Inner scrollers hide content from the body's scrollHeight. Include that overflow so a
+  // short connecting step cannot trap the model picker in the current native viewport.
+  for (const list of root.querySelectorAll(".model-list")) {
+    height += Math.max(0, list.scrollHeight - list.clientHeight);
+  }
   // Pushed screens pin live paid consent above their body.
   if (screen !== "main") height += root.querySelector(".key-prompts")?.scrollHeight || 0;
   for (const menu of root.querySelectorAll('.header-menu .menu:not([hidden])')) {

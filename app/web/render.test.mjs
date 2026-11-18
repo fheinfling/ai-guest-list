@@ -1866,6 +1866,25 @@ test("consent answers share size and weight, with no asymmetric CSS overrides", 
   assert.doesNotMatch(selectors, /data-approved|key-answer|k-no|k-go|paid-key-enable|paid-key-back|key-prove|:(?:first|last|nth|only)-(?:child|of-type)/);
 });
 
+test("model picker only offers free visibility when the catalog contains known free models", () => {
+  for (const catalog of [
+    { sort_key: "id", models: [{ id: "claude-sonnet-4-5", display_name: "Claude Sonnet 4.5" }] },
+    { sort_key: "input_usd_per_million_tokens", models: [{ id: "paid", price: livePrice("1", "2") }] },
+    { sort_key: "input_usd_per_million_tokens", models: [{ id: "unknown-output", price: livePrice("0", null) }] },
+    { sort_key: "id", models: [] },
+  ]) {
+    const h = buildModelPicker(keyFlow({ provider: "anthropic", catalog }));
+    assert.doesNotMatch(h, /show-free-models|free-control|free models hidden|free models shown/);
+    assert.match(h, /id="key-model-filter"/);
+  }
+  const h = buildModelPicker(keyFlow({ modelFilter: "paid", catalog: {
+    sort_key: "input_usd_per_million_tokens", models: [
+      { id: "free", price: livePrice("0", "0") }, { id: "paid", price: livePrice("1", "2") },
+    ],
+  } }));
+  assert.match(h, /id="show-free-models"/); // Filtering does not remove the user's toggle.
+});
+
 test("free model visibility is reversible and catalog provenance is outside result rows", () => {
   const h = buildModelPicker(keyFlow({ catalog: { sort_key: "input_usd_per_million_tokens",
     models: [{ id: "free-model", price: livePrice("0", "0") }, { id: "paid-model", price: livePrice("1", "2") }],
@@ -2930,6 +2949,63 @@ test("content height reports intrinsic size through agl and shrinks after disclo
   sizes.content = 241.3; app.window.AGL.update(state()); flush(); assert.equal(heights().at(-1), 318);
   assert.match(css, /max-height:min\(600px,100vh\)/);
   assert.match(css, /\.body \{[^}]*overflow-y:auto/);
+});
+
+test("model picker height includes hidden list overflow and stays intrinsic at the native cap", () => {
+  const frames = [], observer = {};
+  const body = { scrollHeight: 198 };
+  const list = { scrollHeight: 1625, clientHeight: 0 }; // 25 rows in the collapsed picker
+  let pickerVisible = false;
+  const root = { innerHTML: "", firstElementChild: { scrollHeight: 242 },
+    querySelector(q) {
+      if (q === ".body, .set-body") return body;
+      if (q === ".top, .set-head") return { offsetHeight: 44 };
+      return null;
+    },
+    querySelectorAll(q) {
+      if (q === ".app, .content, .set-body, .key-prompts, .model-list") return [this.firstElementChild, body, ...(pickerVisible ? [list] : [])];
+      if (q === ".model-list") return pickerVisible ? [list] : [];
+      return [];
+    },
+  };
+  const app = keyApp({ root, requestAnimationFrame: (fn) => { frames.push(fn); return frames.length; },
+    ResizeObserver: class { constructor(fn) { observer.change = fn; } disconnect() {} observe() {} },
+  });
+  const flush = () => { while (frames.length) frames.shift()(); };
+  const heights = () => app.sent.filter((m) => m.action === "resize").map((m) => m.height);
+  app.click({ action: "key-start" }); app.click({ action: "key-provider", provider: "anthropic" });
+  app.input("key-label", "test seat"); app.input("key-secret", "test-secret");
+  app.click({ action: "key-discover" });
+  const request = app.sent.at(-1);
+  flush(); assert.deepEqual(heights(), [242], "the connecting step starts with a short viewport");
+  pickerVisible = true;
+  app.window.AGL.result({ key_action: "models_list", key_request_id: request.key_request_id,
+    ok: true, sort_key: "id", models: Array.from({ length: 25 }, (_, i) => ({ id: `test-model-${i}` })) });
+  flush();
+  assert.equal(heights().at(-1), 1867, "report the 1625px hidden list overflow so native can expand");
+  body.scrollHeight = 556; list.clientHeight = 358; // native has expanded the viewport to 600px
+  const count = heights().length;
+  observer.change(); observer.change(); flush();
+  assert.equal(heights().length, count, "the intrinsic request stays stable after native clamps it");
+  list.scrollHeight += 65;
+  observer.change(); flush();
+  assert.equal(heights().at(-1), 1932, "count only hidden overflow, not the visible part twice");
+  body.scrollHeight = 304; list.scrollHeight = list.clientHeight = 130;
+  app.windowHandlers.resize(); flush();
+  assert.equal(heights().at(-1), 348, "a short list without hidden overflow can shrink again");
+  pickerVisible = false; body.scrollHeight = 220;
+  app.click({ action: "key-back" }); flush();
+  assert.equal(heights().at(-1), 264, "leaving the picker restores the ordinary pushed-screen height");
+});
+
+test("model picker CSS reserves two rows and lets the outer body scroll below its content floor", () => {
+  const listRule = css.match(/\.model-list \{([^}]*)\}/)?.[1] || "";
+  const minimum = Number(listRule.match(/min-height:\s*([\d.]+)px/)?.[1] || 0);
+  assert.ok(minimum >= 130, "the model list must reserve at least two 65px option rows");
+  assert.match(css, /\.model-picker \{[^}]*min-height:min-content/);
+  assert.match(css, /#key-model-results \{[^}]*min-height:min-content/);
+  assert.match(css, /\.set-body \{[^}]*overflow-y:auto/);
+  assert.doesNotMatch(css, /\.picker-body \{[^}]*overflow:\s*hidden/);
 });
 
 test("button menus retain their purpose through polls, close on Escape and navigate by keyboard", () => {

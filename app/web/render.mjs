@@ -1040,12 +1040,15 @@ export function buildPaidKeyGate(state, flow) {
     ${flow.error ? `<p role="alert">${esc(flow.error)}</p>` : ""}<div class="equal-choices"><button class="choice" data-action="paid-key-back"${disabled}>not now</button><button class="choice" data-action="paid-key-enable"${disabled}>${flow.pending ? "opening…" : "allow and open"}</button></div></section></div></div>`;
 }
 
+function isFreeModel(model) {
+  return ["input", "output"].every((name) => priceRate(model.price, name) !== null && Number(priceRate(model.price, name)) === 0);
+}
+
 // Render only these results on input: the filter field itself keeps focus and its caret.
 export function buildModelResults(flow) {
   const catalog = flow.catalog || {};
   const priced = catalog.sort_key === "input_usd_per_million_tokens";
   const query = (flow.modelFilter || "").toLowerCase();
-  const isFree = (m) => ["input", "output"].every((name) => priceRate(m.price, name) !== null && Number(priceRate(m.price, name)) === 0);
   const models = [...(catalog.models || [])].sort((a,b) => {
     if (!priced) return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
     const av = priceRate(a.price, "input"), bv = priceRate(b.price, "input");
@@ -1059,10 +1062,10 @@ export function buildModelResults(flow) {
     const [whole, fraction] = price.split(".");
     return `<span class="decimal"><span>${whole}</span><span>.${fraction}</span></span>`;
   };
-  return `<p class="model-count" role="status"><span class="without-free">${visible.filter((m) => !isFree(m)).length}</span><span class="with-free">${visible.length}</span> matching models</p>
+  return `<p class="model-count" role="status"><span class="without-free">${visible.filter((m) => !isFreeModel(m)).length}</span><span class="with-free">${visible.length}</span> matching models</p>
     <div class="model-columns"><span>model / context</span>${priced ? `<span>input / output<br>USD per million tokens</span>` : ""}</div>
-    <div class="model-list${priced ? "" : " model-list--unpriced"}">${visible.map((model) => `<button class="key-model-option${isFree(model) ? " is-free" : ""}" data-action="key-model" data-model="${esc(model.id)}"><span class="model-identity"><span class="model-id">${esc(model.id)}</span>${model.context_window != null ? `<span class="model-context">${esc(context(model.context_window))} context</span>` : ""}</span>${priced ? `<span class="model-rates">${isFree(model) ? "free" : `${decimal(priceRate(model.price, "input"))}${decimal(priceRate(model.price, "output"))}`}</span>` : ""}</button>`).join("") || `<p class="empty">${query ? `no models match “${esc(flow.modelFilter)}”.` : "no models returned; go back to check your key and endpoint."}</p>`}
-    ${visible.length && visible.every(isFree) ? `<p class="only-free">only free models match; use “show” above to include them.</p>` : ""}</div>`;
+    <div class="model-list${priced ? "" : " model-list--unpriced"}">${visible.map((model) => `<button class="key-model-option${isFreeModel(model) ? " is-free" : ""}" data-action="key-model" data-model="${esc(model.id)}"><span class="model-identity"><span class="model-id">${esc(model.id)}</span>${model.context_window != null ? `<span class="model-context">${esc(context(model.context_window))} context</span>` : ""}</span>${priced ? `<span class="model-rates">${isFreeModel(model) ? "free" : `${decimal(priceRate(model.price, "input"))}${decimal(priceRate(model.price, "output"))}`}</span>` : ""}</button>`).join("") || `<p class="empty">${query ? `no models match “${esc(flow.modelFilter)}”.` : "no models returned; go back to check your key and endpoint."}</p>`}
+    ${visible.length && visible.every(isFreeModel) ? `<p class="only-free">only free models match; use “show” above to include them.</p>` : ""}</div>`;
 }
 
 export function buildModelPicker(flow) {
@@ -1070,7 +1073,7 @@ export function buildModelPicker(flow) {
   const provider = KEY_PROVIDERS[flow.provider];
   const priced = catalog.sort_key === "input_usd_per_million_tokens";
   return `<section class="model-picker"><div class="search-region"><label class="set-label" for="key-model-filter">find your model</label><input class="add-input" id="key-model-filter" type="search" autofocus aria-label="search models" placeholder="model id or name" autocomplete="off" spellcheck="false" value="${esc(flow.modelFilter || "")}">
-    <label class="free-control"><input id="show-free-models" type="checkbox"><span class="without-free">free models hidden <b>show</b></span><span class="with-free">free models shown <b>hide</b></span></label>
+    ${(catalog.models || []).some(isFreeModel) ? `<label class="free-control"><input id="show-free-models" type="checkbox"><span class="without-free">free models hidden <b>show</b></span><span class="with-free">free models shown <b>hide</b></span></label>` : ""}
     <p class="support">${priced ? "sorted by input price; unknown prices last" : "this provider publishes no machine-readable prices."}</p></div><div id="key-model-results">${buildModelResults(flow)}</div>
     <footer class="model-footer"><p class="support">${catalog.source === "cache" ? "cached" : "live"} ${priced ? "price estimates" : "catalog"}; ${esc(fmtUsageAge(catalog.fetched_at))}${catalog.potentially_stale ? "; over 24h old" : ""}</p>${catalog.error ? `<p class="usage-error">refresh failed; showing the last catalog.</p>` : ""}
     ${provider?.pricing ? `<button class="pricing-link" data-action="key-pricing" data-provider="${esc(flow.provider)}">provider pricing and budget controls</button>` : `<p class="support">ask your endpoint operator about pricing.</p>`}<p class="support">this app does not cap spend.</p></footer></section>`;

@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Literal
+from urllib.parse import urlencode
 
 from .providers import Provider, WireAPI
 from .util import redact_key as _sanitize_catalog
@@ -363,11 +364,24 @@ def fetch_catalog(provider: Provider, key: str = "", *, get: HttpGet = _default_
     if cached is not None and not cached.cache_expired:
         return cached
     try:
-        status, body = get(provider.models_endpoint,
-                           {} if provider.catalog_public else provider.headers(key), timeout)
-        if status != 200:
-            raise ValueError(f"http_{status}")
-        models = parse_catalog(provider, body, wire_api=wire, verified_at=at.isoformat())
+        url = provider.models_endpoint
+        cursors: set[str] = set()
+        models = []
+        while True:
+            status, body = get(url, {} if provider.catalog_public else provider.headers(key), timeout)
+            if status != 200:
+                raise ValueError(f"http_{status}")
+            models.extend(parse_catalog(provider, body, wire_api=wire, verified_at=at.isoformat()))
+            # Anthropic's /v1/models is cursor-paginated. Only publish/cache a complete catalog;
+            # a failed later page must use the same fallback as a failed first request.
+            page = json.loads(body) if provider.id == "anthropic" else {}
+            if page.get("has_more") is not True:
+                break
+            cursor = page.get("last_id")
+            if not isinstance(cursor, str) or not cursor or cursor in cursors or not page.get("data"):
+                raise ValueError("invalid_catalog_cursor")
+            cursors.add(cursor)
+            url = provider.models_endpoint + "?" + urlencode({"after_id": cursor})
         models = _sanitize_catalog(models, key)
         if not models:
             if provider.id == "langdock_anthropic":

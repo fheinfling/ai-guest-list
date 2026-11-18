@@ -33,6 +33,76 @@ def fake_get(mapping, calls):
     return get
 
 
+def anthropic_page(ids, *, has_more=False, last_id=None):
+    return json.dumps({"data": [{"type": "model", "id": id, "display_name": id,
+                                "created_at": "2025-09-29T00:00:00Z"} for id in ids],
+                       "has_more": has_more, "first_id": ids[0] if ids else None,
+                       "last_id": last_id if last_id is not None else (ids[-1] if ids else None)})
+
+
+def test_anthropic_catalog_follows_after_id_and_caches_all_pages(tmp_path):
+    p = get_provider("anthropic")
+    calls = []
+    # The cursor is an opaque id, not a URL to follow or raw query text to append.
+    cursor = "claude-opus/4?&"
+    second = p.models_endpoint + "?after_id=claude-opus%2F4%3F%26"
+    get = fake_get({p.models_endpoint: (200, anthropic_page([cursor], has_more=True)),
+                    second: (200, anthropic_page(["claude-sonnet-4-5-20250929"]))}, calls)
+    path = tmp_path / "prices.json"
+    catalog = P.fetch_catalog(p, "fake-key-example-only", get=get, cache_path=path, at=NOW)
+    assert catalog.source == "live" and catalog.error is None
+    assert [m.id for m in catalog.models] == [cursor, "claude-sonnet-4-5-20250929"]
+    assert calls == [(url, {"x-api-key": "fake-key-example-only",
+                           "anthropic-version": "2023-06-01"}, 20)
+                     for url in (p.models_endpoint, second)]
+    cached = P.fetch_catalog(p, "fake-key-example-only", get=get, cache_path=path, at=NOW)
+    assert cached.source == "cache" and cached.models == catalog.models
+    assert len(calls) == 2
+    assert "fake-key-example-only" not in path.read_text()
+
+
+@pytest.mark.parametrize("with_cache", [False, True])
+@pytest.mark.parametrize("status,body,error", [
+    (401, '{"error":{"type":"authentication_error"}}', "http_401"),
+    (429, '{"error":{"type":"rate_limit_error"}}', "http_429"),
+    (503, "", "http_503"), (200, "{", "catalog_unavailable"),
+])
+def test_anthropic_later_page_failure_never_publishes_or_caches_partial_catalog(
+        tmp_path, with_cache, status, body, error):
+    p = get_provider("anthropic")
+    path = tmp_path / "prices.json"
+    if with_cache:
+        P.fetch_catalog(p, get=lambda *_: (200, anthropic_page(["old-complete"])),
+                        cache_path=path, at=NOW)
+    original_cache = path.read_bytes() if with_cache else None
+    calls = []
+    get = fake_get({p.models_endpoint: (200, anthropic_page(["partial"], has_more=True)),
+                    p.models_endpoint + "?after_id=partial": (status, body)}, calls)
+    result = P.fetch_catalog(p, get=get, cache_path=path, at=NOW + timedelta(hours=31))
+    assert result.error == error
+    assert [m.id for m in result.models] == (["old-complete"] if with_cache else [])
+    assert result.source == ("cache" if with_cache else "unavailable")
+    assert result.potentially_stale is with_cache
+    assert (path.read_bytes() if path.exists() else None) == original_cache
+
+
+@pytest.mark.parametrize("page", [
+    '{"data":[{"id":"partial"}],"has_more":true}',
+    anthropic_page(["partial"], has_more=True),  # Same cursor returned forever.
+    anthropic_page([], has_more=True, last_id="partial"),
+])
+def test_anthropic_invalid_or_repeated_cursor_stops_without_partial_success(tmp_path, page):
+    calls = []
+    def get(url, headers, timeout):
+        calls.append(url)
+        assert len(calls) <= 2, "pagination must stop when its cursor fails to advance"
+        return 200, page
+    result = P.fetch_catalog(get_provider("anthropic"), get=get,
+                             cache_path=tmp_path / "prices.json", at=NOW)
+    assert result.source == "unavailable" and result.models == []
+    assert result.error == "catalog_unavailable"
+
+
 def test_xai_cents_per_100m_and_zero_long_context_fallback():
     # docs.x.ai/developers/rest-api-reference/inference/models (language-models envelope).
     body = json.dumps({"models": [{"id": "grok", "prompt_text_token_price": 20000,
