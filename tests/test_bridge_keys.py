@@ -105,6 +105,52 @@ def test_models_live_prices_or_absent(ctx, transport, provider, sort_key, ids):
     assert result["state"]["rev"] == 0  # Catalog discovery is not a state mutation.
 
 
+def test_anthropic_models_list_returns_every_page_in_picker_shape(ctx, monkeypatch):
+    from acctsw.paths import ANTHROPIC_VERSION
+    from acctsw.providers import get_provider
+    endpoint = get_provider("anthropic").models_endpoint
+    rows = [
+        {"type": "model", "id": "claude-sonnet-4-5-20250929",
+         "display_name": "Claude Sonnet 4.5", "created_at": "2025-09-29T00:00:00Z"},
+        {"type": "model", "id": "claude-opus-4-1-20250805",
+         "display_name": "Claude Opus 4.1", "created_at": "2025-08-05T00:00:00Z",
+         "max_input_tokens": 200000},
+    ]
+    calls = []
+    def get(url, headers, timeout):
+        calls.append((url, headers, timeout))
+        index = 0 if url == endpoint else 1
+        return 200, json.dumps({"data": [rows[index]], "has_more": index == 0,
+                                "first_id": rows[index]["id"], "last_id": rows[index]["id"]})
+    monkeypatch.setattr(pricing, "_default_get", get)
+    result = bridge.handle(ctx, {"action": "models_list", "provider": "anthropic",
+                                 "secret": SECRET})
+    envelope(ctx, result)
+    assert result["ok"] and result["sort_key"] == "id" and result["source"] == "live"
+    assert result["key_action"] == "models_list"
+    assert result["models"] == [
+        {"id": rows[1]["id"], "display_name": "Claude Opus 4.1", "context_window": 200000},
+        {"id": rows[0]["id"], "display_name": "Claude Sonnet 4.5", "context_window": None},
+    ]
+    assert calls == [(url, {"x-api-key": SECRET, "anthropic-version": ANTHROPIC_VERSION}, 20)
+                     for url in (endpoint, endpoint + "?after_id=" + rows[0]["id"])]
+    assert not result["state"]["keys"] and result["state"]["rev"] == 0
+
+
+@pytest.mark.parametrize("status,kind", [
+    (401, "authentication_error"), (403, "permission_error"),
+    (429, "rate_limit_error"), (529, "overloaded_error"),
+])
+def test_anthropic_catalog_errors_return_safe_details(ctx, monkeypatch, status, kind):
+    monkeypatch.setattr(pricing, "_default_get", lambda *_: (status, json.dumps({
+        "type": "error", "error": {"type": kind, "message": SECRET}})))
+    result = bridge.handle(ctx, {"action": "models_list", "provider": "anthropic",
+                                 "secret": SECRET})
+    envelope(ctx, result)
+    assert not result["ok"] and result["models"] == []
+    assert result["error"] == "couldn't refresh the provider's model catalog"
+
+
 @pytest.mark.parametrize("action", sorted(bridge.KEY_ACTIONS))
 def test_missing_fields_always_return_envelope(ctx, action):
     result = bridge.handle(ctx, {"action": action, "secret": SECRET})
