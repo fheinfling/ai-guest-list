@@ -70,6 +70,7 @@ _START_CACHE: dict[int, str] = {}
 # Whether this process's session can reopen itself on a newer engine (set by launcher.run): one that
 # can't, such as `cl "a prompt"`, still needs the user, so the app keeps warning about it.
 SELF_RESTART = False
+RESTART_BLOCKER: str | None = None
 
 
 def _where_am_i() -> dict:
@@ -113,6 +114,7 @@ def mark_session(data_dir: Path, tool: str, email: str, *, pin: str | None = Non
         "engine": __version__,
         "capabilities": list(CAPABILITIES),
         "self_restart": SELF_RESTART,
+        "restart_blocker": RESTART_BLOCKER,
     }
     # Where this terminal is, so a notice about it can say which one ("started 19:23 in ~/Work/x").
     data.update(_where_am_i())
@@ -135,6 +137,25 @@ def mark_session(data_dir: Path, tool: str, email: str, *, pin: str | None = Non
         pass
     write_json(_process_file(data_dir, tool, pid), data, mode=0o600)
     write_json(legacy, data, mode=0o600)
+
+
+def update_restart_diagnostics(data_dir: Path, tool: str) -> None:
+    """Update only diagnostics in this supervisor's existing per-process heartbeat.
+
+    A capability/blocker change is not a launch or seat hop. Keep all launch/hop metadata,
+    including fields unknown to this engine. Never write the shared legacy mirror: its owner can
+    change between a read and an atomic replacement. Writes remain atomic and private.
+    """
+    pid = os.getpid()
+    path = _process_file(data_dir, tool, pid)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(data, dict) or data.get("pid") != pid:
+        return
+    data.update(self_restart=SELF_RESTART, restart_blocker=RESTART_BLOCKER)
+    write_json(path, data, mode=0o600)
 
 
 def clear_session(data_dir: Path, tool: str) -> None:
@@ -227,14 +248,22 @@ def active_session(data_dir: Path, tool: str, *, email: str | None = None) -> di
 
 
 def active_sessions(data_dir: Path, tool: str, *, strict: bool = False) -> list[dict]:
-    """Every live terminal; strict maintenance reads raise on uncertain/malformed records."""
+    """Every live terminal's latest launch/hop, preferring its per-process record on a tie.
+
+    Diagnostics change only the per-process record without advancing its launch/hop timestamp.
+    A legacy-only owner's later hop supersedes its upgrade-preserved per-process snapshot.
+    Strict maintenance reads raise on uncertain/malformed records.
+    """
     sessions = {}
     for path in _session_files(data_dir, tool, strict=strict):
         data = _read_session(path, strict=strict)
         if data is not None:
-            previous = sessions.get(data["pid"])
-            sessions[data["pid"]] = (newest_session([data, previous])
-                                     if previous is not None else data)
+            pid = data["pid"]
+            previous = sessions.get(pid)
+            if (previous is None or data["started_at"] > previous["started_at"]
+                    or (data["started_at"] == previous["started_at"]
+                        and path == _process_file(data_dir, tool, pid))):
+                sessions[pid] = data
     return list(sessions.values())
 
 
@@ -316,6 +345,9 @@ def _read_session(path: Path, *, strict: bool = False) -> dict | None:
         caps = data.get("capabilities")
         public["capabilities"] = caps if isinstance(caps, list) else []
         public["self_restart"] = data.get("self_restart") is True
+    if "restart_blocker" in data and (data["restart_blocker"] is None
+                                      or isinstance(data["restart_blocker"], str)):
+        public["restart_blocker"] = data["restart_blocker"]
     if isinstance(data.get("pin"), str):
         public.update({k: data.get(k) for k in ("pin", "paid", "key_seat", "end_requested")})
     return public
@@ -342,7 +374,8 @@ def stale_engines(data_dir: Path, live: dict[str, list[dict]] | None = None) -> 
                                            "capabilities": record.get("capabilities")}):
                 out.append({"tool": tool, "pid": record["pid"], "engine": version,
                             "self_restart": record.get("self_restart") is True,
-                            **{k: record[k] for k in ("email", "started_at", "cwd", "tty")
+                            **{k: record[k] for k in ("email", "started_at", "cwd", "tty",
+                                                     "restart_blocker")
                                if isinstance(record.get(k), str)}})
     return out
 

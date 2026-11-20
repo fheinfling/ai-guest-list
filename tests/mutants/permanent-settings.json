@@ -1,0 +1,70 @@
+[
+ {
+  "label": "permanent setting: engine_restart forced False",
+  "file": "acctsw/state.py",
+  "old": "    \"engine_restart\": True,\n",
+  "new": "    \"engine_restart\": False,\n",
+  "test": [
+   "tests/test_state.py::test_load_forces_permanent_settings_and_saves_them_for_older_engines[engine_restart]",
+   "tests/test_state.py::test_empty_has_all_permanent_settings_enabled"
+  ]
+ },
+ {
+  "label": "permanent setting: in_place_switch forced False",
+  "file": "acctsw/state.py",
+  "old": "    \"in_place_switch\": True,\n",
+  "new": "    \"in_place_switch\": False,\n",
+  "test": [
+   "tests/test_state.py::test_load_forces_permanent_settings_and_saves_them_for_older_engines[in_place_switch]",
+   "tests/test_state.py::test_empty_has_all_permanent_settings_enabled"
+  ]
+ },
+ {
+  "label": "permanent setting: in_place_cross_tier forced False",
+  "file": "acctsw/state.py",
+  "old": "    \"in_place_cross_tier\": True,\n",
+  "new": "    \"in_place_cross_tier\": False,\n",
+  "test": [
+   "tests/test_state.py::test_load_forces_permanent_settings_and_saves_them_for_older_engines[in_place_cross_tier]",
+   "tests/test_state.py::test_empty_has_all_permanent_settings_enabled"
+  ]
+ },
+ {
+  "label": "permanent setting: keep_warm forced False",
+  "file": "acctsw/state.py",
+  "old": "    \"keep_warm\": True,\n",
+  "new": "    \"keep_warm\": False,\n",
+  "test": [
+   "tests/test_state.py::test_load_forces_permanent_settings_and_saves_them_for_older_engines[keep_warm]",
+   "tests/test_state.py::test_empty_has_all_permanent_settings_enabled"
+  ]
+ },
+ {
+  "label": "permanent setting: notify forced False",
+  "file": "acctsw/state.py",
+  "old": "    \"notify\": True,\n",
+  "new": "    \"notify\": False,\n",
+  "test": [
+   "tests/test_state.py::test_load_forces_permanent_settings_and_saves_them_for_older_engines[notify]",
+   "tests/test_state.py::test_empty_has_all_permanent_settings_enabled"
+  ]
+ },
+ {
+  "label": "permanent settings: stored values win on load",
+  "file": "acctsw/state.py",
+  "old": "        settings.update(FORCED_SETTINGS)\n",
+  "new": "",
+  "test": [
+   "tests/test_state.py::test_load_forces_permanent_settings_and_saves_them_for_older_engines"
+  ]
+ },
+ {
+  "label": "permanent settings: bridge accepts retired toggles",
+  "file": "acctsw/bridge.py",
+  "old": "    \"confirm_key_switch\", \"key_fallback\", \"crossing_auto\", \"update_tools\",\n",
+  "new": "    \"confirm_key_switch\", \"key_fallback\", \"crossing_auto\", \"update_tools\",\n    \"engine_restart\", \"in_place_switch\", \"in_place_cross_tier\", \"keep_warm\", \"notify\",\n",
+  "test": [
+   "tests/test_bridge.py::test_toggle_rejects_permanent_settings_without_saving"
+  ]
+ }
+]

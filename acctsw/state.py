@@ -12,7 +12,7 @@ Holds only metadata — NEVER credentials (those live in the Keychain). Shape::
       "settings": {"auto_switch": true, "notify": true,
                    "restart_app": false, "supervise_shell": true, "engine_restart": true,
                    "theme": "light", "confirm_key_switch": true, "key_fallback": false,
-                   "in_place_switch": true, "in_place_cross_tier": false},
+                   "in_place_switch": true, "in_place_cross_tier": true, "update_tools": true},
       "engine": {"last_writer": "<version>", "newest_writer": "<version>",
                  "min_writer": "<version>"}
     }
@@ -112,8 +112,19 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "in_place_switch": True,  # move a running claude between seats without restarting it
     "keep_warm": True,        # let Claude Code renew idle parked seats before access expires
     "crossing_auto": False,   # business<->personal switches happen without asking each time
-    "in_place_cross_tier": False,  # ...also between plan tiers (Max/Pro/Team): models may differ
+    "in_place_cross_tier": True,  # ...also between plan tiers (Max/Pro/Team): models may differ
+    "update_tools": True,     # install CLI updates; idle supervisors resume on the new binary
     "engine_restart": True,   # an idle session restarts itself onto a newer engine and resumes
+}
+
+# User decision 2026-11-20: these behaviours are permanent, overriding older stored values.
+# Keep writing the keys so OLDER engines still running in terminals read the same values.
+FORCED_SETTINGS = {
+    "engine_restart": True,
+    "in_place_switch": True,
+    "in_place_cross_tier": True,
+    "keep_warm": True,
+    "notify": True,
 }
 
 
@@ -122,7 +133,7 @@ def _empty() -> dict[str, Any]:
         "version": STATE_VERSION,
         "tools": {t: {"active": None, "accounts": {}} for t in TOOLS},
         "keys": {},  # id -> metadata; secrets remain in Keychain
-        "settings": dict(DEFAULT_SETTINGS),
+        "settings": {**DEFAULT_SETTINGS, **FORCED_SETTINGS},
     }
 
 
@@ -148,6 +159,7 @@ class State:
         data.setdefault("keys", {})
         settings = dict(DEFAULT_SETTINGS)
         settings.update(data.get("settings") or {})
+        settings.update(FORCED_SETTINGS)
         data["settings"] = settings
         return cls(path=path, data=data)
 

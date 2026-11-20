@@ -1454,3 +1454,29 @@ def test_fetch_exception_log_stops_at_a_self_referencing_chain(monkeypatch, caps
 def test_fetch_exception_log_has_no_cause_separator_without_a_chain(capsys):
     U._log_fetch_exception(ValueError("fake-token-must-never-appear"))
     assert capsys.readouterr().err == "Traceback (most recent call last):\nValueError\n"
+
+
+@pytest.mark.parametrize("blip", [
+    U.HttpReply(0, "", None, error="offline"), U.HttpReply(0, "", None),
+    U.HttpReply(0, "", None, error="tls"), (429, ""), (503, "")])
+@pytest.mark.parametrize("verdict,status", [("forbidden", 403), ("unauthorized", 401)])
+def test_a_blip_does_not_erase_a_refused_subscription(ctx, blip, verdict, status):
+    """Found running the real app: a canceled (403) seat turned into the next auto-switch target
+    after one offline poll, because the transient error replaced the provider's verdict."""
+    from acctsw import selection
+    state = _seed_two_codex(ctx)
+    email = "b@x.com"
+    U.refresh(ctx, state, "codex", only=email, force=True,
+              get=fake_get({P.CODEX_USAGE_URL: (status, "")}))
+    assert state.get_seat("codex", email)["usage"]["error"] == verdict
+    U.refresh(ctx, state, "codex", only=email, force=True, get=lambda *a: blip)
+    stored = state.get_seat("codex", email)["usage"]
+    assert stored["error"] == verdict and stored["stale"] is True
+    assert stored["transient_error"] in ("offline", "network", "tls", "rate_limited", "http_503")
+    if verdict == "forbidden":
+        assert selection.choose(state, "codex", exclude={state.active("codex")}).email != email
+    # A real answer still replaces the verdict.
+    U.refresh(ctx, state, "codex", only=email, force=True,
+              get=fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body())}))
+    stored = state.get_seat("codex", email)["usage"]
+    assert stored["error"] is None and stored["ok"] is True and "transient_error" not in stored

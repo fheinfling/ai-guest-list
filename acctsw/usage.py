@@ -885,6 +885,16 @@ def _fetch_for(tool: str, blob: str, get: HttpGet, ua: str | None) -> Usage:
 
 
 MAX_BACKOFF_SECONDS = 3600
+
+# Answers from the provider that stand until the provider says something else.
+VERDICT_ERRORS = frozenset({"forbidden", "unauthorized"})
+
+
+def _no_answer(error: str | None) -> bool:
+    """A failure that carries no verdict about the login: nothing (or only overload) came back."""
+    return (error in ("offline", "network", "tls", "internal", "rate_limited")
+            or (isinstance(error, str) and error.startswith("http_5")))
+
 # Only proven connection-establishment failures get a fast usage GET retry after wake/DNS blips.
 OFFLINE_RETRY_SECONDS = 30
 ACTIVE_MAX_BACKOFF_SECONDS = 300
@@ -1426,6 +1436,12 @@ def store_fetch(state, tool: str, email: str, u: Usage, at=None, *,
             d["fetched_at"] = prev_usage.get("fetched_at") or None
         d["last_attempted_at"] = u.fetched_at or iso(at)
         d["stale"] = True
+        if prev_usage.get("error") in VERDICT_ERRORS and _no_answer(u.error):
+            # The provider already said this login or subscription is refused. A request that got no
+            # answer (offline, timeout, TLS, 429, 5xx) proves nothing new: keep the verdict, so a
+            # canceled subscription doesn't turn back into an auto-switch candidate after a blip.
+            d["transient_error"] = u.error
+            d["error"] = prev_usage["error"]
         if u.error in DEAD_CREDENTIAL_ERRORS:
             # Not transient: no retry streak. The digest lets the next poll skip identical bytes.
             d["error_streak"] = 0

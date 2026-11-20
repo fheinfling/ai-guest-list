@@ -22,7 +22,7 @@ def pending(ctx, monkeypatch, *, notify=True, at=None):
 
 
 @pytest.mark.parametrize("enabled", [True, False])
-def test_pending_confirmation_notifies_once_honouring_setting(ctx, monkeypatch, enabled):
+def test_pending_confirmation_notifies_once_despite_legacy_setting(ctx, monkeypatch, enabled):
     id = pending(ctx, monkeypatch, notify=enabled)
     notices = menubar.KeySwitchNotices()
     delivered = []
@@ -30,26 +30,21 @@ def test_pending_confirmation_notifies_once_honouring_setting(ctx, monkeypatch, 
     result = bridge.handle(ctx, {"action": "status"})
     notices.deliver(result["state"], receiver._notify)
     notices.deliver(result["state"], receiver._notify)
-    assert len(delivered) == int(enabled)
-    if enabled:
-        title, text = delivered[0]
-        assert title == "a paid key needs your okay"
-        assert "work@example.test" in text and "late-night" in text and "vendor/model" in text
-        assert "approve paid use or decline" in text
+    assert len(delivered) == 1
+    title, text = delivered[0]
+    assert title == "a paid key needs your okay"
+    assert "work@example.test" in text and "late-night" in text and "vendor/model" in text
+    assert "approve paid use or decline" in text
     answer = bridge.handle(ctx, {"action": "answer_key_switch", "id": id, "approved": False})
     notices.deliver(answer["state"], receiver._notify)
     notices.deliver(result["state"], receiver._notify)  # stale pending snapshot
-    assert len(delivered) == int(enabled)
+    assert len(delivered) == 1
 
 
-def test_notification_respects_current_setting_and_request_setting(ctx, monkeypatch):
+def test_notification_respects_legacy_request_flag(ctx, monkeypatch):
     pending(ctx, monkeypatch)
-    bridge.handle(ctx, {"action": "toggle", "key": "notify", "value": False})
-    menubar.KeySwitchNotices().deliver(bridge.snapshot_state(ctx), lambda *_: pytest.fail("disabled now"))
-    pending(ctx, monkeypatch, notify=False)
     snapshot = bridge.snapshot_state(ctx)
-    snapshot["pending_key_switches"] = snapshot["pending_key_switches"][-1:]
-    snapshot["settings"]["notify"] = True
+    snapshot["pending_key_switches"][0]["notify"] = False
     menubar.KeySwitchNotices().deliver(snapshot, lambda *_: pytest.fail("disabled when requested"))
 
 

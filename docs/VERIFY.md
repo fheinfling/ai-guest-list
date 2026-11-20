@@ -62,11 +62,12 @@ rollout's thread ID only when the attachment is unambiguous and resumes with `co
 without a captured ID it uses `codex resume --last`. A business ↔ personal move, or one involving
 an unknown seat kind, asks for approval before moving the live session unless already permitted.
 For a supervised Claude session (`cl`), `acctsw switch claude <other-seat-email>` can swap the seat
-**in place** through the per-session local proxy without restarting. Across known different tiers,
-an in-place move requires `in_place_cross_tier` or approval for that tier pair; otherwise the hop
-can restart the child and ask whether future hops between those tiers may go in place.
-Business/personal approval is separate. When in-place switching is turned off in settings, a manual
-switch leaves the running `cl` session on its current seat and applies the new seat to the next session.
+**in place** through the per-session local proxy without restarting. In-place switching and
+cross-tier hops are always enabled for eligible sessions, even when an older store has
+`in_place_switch: false` or `in_place_cross_tier: false`. Verify that a Max ↔ Pro hop asks no
+plan-tier question, and that old tier requests never appear in the popover. Business/personal
+approval is separate and still required unless already permitted. Per-session routing and proxy
+eligibility guards still apply.
 
 ### B — a seat rested by another process makes the running session hop
 The field bug: the menubar's usage poll rests seat A while a supervised session is on it. Rest it the

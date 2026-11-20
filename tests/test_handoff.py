@@ -121,7 +121,7 @@ def test_auto_approval_is_recorded_and_consumed(ctx, seat):
     assert record["status"] == "approved"
     assert record["decision_source"] == "setting"
     assert record["answered_at"] == record["created_at"]
-    assert record["notify"] is False
+    assert record["notify"] is True  # a legacy False no longer mutes new handoffs
     assert handoff.pending(ctx) == []
     assert handoff.resolve(ctx, id)["status"] == "approved"
     assert handoff.resolve(ctx, id) is None

@@ -66,11 +66,11 @@ def test_a_truthy_or_empty_env_switch_leaves_it_on(ctx, tmp_path, value):
     assert seatswap.enabled(ctx, {"ACCTSW_IN_PLACE_SWITCH": value}, cwd=tmp_path)
 
 
-def test_the_setting_turns_it_off(ctx, tmp_path):
+def test_a_stored_false_setting_cannot_turn_in_place_switching_off(ctx, tmp_path):
     state = ctx.load_state()
     state.set_setting("in_place_switch", False)
     state.save()
-    assert seatswap.gate(ctx, {}, cwd=tmp_path) == "setting off"
+    assert seatswap.gate(ctx, {}, cwd=tmp_path) is None
 
 
 @pytest.mark.parametrize("name, value", [
@@ -143,10 +143,10 @@ def test_quarantined_seat_is_not_eligible(ctx):
     assert seatswap.eligible(ctx, "b@x", home_email="home@x") is None
 
 
-def test_a_different_tier_than_home_is_not_eligible(ctx):
+def test_a_different_tier_than_home_is_eligible(ctx):
     put_seat(ctx, "home@x", plan="Max")
     put_seat(ctx, "b@x", plan="Pro")
-    assert seatswap.eligible(ctx, "b@x", home_email="home@x") is None
+    assert seatswap.eligible(ctx, "b@x", home_email="home@x") == "tok"
 
 
 def test_an_unknown_home_tier_does_not_block(ctx):
@@ -395,9 +395,7 @@ def test_pick_spends_a_once_approval_and_not_the_reverse(ctx):
     state = ctx.load_state()
     seatkind.approve(state, T, "home@x", "w@x", "once")
     state.save()
-    # Tier differs (team vs max) so it is not eligible in place even when approved.
-    assert swap.pick(ctx, "home@x") is None
-    ctx.claude_cred("w@x").set_live(blob("w", sub="max"))
+    # Different plan tiers need no additional approval; the crossing's "once" is consumed.
     assert swap.pick(ctx, "home@x") == Seat("w@x", "w")
     assert not seatkind.approved(ctx.load_state(), T, "home@x", "w@x")
     assert swap.pick(ctx, "home@x") is None
@@ -616,14 +614,22 @@ def _lapsing_on_b(ctx):
     return swap, proxy
 
 
-@pytest.mark.parametrize("setting", ["auto_switch", "in_place_switch"])
-def test_maintain_never_moves_to_a_third_seat_with_a_setting_off(ctx, setting):
+def test_maintain_never_moves_to_a_third_seat_with_auto_switch_off(ctx):
     swap, proxy = _lapsing_on_b(ctx)
     state = ctx.load_state()
-    state.set_setting(setting, False)
+    state.set_setting("auto_switch", False)
     state.save()
     assert swap.maintain() == "handover"
     assert proxy.bound().email == "b@x" and swap.third_seat_moves == 0
+
+
+def test_stored_false_does_not_disable_in_place_maintenance(ctx):
+    swap, proxy = _lapsing_on_b(ctx)
+    state = ctx.load_state()
+    state.set_setting("in_place_switch", False)
+    state.save()
+    assert swap.maintain() is None
+    assert proxy.bound().email == "c@x" and swap.third_seat_moves == 1
 
 
 def test_maintain_never_moves_to_a_third_seat_past_the_hop_budget(ctx):

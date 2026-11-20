@@ -102,3 +102,15 @@ def test_a_failed_download_or_check_shows_failed_and_allows_another_try(tmp_path
     assert seen["spawned"] == [] and seen["main"] == [] and receiver._update_inflight is False
     raw = (Path(receiver.ctx.data_dir) / updater.STATUS_FILE).read_text()
     assert '"failed"' in raw and "checksum" in raw
+
+
+def test_automatic_update_timer_starts_tool_worker_without_usage_poll(tmp_path, monkeypatch):
+    from acctsw import toolupdate
+    ctx = Context.for_test(tmp_path)
+    workers, background = [], []
+    monkeypatch.setattr(toolupdate, 'start_updates', lambda c, **kw: workers.append((c, kw)))
+    receiver = SimpleNamespace(ctx=ctx, _notify=lambda *a: None, updateCheckBg_=lambda *a: None,
+        performSelectorInBackground_withObject_=lambda *a: background.append(a))
+    menubar.AGLDelegate.autoUpdateCheck_.callable(receiver, None)
+    assert len(workers) == len(background) == 1
+    assert workers[0][0] is ctx and callable(workers[0][1]['notify'])

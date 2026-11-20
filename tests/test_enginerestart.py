@@ -377,6 +377,27 @@ def test_claude_resume_without_thread_is_refused(old):
     assert restart_args("claude", old, None) is None
 
 
+@pytest.mark.parametrize("old", [
+    [], ["--resume", "old"], ["-r", "old"], ["--resume=old"], ["-r=old"],
+    ["--resume"], ["-r"], ["--session-id", "old"], ["--session-id=old"],
+    ["--continue"], ["-c"],
+])
+def test_claude_picker_replaces_conversation_options_and_keeps_whitelisted_flags(old):
+    flags = ["--chrome", "--model=opus", "--add-dir", "/extra", "--permission-mode", "plan"]
+    args = [*old, *flags]
+    before = list(args)
+    assert restart_args("claude", args, None, claude_picker=True) == [*flags, "--resume"]
+    assert args == before
+
+
+@pytest.mark.parametrize("args", [
+    ["fix the bug"], ["--resume", "old", "fix the bug"], ["--print"], ["--fork-session"],
+    ["--unknown"], ["--model"], ["--session-id"],
+])
+def test_claude_picker_preserves_the_argument_safety_checks(args):
+    assert restart_args("claude", args, None, claude_picker=True) is None
+
+
 @pytest.mark.parametrize("flag", sorted(er._CLAUDE_FLAGS))
 def test_claude_every_boolean_flag_is_kept(flag):
     assert restart_args("claude", [flag], THREAD) == [flag, "--resume", THREAD]
@@ -594,3 +615,52 @@ def test_an_unreadable_process_table_defers():
         raise OSError("no ps")
     assert er.has_late_descendants(1, run=boom) is True
     assert er.has_late_descendants(1, run=_ps("2 1 nonsense\n")) is True
+
+
+def test_cli_restart_allows_equal_engine_without_weakening_engine_loop_guard(tmp_path):
+    exe = tmp_path / 'acctsw'
+    probe = _probe({'version': '1.6.1'})
+    assert target_engine('1.6.1', exe=exe, probe=probe, allow_equal=True) == str(exe)
+    assert target_engine('1.6.1', exe=exe, probe=probe) is None
+    assert target_engine('1.7.0', exe=exe, probe=probe, allow_equal=True) is None
+    assert target_engine('dev', exe=exe, probe=probe, allow_equal=True) is None
+
+
+def test_cli_identity_tracks_symlink_and_same_path_replacements(tmp_path):
+    from acctsw import enginerestart as er
+    first = tmp_path / 'Caskroom' / 'codex' / '1.0.0' / 'bin' / 'codex'
+    first.parent.mkdir(parents=True)
+    first.write_text('old')
+    entry = tmp_path / 'codex'
+    entry.symlink_to(first)
+    before = er.binary_identity(entry)
+    assert before.realpath == str(first) and before.version == '1.0.0'
+    assert not er.binary_changed(before, er.binary_identity(entry))
+    second = first.parent.parent.parent / '2.0.0' / 'bin' / 'codex'
+    second.parent.mkdir(parents=True)
+    second.write_text('new')
+    entry.unlink()
+    assert not er.binary_changed(before, er.binary_identity(entry))
+    entry.symlink_to(second)
+    after = er.binary_identity(entry)
+    assert er.binary_changed(before, after)
+    assert not er.binary_changed(after, er.binary_identity(entry))
+    # npm entrypoints can keep their path, even when atomically replaced.
+    replacement = tmp_path / 'replacement'
+    replacement.write_text('newer')
+    replacement.replace(second)
+    assert er.binary_changed(after, er.binary_identity(entry))
+    assert not er.binary_changed(None, er.binary_identity(entry))
+
+
+def test_a_touched_cli_is_not_a_new_cli(tmp_path):
+    import os
+    binary = tmp_path / "codex"
+    binary.write_bytes(b"same bytes")
+    before = er.binary_identity(str(binary))
+    os.utime(binary, (1, 1))  # a touch, relink or backup tool changes only the timestamp
+    assert not er.binary_changed(before, er.binary_identity(str(binary)))
+    replacement = tmp_path / "codex.new"
+    replacement.write_bytes(b"new version bytes")
+    os.replace(replacement, binary)
+    assert er.binary_changed(before, er.binary_identity(str(binary)))

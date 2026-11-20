@@ -1100,7 +1100,8 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
                 objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
 
         # --- in-app updates -------------------------------------------------------------------
-        # Checks are automatic and quiet; installing happens only on the user's click. The engine
+        # App checks are automatic and quiet; app installs require a click. The same timer also
+        # starts optional CLI maintenance, which owns its worker and six-hour throttle. The engine
         # (acctsw.updater) validates the manifest, downloads and verifies the signed app; this side
         # only knows where the running bundle lives and how to hand over to the install helper.
         @objc.python_method
@@ -1114,6 +1115,8 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
                 None, True)
 
         def autoUpdateCheck_(self, _sender):
+            from acctsw import toolupdate
+            toolupdate.start_updates(self.ctx, notify=lambda text: self._notify("AI Guest List", text))
             self.performSelectorInBackground_withObject_(
                 objc.selector(self.updateCheckBg_, signature=b"v@:@"), {"background": True})
 

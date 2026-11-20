@@ -693,7 +693,7 @@ def test_unknown_signin_verdict_preserves_all_notification_marks(ctx, verdict):
     assert seat["signin_notified"] == marks
 
 
-def test_bridge_poll_delivers_each_notice_once_and_honours_the_setting(ctx, monkeypatch):
+def test_bridge_poll_delivers_each_notice_once_despite_stored_notify_false(ctx, monkeypatch):
     _seed_claude(ctx)
     monkeypatch.setattr(bridge.usage_mod, "refresh_live", lambda *_a, **_k: {"claude": {}})
     monkeypatch.setattr(claudesync, "converge", lambda *_a, **_k: None)
@@ -708,8 +708,8 @@ def test_bridge_poll_delivers_each_notice_once_and_honours_the_setting(ctx, monk
     state.set_setting("notify", False)
     _flag(state, "b@test", True)
     state.save()
-    muted = bridge.handle(ctx, {"action": "usage", "tool": "claude"})
-    assert muted["signin_notices"] == []
+    formerly_muted = bridge.handle(ctx, {"action": "usage", "tool": "claude"})
+    assert len(formerly_muted["signin_notices"]) == 1
     state = ctx.load_state()
     assert state.get_seat("claude", "b@test")["signin_notified"]["signed_out"] is True
     state.set_setting("notify", True)

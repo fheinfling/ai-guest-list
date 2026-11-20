@@ -59,7 +59,7 @@
   "old": "if tier and home_tier and tier != home_tier:",
   "new": "if False:",
   "test": [
-   "tests/test_seatswap.py::test_a_different_tier_than_home_is_not_eligible"
+   "tests/test_seattier.py::test_allow_tier_true_lets_it_through_and_false_refuses_despite_approval"
   ]
  },
  {
@@ -154,34 +154,6 @@
   ]
  },
  {
-  "label": "in_place_switch setting ignored by the gate",
-  "file": "acctsw/seatswap.py",
-  "old": "if not ctx.load_state().settings().get(\"in_place_switch\", True):",
-  "new": "if False:",
-  "test": [
-   "tests/test_seatswap.py::test_the_setting_turns_it_off"
-  ]
- },
- {
-  "label": "in_place_switch not a UI toggle",
-  "file": "acctsw/bridge.py",
-  "old": "\"confirm_key_switch\", \"key_fallback\", \"in_place_switch\",",
-  "new": "\"confirm_key_switch\", \"key_fallback\",",
-  "test": [
-   "tests/test_seatkind.py::test_in_place_switch_is_a_default_on_toggle"
-  ]
- },
- {
-  "label": "in_place_switch default off",
-  "file": "acctsw/state.py",
-  "old": "\"in_place_switch\": True,",
-  "new": "\"in_place_switch\": False,",
-  "test": [
-   "tests/test_seatkind.py::test_in_place_switch_is_a_default_on_toggle",
-   "tests/test_seatswap.py::test_enabled_by_default"
-  ]
- },
- {
   "label": "bridge approve action missing",
   "file": "acctsw/bridge.py",
   "old": "if action in (\"approve_crossing\", \"deny_crossing\"):",
@@ -224,19 +196,8 @@
  {
   "label": "UI needs-you item not rendered",
   "file": "app/web/render.mjs",
-  "old": "${seatIssues(p, openDetails, state, nameEdits)}${crossings}${tiers}",
-  "new": "${seatIssues(p, openDetails, state, nameEdits)}${tiers}",
-  "cmd": [
-   "node",
-   "--test",
-   "app/web/render.test.mjs"
-  ]
- },
- {
-  "label": "UI toggle missing",
-  "file": "app/web/render.mjs",
-  "old": "      ${toggleRow(\"in_place_switch\", \"switch seats without restarting claude\", \"the conversation keeps running\", s.in_place_switch !== false)}\n",
-  "new": "",
+  "old": "${seatIssues(p, openDetails, state, nameEdits)}${crossings}",
+  "new": "${seatIssues(p, openDetails, state, nameEdits)}",
   "cmd": [
    "node",
    "--test",
@@ -475,16 +436,7 @@
   "old": "        if not (third_seat and settings.get(\"auto_switch\", True)\n",
   "new": "        if not (third_seat\n",
   "test": [
-   "tests/test_seatswap.py::test_maintain_never_moves_to_a_third_seat_with_a_setting_off"
-  ]
- },
- {
-  "label": "N9 third seat with in_place_switch off",
-  "file": "acctsw/seatswap.py",
-  "old": "                and settings.get(\"in_place_switch\", True)):\n            return None",
-  "new": "                and True):\n            return None",
-  "test": [
-   "tests/test_seatswap.py::test_maintain_never_moves_to_a_third_seat_with_a_setting_off"
+   "tests/test_seatswap.py::test_maintain_never_moves_to_a_third_seat_with_auto_switch_off"
   ]
  },
  {
@@ -1070,8 +1022,7 @@
   "old": "return isinstance(_peek(state, tool, \"tier_approvals\").get(pair(a_tier, b_tier)), dict)",
   "new": "return bool(_peek(state, tool, \"tier_approvals\"))",
   "test": [
-   "tests/test_seattier.py::test_allowed_when_equal_or_unknown_or_setting_or_pair_approval",
-   "tests/test_seattier.py::test_a_pair_approval_allows_only_that_pair"
+   "tests/test_seattier.py::test_allowed_when_equal_or_unknown_or_setting_or_pair_approval"
   ]
  },
  {
@@ -1143,7 +1094,7 @@
   "old": "if not ok:\n                return None, \"tier\"",
   "new": "if False:\n                return None, \"tier\"",
   "test": [
-   "tests/test_seattier.py::test_tier_mismatch_is_refused_by_default_and_named_as_tier"
+   "tests/test_seattier.py::test_allow_tier_true_lets_it_through_and_false_refuses_despite_approval"
   ]
  },
  {
@@ -1161,7 +1112,7 @@
   "old": "return None, \"tier\"",
   "new": "return None, \"seat\"",
   "test": [
-   "tests/test_seattier.py::test_tier_mismatch_is_refused_by_default_and_named_as_tier"
+   "tests/test_seattier.py::test_allow_tier_true_lets_it_through_and_false_refuses_despite_approval"
   ]
  },
  {
@@ -1171,15 +1122,6 @@
   "new": "if not isinstance(token, str) or not token:\n        return None, \"tier\"",
   "test": [
    "tests/test_seattier.py::test_reason_is_seat_when_something_else_blocks_and_tier_is_not_blamed"
-  ]
- },
- {
-  "label": "bridge: cross-tier setting not toggleable",
-  "file": "acctsw/bridge.py",
-  "old": "\"in_place_switch\", \"in_place_cross_tier\",",
-  "new": "\"in_place_switch\",",
-  "test": [
-   "tests/test_seattier.py::test_the_cross_tier_setting_is_a_default_off_toggle"
   ]
  },
  {
@@ -1216,57 +1158,6 @@
   "new": "    _store(state, tool, \"tier_approvals\")[key] = {\"at\": iso(at or now())}\n    from . import seatkind\n    seatkind.approve(state, tool, a_tier, b_tier, \"always\")\n",
   "test": [
    "tests/test_seattier.py::test_a_tier_approval_does_not_approve_a_business_personal_crossing"
-  ]
- },
- {
-  "label": "bridge: tier requests missing from snapshot",
-  "file": "acctsw/bridge.py",
-  "old": "for r in seattier.pending(state, tool)",
-  "new": "for r in []",
-  "test": [
-   "tests/test_seattier.py::test_snapshot_lists_open_tier_requests"
-  ]
- },
- {
-  "label": "UI tier question not rendered",
-  "file": "app/web/render.mjs",
-  "old": "${seatIssues(p, openDetails, state, nameEdits)}${crossings}${tiers}",
-  "new": "${seatIssues(p, openDetails, state, nameEdits)}${crossings}",
-  "cmd": [
-   "node",
-   "--test",
-   "app/web/render.test.mjs"
-  ]
- },
- {
-  "label": "UI tier answer not wired",
-  "file": "app/web/bundle.js",
-  "old": "send(scope === \"deny\" ? \"deny_tier\" : \"approve_tier\"",
-  "new": "send(\"approve_tier\"",
-  "cmd": [
-   "node",
-   "--test",
-   "app/web/render.test.mjs"
-  ]
- },
- {
-  "label": "UI cross-tier toggle missing",
-  "file": "app/web/render.mjs",
-  "old": "s.in_place_cross_tier === true)}",
-  "new": "false)}",
-  "cmd": [
-   "node",
-   "--test",
-   "app/web/render.test.mjs"
-  ]
- },
- {
-  "label": "tier: default permits all plans",
-  "file": "acctsw/state.py",
-  "old": "\"in_place_cross_tier\": False,",
-  "new": "\"in_place_cross_tier\": True,",
-  "test": [
-   "tests/test_seattier.py::test_the_cross_tier_setting_is_a_default_off_toggle"
   ]
  },
  {
@@ -1396,17 +1287,6 @@
   ]
  },
  {
-  "label": "UI tier labels not escaped",
-  "file": "app/web/render.mjs",
-  "old": "const pair = `${esc(r.a)}\\u2194${esc(r.b)}`;",
-  "new": "const pair = `${r.a}\\u2194${r.b}`;",
-  "cmd": [
-   "node",
-   "--test",
-   "app/web/render.test.mjs"
-  ]
- },
- {
   "label": "crossing auto setting ignored by approved",
   "file": "acctsw/seatkind.py",
   "old": "    if state.settings()[\"crossing_auto\"] or not crosses(state, tool, a, b, home=home):\n        return True\n    at = at or now()\n    return _live",
@@ -1422,33 +1302,6 @@
   "new": "    if False or not crosses(state, tool, a, b, home=home):\n        return True\n    at = at or now()\n    store = _peek",
   "test": [
    "tests/test_seatkind.py::test_crossing_auto_is_a_default_off_toggle"
-  ]
- },
- {
-  "label": "keep warm: default disabled",
-  "file": "acctsw/state.py",
-  "old": "\"keep_warm\": True,",
-  "new": "\"keep_warm\": False,",
-  "test": [
-   "tests/test_keep_warm.py::test_setting_defaults_on_and_bridge_toggle_persists"
-  ]
- },
- {
-  "label": "keep warm: toggle not whitelisted",
-  "file": "acctsw/bridge.py",
-  "old": "    \"keep_warm\",\n",
-  "new": "",
-  "test": [
-   "tests/test_keep_warm.py::test_setting_defaults_on_and_bridge_toggle_persists"
-  ]
- },
- {
-  "label": "keep warm: setting ignored",
-  "file": "acctsw/claudehome.py",
-  "old": "if not state.settings()[\"keep_warm\"]:",
-  "new": "if False:",
-  "test": [
-   "tests/test_keep_warm.py::test_skips_ineligible_seat[setting_off]"
   ]
  },
  {
@@ -1656,17 +1509,6 @@
   "new": "threading.Thread(target=worker, name=\"claude-keep-warm\", daemon=False).start()",
   "test": [
    "tests/test_keep_warm.py::test_bridge_poll_does_not_wait_and_prevents_overlap"
-  ]
- },
- {
-  "label": "keep warm: UI defaults off",
-  "file": "app/web/render.mjs",
-  "old": "s.keep_warm !== false",
-  "new": "s.keep_warm === true",
-  "cmd": [
-   "node",
-   "--test",
-   "app/web/render.test.mjs"
   ]
  },
  {

@@ -499,14 +499,11 @@ export function buildSettings(state) {
     <div class="set-body"><section class="set-sec"><h1 class="set-label">switching</h1>
       ${toggleRow("auto_switch", "auto-switch", "move when a seat runs out", s.auto_switch)}
       ${toggleRow("supervise_shell", "supervise terminals", "include codex and claude commands", s.supervise_shell !== false)}
-      ${toggleRow("engine_restart", "restart idle sessions after an update", "same terminal, the conversation resumes", s.engine_restart !== false)}
-      ${toggleRow("notify", "notify when switched", "show which seat is ready", s.notify)}
       ${toggleRow("restart_app", "restart the Codex app", "refresh its account after a switch", s.restart_app)}
-      ${toggleRow("in_place_switch", "switch seats without restarting claude", "the conversation keeps running", s.in_place_switch !== false)}
-      ${toggleRow("keep_warm", "keep parked claude seats signed in", "renew idle seats before their access expires", s.keep_warm !== false)}
       ${toggleRow("crossing_auto", "switch automatically between business and personal seats", "skip the question when moving between work and personal", s.crossing_auto === true)}
-      ${toggleRow("in_place_cross_tier", "switch without restarting across plan tiers", "models may differ between plans", s.in_place_cross_tier === true)}
       <p class="support">with supervision off, only cx/cl auto-switch. terminals switch without restarting the desktop app.</p>
+    </section><section class="set-sec"><h2 class="set-label">tools</h2>
+      ${toggleRow("update_tools", "update claude &amp; codex", "install new versions, then restart idle sessions", s.update_tools !== false)}
     </section><section class="set-sec paid-settings"><h2 class="set-label">paid keys</h2>
       ${toggleRow("key_fallback", "allow paid use", "off stops sessions and new requests", s.key_fallback === true)}
       ${toggleRow("confirm_key_switch", "ask before using", "approve each move to a paid key", s.confirm_key_switch !== false)}
@@ -781,7 +778,7 @@ export function headerVerdict(state) {
   const seats = subscriptionSeats(state);
   const ready = seats.filter(usable);
   const hard = seats.filter((s) => signedOut(s) || signinNeeded(s) || entitlementRevoked(s)).length
-    + (state?.pending_crossings || []).length + (state?.pending_tier_requests || []).length
+    + (state?.pending_crossings || []).length
     + (state?.pending_key_switches || []).filter((r) => r.status === "pending" && Date.parse(r.expires_at) > Date.now()).length
     + engineWarnings(state).filter(hardWarning).length + Number(Boolean(supervisionProblem(state)));
   if (hard) return `<button class="chip chip--hard" data-action="attention">${ICON.alert}${hard} needs you</button>`;
@@ -840,9 +837,8 @@ function toolBlock(p, state, pending, openDetails, nameEdits) {
     head += rowDetails(p.tool, s, p.seats, openDetails, state, nameEdits);
   }
   const crossings = crossingRequests({ pending_crossings: (state.pending_crossings || []).filter((r) => r.tool === p.tool) });
-  const tiers = tierRequests({ pending_tier_requests: (state.pending_tier_requests || []).filter((r) => r.tool === p.tool) });
   const target = p.seats.find((s) => pending?.tool === p.tool && pending.email === s.email);
-  return `<section class="tool" data-tool="${esc(p.tool)}" aria-label="${esc(p.tool)}"><div class="toolname">${mark(p.tool)}${esc(p.tool)}</div><div class="answer">${head}${thenLine(p, state)}</div>${seatIssues(p, openDetails, state, nameEdits)}${crossings}${tiers}${target ? switchConfirmation(p.tool, target, pending) : ""}</section>`;
+  return `<section class="tool" data-tool="${esc(p.tool)}" aria-label="${esc(p.tool)}"><div class="toolname">${mark(p.tool)}${esc(p.tool)}</div><div class="answer">${head}${thenLine(p, state)}</div>${seatIssues(p, openDetails, state, nameEdits)}${crossings}${target ? switchConfirmation(p.tool, target, pending) : ""}</section>`;
 }
 function listRows(p, state, openDetails, nameEdits) {
   const rest = [...p.ready, ...p.keys, ...p.seats.filter((s) => !p.ready.includes(s))]
@@ -863,8 +859,8 @@ export function buildHTML(state, pendingSwitch = null, openDetails = new Set(), 
   const mood = paid ? "spending" : seats.some(usable) ? "ready" : seats.length ? "resting" : "empty";
   const problems = engineBanner(state) + supervisionBanner(state), update = updateLine(state);
   const prompts = keyConfirmations(state), asking = prompts.includes('class="key-confirm"');
-  const tools = [...new Set(["codex", "claude", ...(state.keys || []).map((k) => k.harness || "codex"), ...(state.pending_crossings || []).map((r) => r.tool), ...(state.pending_tier_requests || []).map((r) => r.tool)])];
-  const plans = tools.map((tool) => toolPlan(tool, state)).filter((p) => p.seats.length || p.keys.length || (state.pending_crossings || []).some((r) => r.tool === p.tool) || (state.pending_tier_requests || []).some((r) => r.tool === p.tool));
+  const tools = [...new Set(["codex", "claude", ...(state.keys || []).map((k) => k.harness || "codex"), ...(state.pending_crossings || []).map((r) => r.tool)])];
+  const plans = tools.map((tool) => toolPlan(tool, state)).filter((p) => p.seats.length || p.keys.length || (state.pending_crossings || []).some((r) => r.tool === p.tool));
   const emptyWithoutWelcome = !seats.length && !state?.keys?.length && (plans.length || asking);
   return `<div class="app ambient-app now-next theme-${theme} mood-${mood}">
     <header class="top"><span class="brand">${appIcon()}</span>${headerVerdict(state)}<div class="top-actions">
@@ -995,19 +991,6 @@ export function crossingRequests(state) {
       : `${from} is out. continue this session on ${to}${namedKind ? "" : ` (${esc(toKind)})`}?`;
     return `<div class="issue issue--soft crossing-confirm" role="group" aria-label="seat crossing approval">${stateGlyph("warn")}<span class="issue-text">${prompt}</span><span class="crossing-acts"><button class="row-action" data-action="crossing-answer" data-scope="once" ${data}>switch now</button><button class="row-action" data-action="crossing-answer" data-scope="deny" ${data}>not now</button></span>
       <button class="pricing-link" data-action="crossing-auto" data-scope="once" ${data}>always switch automatically</button>
-    </div>`;
-  }).join("");
-}
-
-// A hop between plan tiers went by restart; asked once per pair. "no" is remembered.
-export function tierRequests(state) {
-  const requests = state?.pending_tier_requests || [];
-  if (!requests.length) return "";
-  return requests.map((r) => {
-    const data = `data-tool="${esc(r.tool)}" data-a="${esc(r.a)}" data-b="${esc(r.b)}"`;
-    const pair = `${esc(r.a)}\u2194${esc(r.b)}`;
-    return `<div class="issue issue--soft tier-confirm" role="group" aria-label="plan tier approval">${stateGlyph("warn")}<span class="issue-text">switch without restarting across plan tiers? ${esc(r.a)} and ${esc(r.b)} are different plans; models may differ. until you say yes, these moves restart the session.</span>
-      <span class="crossing-acts"><button class="row-action" data-action="tier-answer" data-scope="pair" ${data}>always for ${pair}</button><button class="row-action" data-action="tier-answer" data-scope="all" ${data}>always for all tiers</button><button class="row-action" data-action="tier-answer" data-scope="deny" ${data}>no</button></span>
     </div>`;
   }).join("");
 }

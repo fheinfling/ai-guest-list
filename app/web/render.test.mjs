@@ -11,6 +11,30 @@ import {
 
 const mkAdd = (over = {}) => ({ step: "provider", provider: null, name: "", method: "browser", token: "", ...over });
 
+test("settings shows only the seven user toggles regardless of legacy permanent values", () => {
+  const removed = ["engine_restart", "notify", "in_place_switch", "keep_warm", "in_place_cross_tier"];
+  const kept = ["auto_switch", "crossing_auto", "key_fallback", "confirm_key_switch", "supervise_shell", "restart_app", "update_tools"];
+  for (const value of [undefined, false, true]) {
+    const html = buildSettings({ settings: Object.fromEntries(removed.map((key) => [key, value])) });
+    for (const key of removed) assert.ok(!html.includes(`data-key="${key}"`), `${key} row removed`);
+    assert.deepEqual([...html.matchAll(/data-action="toggle" data-key="([^"]+)"/g)].map((m) => m[1]).sort(), kept.toSorted());
+    assert.match(html, /with supervision off, only cx\/cl auto-switch\. terminals switch without restarting the desktop app\./);
+  }
+});
+
+test("legacy tier requests never render a question or add an attention item or tool", () => {
+  const html = buildHTML(state({ pending_tier_requests: [{ tool: "obsolete", a: "max", b: "team" }] }));
+  assert.doesNotMatch(html, /tier-answer|tier-confirm|plan tier approval|needs you|data-tool="obsolete"/);
+  assert.match(html, /no seats yet/);
+});
+
+test("obsolete tier answer actions no longer dispatch requests", () => {
+  const app = keyApp();
+  const before = app.sent.length;
+  for (const scope of ["pair", "all", "deny"]) app.click({ action: "tier-answer", scope, tool: "claude", a: "max", b: "team" });
+  assert.equal(app.sent.length, before);
+});
+
 function seat(over = {}) {
   return { email: "work@x.com", name: "Work", kind: "business", plan: "Business", status: "ready",
            active: false, limited: false, limited_until: null, usage5h: 20, usageWeek: 10, ...over };
@@ -2277,27 +2301,6 @@ assert.doesNotMatch(rosterOf(html), /data-action="switch"|all good/);
 // --- in-place switching and business/personal crossings ---------------------------------------
 import { crossingRequests } from "./render.mjs";
 
-test("settings offers the in-place switch toggle, on unless turned off", () => {
-  const on = buildSettings({ settings: { theme: "light" } });
-  assert.match(on, /switch seats without restarting claude/);
-  assert.match(on, /data-action="toggle" data-key="in_place_switch" checked/);
-  const off = buildSettings({ settings: { theme: "light", in_place_switch: false } });
-  assert.match(off, /data-key="in_place_switch" >/);
-});
-
-test("settings keeps parked claude seats signed in by default and dispatches its toggle", () => {
-  const on = buildSettings({ settings: {} });
-  assert.match(on, /keep parked claude seats signed in/);
-  assert.match(on, /data-action="toggle" data-key="keep_warm" checked/);
-  assert.match(buildSettings({ settings: { keep_warm: false } }), /data-key="keep_warm" >/);
-  for (const checked of [false, true]) {
-    const app = keyApp();
-    app.handlers.change({ target: { closest: () => ({ dataset: { key: "keep_warm" }, checked }) } });
-    assert.deepEqual(JSON.parse(JSON.stringify(app.sent.at(-1))),
-      { action: "toggle", key: "keep_warm", value: checked });
-  }
-});
-
 const crossing = (over = {}) => ({ tool: "claude", from: "w@x", to: "p@x", at: "2026-10-31T10:00:00Z",
   from_name: "Work", to_name: "Home", from_kind: "business", to_kind: "personal", ...over });
 
@@ -2370,54 +2373,6 @@ test("settings offers automatic business/personal switching, off by default", ()
   }
 });
 
-// --- plan tiers ---------------------------------------------------------------------------------
-import { tierRequests } from "./render.mjs";
-
-test("settings offers the cross-tier toggle, off by default", () => {
-  const off = buildSettings({ settings: { theme: "light" } });
-  assert.match(off, /switch without restarting across plan tiers/);
-  assert.match(off, /data-key="in_place_cross_tier" >/);
-  const on = buildSettings({ settings: { theme: "light", in_place_cross_tier: true } });
-  assert.match(on, /data-action="toggle" data-key="in_place_cross_tier" checked/);
-});
-
-test("a pending tier request is a needs-you item with pair, all tiers and no", () => {
-  const req = { tool: "claude", a: "max", b: "team", at: "2026-10-31T10:00:00Z" };
-  const html = buildHTML(state({ pending_tier_requests: [req] }));
-  assert.match(html, /1 needs you/);
-  assert.match(html, /models may differ/);
-  assert.match(html, /until you say yes, these moves restart the session/);
-  assert.match(html, />always for max↔team</);
-  assert.match(html, />always for all tiers</);
-  for (const scope of ["pair", "all", "deny"]) {
-    assert.match(html, new RegExp(`data-action="tier-answer" data-scope="${scope}" data-tool="claude" data-a="max" data-b="team"`));
-  }
-  assert.equal(tierRequests(state({})), "");
-  assert.doesNotMatch(buildHTML(state({})), /tier-answer/);
-});
-
-test("tier plan labels and action attributes are escaped", () => {
-  const html = tierRequests({ pending_tier_requests: [{ tool: 'claude"', a: '<b>max</b>', b: 'team"' }] });
-  assert.match(html, /data-tool="claude&quot;"/);
-  assert.match(html, /data-a="&lt;b&gt;max&lt;\/b&gt;"/);
-  assert.match(html, /data-b="team&quot;"/);
-  assert.match(html, />always for &lt;b&gt;max&lt;\/b&gt;↔team&quot;</);
-  assert.doesNotMatch(html, /<b>/);
-});
-
-test("tier answers reach the bridge as approve_tier / deny_tier", () => {
-  const html = tierRequests({ pending_tier_requests: [{ tool: "claude", a: "max", b: "team" }] });
-  const buttons = [...html.matchAll(/data-action="tier-answer" data-scope="(\w+)" data-tool="([^"]+)" data-a="([^"]+)" data-b="([^"]+)"/g)];
-  assert.equal(buttons.length, 3);
-  const app = keyApp();
-  for (const [, scope, tool, a, b] of buttons) app.click({ action: "tier-answer", scope, tool, a, b });
-  assert.deepEqual(JSON.parse(JSON.stringify(app.sent.slice(-3))), [
-    { action: "approve_tier", tool: "claude", a: "max", b: "team", scope: "pair" },
-    { action: "approve_tier", tool: "claude", a: "max", b: "team", scope: "all" },
-    { action: "deny_tier", tool: "claude", a: "max", b: "team", scope: "deny" },
-  ]);
-});
-
 // Ledger contracts: the warning is readable before opening seat options, and its action stays
 // with the affected seat. Names, dates and targets still come from the real snapshot fields.
 const factsOf = (html) => html.match(/<(?:button|span) class="chip chip--[^>]*>[\s\S]*?<\/(?:button|span)>/)?.[0] || "";
@@ -2481,14 +2436,14 @@ snapshot.keys[0].responses_verified = false;
 assert.match(toolOf(buildHTML(snapshot), "claude"), /endpoint unproven/);
 });
 
-test("fact line counts live approvals and keeps crossing, tier and paid choices available", () => {
+test("fact line counts live crossing and paid approvals while ignoring legacy tiers", () => {
   const snapshot = claudeState(seat({ status: "active", active: true }));
   snapshot.pending_crossings = [{ tool: "claude", from: "work@x.com", to: "personal@x", from_name: "Work", to_name: "Personal", from_kind: "business", to_kind: "personal" }];
   snapshot.pending_tier_requests = [{ tool: "claude", a: "Max", b: "Pro" }];
   snapshot.pending_key_switches = [keyPrompt()];
   const html = buildHTML(snapshot);
-  assert.match(factsOf(html), /3 needs you/);
-  for (const action of ["crossing-answer", "crossing-auto", "tier-answer", "key-answer"]) assert.ok(html.includes(`data-action="${action}"`));
+  assert.match(factsOf(html), /2 needs you/);
+  for (const action of ["crossing-answer", "crossing-auto", "key-answer"]) assert.ok(html.includes(`data-action="${action}"`));
   assert.match(html, />switch now</);
   assert.match(html, />not now</);
   assert.match(html, />always switch automatically</);
@@ -2676,14 +2631,11 @@ assert.match(factsOf(html), /1 needs you/);
 assert.doesNotMatch(html, /crossing-prompts|crossing-tag|orphan-issues/);
 });
 
-test("cross-tier approval follows the matching plan row with all existing choices", () => {
+test("legacy cross-tier requests leave the plan rows and attention count unchanged", () => {
 const snapshot = claudeState(seat({ email: "max@x", status: "active", plan: "Max" }), seat({ email: "team@x", name: "Team", plan: "Team" }));
+const before = buildHTML(snapshot);
 snapshot.pending_tier_requests = [{ tool: "claude", a: "max", b: "team" }];
-const html = buildHTML(snapshot), tool = toolOf(html, "claude");
-for (const scope of ["pair", "all", "deny"]) assert.ok(tool.includes(`data-action="tier-answer" data-scope="${scope}"`));
-assert.equal((html.match(/class="issue issue--soft tier-confirm"/g) || []).length, 1);
-assert.doesNotMatch(toolOf(html, "codex"), /tier-answer/);
-assert.ok(tool.indexOf('class="answer"') < tool.indexOf('tier-confirm'));
+assert.equal(buildHTML(snapshot), before);
 });
 
 test("one compact fact groups sign-in problems by tool and gives an approval question", () => {
@@ -2838,9 +2790,9 @@ test("header chip answers needs you, all limited, renew soon and all good in pri
     assert.doesNotMatch(h, /all good|all limited|renew soon/);
   }
   const all = { ...healthy, pending_crossings: [crossing()], pending_tier_requests: [{ tool: "claude", a: "max", b: "pro" }], pending_key_switches: [keyPrompt()] };
-  assert.match(headerVerdict(all), /3 needs you/);
-  all.pending_key_switches[0].expires_at = inHours(-1);
   assert.match(headerVerdict(all), /2 needs you/);
+  all.pending_key_switches[0].expires_at = inHours(-1);
+  assert.match(headerVerdict(all), /1 needs you/);
   assert.equal(headerVerdict(state()), "");
   for (const flag of ["usage_stale", "usage_unknown"]) assert.doesNotMatch(headerVerdict(claudeState(seat({ [flag]: true }))), /checking usage/);
   assert.doesNotMatch(buildHTML(healthy).split('<div class="body"')[0], /<h1|<h2/);
@@ -3808,4 +3760,14 @@ test("blank recovery: malformed native replies show a fallback and the next upda
   assert.equal(app.sent.filter((msg) => msg.action === "client_error").length, 1);
   app.window.AGL.update(state({ rev: 1 }));
   assert.doesNotMatch(app.root.innerHTML, /role="alert"/);
+});
+
+
+test("CLI updates are on by default and can be disabled in settings", () => {
+  for (const value of [undefined, true, false]) {
+    const html = buildSettings({ settings: { update_tools: value } });
+    assert.match(html, /update claude &amp; codex/);
+    assert.match(html, /install new versions, then restart idle sessions/);
+    assert.equal(/data-key="update_tools" checked/.test(html), value !== false);
+  }
 });

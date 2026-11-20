@@ -188,6 +188,31 @@ def test_build_number_reads_bundle_info_plist(tmp_path, monkeypatch):
     assert acctsw.build_number() == "142"
 
 
+@pytest.mark.parametrize("key", [
+    "engine_restart", "in_place_switch", "in_place_cross_tier", "keep_warm", "notify",
+])
+@pytest.mark.parametrize("value", [False, True])
+def test_toggle_rejects_permanent_settings_without_saving(ctx, key, value):
+    state = ctx.load_state()
+    state.save()
+    before = ctx.state_file.read_bytes()
+    result = bridge.handle(ctx, {"action": "toggle", "key": key, "value": value})
+    assert result == {"ok": False, "error": f"not a toggle: {key}"}
+    assert ctx.state_file.read_bytes() == before
+
+
+@pytest.mark.parametrize("key", [
+    "auto_switch", "crossing_auto", "key_fallback", "confirm_key_switch", "supervise_shell",
+    "restart_app", "update_tools",
+])
+@pytest.mark.parametrize("value", [False, True])
+def test_kept_toggle_settings_persist(ctx, key, value):
+    result = bridge.handle(ctx, {"action": "toggle", "key": key, "value": value})
+    assert result["ok"] is True
+    assert result["state"]["settings"][key] is value
+    assert ctx.load_state().settings()[key] is value
+
+
 def test_toggle_setting_persists(ctx):
     r = bridge.handle(ctx, {"action": "toggle", "key": "auto_switch", "value": False})
     assert r["ok"] and r["state"]["settings"]["auto_switch"] is False
@@ -521,6 +546,22 @@ def test_snapshot_has_no_engine_warnings_when_everything_is_current(ctx):
     from acctsw import session
     session.mark_session(ctx.data_dir, "claude", "a@x.com")
     assert bridge.snapshot_state(ctx)["engine_warnings"] == []
+
+
+@pytest.mark.parametrize("can_restart", [False, True])
+def test_snapshot_drift_warnings_prefer_per_process_restart_diagnostics(ctx, monkeypatch,
+                                                                      can_restart):
+    from acctsw import session
+    monkeypatch.setattr(session, "__version__", "1.6.1")
+    monkeypatch.setattr(session, "SELF_RESTART", not can_restart)
+    monkeypatch.setattr(session, "RESTART_BLOCKER", "busy_output")
+    session.mark_session(ctx.data_dir, "claude", "a@x.com")
+    own = session._process_file(ctx.data_dir, "claude", session.os.getpid())
+    data = json.loads(own.read_text())
+    session.write_json(own, {**data, "self_restart": can_restart,
+                             "restart_blocker": None if can_restart else "ambiguous_cwd"})
+    warnings = bridge.snapshot_state(ctx)["engine_warnings"]
+    assert [w["kind"] for w in warnings] == ([] if can_restart else ["sessions"])
 
 
 def test_snapshot_warns_about_a_stale_wrapper_and_old_supervisors(ctx, monkeypatch):
