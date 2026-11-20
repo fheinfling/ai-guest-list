@@ -53,7 +53,7 @@ connect through the official tools.
 <p align="center">
   <img src="docs/assets/screenshot.png" width="340" alt="The ai guest list popover: a status chip, then one block per tool with the seat on now, how much of its tighter window is left, when it resets and where work goes next; below, one line per other seat with its kind and plan, a resting seat with its return time, and an API-key seat priced per token." />
   &nbsp;
-  <img src="docs/assets/screenshot-settings.png" width="340" alt="The settings view in three sections: switching, paid keys set apart on gold, and appearance with the theme picker and the menu-bar icon legend." />
+  <img src="docs/assets/screenshot-settings.png" width="340" alt="The settings view in four sections: switching (auto-switch, supervise terminals, restart the Codex app, business and personal seats), tools (keep the Claude Code and Codex CLIs up to date), paid keys set apart on gold, and appearance with the theme picker and the menu-bar icon legend." />
   <br><sub><i>The shipping popover and settings, with fictional accounts. Views are expanded to show all content.</i></sub>
 </p>
 
@@ -97,6 +97,11 @@ connect through the official tools.
   popover only raises an alert when there is something to do (sign in, check a subscription). Active seats
   refresh every 30 seconds while the popover is open; background and parked-seat refreshes run
   every three minutes. Provider throttling backs off and keeps the last reading visibly stale.
+  When your Mac wakes, every seat is read again within seconds. A request that couldn't reach the
+  network at all (Wi-Fi or DNS not up yet) is retried after 30 seconds instead of waiting out the
+  rate-limit backoff, so "no reading yet" clears by itself. A seat the provider refused (an ended
+  subscription, a revoked login) keeps saying so through network blips and is never offered as
+  the next seat until the provider answers differently.
 - **Desktop switching** — the menubar moves a confirmed-limited seat to a verified healthy seat of
   the same tool when auto-switch is enabled. With “restart the Codex app after a swap” enabled, a running
   Codex desktop app quits gracefully and reopens; continue in your existing thread. Supervised
@@ -106,13 +111,23 @@ connect through the official tools.
   If your terminals or running sessions use an older engine than the app (e.g. a source checkout
   that wasn't pulled), the popover says so. An engine below the store's minimum writer version
   won't move credentials; a compatible older one still can, so restart it to get current behaviour.
-  From this release on, a session restarts itself in the same terminal when a newer engine is
-  installed, once it has been idle for over an hour with no unsent draft and nothing it started
-  still running, and resumes the conversation. `codex exec`, `claude -p`, paid key seats, sessions
+  A session restarts itself in the same terminal when a newer engine or a newer Claude Code /
+  Codex CLI is installed, once it has been idle for over an hour with no unsent draft and nothing
+  it started still running, and resumes the conversation. A Claude session you moved with `/resume`
+  or `/clear` resumes the conversation it last wrote in its folder; if another supervised Claude
+  session shares that folder and it can't tell whose conversation changed, it stays and the popover
+  says so. If the picture changes while Claude shuts down, it reopens with Claude's own
+  conversation picker instead of guessing. `codex exec`, `claude -p`, paid key seats, sessions
   started with a prompt or flags that can't be safely rebuilt, and Codex sessions sharing the Mac
   with another Codex session stay as they are; so do sessions started on older engines, which need
-  a manual restart. The popover keeps warning about any that can't restart themselves. Idle engine
-  restarts are always enabled, subject to these safety checks.
+  one manual restart. `acctsw status --json` lists running sessions with a `restart_blocker`
+  saying why one hasn't restarted yet. Idle restarts are always enabled, subject to these checks.
+- **Claude Code and Codex stay up to date** — every six hours the app checks each CLI with the
+  installer it came from (a Homebrew cask or formula, or a global npm install) and installs a newer
+  version, then idle sessions restart onto it as above. Claude's native installer already updates
+  itself and is left alone; project-local and `npx` copies are never touched. Updates run quietly
+  in the background, with one notification when a CLI was updated. Turn it off with **update claude &
+  codex** in settings.
 - **Switch notifications** — notices are always sent. Mute the app in macOS **System Settings > Notifications**.
 - **Add / remove seats** — official browser sign-in, plus a no-browser path for Codex (paste an
   `auth.json`). Claude is browser sign-in only: a `claude setup-token` is an env-var token, not the
@@ -122,6 +137,9 @@ connect through the official tools.
 - **Pay-per-token key seats** — an API key becomes a seat too, for when every subscription is
   resting or when you want one terminal on a specific model. Paid use is off by default,
   and confirmation is on by default. One switch stops every paid session. See [below](#bring-your-own-key).
+- **Few settings** — auto-switch, supervise terminals, restart the Codex app, switching between
+  business and personal seats without asking, update claude & codex, and the two paid-key switches.
+  Everything else (idle restarts, in-place switching, keeping parked seats signed in) is always on.
 - **Version & build** shown at the bottom of the settings view.
 
 ## Bring your own key
