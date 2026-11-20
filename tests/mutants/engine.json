@@ -141,13 +141,7 @@
    "file": "acctsw/bridge.py",
    "old": "        if changed:\n            state.save()\n    return notices if",
    "new": "        pass\n    return notices if",
-   "test": ["tests/test_signin.py::test_bridge_poll_delivers_each_notice_once_and_honours_the_setting"]},
-
-  {"label": "notify: the notify setting is ignored",
-   "file": "acctsw/bridge.py",
-   "old": "    return notices if state.settings().get(\"notify\", True) else []",
-   "new": "    return notices",
-   "test": ["tests/test_signin.py::test_bridge_poll_delivers_each_notice_once_and_honours_the_setting"]},
+   "test": ["tests/test_signin.py::test_bridge_poll_delivers_each_notice_once_despite_stored_notify_false"]},
 
   {"label": "door: a signed-out seat that still reads ready/active holds the door open",
    "file": "acctsw/web_dot.py",

@@ -952,7 +952,7 @@ def test_no_hop_in_place_before_the_child_has_used_the_proxy(seats, tokens):
     assert spawn.calls[1][-2:] == ["--resume", _session(spawn)]
 
 
-def test_switching_the_setting_off_mid_run_stops_hops_in_place_at_once(seats, tokens):
+def test_storing_false_mid_run_cannot_stop_hops_in_place(seats, tokens):
     swap = FakeSwap()
 
     def setting_off():
@@ -960,10 +960,10 @@ def test_switching_the_setting_off_mid_run_stops_hops_in_place_at_once(seats, to
         st.set_setting("in_place_switch", False)
         st.save()
 
-    spawn = Spawn(([setting_off, None, lambda: swap.post("limit", C1)], 1), ([None], 0))
+    spawn = Spawn(([setting_off, None, lambda: swap.post("limit", C1), None], 0), ([None], 0))
     assert _run(seats, spawn, swap) == 0
-    assert swap.binds == [] and [seat for _h, seat in swap.answers] == [None]
-    assert spawn.stops == 1
+    assert [seat for _h, seat in swap.answers] == [Seat(C2, tokens[C2])]
+    assert spawn.stops == 0
 
 
 def test_a_401_on_a_renewed_token_replays_on_the_new_one(seats, tokens):
@@ -1852,18 +1852,14 @@ def test_a_tier_request_that_blows_up_never_stops_the_restart(seats, tokens, mon
     assert spawn.stops == 1 and swap.homes == [C1, C2]
 
 
-@pytest.mark.parametrize("blocker", ["setting", "unused", "hop_budget", "no_proxy", "auth"])
+@pytest.mark.parametrize("blocker", ["unused", "hop_budget", "no_proxy", "auth"])
 def test_no_tier_question_when_the_proxy_cannot_carry_the_hop(seats, tokens, monkeypatch,
                                                             blocker):
     _drop(seats, C3)
     tokens.pop(C2)
     _tier_blocks(monkeypatch)
     tiers, swap = FakeTiers(), FakeSwap()
-    if blocker == "setting":
-        st = seats.load_state()
-        st.set_setting("in_place_switch", False)
-        st.save()
-    elif blocker == "unused":
+    if blocker == "unused":
         swap.used = False
     elif blocker == "hop_budget":
         monkeypatch.setattr(L, "MAX_INPLACE_SWITCHES", 0)
@@ -2123,10 +2119,6 @@ def _gate_case(name):
             st = ctx.load_state()
             st.data["engine"] = {}
             st.save()
-        elif name == "turned off":
-            st = ctx.load_state()
-            st.set_setting("engine_restart", False)
-            st.save()
         elif name == "seat can't carry it":
             monkeypatch.setattr(L, "_restart_seat_usable", lambda *_a: False)
         return None
@@ -2135,7 +2127,7 @@ def _gate_case(name):
 
 @pytest.mark.parametrize("name", ["draft", "request in flight", "recent request", "background work",
                                   "app closed", "wrapper not newer", "no newer engine",
-                                  "seat can't carry it", "routing failed", "turned off"])
+                                  "seat can't carry it", "routing failed"])
 def test_every_gate_keeps_the_session_running(seats, engine_ready, monkeypatch, name):
     swap = _quiet_swap()
     if name == "routing failed":
@@ -2163,15 +2155,23 @@ def test_another_conversation_moving_here_means_stay(seats, engine_ready, monkey
                swap_factory=lambda _c: _quiet_swap(), notify=lambda m: None) == 0
 
 
-def test_turning_it_off_reaches_a_running_session_and_the_banner(seats, engine_ready):
+@pytest.mark.parametrize("when", ["before_launch", "mid_run"])
+def test_stored_false_cannot_disable_idle_engine_restart(seats, engine_ready, when):
+    from acctsw.enginerestart import EngineRestart
+
     def off():
         st = seats.load_state()
         st.set_setting("engine_restart", False)
         st.save()
-    spawn = Spawn(_idle_child(engine_ready, off))
-    assert run(seats, "claude", ["--chrome"], spawn=spawn, get=fake_get({}),
-               swap_factory=lambda _c: _quiet_swap(), notify=lambda m: None) == 0
-    assert L.session_mod.SELF_RESTART is False
+    if when == "before_launch":
+        off()
+    spawn = Spawn(_idle_child(engine_ready, *([off] if when == "mid_run" else [])))
+    with pytest.raises(EngineRestart) as raised:
+        run(seats, "claude", ["--chrome"], spawn=spawn, get=fake_get({}),
+            swap_factory=lambda _c: _quiet_swap(), notify=lambda m: None)
+    assert raised.value.argv == ["/new/acctsw", "run", "claude", "--chrome"]
+    assert raised.value.seat == C1
+    assert L.active_session(seats.data_dir, "claude") is None
 
 
 def test_a_conversation_switching_command_means_stay_and_warn(seats, engine_ready):

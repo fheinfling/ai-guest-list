@@ -92,7 +92,7 @@ def test_picks_only_parked_idle_expiring_seat_and_records_success(ctx, monkeypat
 
 @pytest.mark.parametrize("reason", [
     "active", "billed", "homed", "quarantined", "signed_out", "missing_home", "unseeded",
-    "non_expiring", "recent", "setting_off", "no_refresh", "no_access", "no_item",
+    "non_expiring", "recent", "no_refresh", "no_access", "no_item",
     "unknown_expiry", "invalid_expiry", "boolean_expiry",
 ])
 def test_skips_ineligible_seat(ctx, reason):
@@ -117,8 +117,6 @@ def test_skips_ineligible_seat(ctx, reason):
         ctx.claude_cred("parked@test").set_live(blob(30.01))
     elif reason == "recent":
         seat["warm"] = {"at": iso(AT - timedelta(hours=3)), "ok": True, "fails": 0}
-    elif reason == "setting_off":
-        state.set_setting("keep_warm", False)
     elif reason == "no_item":
         item = ctx.claude_cred("parked@test")
         ctx.keychain.delete(item.service, item.account)
@@ -134,6 +132,16 @@ def test_skips_ineligible_seat(ctx, reason):
     assert claudehome.keep_warm(ctx, AT, run=lambda *a, **kw: calls.append(a)) is None
     assert calls == []
     assert warm_record(ctx) == before
+
+
+def test_stored_false_cannot_disable_parked_seat_renewal(ctx):
+    seed(ctx)
+    state = ctx.load_state()
+    state.set_setting("keep_warm", False)
+    state.save()
+    calls = []
+    assert claudehome.keep_warm(ctx, AT, run=lambda *a, **kw: calls.append(a)) == "parked@test"
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize("minutes", [-480, 0, 30])
@@ -235,13 +243,12 @@ def test_maintenance_errors_never_escape(ctx, monkeypatch, failure, caplog):
     assert "secret credential bytes" not in caplog.text
 
 
-def test_setting_defaults_on_and_bridge_toggle_persists(ctx):
+def test_setting_is_permanent_and_bridge_refuses_a_toggle(ctx):
     assert ctx.load_state().settings()["keep_warm"] is True
     for value in (False, True):
         result = bridge.handle(ctx, {"action": "toggle", "key": "keep_warm", "value": value})
-        assert result["ok"] is True
-        assert result["state"]["settings"]["keep_warm"] is value
-        assert ctx.load_state().settings()["keep_warm"] is value
+        assert result == {"ok": False, "error": "not a toggle: keep_warm"}
+        assert ctx.load_state().settings()["keep_warm"] is True
 
 
 @pytest.mark.keep_warm_poll

@@ -448,15 +448,6 @@
     ]
   },
   {
-    "label": "review #7: the in_place_switch setting is not read at decision time",
-    "file": "acctsw/launcher.py",
-    "old": "                            target != launch_email\n                            and not st.settings().get(\"in_place_switch\", True)):",
-    "new": "                            False):",
-    "test": [
-      "tests/test_launcher_inplace.py::test_switching_the_setting_off_mid_run_stops_hops_in_place_at_once"
-    ]
-  },
-  {
     "label": "review #3: a failed preflight still points the child at the proxy",
     "file": "acctsw/launcher.py",
     "old": "            if why:\n                logging.getLogger(__name__).info(\"in-place seat switching off: %s\", why)",

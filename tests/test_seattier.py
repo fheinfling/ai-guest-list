@@ -1,4 +1,4 @@
-"""Plan tiers: when an in-place hop across Max/Pro/Team is allowed, asked once, and answered."""
+"""Permanent cross-tier hops and the retained legacy pair approval/request machinery."""
 import json
 from copy import deepcopy
 from datetime import timedelta
@@ -17,7 +17,34 @@ T = "claude"
 
 
 def state_of(ctx):
-    return ctx.load_state()
+    # Exercise the retained legacy machinery below by bypassing the load policy in memory only.
+    state = ctx.load_state()
+    state.set_setting("in_place_cross_tier", False)
+    return state
+
+
+@pytest.mark.parametrize("legacy_status", [None, "open", "denied"])
+def test_stored_false_allows_cross_tier_hop_without_a_request(ctx, legacy_status):
+    put_seat(ctx, "home@x", plan="Max")
+    put_seat(ctx, "b@x", plan="Pro")
+    state = ctx.load_state()
+    state.set_setting("in_place_cross_tier", False)
+    if legacy_status:
+        state.data["tools"][T]["tier_requests"] = {
+            "max|pro": {"at": iso(now()), "status": legacy_status},
+        }
+    state.save()
+    assert json.loads(ctx.state_file.read_text())["settings"]["in_place_cross_tier"] is False
+
+    state = ctx.load_state()
+    before = deepcopy(state.data["tools"][T].get("tier_requests", {}))
+    assert seattier.allowed(state, T, "max", "pro")
+    assert seatswap.eligible(ctx, "b@x", home_email="home@x") == "tok"
+    assert seatswap.eligible_reason(ctx, "b@x", home_email="home@x") is None
+    assert seattier.request(state, T, "max", "pro") is False
+    assert state.data["tools"][T].get("tier_requests", {}) == before
+    assert seattier.pending(state, T) == []
+    assert bridge.snapshot_state(ctx)["pending_tier_requests"] == []
 
 
 def test_tier_reads_seats_blobs_and_plain_plans():
@@ -88,7 +115,7 @@ def test_approve_all_sets_the_setting_and_clears_questions(ctx):
     # Turning it off later must not resurrect answered questions, including other tools'.
     st.set_setting("in_place_cross_tier", False)
     st.save()
-    st = ctx.load_state()
+    st = state_of(ctx)
     for tool, a, b in ((T, "max", "team"), ("codex", "plus", "pro"), (T, "max", "pro")):
         assert seattier.pending(st, tool) == []
         assert not seattier.request(st, tool, a, b)
@@ -100,7 +127,7 @@ def test_pair_approval_persists_with_its_timestamp_and_is_tool_specific(ctx):
     at = now() - timedelta(days=1)
     seattier.approve(st, T, "team", "max", at)
     st.save()
-    st = ctx.load_state()
+    st = state_of(ctx)
     assert st.data["tools"][T]["tier_approvals"] == {"max|team": {"at": iso(at)}}
     assert seattier.allowed(st, T, "team", "max")
     assert not seattier.allowed(st, "codex", "team", "max")
@@ -112,7 +139,7 @@ def test_pending_requests_persist_and_sort_by_time(ctx):
     assert seattier.request(st, T, "max", "team", at)
     assert seattier.request(st, T, "pro", "max", at - timedelta(hours=1))
     st.save()
-    st = ctx.load_state()
+    st = state_of(ctx)
     assert seattier.pending(st, T) == [
         {"a": "max", "b": "pro", "at": iso(at - timedelta(hours=1))},
         {"a": "max", "b": "team", "at": iso(at)},
@@ -130,12 +157,12 @@ def test_pending_ignores_a_request_that_became_allowed(ctx):
 
 # --- eligible / eligible_reason ---------------------------------------------------------------
 
-def test_tier_mismatch_is_refused_by_default_and_named_as_tier(ctx):
+def test_tier_mismatch_is_allowed_by_default(ctx):
     put_seat(ctx, "home@x", plan="Max")
     put_seat(ctx, "b@x", plan="Team")
     assert seattier.SETTING == "in_place_cross_tier"
-    assert seatswap.eligible(ctx, "b@x", home_email="home@x") is None
-    assert seatswap.eligible_reason(ctx, "b@x", home_email="home@x") == "tier"
+    assert seatswap.eligible(ctx, "b@x", home_email="home@x") == "tok"
+    assert seatswap.eligible_reason(ctx, "b@x", home_email="home@x") is None
 
 
 def test_allow_tier_true_lets_it_through_and_false_refuses_despite_approval(ctx):
@@ -148,9 +175,10 @@ def test_allow_tier_true_lets_it_through_and_false_refuses_despite_approval(ctx)
     st.save()
     assert seatswap.eligible(ctx, "b@x", home_email="home@x") == "tok"
     assert seatswap.eligible(ctx, "b@x", home_email="home@x", allow_tier=False) is None
+    assert seatswap.eligible_reason(ctx, "b@x", home_email="home@x", allow_tier=False) == "tier"
 
 
-def test_a_pair_approval_allows_only_that_pair(ctx):
+def test_a_legacy_pair_approval_does_not_restrict_other_tier_hops(ctx):
     put_seat(ctx, "home@x", plan="Max")
     put_seat(ctx, "b@x", plan="Team")
     put_seat(ctx, "c@x", plan="Pro")
@@ -158,7 +186,7 @@ def test_a_pair_approval_allows_only_that_pair(ctx):
     seattier.approve(st, T, "team", "max")
     st.save()
     assert seatswap.eligible(ctx, "b@x", home_email="home@x") == "tok"
-    assert seatswap.eligible(ctx, "c@x", home_email="home@x") is None
+    assert seatswap.eligible(ctx, "c@x", home_email="home@x") == "tok"
 
 
 def test_reason_is_seat_when_something_else_blocks_and_tier_is_not_blamed(ctx):
@@ -206,8 +234,8 @@ def test_tier_permission_never_blocks_selection_or_a_restart_switch(ctx, denied)
     st.save()
     selection = choose(st, T)
     assert selection.available and selection.email == "b@x"
-    assert seatswap.eligible_reason(ctx, "b@x", home_email="home@x") == "tier"
-    assert seattier.request(st, T, "max", "pro") is (not denied)
+    assert seatswap.eligible_reason(ctx, "b@x", home_email="home@x") is None
+    assert seattier.request(st, T, "max", "pro") is False
     switch(ctx, st, T, "b@x", sync=False, mirror=False)
     assert ctx.load_state().active(T) == "b@x"
 
@@ -215,22 +243,20 @@ def test_tier_permission_never_blocks_selection_or_a_restart_switch(ctx, denied)
 # --- bridge -----------------------------------------------------------------------------------
 
 def ask(ctx, a="max", b="team"):
+    # A request left on disk by an older engine; new engines no longer create these.
     st = ctx.load_state()
-    seattier.request(st, T, a, b)
+    st.data["tools"][T].setdefault("tier_requests", {})[seattier.pair(a, b)] = {
+        "at": iso(now()), "status": "open",
+    }
     st.save()
 
 
-def test_the_cross_tier_setting_is_a_default_off_toggle(ctx):
-    assert ctx.load_state().settings()["in_place_cross_tier"] is False
-    res = bridge.handle(ctx, {"action": "toggle", "key": "in_place_cross_tier", "value": True})
-    assert res["ok"] and ctx.load_state().settings()["in_place_cross_tier"] is True
-
-
-def test_snapshot_lists_open_tier_requests(ctx):
+def test_snapshot_hides_legacy_open_tier_requests_without_rewriting_them(ctx):
     ask(ctx)
+    before = ctx.state_file.read_bytes()
     snap = bridge.snapshot_state(ctx)
-    assert [(r["tool"], r["a"], r["b"]) for r in snap["pending_tier_requests"]] == [(T, "max", "team")]
-    assert bridge.snapshot_state(ctx)["pending_tier_requests"][0]["at"]
+    assert snap["pending_tier_requests"] == []
+    assert ctx.state_file.read_bytes() == before
 
 
 def test_approve_tier_pair_scope_records_the_pair_and_answers(ctx):
@@ -238,7 +264,9 @@ def test_approve_tier_pair_scope_records_the_pair_and_answers(ctx):
     res = bridge.handle(ctx, {"action": "approve_tier", "tool": T, "a": "Team", "b": "max"})
     assert res["ok"] and res["state"]["pending_tier_requests"] == []
     st = ctx.load_state()
-    assert seattier.allowed(st, T, "max", "team") and not st.settings()["in_place_cross_tier"]
+    assert seattier.allowed(st, T, "max", "team") and st.settings()["in_place_cross_tier"]
+    assert "max|team" in st.data["tools"][T]["tier_approvals"]
+    assert "max|team" not in st.data["tools"][T]["tier_requests"]
 
 
 def test_approve_tier_all_sets_the_setting(ctx):
@@ -254,7 +282,8 @@ def test_deny_tier_is_remembered(ctx):
     assert res["ok"] and res["state"]["pending_tier_requests"] == []
     st = ctx.load_state()
     assert seattier.request(st, T, "max", "team") is False
-    assert not seattier.allowed(st, T, "max", "team")
+    assert st.data["tools"][T]["tier_requests"]["max|team"]["status"] == "denied"
+    assert seattier.allowed(st, T, "max", "team")
 
 
 @pytest.mark.parametrize("message", [
@@ -267,7 +296,7 @@ def test_bad_tier_answers_are_refused(ctx, message):
     res = bridge.handle(ctx, {"action": "approve_tier", **message})
     assert not res["ok"]
     st = ctx.load_state()
-    assert not st.settings()["in_place_cross_tier"]
+    assert st.settings()["in_place_cross_tier"] is True
     assert not seattier._peek(st, T, "tier_approvals")
 
 
@@ -290,11 +319,12 @@ def test_a_tier_approval_does_not_approve_a_business_personal_crossing(ctx, scop
     assert not choose(st, T).available
 
 
-def test_crossing_approval_does_not_approve_tiers(ctx):
+def test_crossing_approval_does_not_need_a_separate_tier_approval(ctx):
     put_seat(ctx, "home@x", plan="Max")
     put_seat(ctx, "b@x", plan="Team")
     st = ctx.load_state()
     seatkind.approve(st, T, "home@x", "b@x", "always")
     st.save()
-    assert not seattier.allowed(st, T, "max", "team")
-    assert seatswap.eligible_reason(ctx, "b@x", home_email="home@x") == "tier"
+    assert seattier.allowed(st, T, "max", "team")
+    assert not seattier._peek(st, T, "tier_approvals")
+    assert seatswap.eligible_reason(ctx, "b@x", home_email="home@x") is None

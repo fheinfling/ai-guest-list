@@ -113,7 +113,7 @@ def test_going_home_by_limit_with_the_toggle_off_and_no_restart_budget(seats, to
     assert swap.answers[-1] == (hits[0], Seat(C1, None)) and spawn.stops == 0
 
 
-def test_the_toggle_off_with_no_restart_budget_leaves_the_child_alone(seats, tokens):
+def test_legacy_false_still_hops_in_place_without_restart_budget(seats, tokens):
     swap = FakeSwap()
 
     def toggle_off():
@@ -124,8 +124,8 @@ def test_the_toggle_off_with_no_restart_budget_leaves_the_child_alone(seats, tok
     hits = []
     spawn = Spawn(([toggle_off, lambda: hits.append(swap.post("limit", C1)), None], 0))
     assert _run(seats, spawn, swap, max_switches=0) == 0
-    assert swap.answers == [(hits[0], None)] and swap.binds == []
-    assert spawn.stops == 0 and seats.load_state().active("claude") == C1
+    assert swap.answers == [(hits[0], Seat(C2, tokens[C2]))]
+    assert spawn.stops == 0 and seats.load_state().active("claude") == C2
 
 
 def test_a_401_on_the_home_seat_moves_to_another_seat_in_place(seats, tokens):

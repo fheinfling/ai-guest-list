@@ -70,14 +70,14 @@ connect through the official tools.
   per-session local proxy (with a per-session certificate trusted only by that session) swaps the
   seat behind the conversation; Claude Code keeps talking to `api.anthropic.com`, so admin policies
   and features work as before. If anything about it doesn't work, it falls back to the restart
-  switch. Turn it off in settings with **switch seats without restarting claude**.
+  switch. In-place switching is always enabled for eligible sessions.
 - **Work and personal stay apart unless you say so.** Moving a session between a business seat
   (Team/Enterprise) and a personal one (Pro/Max/Plus) asks first — **switch now** or **not now** —
   every time, unless you turn on **switch automatically between business and personal seats**.
-  Switching in place across plan tiers (e.g. Max ↔ Team) is opt-in too.
+  Cross-tier hops (e.g. Max ↔ Team) use in-place switching without a separate plan-tier question.
 - **Parked seats stay ready.** Shortly before a parked Claude seat's sign-in token lapses, the app
   lets Claude Code renew it (`claude mcp list` in that seat's home — no model call), so the seat can
-  take over in place at any time. Setting: **keep parked claude seats signed in**.
+  take over in place at any time. Parked-seat renewal is always enabled.
 - **Stays put while a seat works.** It keeps the current seat until that seat runs out, then moves
   to the next available one. If all seats are resting, it picks the one that unlocks soonest.
 - **Non-destructive & reversible.** A factory-image backup makes uninstall a clean restore.
@@ -111,8 +111,9 @@ connect through the official tools.
   still running, and resumes the conversation. `codex exec`, `claude -p`, paid key seats, sessions
   started with a prompt or flags that can't be safely rebuilt, and Codex sessions sharing the Mac
   with another Codex session stay as they are; so do sessions started on older engines, which need
-  a manual restart. The popover keeps warning about any that can't restart themselves. Turn it off
-  with "restart idle sessions after an update" in settings; running sessions follow within a minute.
+  a manual restart. The popover keeps warning about any that can't restart themselves. Idle engine
+  restarts are always enabled, subject to these safety checks.
+- **Switch notifications** — notices are always sent. Mute the app in macOS **System Settings > Notifications**.
 - **Add / remove seats** — official browser sign-in, plus a no-browser path for Codex (paste an
   `auth.json`). Claude is browser sign-in only: a `claude setup-token` is an env-var token, not the
   Keychain login the switcher reads. Claude snapshots live in the Keychain; Codex snapshots are

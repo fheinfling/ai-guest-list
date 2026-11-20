@@ -315,20 +315,20 @@ def test_pick_honours_exclude_and_does_not_retry_a_resting_home(ctx):
     assert swap.pick(ctx, "home@x", exclude={"b@x"}) is None
 
 
-def test_pick_needs_both_settings_for_a_third_seat(ctx):
+def test_pick_needs_auto_switch_and_budget_but_ignores_legacy_in_place_false(ctx):
     put_seat(ctx, "home@x")
     put_seat(ctx, "b@x", token="b")
     rest(ctx, "home@x")
     swap, _, _ = make(ctx)
     assert swap.pick(ctx, "home@x", third_seat=False) is None
-    for key in ("auto_switch", "in_place_switch"):
-        state = ctx.load_state()
-        state.data["settings"][key] = False
-        state.save()
-        assert swap.pick(ctx, "home@x") is None, key
-        state = ctx.load_state()
-        state.data["settings"][key] = True
-        state.save()
+    state = ctx.load_state()
+    state.set_setting("auto_switch", False)
+    state.save()
+    assert swap.pick(ctx, "home@x") is None
+    state = ctx.load_state()
+    state.set_setting("auto_switch", True)
+    state.set_setting("in_place_switch", False)
+    state.save()
     assert swap.pick(ctx, "home@x") == Seat("b@x", "b")
 
 

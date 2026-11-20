@@ -320,10 +320,11 @@ def test_bridge_rejects_bad_crossing_answers(ctx, message):
     assert not (ctx.load_state().data["tools"][T].get("crossings") or {}).get("approvals")
 
 
-def test_in_place_switch_is_a_default_on_toggle(ctx):
+def test_in_place_switch_is_permanent(ctx):
     assert ctx.load_state().settings()["in_place_switch"] is True
     res = bridge.handle(ctx, {"action": "toggle", "key": "in_place_switch", "value": False})
-    assert res["ok"] and ctx.load_state().settings()["in_place_switch"] is False
+    assert res == {"ok": False, "error": "not a toggle: in_place_switch"}
+    assert ctx.load_state().settings()["in_place_switch"] is True
 
 
 def test_mark_session_records_a_home_that_differs(ctx):

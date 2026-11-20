@@ -188,6 +188,31 @@ def test_build_number_reads_bundle_info_plist(tmp_path, monkeypatch):
     assert acctsw.build_number() == "142"
 
 
+@pytest.mark.parametrize("key", [
+    "engine_restart", "in_place_switch", "in_place_cross_tier", "keep_warm", "notify",
+])
+@pytest.mark.parametrize("value", [False, True])
+def test_toggle_rejects_permanent_settings_without_saving(ctx, key, value):
+    state = ctx.load_state()
+    state.save()
+    before = ctx.state_file.read_bytes()
+    result = bridge.handle(ctx, {"action": "toggle", "key": key, "value": value})
+    assert result == {"ok": False, "error": f"not a toggle: {key}"}
+    assert ctx.state_file.read_bytes() == before
+
+
+@pytest.mark.parametrize("key", [
+    "auto_switch", "crossing_auto", "key_fallback", "confirm_key_switch", "supervise_shell",
+    "restart_app",
+])
+@pytest.mark.parametrize("value", [False, True])
+def test_kept_toggle_settings_persist(ctx, key, value):
+    result = bridge.handle(ctx, {"action": "toggle", "key": key, "value": value})
+    assert result["ok"] is True
+    assert result["state"]["settings"][key] is value
+    assert ctx.load_state().settings()[key] is value
+
+
 def test_toggle_setting_persists(ctx):
     r = bridge.handle(ctx, {"action": "toggle", "key": "auto_switch", "value": False})
     assert r["ok"] and r["state"]["settings"]["auto_switch"] is False

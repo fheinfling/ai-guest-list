@@ -442,10 +442,8 @@ input:focus-visible ~ .sw { outline:3px solid var(--focus); outline-offset:3px; 
 .issue .state-glyph { flex:none; }
 .issue-text { flex:1; min-width:0; overflow-wrap:anywhere; }
 .crossing-confirm { flex-wrap:wrap; }
-.tier-confirm { flex-wrap:wrap; }
 .switch-confirm { flex-wrap:wrap; }
 .crossing-confirm .issue-text { flex-basis:calc(100% - 24px); }
-.tier-confirm .issue-text { flex-basis:calc(100% - 24px); }
 .switch-confirm .issue-text { flex-basis:calc(100% - 24px); }
 .crossing-acts { display:flex; flex-wrap:wrap; gap:6px; margin-left:22px; }
 .crossing-confirm .pricing-link { margin-left:22px; font-size:12px; min-height:0; padding:0; }

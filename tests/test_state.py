@@ -113,6 +113,30 @@ from acctsw import __version__, state as state_mod
 from acctsw.errors import EngineTooOld
 
 
+@pytest.mark.parametrize("key", [
+    "engine_restart", "in_place_switch", "in_place_cross_tier", "keep_warm", "notify",
+])
+def test_load_forces_permanent_settings_and_saves_them_for_older_engines(tmp_path, key):
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"settings": {key: False, "auto_switch": False,
+                                             "theme": "dark", "future": "preserved"}}))
+    before = path.read_bytes()
+    state = State.load(path)
+    assert state.settings()[key] is True
+    assert state.settings()["auto_switch"] is False
+    assert state.settings()["theme"] == "dark"
+    assert state.settings()["future"] == "preserved"
+    assert path.read_bytes() == before
+    state.save()
+    assert json.loads(path.read_text())["settings"][key] is True
+
+
+def test_empty_has_all_permanent_settings_enabled(tmp_path):
+    for data in (state_mod._empty(), State(path=tmp_path / "direct.json").data):
+        for key in ("engine_restart", "in_place_switch", "in_place_cross_tier", "keep_warm", "notify"):
+            assert data["settings"][key] is True
+
+
 def test_save_stamps_the_writer_and_old_files_still_load(tmp_path):
     path = tmp_path / "state.json"
     path.write_text(json.dumps({"version": 1, "tools": {}}))   # written before the stamp existed

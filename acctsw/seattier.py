@@ -1,18 +1,14 @@
 """Plan tiers (Max, Pro, Team, ...) and moving a running session between them in place.
 
-A hop between seats of different tiers is not taken in place unless the user said so: models and
-limits differ across tiers, and Claude Code picked its model for the home seat's. Without a yes the
-hop goes by restart, exactly as it always did. Three things allow it:
+Since the user decision on 2026-11-20, ``State`` forces ``in_place_cross_tier`` True, even when
+an older store says False. Cross-tier hops therefore need no per-pair question, and old open or
+denied requests cannot block them. Models and limits can still differ between plans.
 
-- the setting ``in_place_cross_tier`` ("always for all tiers");
-- an approval for that pair of tiers, ``tools.<tool>.tier_approvals["max|team"] = {"at": iso}``
-  (tiers are symmetric, so the key is the sorted pair, not a direction);
-- equal tiers, or either tier unknown (nothing to compare).
-
-The question is asked once per pair: ``tools.<tool>.tier_requests["max|team"] = {"at": iso,
-"status": "open"|"approved"|"denied"}``. Answers are remembered even if the global setting is
-later turned off, so neither the launcher nor the UI asks again.
-A tier approval never implies a business/personal crossing approval (``seatkind``).
+The legacy pair approval/request machinery remains for compatibility: approvals live in
+``tools.<tool>.tier_approvals["max|team"] = {"at": iso}``, and requests in
+``tools.<tool>.tier_requests["max|team"] = {"at": iso, "status": "open"|"approved"|"denied"}``.
+Pairs are symmetric. With the forced setting, ``request`` never opens a question and ``pending``
+never returns one. Business/personal crossing approval (``seatkind``) remains separate.
 """
 from __future__ import annotations
 
