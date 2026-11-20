@@ -22,6 +22,25 @@ def test_version(capsys):
     assert "acctsw" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("can_restart,blocker", [(False, "ambiguous_cwd"), (True, None)])
+def test_status_json_prefers_per_process_restart_diagnostics(
+        isolated, monkeypatch, capsys, can_restart, blocker):
+    from acctsw import session
+    isolated.ensure_dirs()
+    monkeypatch.setattr(session, "SELF_RESTART", not can_restart)
+    monkeypatch.setattr(session, "RESTART_BLOCKER", "busy_output")
+    session.mark_session(isolated.data_dir, "claude", "a@x.com")
+    own = session._process_file(isolated.data_dir, "claude", session.os.getpid())
+    data = json.loads(own.read_text())
+    session.write_json(own, {**data, "started_at": "2026-10-01",
+                             "self_restart": can_restart, "restart_blocker": blocker})
+    assert cli.main(["status", "--json"]) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["sessions"]["claude"][0]["self_restart"] is can_restart
+    assert status["sessions"]["claude"][0]["restart_blocker"] == blocker
+    assert status["sessions"]["codex"] == []
+
+
 def test_add_list_switch_status_flow(isolated, capsys):
     # sign in as a, add
     isolated.cred["codex"].set_live(make_codex_blob("a@x.com"))

@@ -377,6 +377,27 @@ def test_claude_resume_without_thread_is_refused(old):
     assert restart_args("claude", old, None) is None
 
 
+@pytest.mark.parametrize("old", [
+    [], ["--resume", "old"], ["-r", "old"], ["--resume=old"], ["-r=old"],
+    ["--resume"], ["-r"], ["--session-id", "old"], ["--session-id=old"],
+    ["--continue"], ["-c"],
+])
+def test_claude_picker_replaces_conversation_options_and_keeps_whitelisted_flags(old):
+    flags = ["--chrome", "--model=opus", "--add-dir", "/extra", "--permission-mode", "plan"]
+    args = [*old, *flags]
+    before = list(args)
+    assert restart_args("claude", args, None, claude_picker=True) == [*flags, "--resume"]
+    assert args == before
+
+
+@pytest.mark.parametrize("args", [
+    ["fix the bug"], ["--resume", "old", "fix the bug"], ["--print"], ["--fork-session"],
+    ["--unknown"], ["--model"], ["--session-id"],
+])
+def test_claude_picker_preserves_the_argument_safety_checks(args):
+    assert restart_args("claude", args, None, claude_picker=True) is None
+
+
 @pytest.mark.parametrize("flag", sorted(er._CLAUDE_FLAGS))
 def test_claude_every_boolean_flag_is_kept(flag):
     assert restart_args("claude", [flag], THREAD) == [flag, "--resume", THREAD]

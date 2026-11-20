@@ -1309,6 +1309,70 @@ def _claude_transcript_meta(path: Path) -> dict:
     return {}
 
 
+def _same_cwd(left, right: str) -> bool:
+    return isinstance(left, str) and bool(left) and os.path.realpath(left) == os.path.realpath(right)
+
+
+def _claude_restart_thread(ctx: Context, cwd: str, before: dict[Path, int],
+                           original: str | None, moved: bool, *,
+                           sibling: bool, fallback: bool = False
+                           ) -> tuple[bool, str | None, str | None, bool]:
+    """Return (known, thread, blocker, fallback) without changing other seat handovers' ID.
+
+    Claude's encoded project names can collide. Include a project's changed files before checking
+    the newest one's metadata, so a foreign cwd or sidechain can't make us fall back to stale work.
+    The shallow transcript scan excludes nested subagents; old agent-*.jsonl files and top-level
+    sidechains also need rejecting explicitly.
+
+    ``fallback`` retains discovery mode across every resolution in a restart attempt: a missing
+    or now-invalid candidate must not silently send the user back to the old original conversation.
+    """
+    fallback = fallback or moved or original is None
+    if sibling and fallback:
+        return False, None, "ambiguous_cwd", True
+    transcripts = {path: (stamp, _claude_transcript_meta(path))
+                   for path, stamp in _claude_transcripts(ctx).items()}
+    projects = {path.parent for path, (_, meta) in transcripts.items()
+                if _same_cwd(meta.get("cwd"), cwd) or path.stem == original}
+    project_changed = [(path, stamp, meta) for path, (stamp, meta) in transcripts.items()
+                       if path.parent in projects and before.get(path) != stamp]
+    changed = [(path, stamp, meta) for path, stamp, meta in project_changed
+               if _same_cwd(meta.get("cwd"), cwd)
+               and not (meta.get("isSidechain") or meta.get("agentId")
+                        or path.stem.startswith("agent-"))]
+    foreign = any(path.stem != original for path, _, _ in changed)
+    fallback = fallback or foreign
+    if not fallback:
+        # An idle sibling alone doesn't make a known conversation ambiguous. Until that
+        # conversation has a transcript, preserve the existing fresh-start behavior too.
+        found = [(path, meta) for path, (_, meta) in transcripts.items() if path.stem == original]
+        if not found:
+            return True, None, None, False
+        if len(found) != 1:
+            return False, None, "ambiguous_transcript", False
+        path, meta = found[0]
+    else:
+        if sibling:
+            return False, None, "ambiguous_cwd", True
+        # Without a sibling, a foreign delta can be an unobserved terminal move. Retain the
+        # project-level guards: a newer unsafe file must not send us back to older work.
+        if not project_changed:
+            return False, None, "no_transcript", True
+        newest = max(stamp for _, stamp, _ in project_changed)
+        candidates = [(path, meta) for path, stamp, meta in project_changed if stamp == newest]
+        if len(candidates) != 1:
+            return False, None, "ambiguous_transcript", True
+        path, meta = candidates[0]
+    if fallback and not _same_cwd(meta.get("cwd"), cwd):
+        return False, None, "cwd_mismatch", fallback
+    if meta.get("isSidechain") or meta.get("agentId") or path.stem.startswith("agent-"):
+        return False, None, "sidechain", fallback
+    thread = meta.get("sessionId")
+    if not isinstance(thread, str) or not thread or thread != path.stem:
+        return False, None, "invalid_transcript", fallback
+    return True, thread, None, fallback
+
+
 # Sub-commands that establish/replace credentials rather than run an agent session: codex login,
 # claude auth login / auth status / setup-token, logout. They must NOT be supervised — there is no
 # seat to pick, switch, or auto-switch, and the interactive OAuth flow needs the tool to fully own the
@@ -1503,10 +1567,14 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
     exec_job = codexexec.parse(args) if tool == "codex" else None
     user_args = list(args)     # as typed, before any session id is pinned below
     # Told to the app through the heartbeat: a session that can't reopen itself keeps its warning.
-    could_restart = (
-        exec_job is None and not claude_print and not claude_fork and pin is None
-        and sys.stdin.isatty() and enginerestart.restart_args(tool, user_args, "thread") is not None)
+    launch_blocker = ("exec_job" if exec_job is not None else "print" if claude_print else
+                      "fork" if claude_fork else "pinned" if pin is not None else
+                      "non_tty" if not sys.stdin.isatty() else
+                      "flags" if enginerestart.restart_args(tool, user_args, "thread") is None else
+                      None)
+    could_restart = launch_blocker is None
     session_mod.SELF_RESTART = could_restart
+    session_mod.RESTART_BLOCKER = launch_blocker
     exec_thread = exec_job.thread if exec_job is not None else None
     exec_claimed = None
     exec_stay_notified = False
@@ -2701,6 +2769,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     return EXIT_GAVE_UP
                 argv = _key_command()
                 session_mod.SELF_RESTART = False   # a paid child never restarts itself
+                session_mod.RESTART_BLOCKER = "pinned" if pin else "paid"
                 notify(f"{key_seat['label']} is taking the floor ✨ — {key_runtime.model}, paid per token; "
                        + ("your work's coming with you" if key_session else "ready for your work"))
                 mark_session(ctx.data_dir, tool, key_runtime.seat_id,
@@ -2817,6 +2886,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 "engine_next": 0.0,           # monotonic: next look for a newer engine
                 "engine_probe": None,         # {"for", "done", "target"}: who the wrapper runs now
                 "engine_argv": None,          # what to exec once the child has stopped
+                "engine_claude": None,        # provisional resolution and safe picker argv
                 "routed": False,              # this child's traffic really goes through the proxy
             }
 
@@ -3289,99 +3359,154 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             def _engine_can_see_work() -> bool:
                 return tool != "claude" or (swap is not None and not inplace["off"] and tick["routed"])
 
-            def _engine_idle(at: float) -> bool:
+            def _engine_idle_blocker(at: float) -> str | None:
                 quiet = enginerestart.RESTART_QUIET_S
-                if at - tick["last_output"] < quiet or USER_INPUT.draft:
-                    return False
+                if at - tick["last_output"] < quiet:
+                    return "busy_output"
+                if USER_INPUT.draft:
+                    return "draft"
                 if USER_INPUT.last_input is not None and at - USER_INPUT.last_input < quiet:
-                    return False
+                    return "busy_input"
                 if tool == "claude":
                     # Only the proxy can see a subagent working without a sound.
                     if not _engine_can_see_work():
-                        return False
+                        return "not_routed"
                     try:
                         if swap.proxy.in_flight() != 0 or swap.proxy.idle_for() < quiet:
-                            return False
+                            return "proxy_traffic"
                     except Exception:
-                        return False
-                return not enginerestart.has_late_descendants(os.getpid())
+                        return "proxy_traffic"
+                return "descendants" if enginerestart.has_late_descendants(os.getpid()) else None
 
-            def _engine_thread() -> tuple[bool, str | None]:
-                """(known, thread): can this session be named for a resume, and as what."""
+            def _claude_cwd_ambiguous() -> bool:
+                return tool == "claude" and any(
+                    record["pid"] != os.getpid() and _same_cwd(record.get("cwd"), launch_cwd)
+                    for record in session_mod.active_sessions(ctx.data_dir, "claude"))
+
+            def _engine_thread() -> tuple[bool, str | None, str | None]:
+                """(known, thread, blocker): can this session be named for a resume, and as what."""
                 if tool == "claude":
+                    # Certificate recovery still needs the original exact conversation. Only an
+                    # idle engine restart has permission to choose the newest transcript.
                     thread = resume_thread if _claude_resumable() else None
-                    # /resume and /clear move this child to another conversation without telling
-                    # us: a transcript here other than ours, moved since the spawn, could be that.
                     for path, stamp in _claude_transcripts(ctx).items():
                         if ((claude_before or {}).get(path) != stamp and path.stem != thread
                                 and _claude_transcript_meta(path).get("cwd") == launch_cwd):
-                            return False, None
-                    return True, thread
+                            return False, None, "unknown_thread"
+                    return True, thread, None
                 # A sibling's or a subagent's log can look like ours, and resuming the wrong
                 # conversation is far worse than staying: be the only Codex here, on our own log.
                 if rollout_source is None or rollout_source.attached is None \
                         or not rollout_source.unambiguous \
                         or len(session_mod.active_sessions(ctx.data_dir, "codex")) != 1 \
                         or rollout_source.other_interactive_logs():
-                    return False, None
+                    return False, None, "unknown_thread"
                 meta = rollout.session_meta(rollout_source.attached) or {}
                 thread = meta.get("id")
                 if meta.get("source") != "cli" or meta.get("cwd") != launch_cwd \
                         or not isinstance(thread, str) or not thread:
-                    return False, None
+                    return False, None, "unknown_thread"
                 # If nothing was typed here, a log that moved can only be a since-exited sibling's.
                 if (USER_INPUT.last_input is None and thread != resume_thread
                         and thread not in user_args):
-                    return False, None
+                    return False, None, "unknown_thread"
                 try:
                     changed = rollout_source.attached.stat().st_mtime
                 except OSError:
-                    return False, None
-                return time.time() - changed >= enginerestart.RESTART_QUIET_S, thread
+                    return False, None, "unknown_thread"
+                quiet = time.time() - changed >= enginerestart.RESTART_QUIET_S
+                return quiet, thread, None if quiet else "busy_output"
+
+            def _engine_report(can_restart: bool, blocker: str | None) -> bool:
+                # Called only by the interval-limited engine tick. Seat hops retain these globals
+                # in their existing mark_session writes; unchanged diagnostics cost no write.
+                if (can_restart, blocker) != (session_mod.SELF_RESTART, session_mod.RESTART_BLOCKER):
+                    session_mod.SELF_RESTART = can_restart
+                    session_mod.RESTART_BLOCKER = blocker
+                    session_mod.update_restart_diagnostics(ctx.data_dir, tool)
+                return False
 
             def _tick_engine() -> bool:
                 """A newer engine is installed: once this session is idle, restart into it in this
-                terminal and resume. Anything we can't reopen exactly as it was keeps running."""
+                terminal and resume the last conversation it wrote here."""
                 at = time.monotonic()
                 if at < tick["engine_next"]:
                     return False
                 tick["engine_next"] = at + enginerestart.CHECK_INTERVAL_S
-                can_restart = (could_restart and _engine_can_see_work() and not USER_INPUT.moved
-                               and ctx.load_state().settings().get("engine_restart", True))
-                if can_restart != session_mod.SELF_RESTART:
-                    # The app keeps warning about a session that lost its way to restart.
-                    session_mod.SELF_RESTART = can_restart
-                    mark_session(ctx.data_dir, tool, running_seat() or launch_email,
-                                 home=launch_email)
-                if not can_restart or key_request is not None:
-                    return False
-                newest = enginerestart.newer_writer(ctx.load_state().data)
-                if newest is None or not _engine_idle(at):
-                    return False
+                blocker = (launch_blocker if not could_restart else
+                           "not_routed" if not _engine_can_see_work() else
+                           "moved" if tool != "claude" and USER_INPUT.moved else None)
+                if blocker:
+                    return _engine_report(False, blocker)
+                state = ctx.load_state()
+                if not state.settings().get("engine_restart", True):
+                    return _engine_report(False, "setting_off")
+                if key_request is not None:
+                    return _engine_report(True, "key_pending")
+                newest = enginerestart.newer_writer(state.data)
+                if newest is None:
+                    return _engine_report(True, None)
+                # Sibling verification invokes ps. Until an update exists there is no restart
+                # candidate to disambiguate; known conversations need a scan only at resolution.
+                if tool == "claude" and (USER_INPUT.moved or resume_thread is None) \
+                        and _claude_cwd_ambiguous():
+                    return _engine_report(False, "ambiguous_cwd")
+                blocker = _engine_idle_blocker(at)
+                if blocker:
+                    return _engine_report(True, blocker)
                 # The app being up means its update has finished, and that the restarted engine
                 # supervises rather than falling to stock on some other login. A floor above us
                 # would skip this engine's own cleanup, so that terminal is left alone too.
-                if not appalive.app_running(ctx.data_dir) or ctx.credential_writer_block():
-                    return False
+                if not appalive.app_running(ctx.data_dir):
+                    return _engine_report(True, "app_not_running")
+                if ctx.credential_writer_block():
+                    return _engine_report(True, "credential_floor")
                 target = _engine_target(newest)
                 if target is None:
-                    return False
-                known, thread = _engine_thread()
+                    return _engine_report(True, "no_target")
+                if tool == "claude":
+                    known, thread, blocker, fallback = _claude_restart_thread(
+                        ctx, launch_cwd, claude_before or {}, resume_thread, USER_INPUT.moved,
+                        sibling=_claude_cwd_ambiguous())
+                else:
+                    known, thread, blocker = _engine_thread()
                 # A relaunched child already runs without the flags it was first given, on purpose
                 # in a model fallback's case: reopen what is running, not what was typed.
                 if not known or (resuming and not thread):
-                    return False
+                    return _engine_report(False, blocker or "unknown_thread")
                 rest = enginerestart.restart_args(tool, [] if resuming else user_args, thread)
                 if rest is None:
-                    return False
+                    return _engine_report(False, "flags")
                 with ctx.locked():
                     if not _restart_seat_usable(ctx.load_state(), tool, running_seat()):
-                        return False
+                        return _engine_report(True, "seat_unusable")
+                if tool == "claude":
+                    # The scan (and seat check) can race a new supervisor registering its cwd.
+                    # Re-evaluate with that sibling before committing a provisional selection.
+                    if _claude_cwd_ambiguous():
+                        known, thread, blocker, fallback = _claude_restart_thread(
+                            ctx, launch_cwd, claude_before or {}, resume_thread, USER_INPUT.moved,
+                            sibling=True, fallback=fallback)
+                        if not known or (resuming and not thread):
+                            return _engine_report(False, blocker or "unknown_thread")
+                        rest = enginerestart.restart_args(
+                            tool, [] if resuming else user_args, thread)
+                        if rest is None:
+                            return _engine_report(False, "flags")
+                    picker = enginerestart.restart_args(
+                        tool, [] if resuming else user_args, None, claude_picker=True)
+                    if picker is None:
+                        return _engine_report(False, "flags")
+                    tick["engine_claude"] = {
+                        "original": resume_thread, "moved": USER_INPUT.moved,
+                        "fallback": fallback, "picker": [target, "run", tool, *picker],
+                    }
                 if tool == "codex":
                     # Nobody chose this launch: Codex's update prompt would be waiting for whoever
                     # comes back, with Enter meaning "update now".
                     rest = [*rest, "-c", "check_for_update_on_startup=false"]
                 tick["engine_argv"] = [target, "run", tool, *rest]
+                _engine_report(True, None)
                 hit.update(reason="engine", active=running_seat(), handled=True)
                 notify(f"{tool}: restarting on the new engine ({newest}), resuming your work ✨")
                 return True
@@ -3522,6 +3647,31 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 rollout_source.close()
 
             if hit["reason"] == "engine":
+                if tool == "claude":
+                    selected = tick["engine_claude"]
+                    # spawn has stopped and drained the child, including its final session save.
+                    # Capture may have learned an ID on exit; resolve against the same original,
+                    # movement evidence and before-snapshot as the provisional selection instead.
+                    known, thread, _, fallback = _claude_restart_thread(
+                        ctx, launch_cwd, claude_before or {}, selected["original"],
+                        selected["moved"], sibling=_claude_cwd_ambiguous(),
+                        fallback=selected["fallback"])
+                    if _claude_cwd_ambiguous():
+                        known, thread, _, fallback = _claude_restart_thread(
+                            ctx, launch_cwd, claude_before or {}, selected["original"],
+                            selected["moved"], sibling=True, fallback=fallback)
+                    rest = None
+                    if known and not (resuming and not thread) \
+                            and not (fallback and not selected["fallback"]):
+                        rest = enginerestart.restart_args(
+                            tool, [] if resuming else user_args, thread)
+                    if rest is None:
+                        # The child is already stopped: keep the terminal usable without guessing
+                        # a conversation. Its whitelisted flags were validated before the stop.
+                        tick["engine_argv"] = selected["picker"]
+                        notify("claude: restarted on the new engine — pick your conversation")
+                    else:
+                        tick["engine_argv"] = [*tick["engine_argv"][:3], *rest]
                 # Raised so the cleanup below still runs before the process is replaced.
                 raise enginerestart.EngineRestart(tick["engine_argv"], seat=hit["active"])
 

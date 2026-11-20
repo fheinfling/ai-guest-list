@@ -267,7 +267,7 @@ def _keep(args: list[str], i: int, flags: frozenset, values: frozenset, *,
     return None
 
 
-def _claude_args(args: list[str], thread: str | None) -> list[str] | None:
+def _claude_args(args: list[str], thread: str | None, *, picker: bool = False) -> list[str] | None:
     kept: list[str] = []
     resuming = False
     i = 0
@@ -297,6 +297,8 @@ def _claude_args(args: list[str], thread: str | None) -> list[str] | None:
                 return None
             kept += found[0]
             i = found[1]
+    if picker:
+        return [*kept, "--resume"]
     if thread:
         return [*kept, "--resume", thread]
     return None if resuming else kept
@@ -332,15 +334,20 @@ def _codex_args(args: list[str], thread: str | None) -> list[str] | None:
     return None if resuming else kept
 
 
-def restart_args(tool: str, args: list[str], thread: str | None) -> list[str] | None:
+def restart_args(tool: str, args: list[str], thread: str | None, *,
+                 claude_picker: bool = False) -> list[str] | None:
     """Arguments for ``acctsw run <tool> ...`` that reopen this session with the user's flags.
 
     None means do not restart: this invocation has a prompt, or something we can't vouch for.
+    ``claude_picker`` reopens Claude's conversation picker when a stopped child's final transcript
+    cannot be identified safely, keeping the same whitelisted flags.
     """
     if thread and thread.startswith("-"):
         return None
     if tool == "claude":
-        return _claude_args(args, thread)
+        return _claude_args(args, thread, picker=claude_picker)
+    if claude_picker:
+        return None
     if tool == "codex":
         return _codex_args(args, thread)
     return None

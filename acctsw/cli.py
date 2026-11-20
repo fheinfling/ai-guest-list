@@ -250,6 +250,8 @@ def _cmd_status(ctx: Context, ns) -> int:
     state = ctx.load_state()
     data = acct.status(ctx, state)
     if getattr(ns, "json", False):
+        from . import session
+        data["sessions"] = {tool: session.active_sessions(ctx.data_dir, tool) for tool in TOOLS}
         print(json.dumps(data, indent=2))
         return EXIT_OK
     for tool in TOOLS:

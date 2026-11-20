@@ -6,6 +6,7 @@ rules (acctsw.seatkind) are separate modules; here they are FAKES built on their
 interfaces, so these tests pin the launcher's side of the contract only: which seat is billed,
 what the one decision tail does with a proxy Hit, budgets, crossings, and teardown.
 """
+import json
 import os
 import subprocess
 import sys
@@ -14,7 +15,7 @@ import time
 import types
 from collections import namedtuple
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -2034,6 +2035,14 @@ def test_a_failing_model_decision_answers_and_keeps_the_child_alive(seats, token
 THREAD = "7383292b-d447-4279-b899-1634d45286dd"
 
 
+def _engine_transcript(ctx, thread, *, cwd=None, project="engine-test", **meta):
+    path = ctx._claude_real / "projects" / project / f"{thread}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"sessionId": thread, "cwd": cwd or os.getcwd(),
+                                "isSidechain": False, **meta}) + "\n")
+    return path
+
+
 @pytest.fixture
 def engine_ready(seats, tokens, monkeypatch):
     """Every gate open: a newer engine, the app up, nothing running in the session."""
@@ -2046,7 +2055,7 @@ def engine_ready(seats, tokens, monkeypatch):
     monkeypatch.setattr(er, "target_engine", lambda *a, **k: "/new/acctsw")
     monkeypatch.setattr(er, "has_late_descendants", lambda *a, **k: False)
     monkeypatch.setattr(L, "USER_INPUT", er.InputTracker())
-    monkeypatch.setattr(L, "_claude_transcripts", lambda _c=None: {Path(f"/t/{THREAD}.jsonl"): 1})
+    _engine_transcript(seats, THREAD)
     return Clock(monkeypatch)
 
 
@@ -2066,6 +2075,729 @@ def _quiet_swap():
     return swap
 
 
+@pytest.fixture
+def engine_records(seats, monkeypatch):
+    """Read the last heartbeat before run() removes it, using the real session writer."""
+    records = []
+    clear = L.clear_session
+
+    def capture(data_dir, tool):
+        path = data_dir / f"session-{tool}-{os.getpid()}.json"
+        if path.exists():
+            records.append(json.loads(path.read_text()))
+        clear(data_dir, tool)
+    monkeypatch.setattr(L, "clear_session", capture)
+    return records
+
+
+@pytest.fixture
+def engine_siblings(monkeypatch):
+    siblings = [{"pid": os.getpid() + 1, "cwd": os.getcwd(), "email": C2,
+                 "started_at": iso(now())}]
+    active = L.session_mod.active_sessions
+    monkeypatch.setattr(L.session_mod, "active_sessions",
+                        lambda *a, **kw: [*active(*a, **kw), *siblings])
+    return siblings
+
+
+@pytest.mark.parametrize("original_changed", [False, True])
+def test_known_thread_with_an_idle_sibling_resumes_original(
+        seats, engine_ready, engine_records, engine_siblings, original_changed):
+    from acctsw.enginerestart import EngineRestart
+    _engine_transcript(seats, "idle-sibling")  # Present in the child's before snapshot.
+
+    def changed():
+        if original_changed:
+            path = seats._claude_real / "projects" / "engine-test" / f"{THREAD}.jsonl"
+            stamp = path.stat().st_mtime_ns + 100
+            os.utime(path, ns=(stamp, stamp))
+
+    spawn = Spawn(_idle_child(engine_ready, changed))
+    with pytest.raises(EngineRestart) as raised:
+        run(seats, "claude", ["--resume", THREAD], spawn=spawn, get=fake_get({}),
+            swap_factory=lambda _c: _quiet_swap(), notify=lambda _m: None)
+    assert raised.value.argv[-2:] == ["--resume", THREAD]
+    assert spawn.stops == 1
+    assert engine_records[-1]["self_restart"] is True
+    assert engine_records[-1]["restart_blocker"] is None
+
+
+@pytest.mark.parametrize("sibling", [False, True])
+@pytest.mark.parametrize("thread,meta", [
+    ("sidechain", {"isSidechain": True}), ("agent", {"agentId": "subagent"}),
+    ("agent-123", {}), ("different-cwd", {"cwd": "/somewhere/else"}),
+])
+def test_known_thread_ignores_changes_outside_the_cwd_conversations(
+        seats, engine_ready, engine_siblings, sibling, thread, meta):
+    from acctsw.enginerestart import EngineRestart
+    if not sibling:
+        engine_siblings.clear()
+    spawn = Spawn(_idle_child(engine_ready, lambda: _engine_transcript(seats, thread, **meta)))
+    with pytest.raises(EngineRestart) as raised:
+        run(seats, "claude", ["--resume", THREAD], spawn=spawn, get=fake_get({}),
+            swap_factory=lambda _c: _quiet_swap(), notify=lambda _m: None)
+    assert raised.value.argv[-2:] == ["--resume", THREAD]
+
+
+@pytest.mark.parametrize("newer_engine", [False, True])
+@pytest.mark.parametrize("conversation", ["known", "moved", "unknown"])
+def test_sibling_heartbeat_does_not_scan_transcripts(
+        seats, engine_ready, engine_records, engine_siblings, monkeypatch,
+        newer_engine, conversation):
+    from acctsw import enginerestart as er
+    if not newer_engine:
+        state = seats.load_state()
+        state.data["engine"] = {}
+        state.save()
+    args = ["--continue"] if conversation == "unknown" else ["--resume", THREAD]
+
+    def spawn(argv, on_output, on_tick=None, **kw):
+        if conversation == "moved":
+            L.USER_INPUT.note(b"/clear\r", -1e9)
+
+        def no_scan(*_a):
+            pytest.fail("heartbeat scanned transcripts")
+        # Restore the scanners before normal child-exit conversation capture.
+        with monkeypatch.context() as scan_patch:
+            scan_patch.setattr(L, "_claude_transcripts", no_scan)
+            scan_patch.setattr(L, "_claude_transcript_meta", no_scan)
+            for _ in range(3):
+                assert on_tick() is False
+                engine_ready.advance(er.CHECK_INTERVAL_S)
+        return 0
+
+    assert run(seats, "claude", args, spawn=spawn, get=fake_get({}),
+               swap_factory=lambda _c: _quiet_swap(), notify=lambda _m: None) == 0
+    known = conversation == "known"
+    assert engine_records[-1]["self_restart"] is (known or not newer_engine)
+    assert engine_records[-1]["restart_blocker"] == (
+        ("busy_output" if known else "ambiguous_cwd") if newer_engine else None)
+
+
+@pytest.mark.parametrize("command", [b"/resume\r", b"/clear\r", b"\x1b[A\r"])
+def test_moved_session_resumes_the_latest_transcript_at_restart(
+        seats, engine_ready, engine_records, command):
+    from acctsw.enginerestart import EngineRestart
+
+    def moved():
+        L.USER_INPUT.note(command, -1e9)
+        _engine_transcript(seats, "first")
+
+    def newer():
+        path = _engine_transcript(seats, "latest")
+        os.utime(path, ns=(path.stat().st_mtime_ns + 10, path.stat().st_mtime_ns + 10))
+
+    spawn = Spawn(_idle_child(engine_ready, moved, newer))
+    with pytest.raises(EngineRestart) as raised:
+        run(seats, "claude", ["--resume", THREAD, "--chrome"], spawn=spawn, get=fake_get({}),
+            swap_factory=lambda _c: _quiet_swap(), notify=lambda _m: None)
+    assert raised.value.argv == ["/new/acctsw", "run", "claude", "--chrome", "--resume", "latest"]
+    assert engine_records[-1]["self_restart"] is True
+    assert engine_records[-1]["restart_blocker"] is None
+
+
+def test_restart_uses_a_resumed_transcript_changed_since_spawn(seats, engine_ready):
+    from acctsw.enginerestart import EngineRestart
+    path = _engine_transcript(seats, "resumed-earlier")
+
+    def changed():
+        with path.open("a") as dest:
+            dest.write("{}\n")
+        L.USER_INPUT.note(b"/resume\r", -1e9)
+    with pytest.raises(EngineRestart) as raised:
+        run(seats, "claude", ["--resume", THREAD],
+            spawn=Spawn(_idle_child(engine_ready, changed)), get=fake_get({}),
+            swap_factory=lambda _c: _quiet_swap(), notify=lambda _m: None)
+    assert raised.value.argv[-2:] == ["--resume", "resumed-earlier"]
+
+
+def test_restart_ignores_a_newer_transcript_in_another_project(seats, engine_ready):
+    from acctsw.enginerestart import EngineRestart
+
+    def changed():
+        L.USER_INPUT.note(b"/clear\r", -1e9)
+        _engine_transcript(seats, "ours")
+        _engine_transcript(seats, "foreign", cwd="/somewhere/else", project="another-project")
+    with pytest.raises(EngineRestart) as raised:
+        run(seats, "claude", ["--resume", THREAD],
+            spawn=Spawn(_idle_child(engine_ready, changed)), get=fake_get({}),
+            swap_factory=lambda _c: _quiet_swap(), notify=lambda _m: None)
+    assert raised.value.argv[-2:] == ["--resume", "ours"]
+
+
+@pytest.mark.parametrize("moved", [False, True])
+@pytest.mark.parametrize("same_cwd", [True, False])
+def test_claude_restart_checks_other_live_sessions_by_real_cwd(
+        seats, engine_ready, engine_records, monkeypatch, tmp_path, same_cwd, moved):
+    from acctsw.enginerestart import EngineRestart
+    alias = tmp_path / "cwd-alias"
+    alias.symlink_to(os.getcwd(), target_is_directory=True)
+    active = L.session_mod.active_sessions
+
+    def sessions(data_dir, tool, **kw):
+        return [*active(data_dir, tool, **kw),
+                {"pid": os.getpid() + 1, "cwd": str(alias if same_cwd else tmp_path),
+                 "email": C2, "started_at": iso(now())}]
+    monkeypatch.setattr(L.session_mod, "active_sessions", sessions)
+
+    def changed():
+        if moved:
+            L.USER_INPUT.note(b"/clear\r", -1e9)
+        _engine_transcript(seats, "latest")  # The only changed transcript, even when moved.
+
+    spawn = Spawn(_idle_child(engine_ready, changed))
+    if same_cwd:
+        assert run(seats, "claude", ["--resume", THREAD], spawn=spawn, get=fake_get({}),
+                   swap_factory=lambda _c: _quiet_swap(), notify=lambda _m: None) == 0
+        assert spawn.stops == 0
+        assert engine_records[-1]["self_restart"] is False
+        assert engine_records[-1]["restart_blocker"] == "ambiguous_cwd"
+    else:
+        with pytest.raises(EngineRestart) as raised:
+            run(seats, "claude", ["--resume", THREAD], spawn=spawn, get=fake_get({}),
+                swap_factory=lambda _c: _quiet_swap(), notify=lambda _m: None)
+        assert raised.value.argv[-2:] == ["--resume", "latest"]
+
+
+def test_known_thread_with_a_changed_sibling_stays_even_if_original_is_newest(
+        seats, engine_ready, engine_records, engine_siblings):
+    sibling = _engine_transcript(seats, "sibling")
+
+    def changed():
+        stamp = max(path.stat().st_mtime_ns for path in sibling.parent.glob("*.jsonl")) + 100
+        os.utime(sibling, ns=(stamp, stamp))
+        original = sibling.with_name(f"{THREAD}.jsonl")
+        os.utime(original, ns=(stamp + 100, stamp + 100))
+
+    spawn = Spawn(_idle_child(engine_ready, changed))
+    assert run(seats, "claude", ["--resume", THREAD], spawn=spawn, get=fake_get({}),
+               swap_factory=lambda _c: _quiet_swap(), notify=lambda _m: None) == 0
+    assert spawn.stops == 0
+    assert engine_records[-1]["self_restart"] is False
+    assert engine_records[-1]["restart_blocker"] == "ambiguous_cwd"
+
+
+def test_restart_rechecks_a_sibling_arriving_after_the_cheap_check(
+        seats, engine_ready, engine_records, engine_siblings, monkeypatch):
+    sibling = engine_siblings.pop()
+
+    def app_running(_data_dir):
+        engine_siblings.append(sibling)
+        return True
+
+    monkeypatch.setattr(L.appalive, "app_running", app_running)
+    steps, status = _idle_child(engine_ready)
+
+    def before_tick():
+        engine_siblings.clear()
+        steps[0]()
+
+    def moved():
+        L.USER_INPUT.note(b"/clear\r", -1e9)
+        _engine_transcript(seats, "latest")
+
+    spawn = Spawn(([moved, *([before_tick] * len(steps))], status))
+    assert run(seats, "claude", ["--resume", THREAD], spawn=spawn, get=fake_get({}),
+               swap_factory=lambda _c: _quiet_swap(), notify=lambda _m: None) == 0
+    assert spawn.stops == 0
+    assert engine_records[-1]["restart_blocker"] == "ambiguous_cwd"
+
+
+def test_restart_rechecks_a_sibling_registered_during_metadata_read(
+        seats, engine_ready, engine_records, engine_siblings, monkeypatch):
+    sibling = engine_siblings.pop()
+    read = L._claude_transcript_meta
+
+    def read_and_register(path):
+        if path.stem == "other" and not engine_siblings:
+            engine_siblings.append(sibling)
+        return read(path)
+
+    monkeypatch.setattr(L, "_claude_transcript_meta", read_and_register)
+    spawn = Spawn(_idle_child(engine_ready, lambda: _engine_transcript(seats, "other")))
+    assert run(seats, "claude", ["--resume", THREAD], spawn=spawn, get=fake_get({}),
+               swap_factory=lambda _c: _quiet_swap(), notify=lambda _m: None) == 0
+    assert engine_siblings == [sibling]
+    assert spawn.stops == 0
+    assert engine_records[-1]["restart_blocker"] == "ambiguous_cwd"
+
+
+def test_restart_rechecks_a_sibling_registered_by_the_final_seat_check(
+        seats, engine_ready, engine_records, engine_siblings, monkeypatch):
+    sibling = engine_siblings.pop()
+    usable = L._restart_seat_usable
+
+    def check(*args):
+        if not engine_siblings:
+            engine_siblings.append(sibling)
+        return usable(*args)
+
+    monkeypatch.setattr(L, "_restart_seat_usable", check)
+    spawn = Spawn(_idle_child(engine_ready, lambda: _engine_transcript(seats, "other")))
+    assert run(seats, "claude", ["--resume", THREAD], spawn=spawn, get=fake_get({}),
+               swap_factory=lambda _c: _quiet_swap(), notify=lambda _m: None) == 0
+    assert engine_siblings == [sibling]
+    assert spawn.stops == 0
+    assert engine_records[-1]["restart_blocker"] == "ambiguous_cwd"
+
+
+def test_restart_keeps_discovery_when_candidate_disappears_before_final_sibling_check(
+        seats, engine_ready, engine_records, engine_siblings, monkeypatch):
+    sibling = engine_siblings.pop()
+    other = seats._claude_real / "projects" / "engine-test" / "other.jsonl"
+    usable, resolve = L._restart_seat_usable, L._claude_restart_thread
+    resolutions = []
+
+    def check(*args):
+        other.unlink()
+        engine_siblings.append(sibling)
+        return usable(*args)
+
+    def record(*args, **kwargs):
+        result = resolve(*args, **kwargs)
+        resolutions.append((kwargs.get("fallback", False), result))
+        return result
+
+    monkeypatch.setattr(L, "_restart_seat_usable", check)
+    monkeypatch.setattr(L, "_claude_restart_thread", record)
+    steps, status = _idle_child(engine_ready, lambda: _engine_transcript(seats, "other"))
+    # End after the first quiet tick: this test concerns one restart attempt.
+    spawn = Spawn((steps[:2], status))
+    assert run(seats, "claude", ["--resume", THREAD], spawn=spawn, get=fake_get({}),
+               swap_factory=lambda _c: _quiet_swap(), notify=lambda _m: None) == 0
+    assert resolutions == [(False, (True, "other", None, True)),
+                           (True, (False, None, "ambiguous_cwd", True))]
+    assert engine_siblings == [sibling]
+    assert spawn.stops == 0
+    assert engine_records[-1]["restart_blocker"] == "ambiguous_cwd"
+
+
+def _draining_child(clock, change, drain):
+    """Flush final transcript writes after the tick requests stop, before spawn returns."""
+    steps, status = _idle_child(clock, change)
+    stopped = []
+
+    def spawn(argv, on_output, on_tick=None, **kw):
+        for step in steps:
+            if step is not None:
+                step()
+            if on_tick():
+                drain()
+                stopped.append(True)
+                return status
+        return status
+    return spawn, stopped
+
+
+@pytest.mark.parametrize("discovered", ["before_stop", "after_drain"])
+def test_restart_keeps_discovery_when_candidate_disappears_between_postdrain_resolutions(
+        seats, engine_ready, engine_siblings, monkeypatch, discovered):
+    from acctsw.enginerestart import EngineRestart
+    sibling = engine_siblings.pop()
+    resolve = L._claude_restart_thread
+    resolutions = []
+
+    def record(*args, **kwargs):
+        result = resolve(*args, **kwargs)
+        resolutions.append((kwargs.get("fallback", False), result))
+        return result
+
+    monkeypatch.setattr(L, "_claude_restart_thread", record)
+
+    def changed():
+        if discovered == "before_stop":
+            _engine_transcript(seats, "other")
+
+    def drain():
+        if discovered == "after_drain":
+            _engine_transcript(seats, "other")
+        read = L._claude_transcript_meta
+
+        def read_remove_register(path):
+            meta = read(path)
+            if path.stem == "other":
+                path.unlink()
+                engine_siblings.append(sibling)
+            return meta
+
+        monkeypatch.setattr(L, "_claude_transcript_meta", read_remove_register)
+
+    spawn, stopped = _draining_child(engine_ready, changed, drain)
+    with pytest.raises(EngineRestart) as raised:
+        run(seats, "claude", ["--resume", THREAD, "--chrome"], spawn=spawn, get=fake_get({}),
+            swap_factory=lambda _c: _quiet_swap(), notify=lambda _m: None)
+    was_discovery = discovered == "before_stop"
+    assert resolutions == [
+        (False, (True, "other" if was_discovery else THREAD, None, was_discovery)),
+        (was_discovery, (True, "other", None, True)),
+        (True, (False, None, "ambiguous_cwd", True)),
+    ]
+    assert engine_siblings == [sibling]
+    assert stopped == [True]
+    assert raised.value.argv == ["/new/acctsw", "run", "claude", "--chrome", "--resume"]
+    assert raised.value.seat == C1
+
+
+def test_restart_reselects_the_thread_appended_during_stop_and_drain(seats, engine_ready):
+    from acctsw.enginerestart import EngineRestart
+    original = seats._claude_real / "projects" / "engine-test" / f"{THREAD}.jsonl"
+    other = original.with_name("other.jsonl")
+
+    def changed():
+        _engine_transcript(seats, "other")
+        stamp = original.stat().st_mtime_ns + 1000
+        os.utime(other, ns=(stamp, stamp))
+
+    def drain():
+        with original.open("a") as dest:
+            dest.write("{}\n")
+        stamp = max(original.stat().st_mtime_ns, other.stat().st_mtime_ns) + 1000
+        os.utime(original, ns=(stamp, stamp))
+
+    spawn, stopped = _draining_child(engine_ready, changed, drain)
+    with pytest.raises(EngineRestart) as raised:
+        run(seats, "claude", ["--resume", THREAD, "--chrome"], spawn=spawn, get=fake_get({}),
+            swap_factory=lambda _c: _quiet_swap(), notify=lambda _m: None)
+    assert stopped == [True]
+    assert original.stat().st_mtime_ns > other.stat().st_mtime_ns
+    assert raised.value.argv == ["/new/acctsw", "run", "claude", "--chrome", "--resume", THREAD]
+    assert raised.value.seat == C1
+
+
+@pytest.mark.parametrize("conversation", ["known", "unknown", "moved"])
+@pytest.mark.parametrize("after_drain", [
+    "sibling", "sibling_during_scan", "tie", "missing", "cwd_mismatch", "invalid", "sidechain",
+])
+def test_restart_opens_picker_when_resolution_refuses_after_drain(
+        seats, engine_ready, engine_siblings, monkeypatch, conversation, after_drain):
+    from acctsw.enginerestart import EngineRestart
+    sibling = engine_siblings.pop()
+    path = seats._claude_real / "projects" / "engine-test" / "latest.jsonl"
+
+    def changed():
+        _engine_transcript(seats, "latest")
+        if conversation == "moved":
+            L.USER_INPUT.note(b"/clear\r", -1e9)
+
+    def drain():
+        if after_drain == "sibling":
+            engine_siblings.append(sibling)
+        elif after_drain == "sibling_during_scan":
+            read = L._claude_transcript_meta
+
+            def read_and_register(path):
+                if path.stem == "latest" and not engine_siblings:
+                    engine_siblings.append(sibling)
+                return read(path)
+            monkeypatch.setattr(L, "_claude_transcript_meta", read_and_register)
+        elif after_drain == "tie":
+            other = _engine_transcript(seats, "tied")
+            stamp = max(path.stat().st_mtime_ns, other.stat().st_mtime_ns) + 1000
+            for p in (path, other):
+                os.utime(p, ns=(stamp, stamp))
+        elif after_drain == "missing":
+            # Delete all candidates so the known original cannot silently become exact again.
+            for p in path.parent.glob("*.jsonl"):
+                p.unlink()
+        else:
+            meta = {"cwd": "/elsewhere"} if after_drain == "cwd_mismatch" else (
+                {"sessionId": "wrong-id"} if after_drain == "invalid" else {"isSidechain": True})
+            _engine_transcript(seats, "latest", **meta)
+
+    spawn, stopped = _draining_child(engine_ready, changed, drain)
+    said = []
+    args = ["--continue"] if conversation == "unknown" else ["--resume", THREAD]
+    flags = ["--chrome", "--model=opus", "--add-dir", "/extra", "--permission-mode", "plan"]
+    with pytest.raises(EngineRestart) as raised:
+        run(seats, "claude", [*args, *flags], spawn=spawn, get=fake_get({}),
+            swap_factory=lambda _c: _quiet_swap(), notify=said.append)
+    assert stopped == [True]
+    assert raised.value.argv == ["/new/acctsw", "run", "claude", *flags, "--resume"]
+    assert raised.value.seat == C1
+    assert "claude: restarted on the new engine — pick your conversation" in said
+    assert not (seats.data_dir / f"session-claude-{os.getpid()}.json").exists()
+
+
+@pytest.mark.parametrize("fresh", [False, True])
+def test_exact_restart_opens_picker_if_foreign_transcript_appears_during_drain(
+        seats, engine_ready, fresh):
+    from acctsw.enginerestart import EngineRestart
+    if fresh:
+        (seats._claude_real / "projects" / "engine-test" / f"{THREAD}.jsonl").unlink()
+    spawn, stopped = _draining_child(
+        engine_ready, lambda: None, lambda: _engine_transcript(seats, "foreign"))
+    said = []
+    args = ["--chrome"] if fresh else ["--resume", THREAD, "--chrome"]
+    with pytest.raises(EngineRestart) as raised:
+        run(seats, "claude", args, spawn=spawn, get=fake_get({}),
+            swap_factory=lambda _c: _quiet_swap(), notify=said.append)
+    assert stopped == [True]
+    assert raised.value.argv == ["/new/acctsw", "run", "claude", "--chrome", "--resume"]
+    assert "claude: restarted on the new engine — pick your conversation" in said
+
+
+def test_known_unmoved_original_resumes_with_historical_metadata_cwd(seats, engine_ready):
+    from acctsw.enginerestart import EngineRestart
+    _engine_transcript(seats, THREAD, cwd="/previous-project")
+    spawn = Spawn(_idle_child(engine_ready))
+    with pytest.raises(EngineRestart) as raised:
+        run(seats, "claude", ["--resume", THREAD], spawn=spawn, get=fake_get({}),
+            swap_factory=lambda _c: _quiet_swap(), notify=lambda _m: None)
+    assert spawn.stops == 1
+    assert raised.value.argv == ["/new/acctsw", "run", "claude", "--resume", THREAD]
+
+
+@pytest.mark.parametrize("meta,blocker", [
+    ({"sessionId": "wrong-id"}, "invalid_transcript"),
+    ({"isSidechain": True}, "sidechain"), ({"agentId": "subagent"}, "sidechain"),
+])
+def test_known_original_historical_cwd_still_requires_a_matching_non_sidechain_id(
+        seats, engine_ready, engine_records, meta, blocker):
+    _engine_transcript(seats, THREAD, cwd="/previous-project", **meta)
+    spawn = Spawn(_idle_child(engine_ready))
+    assert run(seats, "claude", ["--resume", THREAD], spawn=spawn, get=fake_get({}),
+               swap_factory=lambda _c: _quiet_swap(), notify=lambda _m: None) == 0
+    assert spawn.stops == 0
+    assert engine_records[-1]["restart_blocker"] == blocker
+
+
+@pytest.mark.parametrize("conversation", ["known", "unknown", "moved"])
+def test_no_update_heartbeat_does_not_poll_active_sessions_or_ps(
+        seats, engine_ready, engine_records, engine_siblings, monkeypatch, conversation):
+    from acctsw import enginerestart as er
+    state = seats.load_state()
+    state.data["engine"] = {}
+    state.save()
+    active, proc = L.session_mod.active_sessions, L.session_mod._proc_start
+    active_calls, ps_calls = [], []
+
+    def active_sessions(*args, **kw):
+        active_calls.append(True)
+        return active(*args, **kw)
+
+    monkeypatch.setattr(L.session_mod, "active_sessions", active_sessions)
+    monkeypatch.setattr(L.session_mod, "_proc_start", lambda pid: ps_calls.append(pid) or proc(pid))
+
+    def spawn(argv, on_output, on_tick=None, **kw):
+        if conversation == "moved":
+            L.USER_INPUT.note(b"/clear\r", -1e9)
+        active_calls.clear()
+        ps_calls.clear()
+        for _ in range(3):
+            assert on_tick() is False
+            engine_ready.advance(er.CHECK_INTERVAL_S)
+        assert active_calls == []
+        assert ps_calls == []
+        return 0
+
+    args = ["--continue"] if conversation == "unknown" else ["--resume", THREAD]
+    assert run(seats, "claude", args, spawn=spawn, get=fake_get({}),
+               swap_factory=lambda _c: _quiet_swap(), notify=lambda _m: None) == 0
+    assert engine_records[-1]["self_restart"] is True
+    assert engine_records[-1]["restart_blocker"] is None
+
+
+def test_diagnostic_change_preserves_launch_record_66_minutes_later(
+        seats, engine_ready, engine_records, monkeypatch):
+    from acctsw import enginerestart as er
+    base = datetime(2026, 11, 20, 10, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(L.session_mod, "now", lambda: base + timedelta(seconds=engine_ready.offset))
+    monkeypatch.setattr(L.appalive, "app_running", lambda _d: False)
+    before = []
+
+    def spawn(argv, on_output, on_tick=None, **kw):
+        path = seats.data_dir / f"session-claude-{os.getpid()}.json"
+        before.append(json.loads(path.read_text()))
+        engine_ready.advance(er.RESTART_QUIET_S + er.CHECK_INTERVAL_S)
+        assert on_tick() is False
+        return 0
+
+    assert run(seats, "claude", ["--resume", THREAD], spawn=spawn, get=fake_get({}),
+               swap_factory=lambda _c: _quiet_swap(), notify=lambda _m: None) == 0
+    after = engine_records[-1]
+    assert after["restart_blocker"] == "app_not_running"
+    assert after["started_at"] == before[0]["started_at"] == iso(base)
+    assert after == {**before[0], "self_restart": True, "restart_blocker": "app_not_running"}
+
+
+def test_unknown_thread_without_a_sibling_resumes_the_newest_changed_transcript(
+        seats, engine_ready):
+    from acctsw.enginerestart import EngineRestart
+
+    def changed():
+        first = _engine_transcript(seats, "first")
+        latest = _engine_transcript(seats, "latest")
+        stamp = max(first.stat().st_mtime_ns, latest.stat().st_mtime_ns) + 100
+        os.utime(latest, ns=(stamp, stamp))
+
+    spawn = Spawn(_idle_child(engine_ready, changed))
+    with pytest.raises(EngineRestart) as raised:
+        run(seats, "claude", ["--continue"], spawn=spawn, get=fake_get({}),
+            swap_factory=lambda _c: _quiet_swap(), notify=lambda _m: None)
+    assert raised.value.argv[-2:] == ["--resume", "latest"]
+
+
+@pytest.mark.parametrize("args", [["--resume", THREAD], ["--continue"]])
+def test_restart_refuses_tied_changes_without_a_sibling(
+        seats, engine_ready, engine_records, args):
+    def changed():
+        first = _engine_transcript(seats, "first")
+        second = _engine_transcript(seats, "second")
+        stamp = max(first.stat().st_mtime_ns, second.stat().st_mtime_ns) + 100
+        os.utime(first, ns=(stamp, stamp))
+        os.utime(second, ns=(stamp, stamp))
+
+    spawn = Spawn(_idle_child(engine_ready, changed))
+    assert run(seats, "claude", args, spawn=spawn, get=fake_get({}),
+               swap_factory=lambda _c: _quiet_swap(), notify=lambda _m: None) == 0
+    assert spawn.stops == 0
+    assert engine_records[-1]["restart_blocker"] == "ambiguous_transcript"
+
+
+@pytest.mark.parametrize("args,moved", [(["--continue"], False), (["--resume", THREAD], True)])
+def test_unknown_thread_without_a_changed_transcript_stays(
+        seats, engine_ready, engine_records, args, moved):
+    hooks = [lambda: L.USER_INPUT.note(b"/clear\r", -1e9)] if moved else []
+    spawn = Spawn(_idle_child(engine_ready, *hooks))
+    assert run(seats, "claude", args, spawn=spawn, get=fake_get({}),
+               swap_factory=lambda _c: _quiet_swap(), notify=lambda _m: None) == 0
+    assert engine_records[-1]["restart_blocker"] == "no_transcript"
+    assert engine_records[-1]["self_restart"] is False
+    assert spawn.stops == 0
+
+
+@pytest.mark.parametrize("blocker", ["no_transcript", "ambiguous_cwd"])
+def test_restart_retries_when_transcript_ambiguity_clears(
+        seats, engine_ready, monkeypatch, blocker):
+    from acctsw.enginerestart import EngineRestart
+    active = L.session_mod.active_sessions
+    siblings = ([{"pid": os.getpid() + 1, "cwd": os.getcwd(), "email": C2,
+                  "started_at": iso(now())}] if blocker == "ambiguous_cwd" else [])
+    monkeypatch.setattr(L.session_mod, "active_sessions",
+                        lambda *a, **kw: [*active(*a, **kw), *siblings])
+    steps, status = _idle_child(engine_ready, lambda: L.USER_INPUT.note(b"/clear\r", -1e9))
+
+    def resolve():
+        assert L.session_mod.SELF_RESTART is False
+        assert L.session_mod.RESTART_BLOCKER == blocker
+        siblings.clear()
+        _engine_transcript(seats, "finally-known")
+    steps.insert(-1, resolve)
+    with pytest.raises(EngineRestart) as raised:
+        run(seats, "claude", ["--resume", THREAD], spawn=Spawn((steps, status)), get=fake_get({}),
+            swap_factory=lambda _c: _quiet_swap(), notify=lambda _m: None)
+    assert raised.value.argv[-2:] == ["--resume", "finally-known"]
+    assert L.session_mod.SELF_RESTART is True
+
+
+@pytest.mark.parametrize("collision", [True, False])
+def test_foreign_cwd_transcript_is_never_resumed(
+        seats, engine_ready, engine_records, tmp_path, collision):
+    def changed():
+        L.USER_INPUT.note(b"/resume\r", -1e9)
+        _engine_transcript(seats, "foreign", cwd=str(tmp_path),
+                           project="engine-test" if collision else "another-project")
+    spawn = Spawn(_idle_child(engine_ready, changed))
+    assert run(seats, "claude", ["--resume", THREAD], spawn=spawn, get=fake_get({}),
+               swap_factory=lambda _c: _quiet_swap(), notify=lambda _m: None) == 0
+    assert engine_records[-1]["restart_blocker"] == ("cwd_mismatch" if collision else "no_transcript")
+    assert engine_records[-1]["self_restart"] is False
+
+
+@pytest.mark.parametrize("kind", ["sidechain", "agent", "nested", "mismatched_id", "tie"])
+def test_restart_refuses_subagents_and_ambiguous_transcripts(
+        seats, engine_ready, engine_records, kind):
+    def changed():
+        L.USER_INPUT.note(b"/clear\r", -1e9)
+        if kind == "sidechain":
+            _engine_transcript(seats, "latest", isSidechain=True)
+        elif kind == "agent":
+            _engine_transcript(seats, "agent-123")
+        elif kind == "nested":
+            _engine_transcript(seats, "agent-123", project=f"engine-test/{THREAD}/subagents")
+        elif kind == "mismatched_id":
+            path = _engine_transcript(seats, "latest")
+            path.write_text(json.dumps({"cwd": os.getcwd(), "sessionId": "wrong"}) + "\n")
+        else:
+            first = _engine_transcript(seats, "first")
+            second = _engine_transcript(seats, "second")
+            stamp = first.stat().st_mtime_ns
+            os.utime(second, ns=(stamp, stamp))
+    spawn = Spawn(_idle_child(engine_ready, changed))
+    assert run(seats, "claude", ["--resume", THREAD], spawn=spawn, get=fake_get({}),
+               swap_factory=lambda _c: _quiet_swap(), notify=lambda _m: None) == 0
+    assert engine_records[-1]["restart_blocker"] == {
+        "sidechain": "sidechain", "agent": "sidechain", "nested": "no_transcript",
+        "mismatched_id": "invalid_transcript", "tie": "ambiguous_transcript"}[kind]
+    assert engine_records[-1]["self_restart"] is False
+
+
+@pytest.mark.parametrize("name,reason", [
+    ("draft", "draft"), ("request in flight", "proxy_traffic"),
+    ("recent request", "proxy_traffic"), ("background work", "descendants"),
+    ("app closed", "app_not_running"), ("wrapper not newer", "no_target"),
+    ("seat can't carry it", "seat_unusable"), ("routing failed", "not_routed"),
+    ("recent input", "busy_input"), ("credential floor", "credential_floor"),
+    ("setting off", "setting_off"), ("flags", "flags"), ("output", "busy_output"),
+])
+def test_heartbeat_explains_why_a_newer_engine_has_not_restarted(
+        seats, engine_ready, engine_records, monkeypatch, name, reason):
+    swap = _quiet_swap()
+    hooks = []
+    args = ["--resume", THREAD]
+    if name == "routing failed":
+        swap.env = lambda _env: None
+    elif name == "recent input":
+        hooks = [lambda: L.USER_INPUT.note(b"hello\r", L.time.monotonic() + 1e9)]
+    elif name == "credential floor":
+        monkeypatch.setattr(seats, "credential_writer_block", lambda: "newer writer")
+    elif name == "setting off":
+        # Production state forces this on; inject settings only to exercise the retained gate.
+        from acctsw.state import State
+        settings = State.settings
+        monkeypatch.setattr(State, "settings", lambda st: {**settings(st), "engine_restart": False})
+    elif name == "flags":
+        args.append("--unknown")
+    else:
+        hook = _gate_case(name)(seats, monkeypatch, swap)
+        hooks = [hook] if hook else []
+    script = ([None, None, None], 0) if name == "output" else _idle_child(engine_ready, *hooks)
+    assert run(seats, "claude", args, spawn=Spawn(script), get=fake_get({}),
+               swap_factory=lambda _c: swap, notify=lambda _m: None) == 0
+    assert engine_records[-1]["restart_blocker"] == reason
+
+
+def test_restart_diagnostics_write_only_on_change_and_at_the_check_interval(
+        seats, engine_ready, monkeypatch):
+    from acctsw import enginerestart as er
+    monkeypatch.setattr(L.appalive, "app_running", lambda _d: False)
+    mark = L.mark_session
+    update = L.session_mod.update_restart_diagnostics
+    writes = []
+
+    def record(writer, *args, **kw):
+        writes.append((engine_ready.offset, L.session_mod.SELF_RESTART,
+                       getattr(L.session_mod, "RESTART_BLOCKER", None)))
+        writer(*args, **kw)
+    monkeypatch.setattr(L, "mark_session", lambda *a, **kw: record(mark, *a, **kw))
+    monkeypatch.setattr(L.session_mod, "update_restart_diagnostics",
+                        lambda *a, **kw: record(update, *a, **kw))
+    steps = [None, None, lambda: engine_ready.advance(er.RESTART_QUIET_S + er.CHECK_INTERVAL_S),
+             None, lambda: engine_ready.advance(er.CHECK_INTERVAL_S),
+             lambda: L.USER_INPUT.note(b"draft", -1e9),
+             lambda: engine_ready.advance(er.CHECK_INTERVAL_S / 2),
+             lambda: engine_ready.advance(er.CHECK_INTERVAL_S / 2),
+             lambda: engine_ready.advance(er.CHECK_INTERVAL_S),
+             lambda: L.USER_INPUT.note(b"\r", -1e9),
+             lambda: engine_ready.advance(er.CHECK_INTERVAL_S),
+             lambda: engine_ready.advance(er.CHECK_INTERVAL_S)]
+    assert run(seats, "claude", ["--resume", THREAD], spawn=Spawn((steps, 0)), get=fake_get({}),
+               swap_factory=lambda _c: _quiet_swap(), notify=lambda _m: None) == 0
+    assert [blocker for _, _, blocker in writes] == [None, "busy_output", "app_not_running",
+                                                    "draft", "app_not_running"]
+    assert all(at2 - at1 >= er.CHECK_INTERVAL_S for (at1, *_), (at2, *_) in zip(writes[1:], writes[2:]))
+
+
 def test_idle_session_restarts_on_the_new_engine_with_its_flags_and_seat(seats, engine_ready):
     from acctsw.enginerestart import EngineRestart
     said = []
@@ -2080,8 +2812,12 @@ def test_idle_session_restarts_on_the_new_engine_with_its_flags_and_seat(seats, 
     assert L.active_session(seats.data_dir, "claude") is None
 
 
-def test_session_with_nothing_said_restarts_fresh_without_the_pinned_id(seats, engine_ready, monkeypatch):
+@pytest.mark.parametrize("sibling", [False, True])
+def test_session_with_nothing_said_restarts_fresh_without_the_pinned_id(
+        seats, engine_ready, engine_siblings, monkeypatch, sibling):
     from acctsw.enginerestart import EngineRestart
+    if not sibling:
+        engine_siblings.clear()
     monkeypatch.setattr(L, "_claude_transcripts", lambda _c=None: {})
     spawn = Spawn(_idle_child(engine_ready))
     with pytest.raises(EngineRestart) as raised:
@@ -2144,15 +2880,23 @@ def test_claude_without_the_proxy_stays_because_silence_proves_nothing(seats, en
                swap_factory=lambda _c: None, notify=lambda m: None) == 0
 
 
-def test_another_conversation_moving_here_means_stay(seats, engine_ready, monkeypatch):
-    # /resume or /clear inside the child leaves the id we pinned behind, still with a transcript.
-    ours, other = Path(f"/t/{THREAD}.jsonl"), Path("/t/other.jsonl")
-    seen = {ours: 1}
-    monkeypatch.setattr(L, "_claude_transcripts", lambda _c=None: dict(seen))
-    monkeypatch.setattr(L, "_claude_transcript_meta", lambda _p: {"cwd": os.getcwd()})
-    spawn = Spawn(_idle_child(engine_ready, lambda: seen.update({other: 1})))
-    assert run(seats, "claude", ["--resume", THREAD], spawn=spawn, get=fake_get({}),
-               swap_factory=lambda _c: _quiet_swap(), notify=lambda m: None) == 0
+@pytest.mark.parametrize("newest", [THREAD, "other"])
+def test_another_conversation_moving_here_resumes_the_newest(seats, engine_ready, newest):
+    from acctsw.enginerestart import EngineRestart
+
+    def changed():
+        # No observed move and no sibling: the terminal probably moved without us seeing it.
+        other = _engine_transcript(seats, "other")
+        original = other.with_name(f"{THREAD}.jsonl")
+        stamp = max(other.stat().st_mtime_ns, original.stat().st_mtime_ns) + 100
+        os.utime(other, ns=(stamp, stamp))
+        os.utime(original, ns=(stamp + (100 if newest == THREAD else -100),) * 2)
+
+    spawn = Spawn(_idle_child(engine_ready, changed))
+    with pytest.raises(EngineRestart) as raised:
+        run(seats, "claude", ["--resume", THREAD], spawn=spawn, get=fake_get({}),
+            swap_factory=lambda _c: _quiet_swap(), notify=lambda m: None)
+    assert raised.value.argv == ["/new/acctsw", "run", "claude", "--resume", newest]
 
 
 @pytest.mark.parametrize("when", ["before_launch", "mid_run"])
