@@ -2998,3 +2998,106 @@ def test_restarted_engine_lands_on_the_seat_it_was_billing(seats, tokens, monkey
     assert envs == [C2]
     assert SEAT_ENV not in os.environ   # never inherited by the child
 
+
+
+@pytest.mark.parametrize('change,newer', [(True, False), (False, False), (True, True)])
+def test_cli_replacement_reuses_idle_restart_and_engine_priority(
+        seats, engine_ready, monkeypatch, tmp_path, change, newer):
+    from acctsw import enginerestart as er
+    first = tmp_path / 'cli-1'
+    second = tmp_path / 'cli-2'
+    first.write_text('old')
+    second.write_text('new')
+    binary = tmp_path / 'claude-cli'
+    binary.symlink_to(first)
+    seats.claude_bin = str(binary)
+    if not newer:
+        state = seats.load_state()
+        state.data['engine'] = {}
+        state.save()
+    wrapper = str(Path.home() / '.local' / 'bin' / 'acctsw')
+    probes = []
+    def target(**kw):
+        probes.append(kw)
+        return '/new/acctsw' if newer else wrapper
+    monkeypatch.setattr(er, 'target_engine', target)
+    def replace():
+        if change:
+            binary.unlink()
+            binary.symlink_to(second)
+    said = []
+    spawn = Spawn(_idle_child(engine_ready, replace))
+    if change or newer:
+        with pytest.raises(er.EngineRestart) as raised:
+            run(seats, 'claude', ['--resume', THREAD, '--chrome'], spawn=spawn, get=fake_get({}),
+                swap_factory=lambda _c: _quiet_swap(), notify=said.append)
+        assert raised.value.argv == ['/new/acctsw' if newer else wrapper, 'run', 'claude',
+                                     '--chrome', '--resume', THREAD]
+        assert probes == [{'allow_equal': not newer}]
+        assert any(('new engine' if newer else 'updated CLI') in msg for msg in said)
+    else:
+        assert run(seats, 'claude', ['--resume', THREAD], spawn=spawn, get=fake_get({}),
+                   swap_factory=lambda _c: _quiet_swap(), notify=said.append) == 0
+        assert probes == [] and spawn.stops == 0
+
+
+def test_updated_cli_waits_while_busy_then_resumes_when_idle(seats, engine_ready, monkeypatch, tmp_path):
+    from acctsw import enginerestart as er
+    state = seats.load_state()
+    state.data['engine'] = {}
+    state.save()
+    binary = tmp_path / 'claude-cli'
+    binary.write_text('old')
+    seats.claude_bin = str(binary)
+    monkeypatch.setattr(er, 'target_engine', lambda **kw: '/current/acctsw')
+    def spawn(argv, on_output, on_tick=None, **kw):
+        replacement = tmp_path / 'new'
+        replacement.write_text('new')
+        replacement.replace(binary)
+        for _ in range(3):
+            assert on_output(b'working') is False
+            assert on_tick() is False
+            engine_ready.advance(er.CHECK_INTERVAL_S)
+        for _ in range(4):
+            engine_ready.advance(er.RESTART_QUIET_S + er.CHECK_INTERVAL_S)
+            time.sleep(0.01)
+            if on_tick():
+                return 0
+        pytest.fail('updated CLI never resumed when idle')
+    with pytest.raises(er.EngineRestart) as raised:
+        run(seats, 'claude', ['--resume', THREAD], spawn=spawn, get=fake_get({}),
+            swap_factory=lambda _c: _quiet_swap())
+    assert raised.value.argv == ['/current/acctsw', 'run', 'claude', '--resume', THREAD]
+
+
+def test_cli_restart_waits_until_installer_finishes(seats, engine_ready, monkeypatch, tmp_path):
+    from acctsw import enginerestart as er
+    state = seats.load_state()
+    state.data['engine'] = {}
+    state.save()
+    binary = tmp_path / 'claude-cli'
+    binary.write_text('old')
+    seats.claude_bin = str(binary)
+    monkeypatch.setattr(er, 'target_engine', lambda **kw: '/current/acctsw')
+    def spawn(argv, on_output, on_tick=None, **kw):
+        binary.write_text('new')
+        state = seats.load_state()
+        state.data['tool_updates'] = {'claude': {'installing_until': iso(now() + timedelta(minutes=16))}}
+        state.save()
+        for _ in range(3):
+            engine_ready.advance(er.RESTART_QUIET_S + er.CHECK_INTERVAL_S)
+            time.sleep(0.01)
+            assert on_tick() is False
+        assert L.session_mod.RESTART_BLOCKER == 'tool_installing'
+        state = seats.load_state()
+        del state.data['tool_updates']['claude']['installing_until']
+        state.save()
+        for _ in range(3):
+            engine_ready.advance(er.CHECK_INTERVAL_S)
+            time.sleep(0.01)
+            if on_tick():
+                return 0
+        pytest.fail('completed install still blocks restart')
+    with pytest.raises(er.EngineRestart):
+        run(seats, 'claude', ['--resume', THREAD], spawn=spawn, get=fake_get({}),
+            swap_factory=lambda _c: _quiet_swap())

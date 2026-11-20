@@ -2,8 +2,8 @@
 
 A terminal session outlives the install that started it: the supervisor keeps running old code long
 after the app or a checkout moved on. It may swap itself for the newer engine, but only when nobody
-is at the keyboard (``InputTracker``), only for a strictly newer engine (``target_engine``, which is
-what stops restart loops) and only if the session can be reopened without re-sending a prompt
+is at the keyboard (``InputTracker``), only for a newer engine or a replaced CLI binary (each has
+its own loop guard) and only if the session can be reopened without re-sending a prompt
 (``restart_args``). Stdlib-only and pure apart from the injected probe; launcher.py and cli.py do
 the waiting and the exec.
 
@@ -13,8 +13,10 @@ a guessed argv can re-send a prompt or drop the sandbox.
 """
 from __future__ import annotations
 
+import os
 import re
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import __version__, engine
@@ -80,7 +82,7 @@ class EngineRestart(Exception):
     """Raised by run() to unwind to the cli, which execs ``argv``."""
 
     def __init__(self, argv: list[str], *, seat: str | None = None):
-        super().__init__("restart on a newer engine")
+        super().__init__("restart supervised session")
         self.argv = list(argv)
         self.seat = seat
 
@@ -239,15 +241,46 @@ def newer_writer(state_data: dict, version: str = __version__) -> str | None:
     return newest if engine.older_than(version, newest) else None
 
 
-def target_engine(version: str = __version__, *, exe=None, probe=engine.probe) -> str | None:
-    """The wrapper to exec, only if the engine behind it is strictly newer than ``version``.
+def target_engine(version: str = __version__, *, exe=None, probe=engine.probe,
+                  allow_equal: bool = False) -> str | None:
+    """The wrapper to exec for a newer engine, or the same engine after a CLI replacement.
 
-    Equal must stay None: the restarted engine asks this same question, and that is the loop guard.
+    ``allow_equal`` is only for a replaced CLI: the new child's binary identity is its loop guard.
+    Unknown or older wrappers are never eligible, even for a CLI replacement.
     """
     path = exe if exe is not None else Path.home() / ".local" / "bin" / "acctsw"
     found = probe(path)
     newer = found.get("version") if isinstance(found, dict) else None
-    return str(path) if engine.older_than(version, newer) else None
+    equal = (allow_equal and engine.parse_version(version) is not None
+             and engine.parse_version(version) == engine.parse_version(newer))
+    return str(path) if engine.older_than(version, newer) or equal else None
+
+
+@dataclass(frozen=True)
+class BinaryIdentity:
+    realpath: str
+    version: str | None
+    file_id: tuple[int, int, int, int]
+
+
+def binary_identity(binary_path, *, realpath=os.path.realpath, stat=os.stat) -> BinaryIdentity | None:
+    """Snapshot a child's executable without invoking it. Missing paths defer any restart.
+
+    The file identity also catches copied casks and npm entrypoints replaced at the same path.
+    Never stat the old resolved path later: Homebrew may already have cleaned that version up.
+    """
+    from .toolupdate import path_version
+    try:
+        resolved = str(realpath(binary_path))
+        info = stat(resolved)
+    except (OSError, ValueError, TypeError):
+        return None
+    return BinaryIdentity(resolved, path_version(resolved),
+                          (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size))
+
+
+def binary_changed(running: BinaryIdentity | None, current: BinaryIdentity | None) -> bool:
+    return running is not None and current is not None and running != current
 
 
 def _keep(args: list[str], i: int, flags: frozenset, values: frozenset, *,

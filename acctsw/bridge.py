@@ -40,7 +40,7 @@ from .web_dot import door_for
 # Settings the UI may toggle (boolean only) — a whitelist so a stray key can't clobber e.g. theme.
 TOGGLE_KEYS = {
     "auto_switch", "restart_app", "supervise_shell",
-    "confirm_key_switch", "key_fallback", "crossing_auto",
+    "confirm_key_switch", "key_fallback", "crossing_auto", "update_tools",
 }
 
 _KEEP_WARM_LOCK = threading.Lock()

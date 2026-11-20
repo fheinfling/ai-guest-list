@@ -505,6 +505,8 @@ function buildSettings(state) {
       ${toggleRow("restart_app", "restart the Codex app", "refresh its account after a switch", s.restart_app)}
       ${toggleRow("crossing_auto", "switch automatically between business and personal seats", "skip the question when moving between work and personal", s.crossing_auto === true)}
       <p class="support">with supervision off, only cx/cl auto-switch. terminals switch without restarting the desktop app.</p>
+    </section><section class="set-sec"><h2 class="set-label">tools</h2>
+      ${toggleRow("update_tools", "update claude &amp; codex", "install new versions, then restart idle sessions", s.update_tools !== false)}
     </section><section class="set-sec paid-settings"><h2 class="set-label">paid keys</h2>
       ${toggleRow("key_fallback", "allow paid use", "off stops sessions and new requests", s.key_fallback === true)}
       ${toggleRow("confirm_key_switch", "ask before using", "approve each move to a paid key", s.confirm_key_switch !== false)}

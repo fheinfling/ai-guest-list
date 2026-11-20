@@ -615,3 +615,39 @@ def test_an_unreadable_process_table_defers():
         raise OSError("no ps")
     assert er.has_late_descendants(1, run=boom) is True
     assert er.has_late_descendants(1, run=_ps("2 1 nonsense\n")) is True
+
+
+def test_cli_restart_allows_equal_engine_without_weakening_engine_loop_guard(tmp_path):
+    exe = tmp_path / 'acctsw'
+    probe = _probe({'version': '1.6.1'})
+    assert target_engine('1.6.1', exe=exe, probe=probe, allow_equal=True) == str(exe)
+    assert target_engine('1.6.1', exe=exe, probe=probe) is None
+    assert target_engine('1.7.0', exe=exe, probe=probe, allow_equal=True) is None
+    assert target_engine('dev', exe=exe, probe=probe, allow_equal=True) is None
+
+
+def test_cli_identity_tracks_symlink_and_same_path_replacements(tmp_path):
+    from acctsw import enginerestart as er
+    first = tmp_path / 'Caskroom' / 'codex' / '1.0.0' / 'bin' / 'codex'
+    first.parent.mkdir(parents=True)
+    first.write_text('old')
+    entry = tmp_path / 'codex'
+    entry.symlink_to(first)
+    before = er.binary_identity(entry)
+    assert before.realpath == str(first) and before.version == '1.0.0'
+    assert not er.binary_changed(before, er.binary_identity(entry))
+    second = first.parent.parent.parent / '2.0.0' / 'bin' / 'codex'
+    second.parent.mkdir(parents=True)
+    second.write_text('new')
+    entry.unlink()
+    assert not er.binary_changed(before, er.binary_identity(entry))
+    entry.symlink_to(second)
+    after = er.binary_identity(entry)
+    assert er.binary_changed(before, after)
+    assert not er.binary_changed(after, er.binary_identity(entry))
+    # npm entrypoints can keep their path, even when atomically replaced.
+    replacement = tmp_path / 'replacement'
+    replacement.write_text('newer')
+    replacement.replace(second)
+    assert er.binary_changed(after, er.binary_identity(entry))
+    assert not er.binary_changed(None, er.binary_identity(entry))

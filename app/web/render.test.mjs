@@ -11,9 +11,9 @@ import {
 
 const mkAdd = (over = {}) => ({ step: "provider", provider: null, name: "", method: "browser", token: "", ...over });
 
-test("settings shows only the six user toggles regardless of legacy permanent values", () => {
+test("settings shows only the seven user toggles regardless of legacy permanent values", () => {
   const removed = ["engine_restart", "notify", "in_place_switch", "keep_warm", "in_place_cross_tier"];
-  const kept = ["auto_switch", "crossing_auto", "key_fallback", "confirm_key_switch", "supervise_shell", "restart_app"];
+  const kept = ["auto_switch", "crossing_auto", "key_fallback", "confirm_key_switch", "supervise_shell", "restart_app", "update_tools"];
   for (const value of [undefined, false, true]) {
     const html = buildSettings({ settings: Object.fromEntries(removed.map((key) => [key, value])) });
     for (const key of removed) assert.ok(!html.includes(`data-key="${key}"`), `${key} row removed`);
@@ -3760,4 +3760,14 @@ test("blank recovery: malformed native replies show a fallback and the next upda
   assert.equal(app.sent.filter((msg) => msg.action === "client_error").length, 1);
   app.window.AGL.update(state({ rev: 1 }));
   assert.doesNotMatch(app.root.innerHTML, /role="alert"/);
+});
+
+
+test("CLI updates are on by default and can be disabled in settings", () => {
+  for (const value of [undefined, true, false]) {
+    const html = buildSettings({ settings: { update_tools: value } });
+    assert.match(html, /update claude &amp; codex/);
+    assert.match(html, /install new versions, then restart idle sessions/);
+    assert.equal(/data-key="update_tools" checked/.test(html), value !== false);
+  }
 });

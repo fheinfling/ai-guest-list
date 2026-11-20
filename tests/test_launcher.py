@@ -2908,3 +2908,35 @@ def test_every_lazy_standard_library_import_is_preloaded():
     stdlib = {m for m in lazy if m.split(".")[0] in sys.stdlib_module_names}
     assert stdlib <= set(LAZY_STDLIB), sorted(stdlib - set(LAZY_STDLIB))
 
+
+
+def test_idle_codex_resumes_on_updated_cli_through_equal_engine_wrapper(ctx, monkeypatch, tmp_path):
+    from pathlib import Path
+    from acctsw import enginerestart as er
+    ticks = _codex_engine_ready(ctx, monkeypatch, tmp_path)
+    state = ctx.load_state()
+    state.data['engine'] = {}
+    state.save()
+    first, second, binary = (tmp_path / name for name in ('cli-old', 'cli-new', 'codex-cli'))
+    first.write_text('old')
+    second.write_text('new')
+    binary.symlink_to(first)
+    ctx.codex_bin = str(binary)
+    def replace():
+        binary.unlink()
+        binary.symlink_to(second)
+    appended = ticks[0]
+    ticks[0] = lambda: (appended(), replace())
+    wrapper = str(Path.home() / '.local' / 'bin' / 'acctsw')
+    probes = []
+    def target(**kw):
+        probes.append(kw)
+        return wrapper
+    monkeypatch.setattr(er, 'target_engine', target)
+    with pytest.raises(er.EngineRestart) as raised:
+        run(ctx, 'codex', ['--search', '-m', 'gpt-x'], spawn=FakeSpawn([(None, 0, ticks)]),
+            get=fake_get({}))
+    assert probes == [{'allow_equal': True}]
+    assert raised.value.argv == [wrapper, 'run', 'codex', 'resume', '01a0abcd',
+                                 '--search', '-m', 'gpt-x',
+                                 '-c', 'check_for_update_on_startup=false']

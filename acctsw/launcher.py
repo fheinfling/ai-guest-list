@@ -55,7 +55,7 @@ from . import codexexec, handoff, keyhome, keyseats, pricing, providers
 from . import rollout
 from . import session as session_mod
 from . import usage as usage_mod
-from . import appalive, enginerestart
+from . import appalive, enginerestart, toolupdate
 from .context import Context
 from .errors import AcctswError
 from .procenv import harden_env
@@ -2883,6 +2883,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 "last_structured": None,      # last structured limit signal (post-exit evidence)
                 "proxy_limit_at": None,       # monotonic of the proxy's last structured limit Hit
                 "last_output": time.monotonic(),   # the child's last PTY output (handover waits)
+                "child_binary": enginerestart.binary_identity(argv[0]),
+                "restart_cli": False,
                 "engine_next": 0.0,           # monotonic: next look for a newer engine
                 "engine_probe": None,         # {"for", "done", "target"}: who the wrapper runs now
                 "engine_argv": None,          # what to exec once the child has stopped
@@ -3339,7 +3341,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 return (_guarded(_tick_state) or _guarded(_tick_recover)
                         or _guarded(_tick_engine))
 
-            def _engine_target(newest: str) -> str | None:
+            def _engine_target(newest: str | None) -> str | None:
                 """The newer wrapper, probed off this thread: a probe can take 30s and the tick
                 shares a thread with the terminal's I/O. None until an answer has arrived."""
                 at = time.monotonic()
@@ -3351,7 +3353,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                                                     "at": at}
 
                     def _probe_wrapper() -> None:
-                        probe["target"] = enginerestart.target_engine()
+                        probe["target"] = enginerestart.target_engine(allow_equal=newest is None)
                         probe["done"] = True
                     threading.Thread(target=_probe_wrapper, daemon=True).start()
                 return probe["target"] if probe["done"] else None
@@ -3427,8 +3429,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 return False
 
             def _tick_engine() -> bool:
-                """A newer engine is installed: once this session is idle, restart into it in this
-                terminal and resume the last conversation it wrote here."""
+                """Resume an idle session on a newer engine or a replaced CLI binary."""
                 at = time.monotonic()
                 if at < tick["engine_next"]:
                     return False
@@ -3443,8 +3444,12 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     return _engine_report(False, "setting_off")
                 if key_request is not None:
                     return _engine_report(True, "key_pending")
+                if toolupdate.installation_in_progress(state.data, tool):
+                    return _engine_report(True, "tool_installing")
                 newest = enginerestart.newer_writer(state.data)
-                if newest is None:
+                cli_changed = enginerestart.binary_changed(
+                    tick["child_binary"], enginerestart.binary_identity(build_cmd(ctx, tool, [])[0]))
+                if newest is None and not cli_changed:
                     return _engine_report(True, None)
                 # Sibling verification invokes ps. Until an update exists there is no restart
                 # candidate to disambiguate; known conversations need a scan only at resolution.
@@ -3505,10 +3510,15 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     # Nobody chose this launch: Codex's update prompt would be waiting for whoever
                     # comes back, with Enter meaning "update now".
                     rest = [*rest, "-c", "check_for_update_on_startup=false"]
+                if newest is None and not enginerestart.binary_changed(
+                        tick["child_binary"], enginerestart.binary_identity(build_cmd(ctx, tool, [])[0])):
+                    return _engine_report(True, None)
+                tick["restart_cli"] = newest is None
                 tick["engine_argv"] = [target, "run", tool, *rest]
                 _engine_report(True, None)
                 hit.update(reason="engine", active=running_seat(), handled=True)
-                notify(f"{tool}: restarting on the new engine ({newest}), resuming your work ✨")
+                update = "updated CLI" if newest is None else f"new engine ({newest})"
+                notify(f"{tool}: restarting on the {update}, resuming your work ✨")
                 return True
 
             def on_output(chunk: bytes) -> bool:
@@ -3669,7 +3679,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                         # The child is already stopped: keep the terminal usable without guessing
                         # a conversation. Its whitelisted flags were validated before the stop.
                         tick["engine_argv"] = selected["picker"]
-                        notify("claude: restarted on the new engine — pick your conversation")
+                        update = "updated CLI" if tick["restart_cli"] else "new engine"
+                        notify(f"claude: restarted on the {update} — pick your conversation")
                     else:
                         tick["engine_argv"] = [*tick["engine_argv"][:3], *rest]
                 # Raised so the cleanup below still runs before the process is replaced.

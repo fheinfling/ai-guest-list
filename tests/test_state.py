@@ -202,3 +202,13 @@ def test_too_old_engine_runs_the_stock_tool_instead_of_supervising(ctx, monkeypa
     assert cli._cmd_run(ctx, ns) == 0
     assert calls == [("claude", ["--resume"])]
     assert "not supervising" in capsys.readouterr().err
+
+
+def test_tool_updates_default_on_for_existing_stores_and_remain_user_controlled(tmp_path):
+    path = tmp_path / 'state.json'
+    path.write_text('{"settings":{"theme":"dark"}}')
+    state = State.load(path)
+    assert state.settings()['update_tools'] is True
+    state.set_setting('update_tools', False)
+    state.save()
+    assert State.load(path).settings()['update_tools'] is False

@@ -203,7 +203,7 @@ def test_toggle_rejects_permanent_settings_without_saving(ctx, key, value):
 
 @pytest.mark.parametrize("key", [
     "auto_switch", "crossing_auto", "key_fallback", "confirm_key_switch", "supervise_shell",
-    "restart_app",
+    "restart_app", "update_tools",
 ])
 @pytest.mark.parametrize("value", [False, True])
 def test_kept_toggle_settings_persist(ctx, key, value):
