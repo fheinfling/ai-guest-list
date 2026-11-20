@@ -61,8 +61,8 @@
  {
   "label": "permanent settings: bridge accepts retired toggles",
   "file": "acctsw/bridge.py",
-  "old": "    \"confirm_key_switch\", \"key_fallback\", \"crossing_auto\",\n",
-  "new": "    \"confirm_key_switch\", \"key_fallback\", \"crossing_auto\",\n    \"engine_restart\", \"in_place_switch\", \"in_place_cross_tier\", \"keep_warm\", \"notify\",\n",
+  "old": "    \"confirm_key_switch\", \"key_fallback\", \"crossing_auto\", \"update_tools\",\n",
+  "new": "    \"confirm_key_switch\", \"key_fallback\", \"crossing_auto\", \"update_tools\",\n    \"engine_restart\", \"in_place_switch\", \"in_place_cross_tier\", \"keep_warm\", \"notify\",\n",
   "test": [
    "tests/test_bridge.py::test_toggle_rejects_permanent_settings_without_saving"
   ]

@@ -132,7 +132,7 @@ def test_diagnostics_never_fall_back_to_legacy_when_own_record_is_unusable(
 
 @pytest.mark.parametrize("strict", [False, True])
 @pytest.mark.parametrize("process_first", [False, True])
-@pytest.mark.parametrize("legacy_started_at", ["2026-10-01", "2026-10-02"])
+@pytest.mark.parametrize("legacy_started_at", ["2026-09-30", "2026-10-01"])
 def test_readers_prefer_per_process_diagnostics_over_same_pid_legacy(
         ctx, monkeypatch, strict, process_first, legacy_started_at):
     monkeypatch.setattr(session, "__version__", "1.6.1")
@@ -158,6 +158,44 @@ def test_readers_prefer_per_process_diagnostics_over_same_pid_legacy(
         assert record["self_restart"] is False
         assert record["restart_blocker"] == "ambiguous_cwd"
         assert record["started_at"] == "2026-10-01"
+
+
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("process_first", [False, True])
+def test_upgrade_preserved_legacy_owner_can_publish_a_later_hop(
+        ctx, monkeypatch, strict, process_first):
+    from acctsw import accounts
+    home, billed, sibling = "home@x.com", "billed@x.com", "sibling@x.com"
+    state = ctx.load_state()
+    for email in (home, billed, sibling):
+        state.upsert_seat("claude", email)
+    state.save()
+    monkeypatch.setattr(session, "_alive", lambda _pid: True)
+    monkeypatch.setattr(session, "_proc_start", lambda _pid: "Stable Start")
+    legacy = _path(ctx, "claude")
+    old = {"pid": 101, "process_start": "Stable Start", "email": home,
+           "started_at": "2026-10-01", "cwd": "/work", "self_restart": False}
+    write_json(legacy, old)
+    with monkeypatch.context() as other:
+        other.setattr(session.os, "getpid", lambda: 202)
+        session.mark_session(ctx.data_dir, "claude", sibling)
+    snapshot = session._process_file(ctx.data_dir, "claude", 101)
+    assert json.loads(snapshot.read_text()) == old  # Production upgrade preservation.
+    hopped = {**old, "email": billed, "home": home, "started_at": "2026-10-02"}
+    write_json(legacy, hopped)  # The legacy-only owner still writes only its shared heartbeat.
+    if process_first:
+        files = session._session_files
+        monkeypatch.setattr(session, "_session_files",
+                            lambda *a, **kw: list(reversed(files(*a, **kw))))
+    observed = next(s for s in session.active_sessions(ctx.data_dir, "claude", strict=strict)
+                    if s["pid"] == 101)
+    assert observed["email"] == billed
+    assert observed["home"] == home
+    assert observed["started_at"] == "2026-10-02"
+    views = {s["email"]: s for s in accounts.list_seats(
+        ctx.load_state(), "claude", data_dir=ctx.data_dir)}
+    assert views[billed]["in_session"] is True
+    assert views[home]["in_session"] is False
 
 
 def test_diagnostics_leave_another_supervisors_legacy_mirror_unchanged(ctx, monkeypatch):

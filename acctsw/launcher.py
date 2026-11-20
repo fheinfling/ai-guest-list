@@ -1315,7 +1315,8 @@ def _same_cwd(left, right: str) -> bool:
 
 def _claude_restart_thread(ctx: Context, cwd: str, before: dict[Path, int],
                            original: str | None, moved: bool, *,
-                           sibling: bool, fallback: bool = False
+                           sibling: bool, fallback: bool = False,
+                           seen_candidates: set[str] | None = None
                            ) -> tuple[bool, str | None, str | None, bool]:
     """Return (known, thread, blocker, fallback) without changing other seat handovers' ID.
 
@@ -1324,7 +1325,7 @@ def _claude_restart_thread(ctx: Context, cwd: str, before: dict[Path, int],
     The shallow transcript scan excludes nested subagents; old agent-*.jsonl files and top-level
     sidechains also need rejecting explicitly.
 
-    ``fallback`` retains discovery mode across every resolution in a restart attempt: a missing
+    ``fallback`` retains discovery mode across every resolution for the current child: a missing
     or now-invalid candidate must not silently send the user back to the old original conversation.
     """
     fallback = fallback or moved or original is None
@@ -1340,6 +1341,8 @@ def _claude_restart_thread(ctx: Context, cwd: str, before: dict[Path, int],
                if _same_cwd(meta.get("cwd"), cwd)
                and not (meta.get("isSidechain") or meta.get("agentId")
                         or path.stem.startswith("agent-"))]
+    if seen_candidates is not None:
+        seen_candidates.update(path.stem for path, _, _ in project_changed)
     foreign = any(path.stem != original for path, _, _ in changed)
     fallback = fallback or foreign
     if not fallback:
@@ -1370,6 +1373,8 @@ def _claude_restart_thread(ctx: Context, cwd: str, before: dict[Path, int],
     thread = meta.get("sessionId")
     if not isinstance(thread, str) or not thread or thread != path.stem:
         return False, None, "invalid_transcript", fallback
+    if seen_candidates is not None:
+        seen_candidates.add(thread)
     return True, thread, None, fallback
 
 
@@ -3385,6 +3390,14 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     record["pid"] != os.getpid() and _same_cwd(record.get("cwd"), launch_cwd)
                     for record in session_mod.active_sessions(ctx.data_dir, "claude"))
 
+            def _resolve_claude_restart(original, moved, *, sibling):
+                nonlocal seen_foreign
+                result = _claude_restart_thread(
+                    ctx, launch_cwd, claude_before or {}, original, moved, sibling=sibling,
+                    fallback=seen_foreign, seen_candidates=seen_candidates)
+                seen_foreign |= result[3]  # Refused/deferred attempts still belong to this child.
+                return result
+
             def _engine_thread() -> tuple[bool, str | None, str | None]:
                 """(known, thread, blocker): can this session be named for a resume, and as what."""
                 if tool == "claude":
@@ -3470,8 +3483,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 if target is None:
                     return _engine_report(True, "no_target")
                 if tool == "claude":
-                    known, thread, blocker, fallback = _claude_restart_thread(
-                        ctx, launch_cwd, claude_before or {}, resume_thread, USER_INPUT.moved,
+                    known, thread, blocker, fallback = _resolve_claude_restart(
+                        resume_thread, USER_INPUT.moved,
                         sibling=_claude_cwd_ambiguous())
                 else:
                     known, thread, blocker = _engine_thread()
@@ -3489,9 +3502,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     # The scan (and seat check) can race a new supervisor registering its cwd.
                     # Re-evaluate with that sibling before committing a provisional selection.
                     if _claude_cwd_ambiguous():
-                        known, thread, blocker, fallback = _claude_restart_thread(
-                            ctx, launch_cwd, claude_before or {}, resume_thread, USER_INPUT.moved,
-                            sibling=True, fallback=fallback)
+                        known, thread, blocker, fallback = _resolve_claude_restart(
+                            resume_thread, USER_INPUT.moved, sibling=True)
                         if not known or (resuming and not thread):
                             return _engine_report(False, blocker or "unknown_thread")
                         rest = enginerestart.restart_args(
@@ -3519,6 +3531,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 hit.update(reason="engine", active=running_seat(), handled=True)
                 update = "updated CLI" if newest is None else f"new engine ({newest})"
                 notify(f"{tool}: restarting on the {update}, resuming your work ✨")
+                if tool == "claude":
+                    tick["engine_claude"]["stopped_at"] = time.time_ns()
                 return True
 
             def on_output(chunk: bytes) -> bool:
@@ -3616,6 +3630,8 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             # Shared transcript deltas identify resumed Claude sessions, across seat homes.
             if tool == "claude":
                 claude_before = _claude_transcripts(ctx)
+                seen_foreign = False
+                seen_candidates: set[str] = set()
             child_started = True
             USER_INPUT.reset()
             if tool == "claude":
@@ -3662,22 +3678,25 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     # spawn has stopped and drained the child, including its final session save.
                     # Capture may have learned an ID on exit; resolve against the same original,
                     # movement evidence and before-snapshot as the provisional selection instead.
-                    known, thread, _, fallback = _claude_restart_thread(
-                        ctx, launch_cwd, claude_before or {}, selected["original"],
-                        selected["moved"], sibling=_claude_cwd_ambiguous(),
-                        fallback=selected["fallback"])
+                    known, thread, _, fallback = _resolve_claude_restart(
+                        selected["original"], selected["moved"], sibling=_claude_cwd_ambiguous())
                     if _claude_cwd_ambiguous():
-                        known, thread, _, fallback = _claude_restart_thread(
-                            ctx, launch_cwd, claude_before or {}, selected["original"],
-                            selected["moved"], sibling=True, fallback=fallback)
+                        known, thread, _, fallback = _resolve_claude_restart(
+                            selected["original"], selected["moved"], sibling=True)
+                    after = _claude_transcripts(ctx)
+                    missing = seen_candidates.difference(path.stem for path in after)
+                    fresh = any(path.stem == thread and stamp > selected["stopped_at"]
+                                for path, stamp in after.items())
                     rest = None
                     if known and not (resuming and not thread) \
-                            and not (fallback and not selected["fallback"]):
+                            and not (fallback and not selected["fallback"]) \
+                            and (not missing or fresh):
                         rest = enginerestart.restart_args(
                             tool, [] if resuming else user_args, thread)
                     if rest is None:
                         # The child is already stopped: keep the terminal usable without guessing
-                        # a conversation. Its whitelisted flags were validated before the stop.
+                        # a conversation. A vanished candidate's ordering is lost; require a save
+                        # after stop began before accepting any survivor. Flags were prevalidated.
                         tick["engine_argv"] = selected["picker"]
                         update = "updated CLI" if tick["restart_cli"] else "new engine"
                         notify(f"claude: restarted on the {update} — pick your conversation")

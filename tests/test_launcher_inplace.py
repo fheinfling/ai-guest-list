@@ -268,7 +268,8 @@ class Clock:
     def __init__(self, monkeypatch):
         self.offset = 0.0
         monkeypatch.setattr(L, "time", types.SimpleNamespace(
-            monotonic=lambda: time.monotonic() + self.offset, sleep=time.sleep))
+            monotonic=lambda: time.monotonic() + self.offset, time_ns=time.time_ns,
+            sleep=time.sleep))
 
     def advance(self, seconds):
         self.offset += seconds
@@ -2349,8 +2350,9 @@ def test_restart_keeps_discovery_when_candidate_disappears_before_final_sibling_
     resolutions = []
 
     def check(*args):
-        other.unlink()
-        engine_siblings.append(sibling)
+        if other.exists():
+            other.unlink()
+            engine_siblings.append(sibling)
         return usable(*args)
 
     def record(*args, **kwargs):
@@ -2360,13 +2362,14 @@ def test_restart_keeps_discovery_when_candidate_disappears_before_final_sibling_
 
     monkeypatch.setattr(L, "_restart_seat_usable", check)
     monkeypatch.setattr(L, "_claude_restart_thread", record)
-    steps, status = _idle_child(engine_ready, lambda: _engine_transcript(seats, "other"))
-    # End after the first quiet tick: this test concerns one restart attempt.
-    spawn = Spawn((steps[:2], status))
+    spawn = Spawn(_idle_child(engine_ready, lambda: _engine_transcript(seats, "other")))
     assert run(seats, "claude", ["--resume", THREAD], spawn=spawn, get=fake_get({}),
                swap_factory=lambda _c: _quiet_swap(), notify=lambda _m: None) == 0
-    assert resolutions == [(False, (True, "other", None, True)),
-                           (True, (False, None, "ambiguous_cwd", True))]
+    assert resolutions[:2] == [(False, (True, "other", None, True)),
+                               (True, (False, None, "ambiguous_cwd", True))]
+    assert len(resolutions) > 2  # Continue through later quiet heartbeats with the sibling live.
+    assert all(result == (True, (False, None, "ambiguous_cwd", True))
+               for result in resolutions[2:])
     assert engine_siblings == [sibling]
     assert spawn.stops == 0
     assert engine_records[-1]["restart_blocker"] == "ambiguous_cwd"
@@ -2387,6 +2390,67 @@ def _draining_child(clock, change, drain):
                 return status
         return status
     return spawn, stopped
+
+
+@pytest.mark.parametrize("deferred", [None, "seat", "ambiguous"])
+@pytest.mark.parametrize("fresh", [False, True])
+def test_restart_requires_fresh_evidence_after_a_seen_candidate_disappears(
+        seats, engine_ready, monkeypatch, deferred, fresh):
+    from acctsw.enginerestart import EngineRestart
+    original = seats._claude_real / "projects" / "engine-test" / f"{THREAD}.jsonl"
+    other_id = "e748b4c0-0154-48cc-a5c2-54b06f9b401e"
+    other = original.with_name(f"{other_id}.jsonl")
+    stamp = original.stat().st_mtime_ns
+    stop_stamp = stamp + 3000
+    # Explicit stamps distinguish pre-stop deltas from an actual final save during drain.
+    monkeypatch.setattr(L.time, "time_ns", lambda: stop_stamp, raising=False)
+
+    def changed():
+        with original.open("a") as dest:
+            dest.write("{}\n")
+        os.utime(original, ns=(stamp + 1000, stamp + 1000))
+        _engine_transcript(seats, other_id)
+        newer = stamp + (1000 if deferred == "ambiguous" else 2000)
+        os.utime(other, ns=(newer, newer))
+
+    if deferred == "seat":
+        usable = L._restart_seat_usable
+
+        def defer(*args):
+            if other.exists():
+                other.unlink()  # B was seen, but disappears before the next restart attempt.
+                return False
+            return usable(*args)
+
+        monkeypatch.setattr(L, "_restart_seat_usable", defer)
+
+    def drain():
+        if other.exists():
+            other.unlink()
+        if fresh:
+            with original.open("a") as dest:
+                dest.write("{}\n")
+            os.utime(original, ns=(stop_stamp + 1000, stop_stamp + 1000))
+
+    if deferred == "ambiguous":
+        # The first attempt sees both changed IDs but refuses the tie without selecting B.
+        resolve = L._claude_restart_thread
+
+        def clear_tie(*args, **kw):
+            result = resolve(*args, **kw)
+            if result[2] == "ambiguous_transcript" and other.exists():
+                other.unlink()
+            return result
+
+        monkeypatch.setattr(L, "_claude_restart_thread", clear_tie)
+    spawn, stopped = _draining_child(engine_ready, changed, drain)
+    with pytest.raises(EngineRestart) as raised:
+        run(seats, "claude", ["--resume", THREAD, "--chrome"], spawn=spawn, get=fake_get({}),
+            swap_factory=lambda _c: _quiet_swap(), notify=lambda _m: None)
+    assert stopped == [True]
+    assert raised.value.argv == ["/new/acctsw", "run", "claude", "--chrome", "--resume",
+                                 *([THREAD] if fresh else [])]
+    assert raised.value.seat == C1
 
 
 @pytest.mark.parametrize("discovered", ["before_stop", "after_drain"])
@@ -2962,6 +3026,35 @@ def test_relaunched_child_restarts_as_it_runs_not_as_it_was_typed(seats, engine_
         run(seats, "claude", ["--resume", THREAD, "--model", "opus"], spawn=spawn, get=fake_get({}),
             swap_factory=lambda _c: swap, notify=lambda m: None)
     assert raised.value.argv == ["/new/acctsw", "run", "claude", "--resume", THREAD]
+
+
+def test_restart_discovery_is_reset_with_the_replacement_childs_snapshot(
+        seats, engine_ready, engine_siblings, monkeypatch):
+    from acctsw.enginerestart import EngineRestart
+    sibling = engine_siblings.pop()
+    swap = _quiet_swap()
+    usable = L._restart_seat_usable
+    other = seats._claude_real / "projects" / "engine-test" / "other.jsonl"
+
+    def defer(*args):
+        if other.exists():
+            other.unlink()
+            engine_siblings.append(sibling)
+            return False
+        return usable(*args)
+
+    monkeypatch.setattr(L, "_restart_seat_usable", defer)
+    monkeypatch.setattr(L, "_inplace_eligible", lambda *_a, **_k: None)
+    steps, _ = _idle_child(engine_ready, lambda: _engine_transcript(seats, "other"))
+    first = ([*steps, lambda: swap.post("limit", C1), None], 1)
+    spawn = Spawn(first, _idle_child(engine_ready))
+    with pytest.raises(EngineRestart) as raised:
+        run(seats, "claude", ["--resume", THREAD], spawn=spawn, get=fake_get({}),
+            swap_factory=lambda _c: swap, notify=lambda _m: None)
+    assert len(spawn.calls) == 2
+    assert engine_siblings == [sibling]
+    assert raised.value.argv == ["/new/acctsw", "run", "claude", "--resume", THREAD]
+    assert raised.value.seat == C2
 
 
 def test_relaunched_child_with_no_known_conversation_never_restarts_fresh(seats, engine_ready, monkeypatch):

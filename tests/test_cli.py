@@ -32,8 +32,7 @@ def test_status_json_prefers_per_process_restart_diagnostics(
     session.mark_session(isolated.data_dir, "claude", "a@x.com")
     own = session._process_file(isolated.data_dir, "claude", session.os.getpid())
     data = json.loads(own.read_text())
-    session.write_json(own, {**data, "started_at": "2026-10-01",
-                             "self_restart": can_restart, "restart_blocker": blocker})
+    session.write_json(own, {**data, "self_restart": can_restart, "restart_blocker": blocker})
     assert cli.main(["status", "--json"]) == 0
     status = json.loads(capsys.readouterr().out)
     assert status["sessions"]["claude"][0]["self_restart"] is can_restart

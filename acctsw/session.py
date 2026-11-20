@@ -248,26 +248,22 @@ def active_session(data_dir: Path, tool: str, *, email: str | None = None) -> di
 
 
 def active_sessions(data_dir: Path, tool: str, *, strict: bool = False) -> list[dict]:
-    """Every live terminal, preferring its per-process record over the shared legacy mirror.
+    """Every live terminal's latest launch/hop, preferring its per-process record on a tie.
 
     Diagnostics change only the per-process record without advancing its launch/hop timestamp.
+    A legacy-only owner's later hop supersedes its upgrade-preserved per-process snapshot.
     Strict maintenance reads raise on uncertain/malformed records.
     """
     sessions = {}
-    per_process = set()
     for path in _session_files(data_dir, tool, strict=strict):
         data = _read_session(path, strict=strict)
         if data is not None:
             pid = data["pid"]
-            if pid in per_process:
-                continue
-            if path == _process_file(data_dir, tool, pid):
+            previous = sessions.get(pid)
+            if (previous is None or data["started_at"] > previous["started_at"]
+                    or (data["started_at"] == previous["started_at"]
+                        and path == _process_file(data_dir, tool, pid))):
                 sessions[pid] = data
-                per_process.add(pid)
-                continue
-            previous = sessions.get(data["pid"])
-            sessions[data["pid"]] = (newest_session([data, previous])
-                                     if previous is not None else data)
     return list(sessions.values())
 
 

@@ -558,7 +558,7 @@ def test_snapshot_drift_warnings_prefer_per_process_restart_diagnostics(ctx, mon
     session.mark_session(ctx.data_dir, "claude", "a@x.com")
     own = session._process_file(ctx.data_dir, "claude", session.os.getpid())
     data = json.loads(own.read_text())
-    session.write_json(own, {**data, "started_at": "2026-10-01", "self_restart": can_restart,
+    session.write_json(own, {**data, "self_restart": can_restart,
                              "restart_blocker": None if can_restart else "ambiguous_cwd"})
     warnings = bridge.snapshot_state(ctx)["engine_warnings"]
     assert [w["kind"] for w in warnings] == ([] if can_restart else ["sessions"])
