@@ -53,7 +53,7 @@ connect through the official tools.
 <p align="center">
   <img src="docs/assets/screenshot.png" width="340" alt="The ai guest list popover: a status chip, then one block per tool with the seat on now, how much of its tighter window is left, when it resets and where work goes next; below, one line per other seat with its kind and plan, a resting seat with its return time, and an API-key seat priced per token." />
   &nbsp;
-  <img src="docs/assets/screenshot-settings.png" width="340" alt="The settings view in three sections: switching, paid keys set apart on gold, and appearance with the theme picker and the menu-bar icon legend." />
+  <img src="docs/assets/screenshot-settings.png" width="340" alt="The settings view in four sections: switching (auto-switch, supervise terminals, restart the Codex app, business and personal seats), tools (keep the Claude Code and Codex CLIs up to date), paid keys set apart on gold, and appearance with the theme picker and the menu-bar icon legend." />
   <br><sub><i>The shipping popover and settings, with fictional accounts. Views are expanded to show all content.</i></sub>
 </p>
 
