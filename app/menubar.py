@@ -52,6 +52,7 @@ try:
     from AppKit import (NSApplication, NSStatusBar, NSPopover, NSViewController,
                         NSVariableStatusItemLength, NSApplicationActivationPolicyAccessory,
                         NSUserNotification, NSUserNotificationCenter, NSImage, NSWorkspace,
+                        NSWorkspaceDidWakeNotification,
                         NSMenu, NSMenuItem, NSEventModifierFlagCommand, NSEventModifierFlagShift)
     from WebKit import WKWebView, WKWebViewConfiguration, WKUserContentController
     from Foundation import NSObject, NSURL, NSTimer, NSMakeRect, NSMakeSize, NSBundle, NSLog
@@ -164,6 +165,9 @@ USAGE_POLL_OPEN_SECONDS = 30.0
 UPDATE_FIRST_CHECK_S = 60.0          # after launch, once the first usage poll has had its turn
 UPDATE_CHECK_EVERY_S = 6 * 3600.0    # the engine throttles real requests to one per 20 hours
 USAGE_POLL_HIDDEN_SECONDS = 180.0
+WAKE_POLL_DELAY_SECONDS = 5.0        # give Wi-Fi/DNS a moment after wake
+# Lands after usage.OFFLINE_RETRY_SECONDS so an offline sweep right after wake is retried.
+WAKE_FOLLOWUP_SECONDS = 40.0
 STATE_POLL_SECONDS = 3.0
 # The menu-bar mark is the door (icon handoff): open onto the disco when a model's free, shut when
 # every seat is resting. SF Symbols give a native, template (auto light/dark) glyph; emoji is the
@@ -398,6 +402,8 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
             self._web_reload_times = []
             self._state_timer = None
             self._usage_timer = None
+            self._wake_poll_timer = None
+            self._wake_followup_timer = None
             self._usage_interval = None
             self._claude_sync_inflight = False
             self._usage_poll_inflight = False
@@ -433,6 +439,12 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
             self._startUsageTimer()
             self._startUpdateChecks()
             try:
+                NSWorkspace.sharedWorkspace().notificationCenter().addObserver_selector_name_object_(
+                    self, objc.selector(self.systemDidWake_, signature=b"v@:@"),
+                    NSWorkspaceDidWakeNotification, None)
+            except Exception as exc:
+                _log_exception(exc)
+            try:
                 # Tell an install helper that's waiting that this version came up: only then does
                 # it delete the previous app it kept for putting back.
                 from acctsw import updater
@@ -449,6 +461,32 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
             # autoswitch works out of the box and a deleted rc block self-heals.
             self.performSelectorInBackground_withObject_(
                 objc.selector(self.bootstrapBg_, signature=b"v@:@"), None)
+
+        def systemDidWake_(self, _notification):
+            try:
+                for timer in (self._wake_poll_timer, self._wake_followup_timer):
+                    if timer is not None:
+                        timer.invalidate()
+                self._wake_poll_timer = None
+                self._wake_followup_timer = None
+                self._wake_poll_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                    WAKE_POLL_DELAY_SECONDS, self,
+                    objc.selector(self.pollUsageAfterWake_, signature=b"v@:@"), None, False)
+                self._wake_followup_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                    WAKE_FOLLOWUP_SECONDS, self,
+                    objc.selector(self.pollUsageAfterWake_, signature=b"v@:@"), None, False)
+            except Exception as exc:
+                _log_exception(exc)
+
+        def pollUsageAfterWake_(self, _timer):
+            if _timer is self._wake_poll_timer:
+                self._wake_poll_timer = None
+            elif _timer is self._wake_followup_timer:
+                self._wake_followup_timer = None
+            try:
+                self.pollUsage_({"scope": "all"})
+            except Exception as exc:
+                _log_exception(exc)
 
         def bootstrapBg_(self, _arg):
             # Two responsibilities, two lifetimes:
@@ -653,6 +691,11 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
                 # the ordinary in-flight poll finishes instead of silently dropping it.
                 if isinstance(_timer, dict) and _timer.get("force"):
                     self._pending_usage_request = dict(_timer)
+                elif (isinstance(_timer, dict) and _timer.get("scope") == "all"
+                      and self._pending_usage_request is None):
+                    # A delayed wake sweep must survive an overlapping poll. Forced/targeted
+                    # follow-ups retain priority over this ordinary all-seat request.
+                    self._pending_usage_request = dict(_timer)
                 return
             self._usage_poll_inflight = True
             self.performSelectorInBackground_withObject_(
@@ -665,8 +708,8 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
                     visible = self._usage_interval == USAGE_POLL_OPEN_SECONDS
                     scope = usage_poll_scope(visible, self._last_all_usage_poll, at=time.monotonic())
                     request = {"scope": scope}
-                    if scope == "all":
-                        self._last_all_usage_poll = time.monotonic()
+                if request.get("scope") == "all":
+                    self._last_all_usage_poll = time.monotonic()
                 result = dict(bridge.handle(self.ctx, {"action": "usage", **request}))
             except Exception as exc:
                 _log_exception(exc)

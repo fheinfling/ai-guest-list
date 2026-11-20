@@ -583,6 +583,88 @@ def test_active_usage_due_does_not_shorten_recovery_backoff(ctx, monkeypatch, pa
     assert stored["error_streak"] == 5
 
 
+@pytest.mark.parametrize("active", [False, True])
+def test_expired_snapshot_offline_retry_preserves_recovery_deadline(ctx, monkeypatch,
+                                                                  parked_seat, active):
+    email = parked_seat
+    start = now()
+    elapsed = 0
+    monkeypatch.setattr(usage, "now", lambda: start + timedelta(seconds=elapsed))
+    monkeypatch.setattr(session, "active_session", lambda *a, **kw: None)
+    before = ctx.snapshot_get("codex", email)
+    state = ctx.load_state()
+    state.set_active("codex", email if active else None)
+    state.save()
+    posts, gets = [], []
+
+    def post(url, payload, timeout):
+        posts.append((elapsed, payload["refresh_token"]))
+        return (0, "") if elapsed == 0 else _renewal_response()
+
+    def get(url, headers, timeout):
+        gets.append((elapsed, headers["Authorization"]))
+        if elapsed == 0:
+            return usage.HttpReply(0, "", None, error="offline")
+        # Real usage rejects the locally expired token; a fake 200 hides clock starvation.
+        if headers["Authorization"] == "Bearer " + usage.codex_token_account(before)[0]:
+            return 401, "{}"
+        return 200, codex_ok_body()
+
+    assert usage.refresh_live(ctx, "codex", get=get, post=post)["codex"][email] == "offline"
+    previous = ctx.load_state().get_seat("codex", email)["usage"]
+    assert previous["error_streak"] == 1
+    assert posts == [(0, "refresh-credential")] and len(gets) == 1
+
+    elapsed = 31
+    # Exercise the blob-less candidate gate, the locked gate, and the parked active-tick exception.
+    for active_only in (False, True):
+        result = usage.refresh_live(ctx, "codex", active_only=active_only, get=get, post=post)
+        assert result["codex"][email] == "cached"
+        assert posts == [(0, "refresh-credential")] and len(gets) == 1
+        assert ctx.load_state().get_seat("codex", email)["usage"] == previous
+        assert ctx.snapshot_get("codex", email) == before
+
+    elapsed = 301
+    if not active:
+        result = usage.refresh_live(ctx, "codex", active_only=True, get=get, post=post)
+        assert result["codex"][email] == "cached"
+        assert posts == [(0, "refresh-credential")] and len(gets) == 1
+    result = usage.refresh_live(ctx, "codex", get=get, post=post)
+    assert posts == [(0, "refresh-credential"), (301, "refresh-credential")]
+    assert result["codex"][email] == "ok"
+    assert [at for at, _ in gets] == [0, 301]
+    assert gets[1][1] != gets[0][1]
+    stored = ctx.load_state().get_seat("codex", email)
+    assert not stored.get("auth_error")
+    assert stored["usage"]["error_streak"] == 0
+    assert usage._codex_refresh_token(ctx.snapshot_get("codex", email)) == "renewed-refresh"
+
+
+@pytest.mark.parametrize("error", ["offline", "network"])
+def test_recovery_rechecks_conservative_transient_backoff_after_post(ctx, monkeypatch,
+                                                                  parked_seat, error):
+    email = parked_seat
+    at = now()
+    monkeypatch.setattr(usage, "now", lambda: at)
+    monkeypatch.setattr(session, "active_session", lambda *a, **kw: None)
+
+    def post(*args):
+        state = ctx.load_state()
+        state.get_seat("codex", email)["usage"] = {
+            "error": error, "error_streak": 1,
+            "last_attempted_at": iso(at - timedelta(seconds=31)),
+        }
+        state.save()
+        return _renewal_response()
+
+    def no_get(*args):
+        pytest.fail("recovery commit must respect conservative backoff after an overlapping poll")
+
+    result = usage.refresh_live(ctx, "codex", post=post, get=no_get)
+    assert result["codex"][email] == "cached"
+    assert usage._codex_refresh_token(ctx.snapshot_get("codex", email)) == "renewed-refresh"
+
+
 @pytest.mark.parametrize("change, expected", [
     ("login", "stale"), ("keychain", "unreadable"), ("disk", "unreadable"),
 ])

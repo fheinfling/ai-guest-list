@@ -18,9 +18,11 @@ Network access is injected (``get`` parameter) so unit tests never hit the wire.
 """
 from __future__ import annotations
 
+import errno
 import json
 import hashlib
 import shutil
+import socket
 import ssl
 import subprocess
 import sys
@@ -54,7 +56,7 @@ class Window:
 @dataclass
 class Usage:
     ok: bool = False
-    error: str | None = None  # "unauthorized" | "forbidden" | "rate_limited" | "network" | ...
+    error: str | None = None  # "unauthorized" | "forbidden" | "rate_limited" | "offline" | "network" | ...
     windows: dict[str, Window] = field(default_factory=dict)  # "5h" / "weekly"
     # Exact Codex window labels when the provider supplied durations. ``None`` means the response
     # used legacy positional buckets (or came from Claude/failed), so consumers must keep their
@@ -118,6 +120,15 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+class _TrackRedirects(urllib.request.HTTPRedirectHandler):
+    def __init__(self):
+        self.redirected = False
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        self.redirected = True
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 class HttpReply(tuple):
     """Two-value transport result with a safe error kind and parsed retry delay attached."""
     def __new__(cls, status, body, headers, *, error=None):
@@ -143,10 +154,11 @@ class HttpReply(tuple):
 
 def _default_get(url: str, headers: dict, timeout: float) -> tuple[int, str]:
     req = urllib.request.Request(url, headers=headers, method="GET")
+    redirects = _TrackRedirects()
     try:
         # A profile probe must never forward the bearer token to a redirect target.
-        open_request = (urllib.request.build_opener(_NoRedirect()).open
-                        if url == P.CLAUDE_PROFILE_URL else urllib.request.urlopen)
+        open_request = urllib.request.build_opener(
+            _NoRedirect() if url == P.CLAUDE_PROFILE_URL else redirects).open
         with open_request(req, timeout=timeout) as resp:
             return HttpReply(resp.status, resp.read().decode("utf-8", "replace"), resp.headers)
     except urllib.error.HTTPError as e:
@@ -161,6 +173,11 @@ def _default_get(url: str, headers: dict, timeout: float) -> tuple[int, str]:
     except urllib.error.URLError as e:
         if isinstance(e.reason, ssl.SSLError):
             return HttpReply(0, "", None, error="tls")
+        # A redirect proves the provider already answered, even if the next connection fails.
+        if not redirects.redirected and (isinstance(e.reason, (socket.gaierror, ConnectionRefusedError))
+                or isinstance(e.reason, OSError) and e.reason.errno in {
+                    errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ENETDOWN, errno.EADDRNOTAVAIL}):
+            return HttpReply(0, "", None, error="offline")
         return HttpReply(0, "", None)
     except (OSError, TimeoutError):
         return HttpReply(0, "", None)  # network failure
@@ -868,13 +885,18 @@ def _fetch_for(tool: str, blob: str, get: HttpGet, ua: str | None) -> Usage:
 
 
 MAX_BACKOFF_SECONDS = 3600
+# Only proven connection-establishment failures get a fast usage GET retry after wake/DNS blips.
+OFFLINE_RETRY_SECONDS = 30
 ACTIVE_MAX_BACKOFF_SECONDS = 300
 
 
-def _backoff_seconds(prev_usage: dict | None, base: int, *, active: bool = False) -> float:
+def _backoff_seconds(prev_usage: dict | None, base: int, *, active: bool = False,
+                     fast_retry: bool = True) -> float:
     """Exponential backoff, capped at 1h for stored seats and 5m for the active seat.
 
-    Claude's usage endpoint rate-limits hard; sustained 429s must not be retried every `base`s.
+    Proven offline failures start at 30s for GETs; expired Codex tokens and recovery POSTs disable
+    fast retries so rejected GETs cannot move the recovery deadline.
+    Ambiguous network failures and other errors retain the provider-safe base for sustained 429s.
     The seat actually on the floor gets the tighter cap so restored entitlement/network service is
     re-validated promptly instead of remaining hidden behind an hour-long historical error streak.
     """
@@ -883,16 +905,19 @@ def _backoff_seconds(prev_usage: dict | None, base: int, *, active: bool = False
         # A dead credential is only re-READ at the base cadence (a local Keychain/file read, never
         # the network); _dead_unchanged then skips it unless its bytes changed.
         wait = base
+    elif fast_retry and prev_usage.get("error") == "offline":
+        wait = min(OFFLINE_RETRY_SECONDS * (2 ** (streak - 1)), MAX_BACKOFF_SECONDS)
     else:
-        # A visible popover asks healthy active seats for a fresher cadence (30s), but an error must
-        # retain the existing provider-safe 150s base.  In particular, an Anthropic 429 may not be
+        # A visible popover asks healthy active seats for a fresher cadence (30s), but other errors
+        # retain the provider-safe 150s base. In particular, an Anthropic 429 may not be
         # retried every 60 seconds merely because the card is on screen.
         error_base = max(base, USAGE_MIN_REFRESH_SECONDS)
         wait = min(error_base * (2 ** streak), MAX_BACKOFF_SECONDS)
     return min(wait, ACTIVE_MAX_BACKOFF_SECONDS) if active else wait
 
 
-def _due(prev_usage: dict | None, at, base: int, *, active: bool = False) -> bool:
+def _due(prev_usage: dict | None, at, base: int, *, active: bool = False,
+         fast_retry: bool = True) -> bool:
     from .util import parse_iso
     # ``fetched_at`` is deliberately the LAST SUCCESS so the UI can age the preserved windows.
     # Backoff needs the last ATTEMPT instead, otherwise a stale success would make every failed
@@ -901,7 +926,8 @@ def _due(prev_usage: dict | None, at, base: int, *, active: bool = False) -> boo
                      or (prev_usage or {}).get("fetched_at"))
     if prev is None:
         return True
-    return (at - prev).total_seconds() >= _backoff_seconds(prev_usage, base, active=active)
+    return (at - prev).total_seconds() >= _backoff_seconds(
+        prev_usage, base, active=active, fast_retry=fast_retry)
 
 
 def _dead_unchanged(prev_usage: dict | None, digest: str | None, at) -> bool:
@@ -1161,7 +1187,7 @@ def _recover_parked_codex(ctx, job: UsageFetchJob, *, post,
             return None, "unreadable"
         if _credential_digest(current_blob) != job.credential_digest:
             return None, "refresh_raced"
-        if not _due(seat.get("usage"), now(), min_seconds, active=False):
+        if not _due(seat.get("usage"), now(), min_seconds, active=False, fast_retry=False):
             return None, "cached"
         if not (_codex_access_token_expired(current_blob)
                 and _codex_refresh_token(current_blob)):
@@ -1190,7 +1216,8 @@ def refresh_live(ctx, tool: str | None = None, *, only: str | None = None,
     Preparation records one immutable job per due seat.  Active Codex and Claude requests start in
     parallel so a slow provider cannot postpone the other provider's live card; each response is
     committed immediately under a fresh, short lock.  Parked seats follow afterward on the gentler
-    cadence.  Commit revalidates the seat incarnation, credential bytes, and attempt ordering.
+    cadence, except due offline failures also join active-only ticks. Commit revalidates the seat
+    incarnation, credential bytes, and attempt ordering.
     Seats whose reconciliation credentials were unreadable are left untouched for this poll.
     """
     from . import session
@@ -1209,13 +1236,13 @@ def refresh_live(ctx, tool: str | None = None, *, only: str | None = None,
             if only and email != only:
                 continue
             active = email == active_email
-            if active_only and not active:
+            previous = seat.get("usage") or {}
+            if active_only and not active and previous.get("error") != "offline":
                 continue
             if unreadable and (t, email) in unreadable:
                 summary[t][email] = "unreadable"
                 continue
             interval = active_min_seconds if active else min_seconds
-            previous = seat.get("usage") or {}
             if (not force or previous.get("error")) and not _due(previous, at, interval, active=active):
                 summary[t][email] = "cached"
                 continue
@@ -1229,6 +1256,10 @@ def refresh_live(ctx, tool: str | None = None, *, only: str | None = None,
     for t, email, added_at, was_active in candidates:
         try:
             blob = _detached_blob(ctx, initial, t, email, active=was_active, strict=True)
+            if (active_only and not was_active and t == "codex"
+                    and _codex_access_token_expired(blob)):
+                summary[t][email] = "cached"
+                continue
             signin, digest, login = _signin_for(ctx, t, email, blob, at)
         except UNREADABLE:
             summary[t][email] = "unreadable"
@@ -1269,19 +1300,26 @@ def refresh_live(ctx, tool: str | None = None, *, only: str | None = None,
                 summary[job.tool][job.email] = "stale"
                 continue
             is_active = current.active(job.tool) == job.email
-            if active_only and not is_active:
+            previous = seat.get("usage") or {}
+            expired_codex = job.tool == "codex" and _codex_access_token_expired(job.blob)
+            if active_only and not is_active and previous.get("error") != "offline":
                 summary[job.tool][job.email] = "stale"
                 continue
+            if active_only and not is_active and expired_codex:
+                summary[job.tool][job.email] = "cached"
+                continue
             interval = active_min_seconds if is_active else min_seconds
-            previous = seat.get("usage") or {}
+            # An expired access token can only 401; keep GETs on the recovery clock so fast
+            # offline retries cannot continually postpone the refresh-token POST.
             if (not force or previous.get("error")) and not _due(previous, checked_at, interval,
-                                                               active=is_active):
+                    active=is_active, fast_retry=not expired_codex):
                 summary[job.tool][job.email] = "cached"
                 continue
             recover_codex = False
-            if (job.tool == "codex" and _codex_access_token_expired(job.blob)
+            if (expired_codex
                     and bool(_codex_refresh_token(job.blob))
-                    and _due(previous, checked_at, min_seconds, active=False)
+                    # Single-use refresh tokens must never inherit the fast GET retry cadence.
+                    and _due(previous, checked_at, min_seconds, active=False, fast_retry=False)
                     and not running_codex.get(job.email, False)):
                 try:
                     # These Codex reads are local files, safe under the short lock. The job must
