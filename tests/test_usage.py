@@ -2,9 +2,16 @@
 
 No network: a fake `get` transport returns canned (status, body) per URL.
 """
+import errno
+import io
 import json
+import socket
 import threading
+import urllib.error
+from contextlib import nullcontext
 from datetime import timedelta
+from email.message import Message
+from types import SimpleNamespace
 
 import pytest
 
@@ -830,6 +837,136 @@ def test_visible_active_cadence_does_not_shorten_error_backoff():
     assert U._backoff_seconds(usage, P.USAGE_ACTIVE_REFRESH_SECONDS, active=True) == 300
 
 
+def test_offline_errors_retry_promptly_with_exponential_backoff_and_seat_caps():
+    for streak, expected in ((1, 30), (2, 60), (3, 120)):
+        usage = {"error": "offline", "error_streak": streak}
+        assert U._backoff_seconds(usage, 150) == expected
+    assert U._backoff_seconds({"error": "offline", "error_streak": 1},
+                              150, active=True) == 30
+    usage = {"error": "offline", "error_streak": 57}
+    assert U._backoff_seconds(usage, 150) == U.MAX_BACKOFF_SECONDS
+    assert U._backoff_seconds(usage, 150, active=True) == U.ACTIVE_MAX_BACKOFF_SECONDS
+
+
+@pytest.mark.parametrize("error", ["network", "rate_limited", "tls"])
+def test_provider_errors_keep_the_provider_safe_backoff(error):
+    assert U._backoff_seconds({"error": error, "error_streak": 1}, 150) == 300
+
+
+def test_offline_recovery_backoff_can_disable_fast_retry():
+    at = now()
+    for streak, expected in ((1, 300), (2, 600), (3, 1200), (57, 3600)):
+        previous = {"error": "offline", "error_streak": streak,
+                    "last_attempted_at": iso(at)}
+        assert U._backoff_seconds(previous, 30, fast_retry=False) == expected
+        assert not U._due(previous, at + timedelta(seconds=expected - 1), 30,
+                          fast_retry=False)
+        assert U._due(previous, at + timedelta(seconds=expected), 30, fast_retry=False)
+
+
+@pytest.mark.parametrize("status,error,expected", [(0, "offline", "ok"),
+                                                  (0, "network", "cached"),
+                                                  (429, "rate_limited", "cached")])
+def test_refresh_live_retries_parked_offline_failure_after_31_seconds(ctx, monkeypatch,
+                                                                   status, error, expected):
+    state = _seed_two_codex(ctx)
+    email = "b@x.com"
+    assert state.active("codex") != email
+    at = now()
+    monkeypatch.setattr(U, "now", lambda: at)
+    calls = []
+
+    def get(url, headers, timeout):
+        calls.append(url)
+        return (U.HttpReply(status, "", None, error=error) if len(calls) == 1
+                else (200, codex_ok_body(primary=31)))
+
+    summary = U.refresh_live(ctx, "codex", only=email, get=get)
+    assert summary["codex"][email] == error
+    usage = ctx.load_state().get_seat("codex", email)["usage"]
+    assert usage["error"] == error and usage["error_streak"] == 1
+    assert usage["last_attempted_at"] == iso(at)
+
+    at += timedelta(seconds=31)
+    summary = U.refresh_live(ctx, "codex", only=email, get=get)
+    assert summary["codex"][email] == expected
+    stored = ctx.load_state().get_seat("codex", email)["usage"]
+    if expected == "ok":
+        assert calls == [P.CODEX_USAGE_URL, P.CODEX_USAGE_URL]
+        assert stored["ok"] is True and stored["error"] is None
+        assert stored["error_streak"] == 0
+        assert stored["fetched_at"] == stored["last_attempted_at"] == iso(at)
+        assert stored["windows"]["5h"]["used_pct"] == 31
+    else:
+        assert calls == [P.CODEX_USAGE_URL]
+        assert stored == usage
+
+
+@pytest.mark.parametrize("tool", ["codex", "claude"])
+def test_active_tick_also_fetches_only_due_parked_offline_seats(ctx, monkeypatch, tool):
+    at = now()
+    monkeypatch.setattr(U, "now", lambda: at)
+    state = ctx.load_state()
+    errors = {"offline": "offline", "network": "network", "rate": "rate_limited",
+              "healthy": None, "recent": "offline"}
+    for name, error in errors.items():
+        email = f"{name}@example.test"
+        seat = state.upsert_seat(tool, email)
+        blob = make_codex_blob(email) if tool == "codex" else make_claude_blob()
+        ctx.snapshot_set(tool, email, blob)
+        if tool == "claude":
+            ctx.claude_home(email).mkdir(parents=True, exist_ok=True)
+            ctx.claude_cred(email).set_live(blob)
+        elapsed = 29 if name == "recent" else (31 if error == "offline" else 301)
+        seat["usage"] = {"error": error, "error_streak": int(bool(error)),
+                         "last_attempted_at": iso(at - timedelta(seconds=elapsed))}
+    state.set_active(tool, None)
+    state.save()
+    calls = []
+
+    def get(url, headers, timeout):
+        calls.append(url)
+        return 200, codex_ok_body() if tool == "codex" else claude_ok_body()
+
+    result = U.refresh_live(ctx, tool, active_only=True, get=get, user_agent="test")
+    assert result[tool] == {"offline@example.test": "ok", "recent@example.test": "cached"}
+    assert calls == [P.CODEX_USAGE_URL if tool == "codex" else P.CLAUDE_USAGE_URL]
+    stored = ctx.load_state().get_seat(tool, "offline@example.test")["usage"]
+    assert stored["ok"] and stored["error_streak"] == 0
+
+
+@pytest.mark.parametrize("error", [None, "network", "rate_limited"])
+def test_active_tick_revalidates_parked_offline_exception_under_lock(ctx, monkeypatch, error):
+    _seed_two_codex(ctx)
+    email = "b@x.com"
+    at = now()
+    monkeypatch.setattr(U, "now", lambda: at)
+    state = ctx.load_state()
+    state.get_seat("codex", email)["usage"] = {
+        "error": "offline", "error_streak": 1,
+        "last_attempted_at": iso(at - timedelta(seconds=31)),
+    }
+    state.save()
+    reads = []
+    real_blob = U._detached_blob
+
+    def blob(*args, **kwargs):
+        reads.append(args[3])
+        current = ctx.load_state()
+        current.get_seat("codex", email)["usage"] = {
+            "error": error, "error_streak": int(bool(error)),
+            "last_attempted_at": iso(at - timedelta(seconds=301)),
+        }
+        current.save()
+        return real_blob(*args, **kwargs)
+
+    monkeypatch.setattr(U, "_detached_blob", blob)
+    result = U.refresh_live(ctx, "codex", only=email, active_only=True,
+                            get=lambda *_: pytest.fail("parked seat left the offline exception"))
+    assert reads == [email]
+    assert result["codex"][email] == "stale"
+
+
 def test_refresh_live_uses_30s_active_and_gentle_parked_cadence(ctx):
     state = _seed_two_codex(ctx)
     attempted = iso(now() - timedelta(seconds=31))
@@ -1145,6 +1282,7 @@ def test_tls_failures_are_distinct_from_network(monkeypatch, wrapped, error_type
         raise error
 
     monkeypatch.setattr(U.urllib.request, "urlopen", fail)
+    monkeypatch.setattr(U.urllib.request, "build_opener", lambda *_: SimpleNamespace(open=fail))
     result = (U.fetch_codex("token", None) if tool == "codex"
               else U.fetch_claude("token", user_agent="test"))
     assert result.error == "tls"
@@ -1174,13 +1312,98 @@ def test_real_connection_failures_keep_status_zero(monkeypatch, error, wrapped):
         raise urllib.error.URLError(error) if wrapped else error
 
     monkeypatch.setattr(U.urllib.request, "urlopen", fail)
+    monkeypatch.setattr(U.urllib.request, "build_opener", lambda *_: SimpleNamespace(open=fail))
     reply = U._default_get("https://example.test", {}, 1)
     assert isinstance(reply, U.HttpReply)
     assert reply == (0, "")
     status, body = reply
     assert status == 0 and body == ""
-    assert reply.error is None and reply.retry_after is None
+    expected = "offline" if wrapped and isinstance(error, ConnectionRefusedError) else "network"
+    assert reply.error == ("offline" if expected == "offline" else None)
+    assert reply.retry_after is None
+    assert U.fetch_codex("token", None).error == expected
+
+
+@pytest.mark.parametrize("url", [P.CODEX_USAGE_URL, P.CLAUDE_USAGE_URL, P.CLAUDE_PROFILE_URL])
+@pytest.mark.parametrize("reason", [socket.gaierror(socket.EAI_NONAME, "DNS unavailable"),
+                                    ConnectionRefusedError("connection refused"),
+                                    *[OSError(code, "connection unavailable") for code in (
+                                        errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ENETDOWN,
+                                        errno.EADDRNOTAVAIL)]])
+def test_pre_request_url_errors_are_offline(monkeypatch, url, reason):
+    def fail(*args, **kwargs):
+        raise urllib.error.URLError(reason)
+
+    monkeypatch.setattr(U.urllib.request, "urlopen", fail)
+    monkeypatch.setattr(U.urllib.request, "build_opener", lambda *_: SimpleNamespace(open=fail))
+    reply = U._default_get(url, {}, 1)
+    assert reply == (0, "") and reply.error == "offline"
+    assert U.fetch_codex("token", None).error == "offline"
+    assert U.fetch_claude("token", user_agent="test").error == "offline"
+
+
+@pytest.mark.parametrize("url", [P.CODEX_USAGE_URL, P.CLAUDE_PROFILE_URL])
+@pytest.mark.parametrize("error", [TimeoutError("read timed out"),
+                                    ConnectionResetError("response reset"),
+                                    OSError(errno.EHOSTUNREACH, "bare read error")])
+def test_read_failure_after_status_200_remains_network(monkeypatch, url, error):
+    def read():
+        raise error
+
+    response = SimpleNamespace(status=200, headers={}, read=read)
+    open_request = lambda *_args, **_kwargs: nullcontext(response)
+    monkeypatch.setattr(U.urllib.request, "urlopen", open_request)
+    monkeypatch.setattr(U.urllib.request, "build_opener",
+                        lambda *_: SimpleNamespace(open=open_request))
+    reply = U._default_get(url, {}, 1)
+    assert reply == (0, "")
+    assert U.fetch_codex("token", None, get=lambda *_: reply).error == "network"
+    assert U.fetch_claude("token", user_agent="test", get=lambda *_: reply).error == "network"
+
+
+@pytest.mark.parametrize("reason", [TimeoutError("connect timed out"),
+                                    ConnectionResetError("connection reset"),
+                                    OSError(errno.EIO, "ambiguous failure"), "unavailable"])
+def test_ambiguous_url_errors_remain_network(monkeypatch, reason):
+    def fail(*args, **kwargs):
+        raise urllib.error.URLError(reason)
+
+    monkeypatch.setattr(U.urllib.request, "urlopen", fail)
+    monkeypatch.setattr(U.urllib.request, "build_opener", lambda *_: SimpleNamespace(open=fail))
     assert U.fetch_codex("token", None).error == "network"
+
+
+@pytest.mark.parametrize("tool", ["codex", "claude"])
+@pytest.mark.parametrize("reason", [socket.gaierror(socket.EAI_NONAME, "DNS unavailable"),
+                                    ConnectionRefusedError("connection refused"),
+                                    OSError(errno.ENETUNREACH, "network unreachable")])
+def test_usage_redirect_then_connection_failure_remains_network(monkeypatch, tool, reason):
+    requests = []
+
+    class RedirectThenFail(urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            requests.append(req.full_url)
+            if req.host == "redirect.test" or len(requests) > 2:
+                raise urllib.error.URLError(reason)
+            headers = Message()
+            headers["Location"] = "https://redirect.test/usage"
+            return self.parent.error("http", req, io.BytesIO(b"redirect"), 302, "Found",
+                                     headers)
+
+    real_builder = urllib.request.build_opener
+    monkeypatch.setattr(U.urllib.request, "build_opener", lambda *handlers: real_builder(
+        *handlers, urllib.request.ProxyHandler({}), RedirectThenFail()))
+    # The original urlopen path must also use the real redirect machinery, without sockets.
+    opener = urllib.request.build_opener()
+    monkeypatch.setattr(U.urllib.request, "urlopen", opener.open)
+    fetch = (lambda: U.fetch_codex("token", None)) if tool == "codex" else (
+        lambda: U.fetch_claude("token", user_agent="test"))
+    assert fetch().error == "network"
+    original = P.CODEX_USAGE_URL if tool == "codex" else P.CLAUDE_USAGE_URL
+    assert requests == [original, "https://redirect.test/usage"]
+    # Redirect state belongs to one request, so a subsequent direct failure is still offline.
+    assert fetch().error == "offline"
+    assert requests == [original, "https://redirect.test/usage", original]
 
 
 def test_worker_records_internal_error_redacts_traceback_and_keeps_attempt_order(ctx, monkeypatch, capsys):
