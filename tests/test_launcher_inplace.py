@@ -3163,6 +3163,41 @@ def test_updated_cli_waits_while_busy_then_resumes_when_idle(seats, engine_ready
     assert raised.value.argv == ['/current/acctsw', 'run', 'claude', '--resume', THREAD]
 
 
+def test_installer_starting_during_the_final_check_blocks_the_restart(seats, engine_ready,
+                                                                     monkeypatch, tmp_path):
+    from acctsw import enginerestart as er
+    state = seats.load_state()
+    state.data['engine'] = {}
+    state.save()
+    binary = tmp_path / 'claude-cli'
+    binary.write_text('old')
+    seats.claude_bin = str(binary)
+    monkeypatch.setattr(er, 'target_engine', lambda **kw: '/current/acctsw')
+    real_usable = L._restart_seat_usable
+    leased = []
+    def usable(state, tool, email):
+        # The installer takes its lease after the tick's first state read, before the handoff.
+        if not leased:
+            leased.append(True)
+            fresh = seats.load_state()
+            fresh.data['tool_updates'] = {
+                'claude': {'installing_until': iso(now() + timedelta(minutes=16))}}
+            fresh.save()
+            state.data['tool_updates'] = fresh.data['tool_updates']
+        return real_usable(state, tool, email)
+    monkeypatch.setattr(L, '_restart_seat_usable', usable)
+    def spawn(argv, on_output, on_tick=None, **kw):
+        binary.write_text('new version')
+        for _ in range(3):
+            engine_ready.advance(er.RESTART_QUIET_S + er.CHECK_INTERVAL_S)
+            time.sleep(0.01)
+            assert on_tick() is False
+        assert leased and L.session_mod.RESTART_BLOCKER == 'tool_installing'
+        return 0
+    assert run(seats, 'claude', ['--resume', THREAD], spawn=spawn, get=fake_get({}),
+               swap_factory=lambda _c: _quiet_swap()) == 0
+
+
 def test_cli_restart_waits_until_installer_finishes(seats, engine_ready, monkeypatch, tmp_path):
     from acctsw import enginerestart as er
     state = seats.load_state()
@@ -3173,7 +3208,7 @@ def test_cli_restart_waits_until_installer_finishes(seats, engine_ready, monkeyp
     seats.claude_bin = str(binary)
     monkeypatch.setattr(er, 'target_engine', lambda **kw: '/current/acctsw')
     def spawn(argv, on_output, on_tick=None, **kw):
-        binary.write_text('new')
+        binary.write_text('new version')
         state = seats.load_state()
         state.data['tool_updates'] = {'claude': {'installing_until': iso(now() + timedelta(minutes=16))}}
         state.save()

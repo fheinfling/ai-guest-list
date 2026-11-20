@@ -21,6 +21,10 @@ from acctsw.util import iso
     ('codex', '/custom/bin/codex', None),
     ('codex', '/custom/Caskroom/codex/1/bin/codex', None),
     ('claude', '/custom/node_modules/@anthropic-ai/claude-code-evil/cli.js', None),
+    # Not global installs: a project's node_modules and an npx cache are never upgraded.
+    ('codex', '/work/app/node_modules/@openai/codex/bin/codex.js', None),
+    ('codex', '/Users/a/.npm/_npx/0f1e/node_modules/@openai/codex/bin/codex.js', None),
+    ('codex', '/work/app/node_modules/x/lib/node_modules/@openai/codex/bin/codex.js', None),
 ])
 def test_install_layouts_resolve_symlinks(tool, path, expected):
     assert U.install_method(tool, '/entry', realpath=lambda _: path, listdir=lambda _: []) == expected
@@ -46,7 +50,8 @@ class Runner:
         result = self.outputs.pop(0)
         if isinstance(result, Exception):
             raise result
-        return SimpleNamespace(returncode=0, stdout=result, stderr='')
+        code, result = result if isinstance(result, tuple) else (0, result)
+        return SimpleNamespace(returncode=code, stdout=result, stderr='')
 
 
 def brew_result(kind='casks', name='codex', auto=False):
@@ -62,34 +67,74 @@ def brew_result(kind='casks', name='codex', auto=False):
 def test_brew_check_and_upgrade_argv_env(kind, flag, path, auto, monkeypatch):
     monkeypatch.setenv('PYTHONHOME', '/frozen')
     monkeypatch.setenv('HOMEBREW_NO_INSTALL_CLEANUP', '1')
-    runner = Runner(brew_result(kind, auto=auto), '')
-    deps = dict(runner=runner, which=lambda name: f'/tools/{name}', realpath=lambda _: path)
+    monkeypatch.setenv('SUDO_ASKPASS', '/fake/gui-password-helper')
+    # Real brew exits 1 when the named package is outdated; that is the success path here.
+    runner = Runner((1, brew_result(kind, auto=auto)), '')
+    prefix = path.split('/Caskroom/')[0].split('/Cellar/')[0]
+    deps = dict(runner=runner, which=lambda name: f'/tools/{name}', realpath=lambda _: path,
+                exists=lambda p: p == prefix + '/bin/brew')
     found = U.check('codex', **deps)
     assert (found.installed, found.latest) == ('1.0', '2.0')
     assert U.upgrade('codex', checked=found, **deps) is True
     greedy = ['--greedy'] if flag == '--cask' else []
-    assert runner.calls[0][0] == ['/tools/brew', 'outdated', flag, *greedy, '--json=v2', 'codex']
+    brew = prefix + '/bin/brew'
+    assert runner.calls[0][0] == [brew, 'outdated', flag, *greedy, '--json=v2', 'codex']
     upgrade_greedy = ['--greedy'] if flag == '--cask' and auto else []
-    assert runner.calls[1][0] == ['/tools/brew', 'upgrade', flag, *upgrade_greedy, 'codex']
+    assert runner.calls[1][0] == [brew, 'upgrade', flag, *upgrade_greedy, 'codex']
     for (_, kw), timeout in zip(runner.calls, [60, 900]):
         assert kw['timeout'] == timeout and kw['stdin'] == subprocess.DEVNULL
         assert kw['env']['NONINTERACTIVE'] == kw['env']['HOMEBREW_NO_ENV_HINTS'] == '1'
         assert 'PYTHONHOME' not in kw['env'] and 'HOMEBREW_NO_INSTALL_CLEANUP' not in kw['env']
+        assert 'SUDO_ASKPASS' not in kw['env']
         assert not kw.get('shell', False)
 
 
 def test_npm_checks_installed_package_json_and_uses_its_installer(tmp_path):
-    root = tmp_path / 'node_modules' / '@openai' / 'codex'
+    root = tmp_path / 'lib' / 'node_modules' / '@openai' / 'codex'
     (root / 'bin').mkdir(parents=True)
     (root / 'package.json').write_text(json.dumps({'version': '1.0.0'}))
     runner = Runner('2.0.0\n', '')
-    deps = dict(runner=runner, which=lambda name: f'/tools/{name}',
-                realpath=lambda _: str(root / 'bin' / 'codex.js'))
+    npm = f'{tmp_path}/bin/npm'
+    # PATH's npm belongs to another Node; the installation's own npm must be used.
+    deps = dict(runner=runner, which=lambda name: f'/other-node/bin/{name}',
+                realpath=lambda p: str(root / 'bin' / 'codex.js') if p == '/entry' else p,
+                exists=lambda p: p == npm, binary_path='/entry')
     found = U.check('codex', **deps)
     assert (found.installed, found.latest) == ('1.0.0', '2.0.0')
     assert U.upgrade('codex', checked=found, **deps)
-    assert runner.calls[0][0] == ['/tools/npm', 'view', '@openai/codex', 'version']
-    assert runner.calls[1][0] == ['/tools/npm', 'install', '-g', '@openai/codex@latest']
+    assert runner.calls[0][0] == [npm, 'view', '@openai/codex', 'version']
+    assert runner.calls[1][0] == [npm, 'install', '-g', '--prefix', str(tmp_path),
+                                  '@openai/codex@latest']
+
+
+def test_installer_from_another_prefix_is_refused():
+    with pytest.raises(U.ToolUpdateError, match='installer unavailable'):
+        U.check('codex', runner=Runner(brew_result()), which=lambda n: '/opt/homebrew/bin/' + n,
+                realpath=lambda p: '/usr/local/Cellar/codex/1.0/bin/codex' if p == '/entry' else p,
+                binary_path='/entry', exists=lambda _: False)
+
+
+def test_brew_failure_status_is_still_an_error():
+    with pytest.raises(U.ToolUpdateError):
+        U.check('codex', runner=Runner((2, '')), which=lambda _: '/fake',
+                realpath=lambda _: '/opt/homebrew/Caskroom/codex/1/bin/codex')
+
+
+def test_timeout_kills_the_installer_process_group(tmp_path):
+    import sys, time
+    marker = tmp_path / 'helper-finished'
+    helper = tmp_path / 'helper.py'
+    helper.write_text(f"import time\ntime.sleep(1.5)\nopen({str(marker)!r}, 'w').close()\n")
+    installer = tmp_path / 'installer.py'
+    installer.write_text(f"import subprocess, sys, time\n"
+                         f"subprocess.Popen([sys.executable, {str(helper)!r}])\n"
+                         f"time.sleep(30)\n")
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        U._run_tree([sys.executable, str(installer)], timeout=0.5, text=True)
+    assert time.monotonic() - started < 5
+    time.sleep(2.0)
+    assert not marker.exists()  # the installer's helper died with it
 
 
 @pytest.mark.parametrize('payload', ['bad json', 'null', '[]', '{}', '{"casks":null}',
@@ -228,7 +273,37 @@ def test_caskroom_ambiguity_and_missing_installer_fail_closed():
                             listdir=lambda _: ['claude-code', 'claude-code@latest']) is None
     with pytest.raises(U.ToolUpdateError, match='installer unavailable'):
         U.check('codex', binary_path='/opt/homebrew/Caskroom/codex/1.0/bin/codex',
-                which=lambda _: None, realpath=str)
+                which=lambda _: None, realpath=str, exists=lambda _: False)
+
+
+def test_future_lease_and_check_stamps_do_not_block_after_a_clock_correction(ctx):
+    at = datetime(2026, 11, 20, 12, tzinfo=timezone.utc)
+    far = iso(at + timedelta(days=1))
+    data = {'tool_updates': {'codex': {'installing_until': far}}}
+    assert U.installation_in_progress(data, 'codex', clock=lambda: at) is False
+    data['tool_updates']['codex']['installing_until'] = iso(at + timedelta(minutes=5))
+    assert U.installation_in_progress(data, 'codex', clock=lambda: at) is True
+    state = ctx.load_state()
+    state.data['tool_updates'] = {'claude': {'checked_at': far}, 'codex': {'checked_at': far}}
+    state.save()
+    seen = []
+    U.run_updates(ctx, runner=Runner(), clock=lambda: at, which=lambda n: seen.append(n) or None)
+    assert 'claude' in seen and 'codex' in seen  # future stamps don't suppress the check
+
+
+def test_a_stale_save_dropping_tool_updates_does_not_abort_maintenance(ctx):
+    dropped = []
+    def which(name):
+        # A stale whole-state save (e.g. an unlocked writer) erases the map mid-run, once.
+        if not dropped:
+            dropped.append(name)
+            state = ctx.load_state()
+            state.data.pop('tool_updates', None)
+            state.save()
+        return None
+    U.run_updates(ctx, runner=Runner(), which=which)
+    records = ctx.load_state().data['tool_updates']
+    assert set(records) == {'claude', 'codex'}
 
 
 def test_install_lease_surrounds_upgrade_and_is_cleared_on_completion(ctx):

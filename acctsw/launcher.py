@@ -3496,8 +3496,12 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 if rest is None:
                     return _engine_report(False, "flags")
                 with ctx.locked():
-                    if not _restart_seat_usable(ctx.load_state(), tool, running_seat()):
+                    final = ctx.load_state()
+                    if not _restart_seat_usable(final, tool, running_seat()):
                         return _engine_report(True, "seat_unusable")
+                    # An installer may have started since the tick's first state read.
+                    if toolupdate.installation_in_progress(final.data, tool):
+                        return _engine_report(True, "tool_installing")
                 if tool == "claude":
                     # The scan (and seat check) can race a new supervisor registering its cwd.
                     # Re-evaluate with that sibling before committing a provisional selection.

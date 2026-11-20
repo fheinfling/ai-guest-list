@@ -260,13 +260,15 @@ def target_engine(version: str = __version__, *, exe=None, probe=engine.probe,
 class BinaryIdentity:
     realpath: str
     version: str | None
-    file_id: tuple[int, int, int, int]
+    file_id: tuple[int, int, int]
 
 
 def binary_identity(binary_path, *, realpath=os.path.realpath, stat=os.stat) -> BinaryIdentity | None:
     """Snapshot a child's executable without invoking it. Missing paths defer any restart.
 
-    The file identity also catches copied casks and npm entrypoints replaced at the same path.
+    The file identity (device, inode, size) also catches copied casks and npm entrypoints replaced
+    at the same path. The mtime is left out on purpose: a touch, relink or backup tool can change
+    it without a new binary, and that must not restart anyone's session.
     Never stat the old resolved path later: Homebrew may already have cleaned that version up.
     """
     from .toolupdate import path_version
@@ -276,7 +278,7 @@ def binary_identity(binary_path, *, realpath=os.path.realpath, stat=os.stat) -> 
     except (OSError, ValueError, TypeError):
         return None
     return BinaryIdentity(resolved, path_version(resolved),
-                          (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size))
+                          (info.st_dev, info.st_ino, info.st_size))
 
 
 def binary_changed(running: BinaryIdentity | None, current: BinaryIdentity | None) -> bool:

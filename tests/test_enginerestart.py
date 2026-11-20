@@ -651,3 +651,16 @@ def test_cli_identity_tracks_symlink_and_same_path_replacements(tmp_path):
     replacement.replace(second)
     assert er.binary_changed(after, er.binary_identity(entry))
     assert not er.binary_changed(None, er.binary_identity(entry))
+
+
+def test_a_touched_cli_is_not_a_new_cli(tmp_path):
+    import os
+    binary = tmp_path / "codex"
+    binary.write_bytes(b"same bytes")
+    before = er.binary_identity(str(binary))
+    os.utime(binary, (1, 1))  # a touch, relink or backup tool changes only the timestamp
+    assert not er.binary_changed(before, er.binary_identity(str(binary)))
+    replacement = tmp_path / "codex.new"
+    replacement.write_bytes(b"new version bytes")
+    os.replace(replacement, binary)
+    assert er.binary_changed(before, er.binary_identity(str(binary)))
