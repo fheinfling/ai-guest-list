@@ -22,7 +22,7 @@ from pathlib import Path
 
 from . import rollout, seatledger
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 _LOCK = threading.Lock()
 _CHUNK = 1 << 20
 _WEEK = 7 * 86400
@@ -42,8 +42,8 @@ CREATE TABLE IF NOT EXISTS usage (
  hour INTEGER, tool TEXT, model TEXT, seat TEXT, input INTEGER, cache_read INTEGER,
  cache_write INTEGER, output INTEGER, PRIMARY KEY(hour,tool,model,seat)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS windows (
- seat TEXT, ends_at INTEGER, peak_pct REAL, observed INTEGER,
- PRIMARY KEY(seat,ends_at)) WITHOUT ROWID;
+ seat TEXT, ends_at INTEGER, peak_pct REAL, source TEXT,
+ PRIMARY KEY(seat,ends_at,source)) WITHOUT ROWID;
 """
 
 
@@ -174,14 +174,15 @@ def _seat(tool, thread, at, ledger, creators, plans, user=None, account=None, *,
     return tool + ":?"
 
 
-def _window(db, seat, end, peak):
+def _window(db, seat, end, peak, source):
+    # source "log" is re-derivable from transcripts; "poll" (usage API readings) exists only here.
     end = _timestamp(end)
     if (end is None or isinstance(peak, bool) or not isinstance(peak, (int, float))
             or not math.isfinite(peak)):
         return
-    db.execute("""INSERT INTO windows VALUES (?,?,?,1) ON CONFLICT(seat,ends_at)
-                  DO UPDATE SET peak_pct=max(peak_pct,excluded.peak_pct), observed=1""",
-               (seat, int(end), float(peak)))
+    db.execute("""INSERT INTO windows VALUES (?,?,?,?) ON CONFLICT(seat,ends_at,source)
+                  DO UPDATE SET peak_pct=max(peak_pct,excluded.peak_pct)""",
+               (seat, int(end), float(peak), source))
 
 
 def _add(db, at, tool, model, seat, counts):
@@ -262,7 +263,7 @@ def _line(db, raw, file, ledger, creators, plans):
         if isinstance(limits, dict):
             for window in limits.values():
                 if isinstance(window, dict) and window.get("window_minutes") == 10080:
-                    _window(db, seat, window.get("resets_at"), window.get("used_percent"))
+                    _window(db, seat, window.get("resets_at"), window.get("used_percent"), "log")
         info = payload.get("info")
         usage = info.get("total_token_usage") if isinstance(info, dict) else None
         if not isinstance(usage, dict):
@@ -319,7 +320,8 @@ def refresh(ctx, *, budget_s: float):
             for email, seat in seats:
                 window = ((seat.get("usage") or {}).get("windows") or {}).get("weekly")
                 if isinstance(window, dict):
-                    _window(db, tool + ":" + email, window.get("resets_at"), window.get("used_pct"))
+                    _window(db, tool + ":" + email, window.get("resets_at"), window.get("used_pct"),
+                            "poll")
         discovered = _discover(ctx, state)
         files = []
         db.row_factory = sqlite3.Row
@@ -379,8 +381,9 @@ def _sync_codex_plans(db, current):
     """Re-read Codex logs when a present seat's plan differs from the one the index was built with.
 
     Plans arrive after the first index (a new seat's first poll) and Codex rows store their seat, so
-    without this, turns indexed before the plan was known would stay on the creator's seat. Plans of
-    removed seats are kept, so removing a seat never triggers a re-read. Claude rows are untouched.
+    without this, turns indexed before the plan was known would stay on the creator's seat. Only
+    present seats are compared: removing a seat never triggers a re-read, re-adding one does (turns
+    indexed while it was gone went elsewhere). Claude rows and polled windows are untouched.
     """
     row = db.execute("SELECT value FROM meta WHERE key='codex_plans'").fetchone()
     try:
@@ -389,18 +392,17 @@ def _sync_codex_plans(db, current):
         known = None
     if not isinstance(known, dict):
         stale = db.execute("SELECT 1 FROM files WHERE tool='codex' LIMIT 1").fetchone() is not None
-        known = {}
     else:
         stale = any(known.get(email) != plan for email, plan in current.items())
     if stale:
         for statement in ("DELETE FROM files WHERE tool='codex'", "DELETE FROM codex_threads",
                           "DELETE FROM codex_seen", "DELETE FROM usage WHERE tool='codex'",
-                          "DELETE FROM windows WHERE seat LIKE 'codex:%'",
+                          "DELETE FROM windows WHERE seat LIKE 'codex:%' AND source='log'",
                           "DELETE FROM meta WHERE key='tracking_codex'"):
             db.execute(statement)
     # Committed by refresh together with the file list, so a failed refresh keeps the old state.
     db.execute("INSERT OR REPLACE INTO meta VALUES ('codex_plans', ?)",
-               (json.dumps({**known, **current}),))
+               (json.dumps(current),))
 
 
 def _save_file(db, file):
@@ -502,8 +504,8 @@ def _billing(ctx, seat, raw, now, bounds):
 
 
 def _own_weeks(db, seat, now, calendar_bounds):
-    rows = db.execute("SELECT ends_at,peak_pct FROM windows WHERE seat=? AND observed=1 ORDER BY ends_at",
-                      (seat["key"],)).fetchall()
+    rows = db.execute("SELECT ends_at,max(peak_pct) FROM windows WHERE seat=? GROUP BY ends_at"
+                      " ORDER BY ends_at", (seat["key"],)).fetchall()
     merged = []
     for end, peak in rows:
         if merged and end - merged[-1][0] <= 1800:

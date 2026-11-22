@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from acctsw import bridge, seatledger, tokenlog, usage
+from tests.conftest import make_codex_blob
 
 AT = "2026-11-21T10:00:00+00:00"
 
@@ -227,7 +228,7 @@ def test_codex_moved_thread_plan_beats_creator_and_attributes_window(ctx):
     refresh(ctx)
     assert {r[3]: list(r[4:]) for r in rows(ctx)} == {
         "codex:started": [10, 0, 0, 5], "codex:moved": [10, 0, 0, 5]}
-    assert rows(ctx, "windows") == [("codex:moved", int(end), 87, 1)]
+    assert rows(ctx, "windows") == [("codex:moved", int(end), 87, "log")]
     assert tokenlog.history(ctx)["own"]["codex:moved"]["week"][0]["limit_pct"] == 87
     # An appended event still gets its own plan, using the persisted creator context.
     write(path, plan_count(30, output=15, at="2026-11-21T12:00:00Z"), append=True)
@@ -311,7 +312,7 @@ def test_late_api_plan_reattributes_turns_already_indexed(ctx):
     seats(ctx, moved={"plan": "Business", "usage": {"plan_type": "business_custom_plan"}})
     refresh(ctx)
     assert contributions(ctx) == {"codex:moved": [10, 0, 0, 5], "claude:?": [10, 4, 3, 5]}
-    assert rows(ctx, "windows") == [("codex:moved", 1795341600, 87, 1)]
+    assert rows(ctx, "windows") == [("codex:moved", 1795341600, 87, "log")]
     assert len(rows(ctx, "claude_seen")) == 1
 
 
@@ -328,10 +329,10 @@ def test_failed_poll_keeps_the_plan_and_its_attribution(ctx):
                            window={**PEAK, "used_percent": 88}), append=True)
     refresh(ctx)
     assert contributions(ctx) == {"codex:moved": [20, 0, 0, 10]}
-    assert rows(ctx, "windows") == [("codex:moved", 1795341600, 88, 1)]
+    assert rows(ctx, "windows") == [("codex:moved", 1795341600, 88, "log")]
 
 
-def test_unchanged_or_removed_plans_do_not_reread_codex_logs(ctx):
+def test_unchanged_plans_and_seat_removal_do_not_reread_codex_logs(ctx):
     seats(ctx, creator={"account_id": "starter", "usage": {"plan_type": "plus"}},
           gone={"usage": {"plan_type": "team"}})
     path = write(xp(ctx), meta(user="starter"), plan_count())
@@ -346,10 +347,74 @@ def test_unchanged_or_removed_plans_do_not_reread_codex_logs(ctx):
     write(path, plan_count(30, output=15, plan="plus", at="2026-11-21T11:00:00Z"), append=True)
     refresh(ctx)
     assert contributions(ctx) == {"codex:gone": [10, 0, 0, 5], "codex:creator": [20, 0, 0, 10]}
-    # Re-adding the seat with the plan it had is not a change either.
-    seats(ctx, gone={"usage": {"plan_type": "team"}})
+
+
+def test_readding_a_seat_repairs_turns_indexed_while_it_was_gone(ctx):
+    seats(ctx, creator={"account_id": "starter", "usage": {"plan_type": "plus"}},
+          moved={"usage": {"plan_type": "team"}})
+    path = write(xp(ctx), meta(user="starter"), plan_count())
     refresh(ctx)
-    assert contributions(ctx) == {"codex:gone": [10, 0, 0, 5], "codex:creator": [20, 0, 0, 10]}
+    state = ctx.load_state()
+    del state.data["tools"]["codex"]["accounts"]["moved"]
+    state.save()
+    write(path, plan_count(20, output=10, at="2026-11-21T11:00:00Z"), append=True)
+    refresh(ctx)
+    assert contributions(ctx) == {"codex:moved": [10, 0, 0, 5], "codex:creator": [10, 0, 0, 5]}
+    seats(ctx, moved={"usage": {"plan_type": "team"}})
+    refresh(ctx)
+    assert contributions(ctx) == {"codex:moved": [20, 0, 0, 10]}
+
+
+def test_plan_reread_keeps_poll_only_windows_and_claude(ctx):
+    older, newer = "2026-11-15T10:00:00Z", "2026-11-22T10:00:00Z"
+    old_end = int(datetime.fromisoformat(older).timestamp())
+    seats(ctx, creator={"account_id": "starter", "usage": {
+        "plan_type": "plus", "windows": {"weekly": {"used_pct": 87, "resets_at": older}}}},
+        moved={"plan": "Business"})
+    seats(ctx, "claude", c={"usage": {"windows": {"weekly": {"used_pct": 42, "resets_at": older}}}})
+    write(xp(ctx), meta(user="starter"), plan_count(plan="business_custom_plan", window=PEAK))
+    write(cp(ctx), claude())
+    refresh(ctx)
+    seats(ctx, creator={"account_id": "starter", "usage": {
+        "plan_type": "plus", "windows": {"weekly": {"used_pct": 5, "resets_at": newer}}}})
+    refresh(ctx)
+    seats(ctx, moved={"plan": "Business", "usage": {"plan_type": "business_custom_plan"}})
+    refresh(ctx)
+    assert contributions(ctx) == {"codex:moved": [10, 0, 0, 5], "claude:?": [10, 4, 3, 5]}
+    assert sorted(rows(ctx, "windows")) == [
+        ("claude:c", old_end, 42, "poll"), ("codex:creator", old_end, 87, "poll"),
+        ("codex:creator", 1795341600, 5, "poll"), ("codex:moved", 1795341600, 87, "log")]
+    # Same end from a poll and a log: the higher reading wins in the view.
+    assert tokenlog.history(ctx)["own"]["codex:creator"]["week"][0]["limit_pct"] == 5
+
+
+@pytest.mark.parametrize("workspace,kept", [("same", "business_custom_plan"), ("moved", None)])
+def test_successful_poll_without_plan_keeps_it_unless_the_subscription_changed(
+        ctx, monkeypatch, workspace, kept):
+    blob = make_codex_blob("moved@example.com", account_id="acct-moved")
+    seats(ctx, creator={"account_id": "starter", "usage": {"plan_type": "plus"}},
+          moved={"plan": "Business", "account_id": "acct-moved", "workspace_id": "same",
+                 "usage": {"ok": True, "plan_type": "business_custom_plan"}})
+    write(xp(ctx), meta(user="starter"), plan_count(plan="business_custom_plan"))
+    refresh(ctx)
+    monkeypatch.setattr(usage, "account_workspace", lambda *_a: workspace)
+    reads = []
+    real_line = tokenlog._line
+    monkeypatch.setattr(tokenlog, "_line", lambda *a: reads.append(1) or real_line(*a))
+    for plan in (None, "business_custom_plan", None):
+        state = ctx.load_state()
+        result = usage.Usage(ok=True, plan_type=plan)
+        usage.store_fetch(state, "codex", "moved", result, blob=blob)
+        state.save()
+        refresh(ctx)
+        if workspace == "same":
+            assert ctx.load_state().get_seat("codex", "moved")["usage"]["plan_type"] == kept
+        else:
+            break
+    if workspace == "same":
+        assert reads == [] and contributions(ctx) == {"codex:moved": [10, 0, 0, 5]}
+    else:
+        assert ctx.load_state().get_seat("codex", "moved")["usage"]["plan_type"] is kept
 
 
 @pytest.mark.parametrize("stored", [None, "not json", "[]"])
@@ -366,6 +431,13 @@ def test_missing_or_corrupt_plan_record_rereads_codex_once(ctx, stored):
     refresh(ctx)
     assert contributions(ctx) == {"codex:other": [10, 0, 0, 5]}
     assert ("codex_plans", '{"other": "team"}') in rows(ctx, "meta")
+
+
+def test_successful_poll_without_credentials_or_plan_keeps_the_plan(ctx):
+    seats(ctx, moved={"usage": {"ok": True, "plan_type": "business_custom_plan"}})
+    state = ctx.load_state()
+    usage.store_fetch(state, "codex", "moved", usage.Usage(ok=True))
+    assert state.get_seat("codex", "moved")["usage"]["plan_type"] == "business_custom_plan"
 
 
 def test_ledger_slack_and_equal_time_last_bind(ctx):
@@ -456,8 +528,8 @@ def test_own_windows_keep_observed_ends_gaps_and_merged_peak(ctx):
     bind(ctx, "codex", "a")
     refresh(ctx)
     with tokenlog._connect(ctx) as db:
-        tokenlog._window(db, "codex:a", (end - timedelta(days=7, hours=2)).timestamp(), 40)
-        tokenlog._window(db, "codex:a", (end - timedelta(minutes=10)).timestamp(), 90)
+        tokenlog._window(db, "codex:a", (end - timedelta(days=7, hours=2)).timestamp(), 40, "log")
+        tokenlog._window(db, "codex:a", (end - timedelta(minutes=10)).timestamp(), 90, "log")
     periods = tokenlog.history(ctx)["own"]["codex:a"]["week"]
     assert periods[0]["current"] and periods[0]["approx"] is False
     assert periods[0]["limit_pct"] == 90
@@ -495,8 +567,8 @@ def test_observed_window_gap_has_no_current_period_and_excludes_gap_tokens(ctx, 
     seats(ctx, a={})
     at = int(now.timestamp())
     with tokenlog._connect(ctx) as db:
-        tokenlog._window(db, "codex:a", at - 3600, 80)
-        tokenlog._window(db, "codex:a", at + tokenlog._WEEK + 3600, 30)
+        tokenlog._window(db, "codex:a", at - 3600, 80, "log")
+        tokenlog._window(db, "codex:a", at + tokenlog._WEEK + 3600, 30, "log")
         # Prior window end, gap, future window start: none belong to any window yet.
         for stamp in (at - 3600, at, at + 3600):
             tokenlog._add(db, stamp, "codex", "fake-model", "codex:a", [1, 2, 3, 4])
@@ -512,7 +584,7 @@ def test_own_weeks_keep_only_latest_thirteen_and_clip_against_omitted_window(ctx
     at = int(tokenlog._now().timestamp())
     with tokenlog._connect(ctx) as db:
         for index in range(15):
-            tokenlog._window(db, "codex:a", at - index * 6 * 86400, index)
+            tokenlog._window(db, "codex:a", at - index * 6 * 86400, index, "log")
     periods = tokenlog.history(ctx)["own"]["codex:a"]["week"]
     assert len(periods) == 13
     assert [p["limit_pct"] for p in periods] == list(range(13))
@@ -523,9 +595,7 @@ def test_own_weeks_keep_only_latest_thirteen_and_clip_against_omitted_window(ctx
 def test_own_weeks_without_observations_are_calendar_fallback(ctx):
     seats(ctx, a={})
     with tokenlog._connect(ctx) as db:
-        db.execute("INSERT INTO windows VALUES ('codex:a', ?, 99, 0)",
-                   (int(tokenlog._now().timestamp()),))
-        tokenlog._window(db, "codex:other", tokenlog._now().timestamp(), 100)
+        tokenlog._window(db, "codex:other", tokenlog._now().timestamp(), 100, "log")
     payload = tokenlog.history(ctx)
     periods = payload["own"]["codex:a"]["week"]
     assert len(periods) == 13
@@ -746,7 +816,7 @@ def test_weekly_snapshot_keeps_peak_across_refreshes(ctx):
     refresh(ctx)
     seats(ctx, a={"usage": {"windows": {"weekly": {"used_pct": 20, "resets_at": end}}}})
     refresh(ctx)
-    assert rows(ctx, "windows")[0][2:] == (87, 1)
+    assert rows(ctx, "windows")[0][2:] == (87, "poll")
     assert tokenlog.history(ctx)["own"]["codex:a"]["week"][0]["limit_pct"] == 87
 
 
@@ -904,7 +974,7 @@ def test_own_week_next_end_boundaries(ctx, monkeypatch, ahead):
     monkeypatch.setattr(tokenlog, "_now", lambda: now)
     seats(ctx, a={})
     with tokenlog._connect(ctx) as db:
-        tokenlog._window(db, "codex:a", now.timestamp() + ahead, 41)
+        tokenlog._window(db, "codex:a", now.timestamp() + ahead, 41, "log")
     periods = tokenlog.history(ctx)["own"]["codex:a"]["week"]
     assert len(periods) == 1
     assert datetime.fromisoformat(periods[0]["to"]).timestamp() == now.timestamp() + ahead
@@ -920,7 +990,7 @@ def test_own_week_merge_tolerance_keeps_latest_end_and_highest_peak(ctx, gap, me
     seats(ctx, a={})
     with tokenlog._connect(ctx) as db:
         for stamp, peak in [(end - gap, 93), (end, 20), (end - 7 * 86400, 10)]:
-            tokenlog._window(db, "codex:a", stamp, peak)
+            tokenlog._window(db, "codex:a", stamp, peak, "log")
     periods = tokenlog.history(ctx)["own"]["codex:a"]["week"]
     assert len(periods) == (2 if merged else 3)
     assert datetime.fromisoformat(periods[0]["to"]).timestamp() == end
@@ -936,8 +1006,8 @@ def test_own_week_only_clips_overlaps_never_fills_gaps(ctx, distance):
     previous = end - 7 * 86400 - distance
     seats(ctx, a={})
     with tokenlog._connect(ctx) as db:
-        tokenlog._window(db, "codex:a", end, 30)
-        tokenlog._window(db, "codex:a", previous, 70)
+        tokenlog._window(db, "codex:a", end, 30, "log")
+        tokenlog._window(db, "codex:a", previous, 70, "log")
     periods = tokenlog.history(ctx)["own"]["codex:a"]["week"]
     assert len(periods) == 2
     assert datetime.fromisoformat(periods[0]["from"]).timestamp() == max(previous, end - tokenlog._WEEK)
@@ -956,7 +1026,7 @@ def test_own_week_keeps_all_observations_even_without_a_current_window(ctx, anch
     seats(ctx, a={})
     with tokenlog._connect(ctx) as db:
         for days, peak in anchors:
-            tokenlog._window(db, "codex:a", at + days * 86400, peak)
+            tokenlog._window(db, "codex:a", at + days * 86400, peak, "log")
     periods = tokenlog.history(ctx)["own"]["codex:a"]["week"]
     assert [datetime.fromisoformat(p["to"]).timestamp() for p in periods] == [
         at + days * 86400 for days, _ in reversed(anchors)]
@@ -1185,14 +1255,14 @@ def test_connect_creates_private_database_and_rebuilds_only_unknown_schema(ctx, 
     tokenlog._connect(fresh).close()
     assert path.stat().st_mode & 0o777 == 0o600
     refresh(ctx)
-    assert ("schema_version", "2") in rows(ctx, "meta")
+    assert ("schema_version", "3") in rows(ctx, "meta")
     # A mismatched cache must be discarded even when no log remains to recreate it.
     with sqlite3.connect(ctx.data_dir / "usage.sqlite") as db:
         db.execute("UPDATE meta SET value='obsolete' WHERE key='schema_version'")
         db.execute("INSERT INTO usage VALUES (1,'claude','old','claude:?',1,0,0,0)")
     refresh(ctx)
     assert rows(ctx) == []
-    assert ("schema_version", "2") in rows(ctx, "meta")
+    assert ("schema_version", "3") in rows(ctx, "meta")
 
 
 def test_default_clock_is_timezone_aware_and_current(clock):
@@ -1329,7 +1399,7 @@ def test_own_weeks_observed_windows_keep_the_existing_label_format(ctx):
     end = tokenlog._now().timestamp() + 86400
     with tokenlog._connect(ctx) as db:
         for days, peak in [(0, 20), (7 + 2 / 24, 30), (21, 40)]:
-            tokenlog._window(db, "codex:a", end - days * 86400, peak)
+            tokenlog._window(db, "codex:a", end - days * 86400, peak, "log")
     periods = tokenlog.history(ctx)["own"]["codex:a"]["week"]
     assert periods[0]["approx"] is False
     assert periods[1]["limit_pct"] == 30
@@ -1394,8 +1464,8 @@ def test_own_week_uses_upcoming_end_instead_of_nearer_past_anchor(ctx, ahead):
     at = tokenlog._now().timestamp()
     seats(ctx, a={})
     with tokenlog._connect(ctx) as db:
-        tokenlog._window(db, "codex:a", at - 86400, 99)
-        tokenlog._window(db, "codex:a", at + ahead * 86400, 20)
+        tokenlog._window(db, "codex:a", at - 86400, 99, "log")
+        tokenlog._window(db, "codex:a", at + ahead * 86400, 20, "log")
     p = tokenlog.history(ctx)["own"]["codex:a"]["week"][0]
     assert datetime.fromisoformat(p["to"]).timestamp() == at + ahead * 86400
     assert p["limit_pct"] == 20

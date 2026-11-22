@@ -1389,6 +1389,7 @@ def store_fetch(state, tool: str, email: str, u: Usage, at=None, *,
     at = at if at is not None else now()
     prev_usage = (state.get_seat(tool, email) or {}).get("usage") or {}
     d = u.to_dict()
+    new_subscription = False
     if u.ok:
         # Bind handoff decisions to the credentials authenticated by this reading.
         d["credential_digest"] = _credential_digest(blob)
@@ -1424,7 +1425,8 @@ def store_fetch(state, tool: str, email: str, u: Usage, at=None, *,
                             seat["billing"] = {"renews_at": anchor, "source": "codex_token"}
                     except (ValueError, TypeError, AttributeError):
                         pass
-                if old_workspace and new_workspace and old_workspace != new_workspace:
+                new_subscription = bool(old_workspace and new_workspace and old_workspace != new_workspace)
+                if new_subscription:
                     # Same email, different provider account means cancellation/re-subscription or
                     # a workspace move. Old rests and auth backoff belong to the old subscription.
                     state.set_limited_until(tool, email, None)
@@ -1433,6 +1435,9 @@ def store_fetch(state, tool: str, email: str, u: Usage, at=None, *,
                     state.data["moved_note"] = (
                         f"new {tool} subscription detected for {email} — saved limits were reset"
                     )
+        if not d.get("plan_type") and not new_subscription:
+            # Same subscription, reading without a plan: keep the plan token history attributes by.
+            d["plan_type"] = prev_usage.get("plan_type")
         state.set_usage(tool, email, d)
         _apply_limit(state, tool, email, u, at, trust_reactive_lag=trust_reactive_lag)
     else:
