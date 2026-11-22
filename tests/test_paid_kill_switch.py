@@ -150,8 +150,8 @@ def test_setting_flipped_after_approval_and_setup_prevents_spawn(ctx, monkeypatc
     marked = L.mark_session
     marks = []
 
-    def mark(*args):
-        marked(*args)
+    def mark(*args, **kwargs):
+        marked(*args, **kwargs)
         marks.append(args)
         # Past the old last approval check, argv construction and the launch notification.
         disable(ctx)

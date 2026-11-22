@@ -6,8 +6,12 @@ import { fileURLToPath } from "node:url";
 import {
   buildHTML, doorKey, doorMark, pct, fmtCountdown, needsHello,
   signedOut, isActive, signinExpiring, usable, resetIsPast, switchNeedsConfirmation, seatIdentity, headerVerdict, seatWindows,
-  buildSettings, buildAddSeat, reduceReply, supervisionBanner, engineBanner, fmtUsageAge, fmtSessionAge, updateClockText,
+  buildSettings, buildUsage, usageCount, fmtUsageTokens, buildAddSeat, reduceReply, supervisionBanner, engineBanner, fmtUsageAge, fmtSessionAge, updateClockText,
 } from "./render.mjs";
+
+// The usage fixtures were captured on a Europe/Berlin machine (+01:00/+02:00 offsets) and the UI
+// renders dates in the machine's zone, like the engine that sends them. Pin it so CI (UTC) agrees.
+process.env.TZ = "Europe/Berlin";
 
 const mkAdd = (over = {}) => ({ step: "provider", provider: null, name: "", method: "browser", token: "", ...over });
 
@@ -1191,7 +1195,8 @@ function keyApp(options = {}) {
     requestAnimationFrame: options.requestAnimationFrame, matchMedia: () => options.motion || { matches: true, addEventListener() {} } };
   runInNewContext(readFileSync(new URL("./bundle.js", import.meta.url), "utf8"),
     { document, window, console, setTimeout: options.setTimeout || setTimeout,
-      setInterval: options.setInterval || setInterval, clearInterval, clearTimeout, URL, confirm: options.confirm || (() => true), ResizeObserver: options.ResizeObserver });
+      setInterval: options.setInterval || setInterval, clearInterval: options.clearInterval || clearInterval,
+      clearTimeout: options.clearTimeout || clearTimeout, URL, confirm: options.confirm || (() => true), ResizeObserver: options.ResizeObserver });
   const click = (dataset) => handlers.click({ target: { closest: (selector) => selector === "[data-action]" ? { dataset } : null }, preventDefault() {} });
   const input = (id, value) => handlers.input({ target: { id, value } });
   return { window, root, sent, click, input, handlers, windowHandlers, document };
@@ -3770,4 +3775,842 @@ test("CLI updates are on by default and can be disabled in settings", () => {
     assert.match(html, /install new versions, then restart idle sessions/);
     assert.equal(/data-key="update_tools" checked/.test(html), value !== false);
   }
+});
+
+// History is a separate, state-free bridge reply. All identities in these local-log fixtures are fake.
+const usageSample = JSON.parse(readFileSync(new URL('./fixtures/usage-history.sample.json', import.meta.url), 'utf8'));
+const usageIndexing = { ...structuredClone(usageSample), index: { done: false, pct: 37 } }; // same data, mid-index
+const usageView = (over = {}) => ({ mode: 'week', idx: 0, basis: 'all', open: null, error: null, ...over });
+const usageHTML = (over = {}, payload = usageSample) => buildUsage(state(), payload, usageView(over));
+const usageFigure = (html) => html.match(/class="u-figure"><b>([^<]+)/)?.[1];
+
+function usageTimers(options = {}) {
+  let sequence = 0;
+  const timers = new Map();
+  const app = keyApp({ ...options,
+    setTimeout: (fn, delay) => { const id = ++sequence; timers.set(id, { fn, delay }); return id; },
+    clearTimeout: (id) => timers.delete(id),
+  });
+  return { ...app, timers, tick() {
+    const [id, timer] = timers.entries().next().value;
+    timers.delete(id); timer.fn();
+  } };
+}
+
+test('usage fixtures cover thirteen weeks, six months and both indexing states', () => {
+  assert.equal(usageSample.calendar.week.length, 13);
+  assert.equal(usageSample.calendar.month.length, 6);
+  assert.equal(usageSample.index.done, true);
+  assert.equal(usageIndexing.index.done, false);
+  assert.ok(usageSample.seats.some((s) => s.kind === 'removed'));
+  assert.ok(usageSample.seats.some((s) => s.kind === 'unattributed'));
+  assert.ok(usageSample.own['claude:biz@example.com'].week.some((p) => p.approx && !Object.keys(p.by).length));
+});
+
+test('observed own windows render one through thirteen columns and find irregular past peaks', () => {
+  const payload = structuredClone(usageSample), key = 'codex:work@example.com';
+  const now = Date.parse(payload.generated_at), day = 86400000;
+  const windows = [-11.02, -3.59, 4.05].map((days, i) => {
+    const end = now + days * day, start = end - 7 * day;
+    return { from: new Date(start).toISOString(), to: new Date(end).toISOString(),
+      label: `observed ${i}`, current: start <= now && now < end, approx: false,
+      limit_pct: [91, 73, 42][i], by: { 'gpt-6.1-sol': [10, 20, 30, 40] } };
+  }).reverse();
+  payload.own[key].week = windows;
+  // A past calendar week intersects the oldest observation, which the old grid lost.
+  payload.calendar.week[2].by = { [key]: { 'gpt-6.1-sol': [1, 2, 3, 4] } };
+  const html = usageHTML({ idx: 2, open: key }, payload);
+  const row = html.match(/data-key="codex:work@example.com"[\s\S]*?<\/button>/)[0];
+  assert.match(row, /weekly limit peak 91%/);
+  assert.doesNotMatch(row, /peak unavailable/);
+  for (let count = 1; count <= 13; count++) {
+    payload.own[key].week = Array.from({ length: count }, (_, i) => ({ ...windows[i % 3], label: `window ${i}` }));
+    const panel = usageHTML({ open: key }, payload).split('<div class="u-own">')[1].split('</article>')[0];
+    assert.ok(panel.includes(`class="u-chart" style="--columns:${count}"`));
+    assert.equal([...panel.matchAll(/class="u-col" role="img"/g)].length, count);
+    assert.ok(panel.indexOf(`aria-label="window ${count - 1}:`) <= panel.indexOf('aria-label="window 0:'));
+    assert.doesNotMatch(panel, /striped windows|not tracked|NaN|Infinity/);
+  }
+  payload.own[key].week = windows.map((w) => ({ ...w, current: false }));
+  const gap = usageHTML({ open: key }, payload).split('<div class="u-own">')[1];
+  assert.doesNotMatch(gap, /own weekly windows \(resets|u-current-limit/);
+});
+
+test('CSV footer disables without a payload, shows progress, and escapes only the saved basename', () => {
+  assert.match(usageHTML({}, null), /data-action="usage-export" disabled>export CSV<\/button>/);
+  assert.match(usageHTML(), /data-action="usage-export">export CSV<\/button>/);
+  assert.match(usageHTML({ export: { pending: true } }), /data-action="usage-export" disabled>exporting…<\/button>/);
+  const saved = usageHTML({ export: { path: '/private/fake-secret/Downloads/<saved>&".csv' } });
+  assert.match(saved, /role="status">saved to Downloads · &lt;saved&gt;&amp;&quot;\.csv<\/p>/);
+  assert.doesNotMatch(saved, /fake-secret|<saved>/);
+  assert.match(saved, /data-action="usage-export">export CSV<\/button>/);
+  const error = usageHTML({ export: { error: '<cannot>& export' } });
+  assert.match(error, /role="status">&lt;cannot&gt;&amp; export<\/p>/);
+  assert.match(error, /data-action="usage-export">export CSV<\/button>/);
+  assert.doesNotMatch(usageHTML(), /u-export-message/);
+  assert.doesNotMatch(usageHTML({ export: { pending: true } }), /u-export-message/);
+  assert.match(usageHTML({ error: 'history failed' }), /data-action="usage-export">export CSV/);
+});
+
+test('CSV replies reduce independently of state revisions and never interrupt another screen', () => {
+  const ui = UI({ screen: 'usage', state: stateRev(12), lastRev: 12, usage: usageSample,
+    usageExport: { pending: true } });
+  const exported = { path: '/fake/Downloads/export.csv', rows: 2 };
+  let out = reduceReply(ui, { ok: true, usage_export: exported });
+  assert.deepEqual(out.usageExport, { path: exported.path });
+  assert.equal(out.render, true); assert.equal(out.screen, 'usage');
+  assert.equal(out.lastRev, 12); assert.equal(out.state, ui.state); assert.equal(out.usage, usageSample);
+  out = reduceReply({ ...out, usageExport: { pending: true } }, { ok: false, usage_export_error: 'could not export' });
+  assert.deepEqual(out.usageExport, { error: 'could not export' });
+  assert.equal(out.render, true); assert.equal(out.flash, null); assert.equal(out.lastRev, 12);
+  for (const reply of [{ ok: true, usage_export: exported }, { ok: false, usage_export_error: 0 }]) {
+    out = reduceReply({ ...ui, screen: 'add', add: mkAdd() }, reply);
+    assert.equal(out.screen, 'add'); assert.equal(out.render, false);
+    assert.deepEqual(out.usageExport, reply.ok ? { path: exported.path } : { error: '0' });
+  }
+  out = reduceReply(ui, { ok: true });
+  assert.equal(out.usageExport, ui.usageExport); assert.equal(out.render, false);
+});
+
+test('CSV click sends once, completes after state-free replies, retries failures, and ignores other screens', () => {
+  const app = keyApp();
+  const requests = () => app.sent.filter((m) => m.action === 'usage_export');
+  app.click({ action: 'usage-export' });
+  app.click({ action: 'usage' });
+  app.click({ action: 'usage-export' });
+  assert.equal(requests().length, 0);
+  app.window.AGL.result({ ok: true, usage_history: usageSample });
+  app.click({ action: 'usage-export' });
+  assert.deepEqual(JSON.parse(JSON.stringify(requests())), [{ action: 'usage_export' }]);
+  assert.match(app.root.innerHTML, /data-action="usage-export" disabled>exporting…/);
+  app.click({ action: 'usage-export' });
+  assert.equal(requests().length, 1);
+  app.window.AGL.result({ ok: true, state: stateRev(5) });
+  assert.match(app.root.innerHTML, /data-action="usage-export" disabled>exporting…/);
+  app.window.AGL.result({ ok: false, usage_export_error: 'Could not export usage' });
+  assert.match(app.root.innerHTML, /Could not export usage/);
+  assert.match(app.root.innerHTML, /data-action="usage-export">export CSV/);
+  app.click({ action: 'usage-export' });
+  assert.equal(requests().length, 2);
+  assert.doesNotMatch(app.root.innerHTML, /Could not export usage/);
+  app.window.AGL.result({ ok: true, usage_export: { path: '/fake/Downloads/token-usage.csv', rows: 42 } });
+  assert.match(app.root.innerHTML, /saved to Downloads · token-usage\.csv/);
+  assert.match(app.root.innerHTML, /data-action="usage-export">export CSV/);
+  for (const screen of ['main', 'settings']) {
+    app.click({ action: screen === 'main' ? 'usage-back' : 'settings' });
+    const before = app.root.innerHTML;
+    app.click({ action: 'usage-export' });
+    assert.equal(requests().length, 2); assert.equal(app.root.innerHTML, before);
+    app.window.AGL.result({ ok: false, usage_export_error: 'late export error' });
+    assert.equal(app.root.innerHTML, before);
+    app.window.AGL.result({ ok: true, usage_export: { path: '/fake/Downloads/late.csv', rows: 0 } });
+    assert.equal(app.root.innerHTML, before);
+  }
+  app.click({ action: 'usage' });
+  assert.match(app.root.innerHTML, /saved to Downloads · late\.csv/);
+});
+
+test('usage icon precedes the add menu and pushes a loading screen with the exact bridge request', () => {
+  const html = buildHTML(state());
+  assert.match(html, /<button class="ibtn" data-action="usage" aria-label="token usage"><svg/);
+  assert.ok(html.indexOf('data-action="usage"') < html.indexOf('data-menu="add"'));
+  const app = keyApp();
+  app.click({ action: 'usage' });
+  assert.deepEqual(JSON.parse(JSON.stringify(app.sent.at(-1))), { action: 'usage_history' });
+  assert.match(app.root.innerHTML, /class="app set-app usage theme-dark"/);
+  assert.match(app.root.innerHTML, /reading your local logs…/);
+});
+
+test('usage stepper respects newest and oldest bounds; history is oldest first with accessible buttons', () => {
+  let html = usageHTML();
+  assert.match(html, /Nov 16 – Nov 22 · so far/);
+  assert.match(html, /calendar week, Mon–Sun · all seats/);
+  assert.match(html, /data-idx="1" aria-label="earlier week">‹/);
+  assert.match(html, /data-idx="-1" aria-label="later week" disabled/);
+  assert.equal((html.match(/class="u-col(?: u-selected)?" data-action="usage-period"/g) || []).length, 13);
+  assert.match(html, /aria-label="Nov 16 – Nov 22: 2B tokens"/);
+  const history = html.slice(html.indexOf('class="u-history"'), html.indexOf('class="u-seats"'));
+  assert.ok(history.indexOf('data-idx="12"') < history.indexOf('data-idx="0"'));
+  html = usageHTML({ idx: 12 });
+  assert.match(html, /data-idx="13" aria-label="earlier week" disabled/);
+  assert.doesNotMatch(html, / · so far/);
+  assert.match(html, /no earlier period to compare/);
+  html = usageHTML({ mode: 'month', idx: 5 });
+  assert.match(html, /June/);
+  assert.match(html, /data-idx="6" aria-label="earlier month" disabled/);
+  assert.equal((html.match(/class="u-col(?: u-selected)?" data-action="usage-period"/g) || []).length, 6);
+});
+
+test('usage basis adds normalised input, reads, writes and output exactly once', () => {
+  const payload = structuredClone(usageSample);
+  payload.calendar.week[0].by = {
+    'codex:work@example.com': { 'gpt-6.1-sol': [100, 600, 20, 50], 'gpt-6.1-mini': [5, 10, 0, 5] },
+    'claude:biz@example.com': { 'claude-opus-5-5': [10, 25, 2, 3] },
+  };
+  // 770 + 20 + 40 = 830; removing 635 reads leaves 195; output is 58.
+  for (const [basis, total] of [['all', '830'], ['fresh', '195'], ['read', '635'], ['output', '58']]) {
+    assert.equal(usageFigure(usageHTML({ basis }, payload)), total);
+    assert.match(usageHTML({ basis }, payload), new RegExp(`data-value="${basis}" aria-pressed="true"`));
+  }
+  assert.equal(usageCount([100, 600, 20, 50], 'all'), 770);
+  assert.equal(usageCount([100, 600, 20, 50], 'fresh'), 170);
+  assert.equal(usageCount([100, 600, 20, 50], 'read'), 600);
+  assert.equal(usageCount([100, 600, 20, 50], 'output'), 50);
+  assert.equal(usageFigure(usageHTML()), '2B');
+  assert.equal(usageFigure(usageHTML({ basis: 'fresh' })), '415M');
+  assert.equal(usageFigure(usageHTML({ basis: 'output' })), '131M');
+});
+
+test('usage basis buttons have compact labels and descriptive titles', () => {
+  const html = usageHTML();
+  assert.match(html, /class="u-basis" role="group" aria-label="token count"/);
+  assert.deepEqual([...html.matchAll(/data-action="usage-basis" data-value="([^"]+)" aria-pressed="([^"]+)" title="([^"]+)">([^<]+)<\/button>/g)]
+    .map((m) => m.slice(1)), [
+    ['all', 'true', 'all tokens', 'all'],
+    ['fresh', 'false', 'everything except cache reads', 'no cache reads'],
+    ['read', 'false', 'cache reads only', 'cache reads'],
+    ['output', 'false', 'output tokens only', 'output'],
+  ]);
+});
+
+test('cache reads drive the headline, delta, history, seat rows and own window panels', () => {
+  for (const mode of ['week', 'month']) {
+    const payload = structuredClone(usageSample), key = 'codex:work@example.com';
+    const by = (read) => ({ [key]: { 'gpt-6.1-sol': [100, read, 20, 50] } });
+    const periods = payload.calendar[mode];
+    for (const period of periods) period.by = {};
+    periods[0].by = by(60);
+    periods[0].by['claude:biz@example.com'] = { 'claude-opus-5-5': [900, 40, 10, 300] };
+    periods[0].prev_same_point = by(50);
+    periods[1].by = by(25);
+    periods[2].by = by(50);
+    const own = mode === 'month' ? payload.own[key].month.periods : payload.own[key].week;
+    for (const period of own) period.by = {};
+    own[0].by = by(9)[key];
+    own[1].by = by(3)[key];
+    const html = usageHTML({ mode, basis: 'read', open: key }, payload);
+    assert.equal(usageFigure(html), '100');
+    assert.match(html, new RegExp(`▲ 100% vs same point last ${mode}`));
+    assert.match(html, /<span>60%<\/span>/);
+    assert.match(html, /<span>40%<\/span>/);
+    const history = html.slice(html.indexOf('class="u-history"'), html.indexOf('class="u-seats"'));
+    assert.ok(history.includes(`${periods[0].label}: 100 tokens`));
+    assert.ok(history.includes(`${periods[1].label}: 25 tokens`));
+    assert.match(history, /height:25%/);
+    assert.match(html, /class="u-total">60<\/span>/);
+    assert.match(html, /class="u-total">40<\/span>/);
+    const panel = html.slice(html.indexOf('class="u-panel"'));
+    assert.match(panel, /<b>60<\/b>/);
+    assert.ok(panel.includes(`${own[0].label}: 9 tokens`));
+    assert.ok(panel.includes(`${own[1].label}: 3 tokens`));
+    assert.match(usageHTML({ mode, idx: 1, basis: 'read' }, payload), new RegExp(`▼ 50% vs last ${mode}`));
+  }
+});
+
+test('cache reads with zero counts render empty bars and finite comparisons', () => {
+  const payload = structuredClone(usageSample), key = 'codex:work@example.com';
+  const noReads = { 'gpt-6.1-sol': [100, 0, 20, 50] };
+  for (const periods of Object.values(payload.calendar)) for (const period of periods) {
+    period.by = { [key]: noReads };
+    period.prev_same_point = { [key]: noReads };
+  }
+  for (const seat of Object.values(payload.own)) {
+    for (const period of [...seat.week, ...(seat.month?.periods || [])]) period.by = noReads;
+  }
+  for (const mode of ['week', 'month']) {
+    const html = usageHTML({ mode, basis: 'read', open: key }, payload);
+    assert.equal(usageFigure(html), '0');
+    assert.match(html, new RegExp(`no tokens at the same point last ${mode}`));
+    assert.match(html, /class="u-bar u-tall"><\/div>/);
+    assert.match(html, /height:0%"><\/span>/);
+    assert.match(html, /class="u-total">0<\/span>/);
+    assert.match(html, /no tokens in this period/);
+    assert.doesNotMatch(html, /NaN|Infinity|style="flex:|not tracked/);
+    assert.match(usageHTML({ mode, basis: 'read' }, payload), /no seat tokens for this count/);
+    payload.calendar[mode][0].prev_same_point[key] = { 'gpt-6.1-sol': [0, 5, 0, 0] };
+    assert.match(usageHTML({ mode, basis: 'read' }, payload), new RegExp(`▼ 100% vs same point last ${mode}`));
+    payload.calendar[mode][0].by = { [key]: { 'gpt-6.1-sol': [0, 5, 0, 0] } };
+    payload.calendar[mode][0].prev_same_point = { [key]: noReads };
+    const fromZero = usageHTML({ mode, basis: 'read' }, payload);
+    assert.equal(usageFigure(fromZero), '5');
+    assert.match(fromZero, new RegExp(`no tokens at the same point last ${mode}`));
+    assert.doesNotMatch(fromZero, /NaN|Infinity/);
+  }
+});
+
+test('usage basis handler accepts cache reads and preserves the selection across updates', () => {
+  const app = keyApp();
+  app.click({ action: 'usage' });
+  app.window.AGL.result({ ok: true, usage_history: usageSample });
+  app.click({ action: 'usage-basis', value: 'read' });
+  const expected = usageFigure(usageHTML({ basis: 'read' }));
+  assert.equal(usageFigure(app.root.innerHTML), expected);
+  assert.match(app.root.innerHTML, /data-value="read" aria-pressed="true"/);
+  app.window.AGL.result({ ok: true, usage_history: usageSample });
+  assert.equal(usageFigure(app.root.innerHTML), expected);
+  app.click({ action: 'usage-mode', value: 'month' });
+  assert.equal(usageFigure(app.root.innerHTML), usageFigure(usageHTML({ mode: 'month', basis: 'read' })));
+});
+
+test('usage number formatting is compact and stable at unit boundaries', () => {
+  for (const [value, text] of [[0, '0'], [86_000, '86K'], [1_200_000, '1.2M'],
+    [412_000_000, '412M'], [2e9, '2B'], [1.4e9, '1.4B'], [999_500, '1M']]) {
+    assert.equal(fmtUsageTokens(value), text);
+  }
+});
+
+test('current usage compares with prev_same_point; older periods use the next full period', () => {
+  assert.match(usageHTML(), /▲ 9% vs same point last week/);
+  assert.match(usageHTML({ idx: 1 }), /▲ 10% vs last week/);
+  assert.match(usageHTML({ mode: 'month' }), /▲ 9% vs same point last month/);
+  const payload = structuredClone(usageSample);
+  payload.calendar.week[0].prev_same_point = { 'codex:work@example.com': { 'gpt-6.1-sol': [4e9, 0, 0, 0] } };
+  assert.match(usageHTML({}, payload), /▼ 50% vs same point last week/);
+  // A change that rounds to 0% gets no arrow (seen in the live app as "▼ 0% vs same point last week").
+  const slightlyMore = structuredClone(payload.calendar.week[0].by);
+  for (const models of Object.values(slightlyMore)) {
+    for (const counts of Object.values(models)) counts.forEach((n, i) => { counts[i] = n * 1.004; });
+  }
+  payload.calendar.week[0].prev_same_point = slightlyMore;
+  assert.match(usageHTML({}, payload), /about the same as the same point last week/);
+  assert.doesNotMatch(usageHTML({}, payload), /[▲▼] 0%/);
+  payload.calendar.week[0].prev_same_point = null;
+  assert.match(usageHTML({}, payload), /no earlier period to compare/);
+  assert.doesNotMatch(usageHTML({}, payload), /NaN|Infinity/);
+});
+
+test('usage hides zero seats, keeps an open zero seat and renders removed and unattributed rows', () => {
+  let html = usageHTML();
+  assert.doesNotMatch(html, /data-key="claude:personal@example.com"/);
+  assert.match(html, /data-key="claude:gone@example.com"/);
+  assert.match(html, /removed seat/);
+  assert.match(html, /u-seat u-unattributed/);
+  assert.match(html, /class="u-bar u-hatch"/);
+  assert.match(html, /before per-seat tracking began, or run outside ai guest list/);
+  assert.match(html, /paid per token/);
+  assert.match(html, /⚠ hit weekly limit/);
+  html = usageHTML({ open: 'claude:personal@example.com' });
+  assert.match(html, /data-key="claude:personal@example.com" aria-expanded="true"/);
+  assert.match(html, /no tokens in this period/);
+});
+
+test('seat peaks use only overlapping weekly windows, including both sides of a calendar boundary', () => {
+  const payload = structuredClone(usageSample), key = 'codex:work@example.com';
+  const p = payload.calendar.week[0];
+  payload.own[key].week = [
+    { from: p.from, to: p.to, limit_pct: 32 },
+    { from: p.from, to: p.to, limit_pct: 91 },
+    { from: p.to, to: '2026-11-30T00:00:00+01:00', limit_pct: 100 },
+  ];
+  const html = usageHTML({}, payload);
+  const row = html.match(/data-key="codex:work@example.com"[\s\S]*?<\/button>/)[0];
+  assert.match(row, /weekly limit peak 91%/);
+});
+
+test('open seats show model totals, own weekly windows, not-tracked hatches and current limit meters', () => {
+  const html = usageHTML({ open: 'claude:biz@example.com' });
+  assert.match(html, /class="u-panel"/);
+  assert.match(html, /class="u-model-row">[\s\S]*Opus 5.5<\/span><b>950M/);
+  assert.match(html, /own weekly windows \(resets/);
+  assert.match(html, /u-untracked u-hatch/);
+  assert.match(html, /aria-label="[^"]+: not tracked" title="[^"]+: extrapolated window before seat tracking"/);
+  assert.match(html, /role="meter" aria-label="current window limit used"[^>]*aria-valuenow="100"/);
+  const payload = structuredClone(usageSample);
+  payload.own['claude:biz@example.com'].week[0].approx = true; // approx alone is not unknown
+  assert.doesNotMatch(usageHTML({ open: 'claude:biz@example.com' }, payload), /Nov 14 – Nov 20: not tracked/);
+});
+
+test('month panels name billing or calendar windows and fall back to weekly when no anchor is known', () => {
+  assert.match(usageHTML({ mode: 'month', open: 'claude:biz@example.com' }), /no billing date known: weekly windows/);
+  assert.match(usageHTML({ mode: 'month', open: 'codex:work@example.com' }), /billing months \(renews on the 29th\)/);
+  assert.match(usageHTML({ mode: 'month', open: 'codex:key-sample' }), /u-window-caption">calendar months/);
+});
+
+test('usage bars have model tooltips, in-block shares only at twelve percent, and a neutral legend', () => {
+  const html = usageHTML();
+  const tall = html.match(/class="u-bar u-tall">([\s\S]*?)<\/div>/)[1];
+  assert.match(tall, /title="Opus 5.5: 990M tokens"><span>49%<\/span>/);
+  assert.match(tall, /class="u-dark-ink"/);
+  assert.doesNotMatch(tall, /<span>[1-9]%<\/span>/);
+  assert.match(html, /class="u-legend">[\s\S]*class="u-swatch"/);
+  assert.doesNotMatch(html, /\$|API prices/);
+});
+
+test('usage loading, indexing, empty and error states remain readable and escape log strings', () => {
+  assert.match(usageHTML({}, null), /u-skeleton[\s\S]*reading your local logs…/);
+  assert.match(usageHTML({}, usageIndexing), /reading history… 37%[\s\S]*2B/);
+  const empty = structuredClone(usageSample);
+  for (const ps of Object.values(empty.calendar)) for (const p of ps) p.by = {};
+  assert.match(usageHTML({}, empty), /No token usage found yet\.[\s\S]*This view reads Claude Code and Codex logs on this Mac\./);
+  assert.match(usageHTML({ error: 'try <again>' }), /couldn't read token usage[\s\S]*try &lt;again&gt;[\s\S]*data-action="usage-retry"/);
+  const hostile = structuredClone(usageSample);
+  hostile.seats[0].name = '<img src=x>';
+  hostile.models[0].label = '<script>bad</script>';
+  const html = usageHTML({}, hostile);
+  // The hostile strings must only appear escaped (exact substrings, not a tag-matching regex).
+  assert.ok(!html.includes('<img src=x>'), 'seat name rendered as markup');
+  assert.ok(!html.includes('<script>bad</script>'), 'model label rendered as markup');
+  assert.ok(html.includes('&lt;img src=x&gt;'));
+  assert.ok(html.includes('&lt;script&gt;bad&lt;/script&gt;'));
+  assert.match(html, /Read from Claude Code and Codex logs on this Mac\. Nothing is sent anywhere\./);
+});
+
+test('history replies do not require state or disturb lastRev, and late replies only refresh the cache', () => {
+  const ui = UI({ screen: 'usage', state: stateRev(12), lastRev: 12 });
+  let out = reduceReply(ui, { ok: true, usage_history: usageSample });
+  assert.equal(out.usage, usageSample);
+  assert.equal(out.lastRev, 12); assert.equal(out.state, ui.state); assert.equal(out.render, true);
+  out = reduceReply({ ...out, usageError: 'old error' }, { ok: true, usage_history: usageSample });
+  assert.equal(out.usageError, null);
+  out = reduceReply(out, { ok: false, usage_history_error: 'cannot read' });
+  assert.equal(out.usageError, 'cannot read'); assert.equal(out.lastRev, 12); assert.equal(out.render, true);
+  out = reduceReply(out, { state: stateRev(11) });
+  assert.equal(out.lastRev, 12); assert.equal(out.usage, usageSample);
+  out = reduceReply({ ...out, screen: 'add', add: mkAdd() }, { ok: true, usage_history: usageSample });
+  assert.equal(out.screen, 'add'); assert.equal(out.render, false); assert.equal(out.usage, usageSample);
+});
+
+test('usage round trip, modes, basis, periods, seat toggles, back, Esc, caching and close lifecycle', () => {
+  const app = keyApp();
+  app.window.AGL.result({ state: state({ rev: 7 }) });
+  app.click({ action: 'usage' });
+  app.window.AGL.result({ ok: true, usage_history: usageSample });
+  assert.equal(usageFigure(app.root.innerHTML), '2B');
+  app.click({ action: 'usage-period', idx: '12' });
+  app.click({ action: 'usage-seat', key: 'claude:personal@example.com' });
+  app.click({ action: 'usage-period', idx: '0' });
+  assert.match(app.root.innerHTML, /data-key="claude:personal@example.com" aria-expanded="true"/);
+  assert.match(app.root.innerHTML, /no tokens in this period/);
+  app.click({ action: 'usage-seat', key: 'claude:personal@example.com' });
+  assert.doesNotMatch(app.root.innerHTML, /data-key="claude:personal@example.com"/);
+  const bounded = app.root.innerHTML;
+  for (const idx of ['-1', '13', 'nope']) app.click({ action: 'usage-period', idx });
+  assert.equal(app.root.innerHTML, bounded);
+  app.click({ action: 'usage-period', idx: '3' });
+  assert.match(app.root.innerHTML, /Oct 26 – Nov 1/);
+  app.click({ action: 'usage-mode', value: 'month' });
+  assert.match(app.root.innerHTML, /November · so far/);
+  app.click({ action: 'usage-period', idx: '2' });
+  assert.match(app.root.innerHTML, /September/);
+  app.click({ action: 'usage-mode', value: 'week' });
+  assert.match(app.root.innerHTML, /Nov 16 – Nov 22 · so far/);
+  app.click({ action: 'usage-basis', value: 'output' });
+  assert.equal(usageFigure(app.root.innerHTML), '131M');
+  app.click({ action: 'usage-seat', key: 'claude:biz@example.com' });
+  assert.match(app.root.innerHTML, /class="u-panel"/);
+  app.window.AGL.result({ ok: true, usage_history: usageSample });
+  assert.equal(usageFigure(app.root.innerHTML), '131M');
+  assert.match(app.root.innerHTML, /class="u-panel"/);
+  app.click({ action: 'usage-seat', key: 'claude:biz@example.com' });
+  assert.doesNotMatch(app.root.innerHTML, /class="u-panel"/);
+  app.click({ action: 'usage-back' });
+  assert.match(app.root.innerHTML, /class="top"/);
+  app.click({ action: 'usage' });
+  assert.equal(app.sent.filter((m) => m.action === 'usage_history').length, 2);
+  assert.equal(usageFigure(app.root.innerHTML), '131M'); // instantly cached
+  app.handlers.keydown({ key: 'Escape' });
+  assert.match(app.root.innerHTML, /class="top"/);
+  app.click({ action: 'usage' });
+  app.window.AGL.closed();
+  assert.match(app.root.innerHTML, /class="top"/);
+});
+
+test('usage payload and state refreshes preserve the scroller and view selections', () => {
+  const body = { scrollTop: 0 };
+  const root = { innerHTML: '', querySelectorAll: () => [], firstElementChild: null,
+    querySelector: (s) => s === '.body, .set-body' ? body : null };
+  const app = keyApp({ root });
+  app.click({ action: 'usage' });
+  app.window.AGL.result({ ok: true, usage_history: usageSample });
+  app.click({ action: 'usage-mode', value: 'month' });
+  app.click({ action: 'usage-period', idx: '1' });
+  app.click({ action: 'usage-seat', key: 'codex:work@example.com' });
+  body.scrollTop = 173;
+  app.window.AGL.result({ ok: true, usage_history: usageSample });
+  assert.equal(body.scrollTop, 173);
+  assert.match(root.innerHTML, /October[\s\S]*billing months/);
+  app.window.AGL.result({ state: state({ rev: 8 }) });
+  assert.equal(body.scrollTop, 173);
+  assert.match(root.innerHTML, /October[\s\S]*billing months/);
+  app.click({ action: 'usage-back' });
+  assert.equal(body.scrollTop, 0);
+});
+
+test('usage polling has one two-second timer only while indexing and stops on completion or exit', () => {
+  const app = usageTimers({ setInterval: () => 1 });
+  app.click({ action: 'usage' });
+  assert.equal(app.timers.size, 0);
+  app.window.AGL.result({ ok: true, usage_history: usageIndexing });
+  assert.equal(app.timers.size, 1);
+  assert.equal([...app.timers.values()][0].delay, 2000);
+  app.click({ action: 'usage-basis', value: 'fresh' });
+  app.window.AGL.result({ state: state({ rev: 1 }) });
+  assert.equal(app.timers.size, 1);
+  app.tick();
+  assert.equal(app.sent.filter((m) => m.action === 'usage_history').length, 2);
+  // The next poll waits for this request's reply: an engine refresh can outlast the 2 s interval.
+  assert.equal(app.timers.size, 0, 'no new timer while a history request is in flight');
+  app.window.AGL.result({ state: state({ rev: 2 }) });
+  assert.equal(app.timers.size, 0, 'a state push does not reschedule while the request is in flight');
+  assert.equal(app.sent.filter((m) => m.action === 'usage_history').length, 2);
+  app.window.AGL.result({ ok: true, usage_history: usageIndexing });
+  assert.equal(app.timers.size, 1, 'the reply schedules the next poll');
+  app.window.AGL.result({ ok: true, usage_history: usageSample });
+  assert.equal(app.timers.size, 0);
+  for (const exit of ['back', 'esc', 'close', 'settings', 'pagehide']) {
+    app.click({ action: 'usage' });
+    app.window.AGL.result({ ok: true, usage_history: usageIndexing });
+    assert.equal(app.timers.size, 1);
+    if (exit === 'back') app.click({ action: 'usage-back' });
+    if (exit === 'esc') app.handlers.keydown({ key: 'Escape' });
+    if (exit === 'close') app.window.AGL.closed();
+    if (exit === 'settings') app.window.AGL.result({ settings_panel: true });
+    if (exit === 'pagehide') app.windowHandlers.pagehide();
+    assert.equal(app.timers.size, 0, exit);
+    if (exit !== 'pagehide') {
+      app.window.AGL.result({ ok: true, usage_history: usageIndexing });
+      assert.equal(app.timers.size, 0, 'a late reply must not restart polling');
+    }
+  }
+});
+
+test('usage errors stop polling and retry clears the error and requests history', () => {
+  const app = usageTimers();
+  app.click({ action: 'usage' });
+  app.window.AGL.result({ ok: true, usage_history: usageIndexing });
+  app.window.AGL.result({ ok: false, usage_history_error: 'local read failed' });
+  assert.equal(app.timers.size, 0);
+  assert.match(app.root.innerHTML, /local read failed/);
+  app.click({ action: 'usage-retry' });
+  assert.equal(app.sent.at(-1).action, 'usage_history');
+  assert.doesNotMatch(app.root.innerHTML, /local read failed/);
+  app.window.AGL.result({ ok: true, usage_history: usageSample });
+  assert.equal(app.timers.size, 0);
+});
+
+test('usage counts missing and short token arrays as zero for every absent component', () => {
+  for (const [tokens, all, fresh, read, output] of [
+    [undefined, 0, 0, 0, 0], [null, 0, 0, 0, 0], [[], 0, 0, 0, 0],
+    [[7], 7, 7, 0, 0], [[7, 11], 18, 7, 11, 0], [[7, 11, 13], 31, 20, 11, 0],
+    [[0, 0, 0, 17], 17, 17, 0, 17],
+  ]) {
+    assert.deepEqual(['all', 'fresh', 'read', 'output'].map((basis) => usageCount(tokens, basis)),
+      [all, fresh, read, output]);
+  }
+  const payload = structuredClone(usageSample);
+  payload.calendar.week[0].by = { 'codex:work@example.com': {
+    'gpt-6.1-sol': [7, 11, 13], 'gpt-6.1-mini': null, other: [],
+  } };
+  for (const [basis, total] of [['all', '31'], ['fresh', '20'], ['read', '11'], ['output', '0']]) {
+    assert.equal(usageFigure(usageHTML({ basis }, payload)), total);
+  }
+});
+
+test('usage token labels round across the ten-unit precision and compact-unit thresholds', () => {
+  for (const [n, expected] of [
+    [7.25, '7'], [999, '999'], [999.5, '1K'], [1_249, '1.2K'],
+    [9_949, '9.9K'], [9_950, '10K'], [10_000, '10K'], [10_449, '10K'], [10_500, '11K'],
+    [999_499, '999K'], [999_500, '1M'], [999_999, '1M'], [1_000_000, '1M'],
+    [1_249_000, '1.2M'], [10_500_000, '11M'], [1_249_000_000, '1.2B'], [10_500_000_000, '11B'],
+  ]) assert.equal(fmtUsageTokens(n), expected, String(n));
+});
+
+test('billing renewal captions use the ordinal for every possible suffix and teen exception', () => {
+  const payload = structuredClone(usageSample), key = 'codex:work@example.com';
+  for (const [day, ordinal] of [[1, '1st'], [2, '2nd'], [3, '3rd'], [4, '4th'],
+    [11, '11th'], [12, '12th'], [13, '13th'], [21, '21st'], [22, '22nd'], [23, '23rd'], [31, '31st']]) {
+    payload.own[key].month.renews_day = day;
+    const html = usageHTML({ mode: 'month', open: key }, payload);
+    assert.ok(html.includes(`billing months (renews on the ${ordinal})`), ordinal);
+  }
+});
+
+const usageHistory = (html) => html.match(/<section class="u-history"[\s\S]*?<\/section>/)[0];
+const usageTicks = (html) => [...html.match(/class="u-ticks"[^>]*>([\s\S]*?)<\/div>/)[1]
+  .matchAll(/<span>(.*?)<\/span>/g)].map((m) => m[1]);
+
+test('calendar ticks label every third week, every month, and the current column as now', () => {
+  assert.deepEqual(usageTicks(usageHistory(usageHTML())),
+    ['Aug 24', '', '', 'Sep 14', '', '', 'Oct 5', '', '', 'Oct 26', '', '', 'now']);
+  assert.deepEqual(usageTicks(usageHistory(usageHTML({ mode: 'month' }))),
+    ['Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'now']);
+  const payload = structuredClone(usageSample);
+  payload.calendar.month[0].current = false;
+  assert.deepEqual(usageTicks(usageHistory(usageHTML({ mode: 'month' }, payload))),
+    ['Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov']);
+});
+
+test('calendar columns scale to the tallest period and mark only the selected period', () => {
+  const payload = structuredClone(usageSample);
+  payload.calendar.week = payload.calendar.week.slice(0, 4);
+  for (const [i, total] of [4, 2, 1, 0].entries()) {
+    payload.calendar.week[i].by = { 'codex:work@example.com': { 'gpt-6.1-sol': [total] } };
+  }
+  const history = usageHistory(usageHTML({ idx: 1 }, payload));
+  assert.match(history, /class="u-chart" style="--columns:4"/);
+  const columns = [...history.matchAll(/<button class="(u-col[^"]*)"[^>]*data-idx="(\d+)" aria-pressed="([^"]+)"[^>]*><span class="u-stack" style="height:([^%]+)%">([\s\S]*?)<\/span><\/button>/g)];
+  assert.deepEqual(columns.map((m) => [m[1], m[2], m[3], Number(m[4])]), [
+    ['u-col', '3', 'false', 0], ['u-col', '2', 'false', 25],
+    ['u-col u-selected', '1', 'true', 50], ['u-col', '0', 'false', 100],
+  ]);
+  assert.equal(columns[0][5], '');
+  assert.match(columns[1][5], /style="flex:1;background:var\(--m3\)"/);
+  payload.calendar.week = [payload.calendar.week[2]];
+  const single = usageHistory(usageHTML({}, payload));
+  assert.match(single, /style="--columns:1"/);
+  assert.match(single, /style="height:100%"/);
+});
+
+test('period indices clamp to the edges and steppers point one period in each direction', () => {
+  assert.equal(usageFigure(buildUsage(state(), usageSample)), '2B');
+  for (const [mode, last] of [['week', 12], ['month', 5]]) {
+    for (const [requested, selected] of [[-7, 0], [1, 1], [last - 1, last - 1], [99, last]]) {
+      const html = usageHTML({ mode, idx: requested });
+      const stepper = html.match(/class="u-stepper">([\s\S]*?)<\/div>/)[1];
+      const buttons = [...stepper.matchAll(/<button[^>]+>/g)].map((m) => m[0]);
+      assert.ok(buttons[0].includes(`data-idx="${selected + 1}" aria-label="earlier ${mode}"`));
+      assert.ok(buttons[1].includes(`data-idx="${selected - 1}" aria-label="later ${mode}"`));
+      assert.equal(buttons[0].includes(' disabled'), selected === last);
+      assert.equal(buttons[1].includes(' disabled'), selected === 0);
+      assert.match(usageHistory(html), new RegExp(`class="u-col u-selected"[^>]*data-idx="${selected}" aria-pressed="true"`));
+      assert.equal(usageFigure(html), usageFigure(usageHTML({ mode, idx: selected })));
+    }
+  }
+});
+
+test('model bars, legends and panels include one token, omit zero and give slot four dark ink', () => {
+  const payload = structuredClone(usageSample), key = 'codex:work@example.com';
+  payload.calendar.week[0].by = { [key]: {
+    'claude-opus-5-5': [12], 'claude-sonnet-5-5': [87], 'gpt-6.1-sol': [0],
+    'gpt-6.1-mini': [1], 'claude-haiku-5-5': [0], other: [0],
+  } };
+  const html = usageHTML({ open: key }, payload);
+  const hero = html.match(/<section class="u-hero"[\s\S]*?<\/section>/)[0];
+  const tall = hero.match(/class="u-bar u-tall">([\s\S]*?)<\/div>/)[1];
+  assert.deepEqual([...tall.matchAll(/<i([^>]*)>/g)].map((m) => m[1].includes('class="u-dark-ink"')),
+    [false, false, true]);
+  assert.match(tall, /title="Opus 5.5: 12 tokens"><span>12%<\/span>/);
+  assert.match(tall, /title="Sonnet 5.5: 87 tokens"><span>87%<\/span>/);
+  assert.match(tall, /title="gpt-6.1-mini: 1 tokens"><\/i>/);
+  const legend = hero.match(/class="u-legend">([\s\S]*?)<\/div>/)[1];
+  assert.deepEqual([...legend.matchAll(/<\/i>([^<]+)/g)].map((m) => m[1]),
+    ['Opus 5.5', 'Sonnet 5.5', 'gpt-6.1-mini']);
+  const panel = html.match(/class="u-panel"[\s\S]*?<div class="u-own">/)[0];
+  assert.match(panel, /gpt-6.1-mini<\/span><b>1<\/b>/);
+  assert.doesNotMatch(panel, /gpt-6.1-sol|Haiku 5.5|other models/);
+});
+
+test('only unattributed seats have the unattributed class and a hatched summary bar', () => {
+  const rows = [...usageHTML().matchAll(/<article class="([^"]+)"[^>]*>([\s\S]*?)<\/article>/g)];
+  assert.ok(rows.length > 1);
+  for (const [, classes, row] of rows) {
+    const unattributed = row.includes('data-key="claude:?"');
+    assert.equal(classes, unattributed ? 'u-seat u-unattributed' : 'u-seat');
+    assert.equal(/class="u-bar u-hatch"/.test(row), unattributed);
+    assert.doesNotMatch(row, /u-tall/);
+  }
+});
+
+test('billing fallback and striped notes appear only for the windows they describe', () => {
+  const payload = structuredClone(usageSample), key = 'claude:biz@example.com';
+  assert.doesNotMatch(usageHTML({ open: key }), /no billing date known/);
+  assert.match(usageHTML({ mode: 'month', open: key }), /no billing date known: weekly windows/);
+  assert.doesNotMatch(usageHTML({ mode: 'month', open: 'codex:work@example.com' }), /no billing date known/);
+  const window = payload.own[key].week[0];
+  payload.own[key].week = [window];
+  for (const [approx, by, striped] of [
+    [false, {}, false], [true, { 'claude-opus-5-5': [1] }, false], [true, {}, true],
+  ]) {
+    Object.assign(window, { approx, by });
+    const html = usageHTML({ open: key, basis: 'output' }, payload);
+    assert.equal(html.includes('striped windows: not tracked'), striped);
+    assert.equal(html.includes('class="u-untracked u-hatch"'), striped);
+    assert.match(html, /class="u-chart" style="--columns:1"/);
+  }
+  payload.own[key].week = [];
+  const html = usageHTML({ open: key }, payload);
+  assert.match(html, /class="u-chart" style="--columns:1"><div class="u-cols"><\/div>/);
+  assert.doesNotMatch(html, /striped windows: not tracked/);
+});
+
+test('current limit meters clamp their range and preserve fractional readings while labels round', () => {
+  const payload = structuredClone(usageSample), key = 'claude:biz@example.com';
+  for (const [limit, label, clamped] of [[-4, '-4', 0], [0, '0', 0], [37.6, '38', 37.6],
+    [100, '100', 100], [124, '124', 100]]) {
+    payload.own[key].week[0].limit_pct = limit;
+    const html = usageHTML({ open: key }, payload);
+    assert.ok(html.includes(`<b>${label}% of limit</b>`));
+    assert.ok(html.includes(`role="meter" aria-label="current window limit used" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${clamped}"><i style="width:${clamped}%"`));
+  }
+  for (const limit of [null, undefined]) {
+    payload.own[key].week[0].limit_pct = limit;
+    assert.doesNotMatch(usageHTML({ open: key }, payload), /u-current-limit|role="meter"/);
+  }
+});
+
+test('month limit peaks exclude windows merely touching either boundary and include crossing windows', () => {
+  const payload = structuredClone(usageSample), key = 'codex:work@example.com';
+  const period = payload.calendar.month[0];
+  const before = '2026-10-31T00:00:00+01:00', after = '2026-12-02T00:00:00+01:00';
+  payload.own[key].week = [
+    { from: before, to: period.from, limit_pct: 100 },
+    { from: period.to, to: after, limit_pct: 100 },
+    { from: before, to: '2026-11-02T00:00:00+01:00', limit_pct: 37 },
+    { from: '2026-11-30T00:00:00+01:00', to: after, limit_pct: 83 },
+  ];
+  const row = () => usageHTML({ mode: 'month' }, payload)
+    .match(/data-key="codex:work@example.com"[\s\S]*?<\/button>/)[0];
+  assert.match(row(), /weekly limit peak 83%/);
+  assert.doesNotMatch(row(), /hit weekly limit/);
+  payload.own[key].week.pop();
+  assert.match(row(), /weekly limit peak 37%/);
+  payload.own[key].week.pop();
+  assert.match(row(), /weekly limit peak unavailable/);
+});
+
+test('usage deltas distinguish a single previous token from zero and show exact signed percentages', () => {
+  const payload = structuredClone(usageSample), key = 'codex:work@example.com';
+  const by = (n) => ({ [key]: { 'gpt-6.1-sol': [n] } });
+  const delta = (idx = 0) => usageHTML({ idx }, payload).match(/class="u-delta">([^<]+)/)[1];
+  for (const [total, previous, expected] of [
+    [2, 1, '▲ 100% vs same point last week'], [1, 2, '▼ 50% vs same point last week'],
+    [101, 100, '▲ 1% vs same point last week'], [99, 100, '▼ 1% vs same point last week'],
+    [1, 0, 'no tokens at the same point last week'],
+  ]) {
+    payload.calendar.week[0].by = by(total);
+    payload.calendar.week[0].prev_same_point = by(previous);
+    assert.equal(delta(), expected);
+  }
+  payload.calendar.week[1].by = by(1);
+  payload.calendar.week[2].by = by(0);
+  assert.equal(delta(1), 'no tokens last week');
+  payload.calendar.week[2].by = by(1);
+  assert.equal(delta(1), 'about the same as last week');
+  // One token anywhere in history is enough to show the usage UI.
+  for (const periods of Object.values(payload.calendar)) for (const period of periods) period.by = {};
+  payload.calendar.week[0].by = by(1);
+  assert.equal(usageFigure(usageHTML({}, payload)), '1');
+});
+
+test('usage theme and indexing progress reflect state, clamp percentages, and hide completed banners', () => {
+  for (const theme of ['dark', 'light']) {
+    assert.match(buildUsage(state({ settings: { theme } }), usageSample),
+      new RegExp(`class="app set-app usage theme-${theme}"`));
+  }
+  for (const mode of ['week', 'month']) {
+    const html = usageHTML({ mode });
+    assert.deepEqual([...html.matchAll(/data-action="usage-mode" data-value="([^"]+)" aria-pressed="([^"]+)"/g)]
+      .map((m) => [m[1], m[2]]), [['week', String(mode === 'week')], ['month', String(mode === 'month')]]);
+    assert.match(html, /class="set-body" aria-label="token usage history" tabindex="0"/);
+  }
+  const payload = structuredClone(usageIndexing);
+  for (const [pct, expected] of [[undefined, 0], [-5, 0], [0, 0], [37.6, 38], [124, 100]]) {
+    payload.index.pct = pct;
+    assert.ok(usageHTML({}, payload).includes(`reading history… ${expected}%`));
+  }
+  assert.doesNotMatch(usageHTML(), /class="u-index"/);
+  assert.doesNotMatch(usageHTML({ error: 'unreadable' }, payload), /class="u-index"/);
+});
+
+test('usage actions on main or settings leave cached mode, basis, period and open seat unchanged', () => {
+  for (const screen of ['main', 'settings']) {
+    for (const action of [
+      { action: 'usage-mode', value: 'month' }, { action: 'usage-basis', value: 'output' },
+      { action: 'usage-period', idx: '3' }, { action: 'usage-seat', key: 'codex:work@example.com' },
+    ]) {
+      const app = keyApp();
+      app.click({ action: 'usage' });
+      app.window.AGL.result({ ok: true, usage_history: usageSample });
+      app.click({ action: 'usage-period', idx: '1' });
+      app.click({ action: 'usage-seat', key: 'codex:work@example.com' });
+      const cached = app.root.innerHTML;
+      app.click({ action: screen === 'main' ? 'usage-back' : 'settings' });
+      const otherScreen = app.root.innerHTML, sent = app.sent.length;
+      app.click(action);
+      assert.equal(app.root.innerHTML, otherScreen, `${screen}: ${action.action}`);
+      assert.equal(app.sent.length, sent);
+      app.click({ action: 'usage' });
+      assert.equal(app.root.innerHTML, cached, `${screen}: cached ${action.action}`);
+    }
+  }
+});
+
+test('usage ignores invalid modes, bases, period indices and unknown seat keys', () => {
+  const app = keyApp();
+  app.click({ action: 'usage' });
+  // A click while the payload is still loading has no periods or seats to select.
+  const loading = app.root.innerHTML;
+  app.click({ action: 'usage-period', idx: '0' });
+  app.click({ action: 'usage-seat', key: 'missing' });
+  assert.equal(app.root.innerHTML, loading);
+  app.window.AGL.result({ ok: true, usage_history: usageSample });
+  app.click({ action: 'usage-period', idx: '2' });
+  app.click({ action: 'usage-seat', key: 'codex:work@example.com' });
+  const selected = app.root.innerHTML;
+  for (const action of [
+    ...['day', '', undefined].map((value) => ({ action: 'usage-mode', value })),
+    ...['cached', '', undefined].map((value) => ({ action: 'usage-basis', value })),
+    ...['-1', '13', '1.5', 'NaN', 'Infinity'].map((idx) => ({ action: 'usage-period', idx })),
+    ...['unknown@example.com', '', undefined].map((key) => ({ action: 'usage-seat', key })),
+  ]) {
+    app.click(action);
+    assert.equal(app.root.innerHTML, selected, JSON.stringify(action));
+  }
+  app.window.AGL.result({ state: state({ rev: 10 }) });
+  assert.equal(usageFigure(app.root.innerHTML), usageFigure(selected));
+  assert.match(app.root.innerHTML, /data-key="codex:work@example.com" aria-expanded="true"/);
+});
+
+test('Escape returns from usage and settings to main and leaves the add flow available', () => {
+  const app = keyApp();
+  app.click({ action: 'usage' });
+  app.window.AGL.result({ ok: true, usage_history: usageSample });
+  app.handlers.keydown({ key: 'Escape' });
+  assert.match(app.root.innerHTML, /class="top"/);
+  assert.doesNotMatch(app.root.innerHTML, /class="app set-app usage/);
+  app.click({ action: 'settings' });
+  assert.match(app.root.innerHTML, /data-action="settings-back"/);
+  app.handlers.keydown({ key: 'Escape' });
+  assert.match(app.root.innerHTML, /class="top"/);
+  app.click({ action: 'add' });
+  const add = app.root.innerHTML;
+  assert.match(add, /data-action="add-provider"/);
+  app.handlers.keydown({ key: 'Escape' });
+  assert.match(app.root.innerHTML, /class="top"/);
+});
+
+test('usage retry sends a fresh request even while the previous request is outstanding', () => {
+  const app = usageTimers();
+  app.click({ action: 'usage' });
+  const requests = () => app.sent.filter((m) => m.action === 'usage_history').length;
+  assert.equal(requests(), 1);
+  app.click({ action: 'usage-retry' });
+  assert.equal(requests(), 2);
+  app.window.AGL.result({ ok: true, usage_history: usageIndexing });
+  app.tick();
+  assert.equal(requests(), 3);
+  app.click({ action: 'usage-retry' });
+  assert.equal(requests(), 4);
+  app.window.AGL.result({ ok: true, usage_history: usageSample });
+  assert.equal(app.timers.size, 0);
+});
+
+test('pagehide stops the visible clock and usage polling, and never starts a hidden clock', () => {
+  let sequence = 0;
+  const intervals = new Map();
+  const app = usageTimers({
+    setInterval: (fn, delay) => { const id = ++sequence; intervals.set(id, { fn, delay }); return id; },
+    clearInterval: (id) => intervals.delete(id),
+  });
+  app.windowHandlers.pagehide();
+  assert.equal(intervals.size, 0);
+  app.window.AGL.setVisible(true);
+  assert.equal(intervals.size, 1);
+  assert.equal([...intervals.values()][0].delay, 1000);
+  app.click({ action: 'usage' });
+  app.window.AGL.result({ ok: true, usage_history: usageIndexing });
+  assert.equal(app.timers.size, 1);
+  app.windowHandlers.pagehide();
+  assert.equal(intervals.size, 0);
+  assert.equal(app.timers.size, 0);
 });

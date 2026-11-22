@@ -1655,6 +1655,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
     key_attempted = False
     key_session = None              # (thread id, source transcript, relative destination)
     rollout_source = None
+    ledger_claimed = None
     claude_before = None
     child_started = False
     key_cold_start = False
@@ -2004,7 +2005,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 state.save()
         relaunch_seat = email   # launch on the seat committed here, whatever moves active next
         if hopped:
-            mark_session(ctx.data_dir, tool, email)
+            mark_session(ctx.data_dir, tool, email, thread=_ledger_thread())
         return True
 
     # A confirmed limit with no landing seat must not kill the live child. Keep one lightweight
@@ -2104,6 +2105,25 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
         """The seat this child is billed to now: the proxy's bound seat after an in-place hop,
         else the seat it was launched on (whose own login the client holds)."""
         return _swapcall("bound") or launch_email
+
+    def _ledger_thread() -> str | None:
+        if tool == "claude":
+            return resume_thread
+        if rollout_source is not None and rollout_source.unambiguous:
+            thread = rollout_source.meta.get("id")
+            if isinstance(thread, str) and thread:
+                return thread
+        return exec_thread or resume_thread
+
+    def _ledger_attach() -> None:
+        nonlocal ledger_claimed
+        thread = _ledger_thread()
+        if thread and thread != ledger_claimed:
+            try:
+                session_mod.claim_thread(ctx.data_dir, tool, thread)
+                ledger_claimed = thread
+            except OSError:
+                pass
 
     def _home() -> str | None:
         """The seat this child was launched on (its own login), once there is a child."""
@@ -2256,6 +2276,11 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             candidates = [(path, meta) for path, meta in candidates if meta.get("cwd") == os.getcwd()]
             if len(candidates) == 1:
                 resume_thread = candidates[0][1].get("sessionId")
+                if resume_thread:
+                    try:
+                        session_mod.claim_thread(ctx.data_dir, tool, resume_thread)
+                    except OSError:
+                        pass
             return bool(resume_thread)
 
         def _claude_resumable() -> bool:
@@ -2422,7 +2447,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
             tick["blocked"] = False
             tick["blocked_until"] = 0.0
             try:   # the hop is done; bookkeeping that fails must not undo it
-                mark_session(ctx.data_dir, tool, target, home=launch_email)
+                mark_session(ctx.data_dir, tool, target, home=launch_email, thread=_ledger_thread())
                 if note is None:
                     note = (f"{frm} needs a rest 💤 — {target} takes over, same session, no "
                             f"restart ✨" if frm else f"{tool}: now on {target}, same session, "
@@ -2778,6 +2803,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 notify(f"{key_seat['label']} is taking the floor ✨ — {key_runtime.model}, paid per token; "
                        + ("your work's coming with you" if key_session else "ready for your work"))
                 mark_session(ctx.data_dir, tool, key_runtime.seat_id,
+                             thread=key_session[0] if key_session else resume_thread,
                              **({"pin": pin, "key_seat": key_seat} if pin else {}))
                 source = None
                 if tool == "codex":
@@ -2787,7 +2813,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 reported = False
 
                 def key_tick():
-                    nonlocal reported
+                    nonlocal reported, ledger_claimed
                     # The existing PTY heartbeat owns this stop too, including silent children.
                     # Return through its normal SIGTERM/flush path; keep the private session home.
                     if not ctx.load_state().settings()["key_fallback"]:
@@ -2800,6 +2826,14 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     # Paid children (including pins) never enter subscription recovery or manual
                     # switch decisions. Freeing or selecting a subscription cannot move this child.
                     signals = source.poll() if source is not None else ()
+                    if source is not None and source.unambiguous and source.meta.get("id"):
+                        thread = source.meta["id"]
+                        if thread != ledger_claimed:
+                            try:
+                                session_mod.claim_thread(ctx.data_dir, tool, thread)
+                                ledger_claimed = thread
+                            except OSError:
+                                pass
                     if not reported and any(sig.kind == "limit" for sig in signals):
                         notify(f"{tool}: {key_runtime.model}'s paid-per-token seat reported a limit "
                                f"— your session is still here")
@@ -2851,7 +2885,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 # Keep the child's actual credentials and its recorded launch seat together.
                 _activate_home(launch_email)
             if launch_email:
-                mark_session(ctx.data_dir, tool, launch_email)
+                mark_session(ctx.data_dir, tool, launch_email, thread=_ledger_thread())
             # ``reason`` is set ONLY for a fully approved stop. ``handled`` also covers matches that
             # deliberately leave this child alive, preventing the post-exit safety net from turning
             # that same banner into a re-derived hop after the child later exits on its own.
@@ -3180,7 +3214,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                         st.save()
                 if to != launch_email:
                     inplace["hops"] += 1   # a third seat, chosen by the swap: still a hop
-                mark_session(ctx.data_dir, tool, to, home=launch_email)
+                mark_session(ctx.data_dir, tool, to, home=launch_email, thread=_ledger_thread())
                 notify(f"{frm}'s login here is running out — {to} takes over, same session ✨")
 
             def _tick_swap() -> bool:
@@ -3316,7 +3350,13 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                         return False
                     if answer == "withdrawn":
                         return False  # withdrawing paid consent must not stop a subscription child
-                for sig in (rollout_source.poll() if rollout_source is not None else ()):
+                signals = rollout_source.poll() if rollout_source is not None else ()
+                if tool == "codex":
+                    if exec_job is not None:
+                        _exec_thread_known()
+                    else:
+                        _ledger_attach()
+                for sig in signals:
                     if sig.kind == "healthy":
                         tick["healthy_at"] = time.monotonic()
                         continue
@@ -3788,7 +3828,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                     resuming = True
                     continue
                 relaunch_seat = target
-                mark_session(ctx.data_dir, tool, target)
+                mark_session(ctx.data_dir, tool, target, thread=_ledger_thread())
                 notify(f"{tool}: switching to {target}, resuming your work")
                 resuming = True
                 continue
@@ -3857,7 +3897,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                                 switched = True
                     if switched:
                         relaunch_seat = dec.email
-                        mark_session(ctx.data_dir, tool, dec.email)
+                        mark_session(ctx.data_dir, tool, dec.email, thread=_ledger_thread())
                         why = ("is no longer entitled" if exit_revoked else "hit its usage limit")
                         notify(f"{active} {why} — hopping to {dec.email}, "
                                f"resuming your work ✨")
@@ -3912,7 +3952,7 @@ def run(ctx: Context, tool: str, args: list, *, spawn: SpawnFn = pty_spawn,
                 notify(f"{tool} {handoff_blocked}")
                 return status
             relaunch_seat = hit["email"]   # launch on the seat committed, whatever moves next
-            mark_session(ctx.data_dir, tool, hit["email"])
+            mark_session(ctx.data_dir, tool, hit["email"], thread=_ledger_thread())
             reason_msg = (
                 "needs you to sign in again 🔑" if hit["reason"] == "auth"
                 else ("is no longer entitled" if hit["reason"] == "revoked" else "needs a rest 💤")

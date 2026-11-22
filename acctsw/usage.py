@@ -1389,6 +1389,7 @@ def store_fetch(state, tool: str, email: str, u: Usage, at=None, *,
     at = at if at is not None else now()
     prev_usage = (state.get_seat(tool, email) or {}).get("usage") or {}
     d = u.to_dict()
+    new_subscription = False
     if u.ok:
         # Bind handoff decisions to the credentials authenticated by this reading.
         d["credential_digest"] = _credential_digest(blob)
@@ -1412,7 +1413,20 @@ def store_fetch(state, tool: str, email: str, u: Usage, at=None, *,
                 seat["plan"] = accounts.plan_of(tool, blob)
                 seat["account_id"] = account_fingerprint(tool, blob)
                 seat["workspace_id"] = new_workspace
-                if old_workspace and new_workspace and old_workspace != new_workspace:
+                if tool == "codex":
+                    # The poll already holds this blob. History never reads Keychain.
+                    from .util import jwt_payload, parse_iso
+                    try:
+                        tokens = json.loads(blob).get("tokens") or {}
+                        auth = jwt_payload(tokens.get("id_token", "")).get("https://api.openai.com/auth") or {}
+                        anchor = (auth.get("chatgpt_subscription_active_until")
+                                  or auth.get("chatgpt_subscription_active_start"))
+                        if isinstance(anchor, str) and parse_iso(anchor) is not None:
+                            seat["billing"] = {"renews_at": anchor, "source": "codex_token"}
+                    except (ValueError, TypeError, AttributeError):
+                        pass
+                new_subscription = bool(old_workspace and new_workspace and old_workspace != new_workspace)
+                if new_subscription:
                     # Same email, different provider account means cancellation/re-subscription or
                     # a workspace move. Old rests and auth backoff belong to the old subscription.
                     state.set_limited_until(tool, email, None)
@@ -1421,6 +1435,9 @@ def store_fetch(state, tool: str, email: str, u: Usage, at=None, *,
                     state.data["moved_note"] = (
                         f"new {tool} subscription detected for {email} — saved limits were reset"
                     )
+        if not d.get("plan_type") and not new_subscription:
+            # Same subscription, reading without a plan: keep the plan token history attributes by.
+            d["plan_type"] = prev_usage.get("plan_type")
         state.set_usage(tool, email, d)
         _apply_limit(state, tool, email, u, at, trust_reactive_lag=trust_reactive_lag)
     else:
@@ -1428,6 +1445,8 @@ def store_fetch(state, tool: str, email: str, u: Usage, at=None, *,
         # separate so backoff still works while the renderer can age the data actually on screen.
         d["windows"] = prev_usage.get("windows", d["windows"])
         d["reported_windows"] = prev_usage.get("reported_windows", d["reported_windows"])
+        # The plan is identity, not a live reading: token history attributes Codex turns by it.
+        d["plan_type"] = prev_usage.get("plan_type", d["plan_type"])
         if prev_usage.get("stale") and "last_attempted_at" not in prev_usage:
             # Pre-fix stale records used fetched_at for the failed attempt, not the retained windows;
             # there is no honest success age to recover, so treat them as never successfully fetched.

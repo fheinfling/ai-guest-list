@@ -1480,3 +1480,19 @@ def test_a_blip_does_not_erase_a_refused_subscription(ctx, blip, verdict, status
               get=fake_get({P.CODEX_USAGE_URL: (200, codex_ok_body())}))
     stored = state.get_seat("codex", email)["usage"]
     assert stored["error"] is None and stored["ok"] is True and "transient_error" not in stored
+
+
+@pytest.mark.parametrize("tool,anchor", [("codex", None), ("codex", 42), ("codex", "invalid"),
+    ("codex", "2026-11-14T20:00:00Z"), ("claude", "2026-11-14T20:00:00Z")])
+def test_store_fetch_billing_requires_valid_codex_anchor(ctx, tool, anchor):
+    import base64
+    email = "fake@example.test"
+    state = ctx.load_state()
+    state.data["tools"][tool]["accounts"][email] = {}
+    claims = {"https://api.openai.com/auth": {"chatgpt_subscription_active_until": anchor}}
+    jwt = "." + base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=") + "."
+    blob = json.dumps({"tokens": {"id_token": jwt}})
+    U.store_fetch(state, tool, email, U.Usage(ok=True), blob=blob)
+    billing = state.get_seat(tool, email).get("billing")
+    assert billing == ({"renews_at": anchor, "source": "codex_token"}
+                       if tool == "codex" and isinstance(anchor, str) and anchor != "invalid" else None)

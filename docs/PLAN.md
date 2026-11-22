@@ -47,6 +47,8 @@
 ├── clh/<8-hex-sha256>/        # 0700: per-seat Claude homes (CLAUDE_CONFIG_DIR)
 │   ├── .claude.json           #   per-seat identity/caches + 3-way merged shared preferences
 │   └── projects, skills, ...  #   symlinks to shared ~/.claude/<entry>
+├── usage.sqlite               # 0600 (+ WAL/SHM files): token-usage index (counts per hour × seat × model, file offsets)
+├── seat-ledger.jsonl          # 0600: append-only session/thread → seat binds for usage attribution
 ├── session-<tool>-<pid>.json   # 0600: live supervised session records
 ├── session-<tool>.json         # 0600: legacy session record
 ├── thread-<tool>-<pid>.json    # 0600: claimed thread ID
