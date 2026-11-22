@@ -78,6 +78,9 @@ def test_engine_payload_matches_the_ui_fixture_shape(ctx, monkeypatch):
     own_theirs = next(iter(sample["own"].values()))
     assert set(own_mine) == set(own_theirs)
     assert set(own_mine["week"][0]) == set(own_theirs["week"][0])
+    assert len(own_mine["week"]) == 1
+    assert own_mine["week"][0]["approx"] is False
+    assert own_mine["week"][0]["limit_pct"] == 40
     # The engine's Claude month anchors need a profile file; with none it reports null, which the UI
     # must accept (its fallback note). Any non-null month must match the sample's keys.
     month = own_mine["month"]

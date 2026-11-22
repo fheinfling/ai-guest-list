@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import bisect
 import calendar
+import csv
 import hashlib
 import json
 import math
@@ -14,8 +15,9 @@ import os
 import re
 import sqlite3
 import threading
+import tempfile
 import time
-from datetime import date, datetime, time as daytime, timedelta
+from datetime import date, datetime, time as daytime, timedelta, timezone
 from pathlib import Path
 
 from . import rollout, seatledger
@@ -467,29 +469,21 @@ def _own_weeks(db, seat, now, calendar_bounds):
             merged.append((end, peak))
     if not merged:
         return [(a, b, True, None) for a, b in calendar_bounds["week"]]
-    at = now.timestamp()
-    end = min((end for end, _ in merged if at < end <= at + _WEEK), default=None)
-    if end is None:
-        anchor = min(merged, key=lambda row: abs(row[0] - at))[0]
-        end = anchor + (math.floor((at - anchor) / _WEEK) + 1) * _WEEK
-
-    def snap(value):
-        closest = min(merged, key=lambda row: abs(row[0] - value))
-        return closest[0] if abs(closest[0] - value) <= 12 * 3600 else value
-
-    ends = [end]
-    for _ in range(13):
-        ends.append(snap(ends[-1] - _WEEK))
-    observed = {end: peak for end, peak in merged}
-    return [(datetime.fromtimestamp(ends[i+1]).astimezone(), datetime.fromtimestamp(ends[i]).astimezone(),
-             ends[i] not in observed or ends[i+1] not in observed,
-             observed.get(ends[i]) if seat["kind"] != "key" else None) for i in range(13)]
+    periods = []
+    previous = None
+    for end, peak in merged:
+        start = end - _WEEK
+        if previous is not None:
+            start = max(start, previous)
+        periods.append((datetime.fromtimestamp(start).astimezone(),
+                        datetime.fromtimestamp(end).astimezone(), False,
+                        peak if seat["kind"] != "key" else None))
+        previous = end
+    return periods[-13:][::-1]
 
 
-def history(ctx) -> dict:
-    now = _now()
-    bounds = _calendar_bounds(now)
-    state = ctx.load_state()
+def _history_seats(state, used):
+    """Seat metadata shared by the history view and the full CSV export."""
     seats, raw_seats = [], {}
     for tool in ("codex", "claude"):
         for email, raw in state.accounts(tool).items():
@@ -501,20 +495,27 @@ def history(ctx) -> dict:
             if raw.get("harness") == tool:
                 seats.append(dict(key=tool + ":" + raw["id"], tool=tool,
                                   name=raw.get("label") or raw["id"], plan="api key", kind="key"))
+    known = {seat["key"] for seat in seats}
+    for key in used:
+        if key not in known and not key.endswith(":?"):
+            tool, email = key.split(":", 1)
+            seats.append(dict(key=key, tool=tool, name=email, plan="", kind="removed"))
+    for tool in ("codex", "claude"):
+        if tool + ":?" in used:
+            seats.append(dict(key=tool + ":?", tool=tool, name="account unknown", plan="",
+                              kind="unattributed",
+                              note="before per-seat tracking began, or run outside ai guest list"))
+    return seats, raw_seats
+
+
+def history(ctx) -> dict:
+    now = _now()
+    bounds = _calendar_bounds(now)
     db = _connect(ctx)
     try:
         db.execute("BEGIN")  # one consistent WAL snapshot while a background refresh commits
-        known = {seat["key"] for seat in seats}
         used = [row[0] for row in db.execute("SELECT DISTINCT seat FROM usage ORDER BY seat")]
-        for key in used:
-            if key not in known and not key.endswith(":?"):
-                tool, email = key.split(":", 1)
-                seats.append(dict(key=key, tool=tool, name=email, plan="", kind="removed"))
-        for tool in ("codex", "claude"):
-            if tool + ":?" in used:
-                seats.append(dict(key=tool + ":?", tool=tool, name="account unknown", plan="",
-                                  kind="unattributed",
-                                  note="before per-seat tracking began, or run outside ai guest list"))
+        seats, raw_seats = _history_seats(ctx.load_state(), used)
         own_bounds = {}
         for seat in seats:
             if seat["kind"] != "unattributed":
@@ -579,3 +580,59 @@ def history(ctx) -> dict:
                     for kind, periods in bounds.items()}, "own": own}
     finally:
         db.close()
+
+
+def _csv_text(value):
+    return "'" + value if value.startswith(("=", "+", "-", "@", "\t", "\r")) else value
+
+
+def export_csv(ctx, directory) -> Path:
+    """Export the complete indexed history without scanning or refreshing any logs."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    db = _connect(ctx)
+    temporary = None
+    try:
+        db.execute("BEGIN")
+        used = [row[0] for row in db.execute("SELECT DISTINCT seat FROM usage ORDER BY seat")]
+        seats, _ = _history_seats(ctx.load_state(), used)
+        metadata = {seat["key"]: seat for seat in seats}
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="", dir=directory,
+                                         prefix=".token-usage-", delete=False) as stream:
+            temporary = Path(stream.name)  # NamedTemporaryFile creates the file with mode 0600.
+            # Quote text so embedded CRs remain inside a cell even with LF record endings.
+            writer = csv.writer(stream, lineterminator="\n", quoting=csv.QUOTE_NONNUMERIC)
+            writer.writerow(("hour_start_local", "hour_start_utc", "tool", "seat", "seat_kind",
+                             "seat_key", "model", "input_tokens", "cache_read_tokens",
+                             "cache_write_tokens", "output_tokens", "total_tokens"))
+            for hour, tool, key, model, *counts in db.execute(
+                    "SELECT hour,tool,seat,model,input,cache_read,cache_write,output FROM usage"
+                    " ORDER BY hour,tool,seat,model"):
+                if not any(counts):
+                    continue
+                at = datetime.fromtimestamp(hour * 3600, timezone.utc)
+                seat = metadata[key]
+                writer.writerow([_csv_text(value) for value in (
+                    at.astimezone().isoformat(), at.isoformat().replace("+00:00", "Z"),
+                    tool, seat["name"], seat["kind"], key, model)] + counts + [sum(counts)])
+        stem = "token-usage-" + _now().date().isoformat()
+        number = 1
+        while True:
+            path = directory / (stem + (f" ({number})" if number > 1 else "") + ".csv")
+            try:
+                # Reserve the name exclusively, including against other exporting processes.
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                number += 1
+                continue
+            os.close(fd)
+            try:
+                os.replace(temporary, path)
+            except Exception:
+                path.unlink()
+                raise
+            return path
+    finally:
+        db.close()
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)

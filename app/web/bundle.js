@@ -283,14 +283,15 @@ function addUsesPaste(add) { return add.method === "token" && add.provider === "
 // PURE reducer for a bridge reply → next UI state + effects. All the async-correlation logic that
 // kept regressing (stale replies, poll ordering, save-in-flight, login-launch failure) lives here so
 // it can be unit-tested without a DOM. app.mjs owns the effects (render/flash/celebrate/timer).
-//   ui  = { screen, add, lastRev, state, usage, usageError }
+//   ui  = { screen, add, lastRev, state, usage, usageError, usageExport }
 //         (add may be null; add is mutated in place and returned)
 //   res = the bridge result object
-// returns { screen, add, lastRev, state, usage, usageError, render, flash, celebrate, closeFlow }
+// returns { screen, add, lastRev, state, usage, usageError, usageExport, render, flash, celebrate, closeFlow }
 //   closeFlow: the add object whose "done" screen should auto-close after a delay, or null.
 function reduceReply(ui, res) {
   let { screen, add, lastRev, state } = ui;
   let usage = ui.usage ?? null, usageError = ui.usageError ?? null;
+  let usageExport = ui.usageExport ?? null;
   let render = false, flash = null, celebrate = false, closeFlow = null;
 
   // Native "open settings" — but never interrupt an in-flight save (its reply would land off-screen).
@@ -347,6 +348,14 @@ function reduceReply(ui, res) {
     usageError = String(res.usage_history_error);
     if (screen === "usage") render = true;
   }
+  if (res.usage_export) {
+    usageExport = { path: res.usage_export.path };
+    if (screen === "usage") render = true;
+  }
+  if (res.usage_export_error != null) {
+    usageExport = { error: String(res.usage_export_error) };
+    if (screen === "usage") render = true;
+  }
 
   // Toast a user-action error, but not a background poll blip, nor an add-op error that isn't for the
   // current flow (a stale/other-tool one would pop over main/settings or the wrong add out of nowhere).
@@ -355,7 +364,7 @@ function reduceReply(ui, res) {
   if (res.update_check && !res.background) flash = updateCheckFlash(res.update_check);
   if (res.celebrate) celebrate = true;
 
-  return { screen, add, lastRev, state, usage, usageError, render, flash, celebrate, closeFlow };
+  return { screen, add, lastRev, state, usage, usageError, usageExport, render, flash, celebrate, closeFlow };
 }
 
 function addProviderStep() {
@@ -637,8 +646,10 @@ function buildUsage(state, usage, view = {}) {
       <section class="u-history" aria-label="calendar history"><h2>last ${periods.length} ${mode}s · all seats</h2>${usageColumns(periods, usage.models, view.basis, idx, false, mode)}</section>
       <section class="u-seats" aria-label="usage by seat"><h2><span>by seat</span><span>tap for history</span></h2>${usage.seats.map((s) => usageSeat(s, period, usage, view)).join("") || '<p class="u-no-seats">no seat tokens for this count</p>'}</section>`;
   }
+  const exported = view.export;
+  const exportMessage = exported?.error || (exported?.path ? `saved to Downloads · ${exported.path.split("/").pop()}` : "");
   return `<div class="app set-app usage theme-${state?.settings?.theme === "dark" ? "dark" : "light"}"><header class="set-head"><button class="set-back" data-action="usage-back" aria-label="back">‹</button><h1 class="set-title">usage</h1><div class="u-mode" role="group" aria-label="period">${["week", "month"].map((m) => `<button data-action="usage-mode" data-value="${m}" aria-pressed="${mode === m}">${m}</button>`).join("")}</div></header>
-    <div class="set-body" aria-label="token usage history" tabindex="0">${usage?.index?.done === false && !view.error ? `<p class="u-index" role="status">reading history… ${Math.max(0, Math.min(100, Math.round(usage.index.pct || 0)))}%</p>` : ""}${content}<p class="u-note">Read from Claude Code and Codex logs on this Mac. Nothing is sent anywhere.</p></div></div>`;
+    <div class="set-body" aria-label="token usage history" tabindex="0">${usage?.index?.done === false && !view.error ? `<p class="u-index" role="status">reading history… ${Math.max(0, Math.min(100, Math.round(usage.index.pct || 0)))}%</p>` : ""}${content}<footer class="u-note"><p>Read from Claude Code and Codex logs on this Mac. Nothing is sent anywhere.</p><button class="u-export" data-action="usage-export"${!usage || exported?.pending ? " disabled" : ""}>${exported?.pending ? "exporting…" : "export CSV"}</button>${exportMessage ? `<p class="u-export-message" role="status">${esc(exportMessage)}</p>` : ""}</footer></div></div>`;
 }
 
 // Settings sub-view (spec §9.1) — a full-panel pushed screen, NOT a modal. Renders into #root in
@@ -1337,11 +1348,12 @@ window.AGL = {
       // applies its decisions to the module state + DOM. The add sub-view holds unsaved typed input,
       // so a pure state push updates `state` without a DOM swap or focus/caret theft, except when
       // a completed browser sign-in advances the connecting step to done.
-      const out = reduceReply({ screen, add, lastRev, state, usage, usageError: usageView.error }, res);
+      const out = reduceReply({ screen, add, lastRev, state, usage, usageError: usageView.error, usageExport: usageView.export }, res);
       const inKeyFlow = screen === "add-key";
       if (inKeyFlow || screen === "paid-key") out.screen = screen; // keep the current input/confirmation
       screen = out.screen; add = out.add; lastRev = out.lastRev; state = out.state;
       usage = out.usage; usageView.error = out.usageError;
+      usageView.export = out.usageExport;
       if (res.usage_history || res.usage_history_error != null) usageInflight = false;
       syncUsagePolling();
       // The click is answered once the engine reports progress (or failure) in a newer snapshot.
@@ -1866,6 +1878,9 @@ document.addEventListener("click", (e) => {
       // An explicit open/retry never waits on a reply that may have been lost.
       screen = "usage"; usageView.error = null; usageInflight = false; render(); requestUsage(); break;
     case "usage-back": screen = "main"; render(); break;
+    case "usage-export":
+      if (screen !== "usage" || !usage || usageView.export?.pending) break;
+      usageView.export = { pending: true }; render(); send("usage_export"); break;
     case "usage-retry":
       usageView.error = null; usageInflight = false; render(); requestUsage(); break;
     case "usage-mode":

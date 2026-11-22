@@ -58,11 +58,12 @@ window.AGL = {
       // applies its decisions to the module state + DOM. The add sub-view holds unsaved typed input,
       // so a pure state push updates `state` without a DOM swap or focus/caret theft, except when
       // a completed browser sign-in advances the connecting step to done.
-      const out = reduceReply({ screen, add, lastRev, state, usage, usageError: usageView.error }, res);
+      const out = reduceReply({ screen, add, lastRev, state, usage, usageError: usageView.error, usageExport: usageView.export }, res);
       const inKeyFlow = screen === "add-key";
       if (inKeyFlow || screen === "paid-key") out.screen = screen; // keep the current input/confirmation
       screen = out.screen; add = out.add; lastRev = out.lastRev; state = out.state;
       usage = out.usage; usageView.error = out.usageError;
+      usageView.export = out.usageExport;
       if (res.usage_history || res.usage_history_error != null) usageInflight = false;
       syncUsagePolling();
       // The click is answered once the engine reports progress (or failure) in a newer snapshot.
@@ -587,6 +588,9 @@ document.addEventListener("click", (e) => {
       // An explicit open/retry never waits on a reply that may have been lost.
       screen = "usage"; usageView.error = null; usageInflight = false; render(); requestUsage(); break;
     case "usage-back": screen = "main"; render(); break;
+    case "usage-export":
+      if (screen !== "usage" || !usage || usageView.export?.pending) break;
+      usageView.export = { pending: true }; render(); send("usage_export"); break;
     case "usage-retry":
       usageView.error = null; usageInflight = false; render(); requestUsage(); break;
     case "usage-mode":

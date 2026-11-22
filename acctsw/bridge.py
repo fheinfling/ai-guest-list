@@ -8,8 +8,10 @@ from __future__ import annotations
 
 from .util import email_key
 
+import csv
 import hashlib
 import logging
+from pathlib import Path
 import threading
 from typing import Any
 
@@ -500,6 +502,16 @@ def _take_signin_notices(ctx: Context) -> list[dict[str, str]]:
 def handle(ctx: Context, message: dict) -> dict[str, Any]:
     action = (message or {}).get("action")
     try:
+        if action == "usage_export":
+            try:
+                from . import tokenlog  # keep sqlite3 optional at app launch
+                path = tokenlog.export_csv(ctx, message.get("directory") or Path.home() / "Downloads")
+                with path.open(encoding="utf-8", newline="") as stream:
+                    rows = sum(1 for _ in csv.reader(stream)) - 1
+                return {"ok": True, "usage_export": {"path": str(path), "rows": rows}}
+            except Exception:
+                return {"ok": False, "usage_export_error": "Could not export usage"}
+
         if action == "usage_history":
             try:
                 from . import tokenlog  # needs sqlite3: a failed import is a view error, not a crash

@@ -146,6 +146,7 @@ def test_engine_warnings_dedupe_identities_and_only_toast_hard_notices():
     ("adopt_engine", "adoptEngineBg_"), ("update_check", "updateCheckBg_"),
     ("update_install", "updateInstallBg_"), ("switch", "switchBg_"),
     ("usage_history", "usageHistoryBg_"),
+    ("usage_export", "usageExportBg_"),
 ])
 def test_script_dispatch_runs_blocking_actions_in_background(action, handler):
     dispatched = []

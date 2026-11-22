@@ -3803,6 +3803,109 @@ test('usage fixtures cover thirteen weeks, six months and both indexing states',
   assert.ok(usageSample.own['claude:biz@example.com'].week.some((p) => p.approx && !Object.keys(p.by).length));
 });
 
+test('observed own windows render one through thirteen columns and find irregular past peaks', () => {
+  const payload = structuredClone(usageSample), key = 'codex:work@example.com';
+  const now = Date.parse(payload.generated_at), day = 86400000;
+  const windows = [-11.02, -3.59, 4.05].map((days, i) => {
+    const end = now + days * day, start = end - 7 * day;
+    return { from: new Date(start).toISOString(), to: new Date(end).toISOString(),
+      label: `observed ${i}`, current: start <= now && now < end, approx: false,
+      limit_pct: [91, 73, 42][i], by: { 'gpt-6.1-sol': [10, 20, 30, 40] } };
+  }).reverse();
+  payload.own[key].week = windows;
+  // A past calendar week intersects the oldest observation, which the old grid lost.
+  payload.calendar.week[2].by = { [key]: { 'gpt-6.1-sol': [1, 2, 3, 4] } };
+  const html = usageHTML({ idx: 2, open: key }, payload);
+  const row = html.match(/data-key="codex:work@example.com"[\s\S]*?<\/button>/)[0];
+  assert.match(row, /weekly limit peak 91%/);
+  assert.doesNotMatch(row, /peak unavailable/);
+  for (let count = 1; count <= 13; count++) {
+    payload.own[key].week = Array.from({ length: count }, (_, i) => ({ ...windows[i % 3], label: `window ${i}` }));
+    const panel = usageHTML({ open: key }, payload).split('<div class="u-own">')[1].split('</article>')[0];
+    assert.ok(panel.includes(`class="u-chart" style="--columns:${count}"`));
+    assert.equal([...panel.matchAll(/class="u-col" role="img"/g)].length, count);
+    assert.ok(panel.indexOf(`aria-label="window ${count - 1}:`) <= panel.indexOf('aria-label="window 0:'));
+    assert.doesNotMatch(panel, /striped windows|not tracked|NaN|Infinity/);
+  }
+  payload.own[key].week = windows.map((w) => ({ ...w, current: false }));
+  const gap = usageHTML({ open: key }, payload).split('<div class="u-own">')[1];
+  assert.doesNotMatch(gap, /own weekly windows \(resets|u-current-limit/);
+});
+
+test('CSV footer disables without a payload, shows progress, and escapes only the saved basename', () => {
+  assert.match(usageHTML({}, null), /data-action="usage-export" disabled>export CSV<\/button>/);
+  assert.match(usageHTML(), /data-action="usage-export">export CSV<\/button>/);
+  assert.match(usageHTML({ export: { pending: true } }), /data-action="usage-export" disabled>exporting…<\/button>/);
+  const saved = usageHTML({ export: { path: '/private/fake-secret/Downloads/<saved>&".csv' } });
+  assert.match(saved, /role="status">saved to Downloads · &lt;saved&gt;&amp;&quot;\.csv<\/p>/);
+  assert.doesNotMatch(saved, /fake-secret|<saved>/);
+  assert.match(saved, /data-action="usage-export">export CSV<\/button>/);
+  const error = usageHTML({ export: { error: '<cannot>& export' } });
+  assert.match(error, /role="status">&lt;cannot&gt;&amp; export<\/p>/);
+  assert.match(error, /data-action="usage-export">export CSV<\/button>/);
+  assert.doesNotMatch(usageHTML(), /u-export-message/);
+  assert.doesNotMatch(usageHTML({ export: { pending: true } }), /u-export-message/);
+  assert.match(usageHTML({ error: 'history failed' }), /data-action="usage-export">export CSV/);
+});
+
+test('CSV replies reduce independently of state revisions and never interrupt another screen', () => {
+  const ui = UI({ screen: 'usage', state: stateRev(12), lastRev: 12, usage: usageSample,
+    usageExport: { pending: true } });
+  const exported = { path: '/fake/Downloads/export.csv', rows: 2 };
+  let out = reduceReply(ui, { ok: true, usage_export: exported });
+  assert.deepEqual(out.usageExport, { path: exported.path });
+  assert.equal(out.render, true); assert.equal(out.screen, 'usage');
+  assert.equal(out.lastRev, 12); assert.equal(out.state, ui.state); assert.equal(out.usage, usageSample);
+  out = reduceReply({ ...out, usageExport: { pending: true } }, { ok: false, usage_export_error: 'could not export' });
+  assert.deepEqual(out.usageExport, { error: 'could not export' });
+  assert.equal(out.render, true); assert.equal(out.flash, null); assert.equal(out.lastRev, 12);
+  for (const reply of [{ ok: true, usage_export: exported }, { ok: false, usage_export_error: 0 }]) {
+    out = reduceReply({ ...ui, screen: 'add', add: mkAdd() }, reply);
+    assert.equal(out.screen, 'add'); assert.equal(out.render, false);
+    assert.deepEqual(out.usageExport, reply.ok ? { path: exported.path } : { error: '0' });
+  }
+  out = reduceReply(ui, { ok: true });
+  assert.equal(out.usageExport, ui.usageExport); assert.equal(out.render, false);
+});
+
+test('CSV click sends once, completes after state-free replies, retries failures, and ignores other screens', () => {
+  const app = keyApp();
+  const requests = () => app.sent.filter((m) => m.action === 'usage_export');
+  app.click({ action: 'usage-export' });
+  app.click({ action: 'usage' });
+  app.click({ action: 'usage-export' });
+  assert.equal(requests().length, 0);
+  app.window.AGL.result({ ok: true, usage_history: usageSample });
+  app.click({ action: 'usage-export' });
+  assert.deepEqual(JSON.parse(JSON.stringify(requests())), [{ action: 'usage_export' }]);
+  assert.match(app.root.innerHTML, /data-action="usage-export" disabled>exporting…/);
+  app.click({ action: 'usage-export' });
+  assert.equal(requests().length, 1);
+  app.window.AGL.result({ ok: true, state: stateRev(5) });
+  assert.match(app.root.innerHTML, /data-action="usage-export" disabled>exporting…/);
+  app.window.AGL.result({ ok: false, usage_export_error: 'Could not export usage' });
+  assert.match(app.root.innerHTML, /Could not export usage/);
+  assert.match(app.root.innerHTML, /data-action="usage-export">export CSV/);
+  app.click({ action: 'usage-export' });
+  assert.equal(requests().length, 2);
+  assert.doesNotMatch(app.root.innerHTML, /Could not export usage/);
+  app.window.AGL.result({ ok: true, usage_export: { path: '/fake/Downloads/token-usage.csv', rows: 42 } });
+  assert.match(app.root.innerHTML, /saved to Downloads · token-usage\.csv/);
+  assert.match(app.root.innerHTML, /data-action="usage-export">export CSV/);
+  for (const screen of ['main', 'settings']) {
+    app.click({ action: screen === 'main' ? 'usage-back' : 'settings' });
+    const before = app.root.innerHTML;
+    app.click({ action: 'usage-export' });
+    assert.equal(requests().length, 2); assert.equal(app.root.innerHTML, before);
+    app.window.AGL.result({ ok: false, usage_export_error: 'late export error' });
+    assert.equal(app.root.innerHTML, before);
+    app.window.AGL.result({ ok: true, usage_export: { path: '/fake/Downloads/late.csv', rows: 0 } });
+    assert.equal(app.root.innerHTML, before);
+  }
+  app.click({ action: 'usage' });
+  assert.match(app.root.innerHTML, /saved to Downloads · late\.csv/);
+});
+
 test('usage icon precedes the add menu and pushes a loading screen with the exact bridge request', () => {
   const html = buildHTML(state());
   assert.match(html, /<button class="ibtn" data-action="usage" aria-label="token usage"><svg/);

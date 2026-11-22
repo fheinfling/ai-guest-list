@@ -122,7 +122,8 @@
       pending_tier_requests: [],
       rev: 1,
     }});
-    // Examples: ?screen=usage&theme=dark, &mode=month, &open=claude:biz@example.com&scroll=seat
+    // Examples: ?screen=usage&theme=dark, &mode=month, &open=claude:biz@example.com&scroll=seat,
+    // &export=pending|success|error (fixture-only export replies; no files are written).
     // Fixture-only history also exercises the shipping action/reply path, without a native bridge.
     async function previewUsage() {
       if (params.get("screen") !== "usage") return;
@@ -142,6 +143,13 @@
       const key = params.get("open");
       const row = key && [...document.querySelectorAll('[data-action="usage-seat"]')].find((el) => el.dataset.key === key);
       row?.click();
+      if (params.has("export")) {
+        document.querySelector('[data-action="usage-export"]')?.click();
+        if (params.get("export") === "success") window.AGL.result({ ok: true,
+          usage_export: { path: "/fake/Downloads/token-usage-2026-11-21.csv", rows: 42 } });
+        if (params.get("export") === "error") window.AGL.result({ ok: false,
+          usage_export_error: "Could not export usage" });
+      }
       await document.fonts.ready;
       if (key && params.get("scroll") === "seat") {
         const currentRow = [...document.querySelectorAll('[data-action="usage-seat"]')].find((el) => el.dataset.key === key);

@@ -1,9 +1,11 @@
 import base64
+import csv
 import json
 import os
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -288,7 +290,7 @@ def test_claude_billing_verifies_email_and_key_calendar(ctx, berlin):
     assert history["own"]["codex:fake-key"]["month"]["source"] == "calendar"
 
 
-def test_own_windows_snap_extrapolate_merge_and_peak(ctx):
+def test_own_windows_keep_observed_ends_gaps_and_merged_peak(ctx):
     end = datetime.fromisoformat("2026-11-22T10:00:00Z")
     seats(ctx, a={"usage": {"windows": {"weekly": {"used_pct": 65, "resets_at": end.isoformat()}}}})
     write(xp(ctx), meta(user="user-fake"), count(10, window={"window_minutes": 10080,
@@ -301,10 +303,283 @@ def test_own_windows_snap_extrapolate_merge_and_peak(ctx):
     periods = tokenlog.history(ctx)["own"]["codex:a"]["week"]
     assert periods[0]["current"] and periods[0]["approx"] is False
     assert periods[0]["limit_pct"] == 90
-    assert datetime.fromisoformat(periods[0]["from"]).timestamp() == (end - timedelta(days=7, hours=2)).timestamp()
-    assert periods[1]["approx"] is True and periods[1]["limit_pct"] == 40
-    assert periods[2]["limit_pct"] is None
-    assert periods[1]["to"] == periods[0]["from"]
+    assert len(periods) == 2
+    assert datetime.fromisoformat(periods[0]["from"]).timestamp() == (end - timedelta(days=7)).timestamp()
+    assert periods[1]["approx"] is False and periods[1]["limit_pct"] == 40
+    assert datetime.fromisoformat(periods[1]["to"]) < datetime.fromisoformat(periods[0]["from"])
+
+
+def test_irregular_74_day_windows_retain_every_peak_from_primary_rate_limits(ctx):
+    now = tokenlog._now()
+    ends = [int((now + timedelta(days=days)).timestamp()) for days in (-11.02, -3.59, 4.05)]
+    seats(ctx, a={"account_id": "fake-user"})
+    events = []
+    for end, peak in zip(ends, (91, 73, 42)):
+        event = count(0, info=False)
+        event["payload"]["rate_limits"] = {"primary": {"window_minutes": 10080,
+            "resets_at": end, "used_percent": peak}, "secondary": None}
+        events.append(event)
+    write(xp(ctx), meta(user="fake-user"), *events)
+    refresh(ctx)
+    periods = tokenlog.history(ctx)["own"]["codex:a"]["week"]
+    assert [p["limit_pct"] for p in periods] == [42, 73, 91]
+    assert len(periods) == 3
+    assert [p["current"] for p in periods] == [True, False, False]
+    for period, end in zip(periods, reversed(ends)):
+        assert period["approx"] is False
+        assert datetime.fromisoformat(period["to"]).timestamp() == end
+        assert datetime.fromisoformat(period["from"]).timestamp() == end - tokenlog._WEEK
+
+
+def test_observed_window_gap_has_no_current_period_and_excludes_gap_tokens(ctx, monkeypatch):
+    now = datetime.fromisoformat(AT)
+    monkeypatch.setattr(tokenlog, "_now", lambda: now)
+    seats(ctx, a={})
+    at = int(now.timestamp())
+    with tokenlog._connect(ctx) as db:
+        tokenlog._window(db, "codex:a", at - 3600, 80)
+        tokenlog._window(db, "codex:a", at + tokenlog._WEEK + 3600, 30)
+        # Prior window end, gap, future window start: none belong to any window yet.
+        for stamp in (at - 3600, at, at + 3600):
+            tokenlog._add(db, stamp, "codex", "fake-model", "codex:a", [1, 2, 3, 4])
+        tokenlog._add(db, at - 7200, "codex", "fake-model", "codex:a", [5, 6, 7, 8])
+    periods = tokenlog.history(ctx)["own"]["codex:a"]["week"]
+    assert len(periods) == 2 and not any(p["current"] for p in periods)
+    assert periods[0]["by"] == {}
+    assert periods[1]["by"] == {"fake-model": [5, 6, 7, 8]}
+
+
+def test_own_weeks_keep_only_latest_thirteen_and_clip_against_omitted_window(ctx):
+    seats(ctx, a={})
+    at = int(tokenlog._now().timestamp())
+    with tokenlog._connect(ctx) as db:
+        for index in range(15):
+            tokenlog._window(db, "codex:a", at - index * 6 * 86400, index)
+    periods = tokenlog.history(ctx)["own"]["codex:a"]["week"]
+    assert len(periods) == 13
+    assert [p["limit_pct"] for p in periods] == list(range(13))
+    assert datetime.fromisoformat(periods[-1]["from"]).timestamp() == at - 13 * 6 * 86400
+    assert all(p["approx"] is False for p in periods)
+
+
+def test_own_weeks_without_observations_are_calendar_fallback(ctx):
+    seats(ctx, a={})
+    with tokenlog._connect(ctx) as db:
+        db.execute("INSERT INTO windows VALUES ('codex:a', ?, 99, 0)",
+                   (int(tokenlog._now().timestamp()),))
+        tokenlog._window(db, "codex:other", tokenlog._now().timestamp(), 100)
+    payload = tokenlog.history(ctx)
+    periods = payload["own"]["codex:a"]["week"]
+    assert len(periods) == 13
+    assert [(p["from"], p["to"]) for p in periods] == [
+        (p["from"], p["to"]) for p in payload["calendar"]["week"]]
+    assert all(p["approx"] is True and p["limit_pct"] is None for p in periods)
+    assert [p["current"] for p in periods] == [True] + [False] * 12
+
+
+CSV_HEADER = ["hour_start_local", "hour_start_utc", "tool", "seat", "seat_kind", "seat_key",
+              "model", "input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens",
+              "total_tokens"]
+
+
+def read_csv(path):
+    with path.open(encoding="utf-8", newline="") as stream:
+        return list(csv.reader(stream))
+
+
+def test_export_csv_all_indexed_rows_raw_models_counts_order_and_seat_names(ctx, tmp_path, monkeypatch, berlin):
+    # Old/future hours are exported too, regardless of the view's current date and model folding.
+    seats(ctx, a={"name": "Équipe, \"A\"\nsecond line"}, b={})
+    seats(ctx, "claude", a={"name": "Claude A"})
+    state = ctx.load_state()
+    state.data["keys"] = {"k": {"id": "k", "harness": "codex", "label": "API label"},
+                          "j": {"id": "j", "harness": "claude"}}
+    state.save()
+    monkeypatch.setattr(tokenlog, "refresh", lambda *_a, **_kw: pytest.fail("export refreshed logs"))
+    monkeypatch.setattr(tokenlog, "history", lambda *_a: pytest.fail("export folded visible history"))
+    hour = int(datetime.fromisoformat("2024-06-01T10:00:00Z").timestamp()) // 3600
+    entries = [
+        (hour + 24000, "codex", "future", "codex:a", 1, 0, 0, 0),
+        (hour, "codex", "z-model", "codex:a", 10, 20, 30, 40),
+        (hour, "codex", "a-model", "codex:a", 0, 1, 0, 0),
+        (hour, "codex", "m", "codex:k", 0, 0, 1, 0),
+        (hour, "claude", "m", "claude:j", 0, 0, 0, 1),
+        (hour, "claude", "m", "claude:a", 1, 2, 3, 4),
+        (hour, "codex", "m", "codex:b", 2, 0, 0, 0),
+        (hour, "claude", "m", "claude:?", 3, 0, 0, 0),
+        (hour, "codex", "m", "codex:?", 4, 0, 0, 0),
+        (hour, "claude", "m", "claude:gone", 5, 0, 0, 0),
+        (hour, "codex", "m", "codex:removed", 6, 0, 0, 0),
+        (hour, "codex", "m", "codex:removed:legacy", 7, 0, 0, 0),
+        (hour, "codex", "zero", "codex:a", 0, 0, 0, 0),
+    ]
+    entries.extend((hour, "codex", f"raw-model-{i}", "codex:a", 1, 0, 0, 0) for i in range(9))
+    with tokenlog._connect(ctx) as db:
+        db.executemany("INSERT INTO usage VALUES (?,?,?,?,?,?,?,?)", entries)
+    path = tokenlog.export_csv(ctx, tmp_path / "downloads" / "nested")
+    contents = read_csv(path)
+    assert contents[0] == CSV_HEADER
+    expected = sorted((e for e in entries if any(e[4:])), key=lambda e: (e[0], e[1], e[3], e[2]))
+    assert len(contents) == len(expected) + 1
+    names = {"codex:a": ("Équipe, \"A\"\nsecond line", "sub"), "codex:b": ("b", "sub"),
+             "claude:a": ("Claude A", "sub"), "codex:k": ("API label", "key"),
+             "claude:j": ("j", "key"), "codex:?": ("account unknown", "unattributed"),
+             "claude:?": ("account unknown", "unattributed"),
+             "claude:gone": ("gone", "removed"), "codex:removed": ("removed", "removed"),
+             "codex:removed:legacy": ("removed:legacy", "removed")}
+    for actual, (h, tool, model, key, *counts) in zip(contents[1:], expected):
+        at = datetime.fromtimestamp(h * 3600, timezone.utc)
+        name, kind = names[key]
+        assert actual == [at.astimezone().isoformat(), at.isoformat().replace("+00:00", "Z"),
+                          tool, name, kind, key, model, *map(str, counts), str(sum(counts))]
+    assert contents[1][0] == "2024-06-01T12:00:00+02:00"
+    assert b"\r\n" not in path.read_bytes()
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_export_csv_empty_index_header_local_date_and_collision_names(ctx, tmp_path, monkeypatch):
+    monkeypatch.setattr(tokenlog, "_now", lambda: datetime.fromisoformat("2026-11-22T00:30:00+14:00"))
+    directory = tmp_path / "downloads"
+    directory.mkdir()
+    original = directory / "token-usage-2026-11-22.csv"
+    original.write_bytes(b"keep existing export")
+    second = tokenlog.export_csv(ctx, directory)
+    third = tokenlog.export_csv(ctx, directory)
+    assert second.name == "token-usage-2026-11-22 (2).csv"
+    assert third.name == "token-usage-2026-11-22 (3).csv"
+    assert original.read_bytes() == b"keep existing export"
+    assert read_csv(second) == read_csv(third) == [CSV_HEADER]
+    assert second.read_bytes() == third.read_bytes()
+    assert second.read_bytes().endswith(b"\n") and b"\r" not in second.read_bytes()
+    assert second.stat().st_mode & 0o777 == third.stat().st_mode & 0o777 == 0o600
+    assert set(directory.iterdir()) == {original, second, third}
+
+
+def test_export_csv_concurrent_exports_reserve_distinct_names(ctx, tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    tokenlog.index_progress(ctx)  # initialize the fixture index before racing exporters
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        paths = list(pool.map(lambda _: tokenlog.export_csv(ctx, tmp_path), range(4)))
+    stem = "token-usage-" + tokenlog._now().date().isoformat()
+    assert {path.name for path in paths} == {stem + suffix + ".csv" for suffix in ("", " (2)", " (3)", " (4)")}
+    assert all(read_csv(path) == [CSV_HEADER] for path in paths)
+
+
+def test_export_csv_keeps_normalized_fresh_input_and_does_not_double_count_reasoning(ctx, tmp_path):
+    write(xp(ctx), meta(), turn("raw-codex-model"), count(100, cached=20, cache_write=10, output=5))
+    refresh(ctx)
+    row = read_csv(tokenlog.export_csv(ctx, tmp_path))[1]
+    assert row[6:] == ["raw-codex-model", "70", "20", "10", "5", "105"]
+
+
+@pytest.mark.parametrize("prefix", ["=", "+", "-", "@", "\t", "\r", "", "normal", " space", "é"])
+def test_export_csv_injection_protects_every_text_cell(ctx, tmp_path, prefix):
+    unsafe = prefix in ("=", "+", "-", "@", "\t", "\r")
+    text = prefix + "fake,\"value\""
+    seats(ctx, **{text: {"name": text}})
+    with tokenlog._connect(ctx) as db:
+        db.execute("INSERT INTO usage VALUES (?,?,?,?,?,?,?,?)", (1, text, text, "codex:" + text, 1, 2, 3, 4))
+    row = read_csv(tokenlog.export_csv(ctx, tmp_path / "out"))[1]
+    assert row[2:7] == [("'" if unsafe else "") + text, ("'" if unsafe else "") + text,
+                        "sub", "codex:" + text, ("'" if unsafe else "") + text]
+    assert row[7:] == ["1", "2", "3", "4", "10"]
+    assert tokenlog._csv_text(prefix) == ("'" if unsafe else "") + prefix
+
+
+@pytest.mark.parametrize("model", ["\rfake-model", "raw\rmodel", "raw\nmodel", " raw\tmodel"])
+def test_export_csv_preserves_raw_control_characters_inside_one_cell(ctx, tmp_path, model):
+    with tokenlog._connect(ctx) as db:
+        db.execute("INSERT INTO usage VALUES (?,?,?,?,?,?,?,?)", (1, "codex", model, "codex:?", 1, 0, 0, 0))
+    contents = read_csv(tokenlog.export_csv(ctx, tmp_path / "out"))
+    assert len(contents) == 2
+    assert len(contents[1]) == len(CSV_HEADER)
+    assert contents[1][6] == ("'" if model.startswith("\r") else "") + model
+
+
+@pytest.mark.parametrize("failure", ["create", "write", "replace"])
+def test_export_csv_atomic_publish_and_cleanup_on_failure(ctx, tmp_path, monkeypatch, failure):
+    directory = tmp_path / "exports"
+    real_replace = os.replace
+    calls = []
+    def replace(source, target):
+        assert source.parent == target.parent == directory
+        assert source.stat().st_mode & 0o777 == 0o600
+        assert read_csv(source) == [CSV_HEADER]
+        assert target.stat().st_mode & 0o777 == 0o600
+        calls.append((source, target))
+        if failure == "replace":
+            raise OSError("fake publication failure")
+        real_replace(source, target)
+    monkeypatch.setattr(tokenlog.os, "replace", replace)
+    if failure == "write":
+        monkeypatch.setattr(tokenlog.csv, "writer", lambda *_a, **_kw: (_ for _ in ()).throw(OSError("fake write failure")))
+    if failure == "create":
+        monkeypatch.setattr(tokenlog.tempfile, "NamedTemporaryFile",
+                            lambda *_a, **_kw: (_ for _ in ()).throw(OSError("fake creation failure")))
+    with pytest.raises(OSError):
+        tokenlog.export_csv(ctx, directory)
+    assert list(directory.iterdir()) == []
+    assert len(calls) == (1 if failure == "replace" else 0)
+
+
+def test_export_csv_uses_atomic_replace_on_success(ctx, tmp_path, monkeypatch):
+    real_replace = os.replace
+    published = []
+    def replace(source, target):
+        assert source != target and source.parent == target.parent == tmp_path
+        assert read_csv(source) == [CSV_HEADER]
+        real_replace(source, target)
+        published.append(target)
+    monkeypatch.setattr(tokenlog.os, "replace", replace)
+    path = tokenlog.export_csv(ctx, tmp_path)
+    assert published == [path]
+    assert list(tmp_path.glob(".token-usage-*")) == []
+
+
+def test_export_csv_uses_one_snapshot_while_indexing_commits(ctx, tmp_path, monkeypatch):
+    seats(ctx, a={})
+    with tokenlog._connect(ctx) as db:
+        tokenlog._add(db, 3600, "codex", "original", "codex:a", [1, 0, 0, 0])
+    original_metadata = tokenlog._history_seats
+    def metadata(state, used):
+        # This happens between the export's seat lookup and its usage scan, on another connection.
+        with tokenlog._connect(ctx) as writer:
+            tokenlog._add(writer, 3600, "codex", "concurrent", "codex:a", [2, 0, 0, 0])
+        return original_metadata(state, used)
+    monkeypatch.setattr(tokenlog, "_history_seats", metadata)
+    first = read_csv(tokenlog.export_csv(ctx, tmp_path))
+    assert len(first) == 2 and first[1][6] == "original"
+    monkeypatch.setattr(tokenlog, "_history_seats", original_metadata)
+    second = read_csv(tokenlog.export_csv(ctx, tmp_path))
+    assert [row[6] for row in second[1:]] == ["concurrent", "original"]
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_export_csv_closes_database_and_reserved_file_descriptor(ctx, tmp_path, monkeypatch, failure):
+    original_connect, original_open = tokenlog._connect, os.open
+    connections, descriptors = [], []
+    def connect(context):
+        db = original_connect(context)
+        connections.append(db)
+        return db
+    def reserve(path, flags, mode=0o777):
+        fd = original_open(path, flags, mode)
+        if Path(path).name.startswith("token-usage-"):
+            descriptors.append(fd)
+        return fd
+    monkeypatch.setattr(tokenlog, "_connect", connect)
+    monkeypatch.setattr(tokenlog.os, "open", reserve)
+    if failure:
+        monkeypatch.setattr(tokenlog.os, "replace", lambda *_a: (_ for _ in ()).throw(OSError("fake publish failure")))
+        with pytest.raises(OSError):
+            tokenlog.export_csv(ctx, tmp_path)
+    else:
+        tokenlog.export_csv(ctx, tmp_path)
+    assert len(connections) == len(descriptors) == 1
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        connections[0].execute("SELECT 1")
+    with pytest.raises(OSError):
+        os.fstat(descriptors[0])
 
 
 def test_weekly_snapshot_keeps_peak_across_refreshes(ctx):
@@ -471,12 +746,12 @@ def test_own_week_next_end_boundaries(ctx, monkeypatch, ahead):
     with tokenlog._connect(ctx) as db:
         tokenlog._window(db, "codex:a", now.timestamp() + ahead, 41)
     periods = tokenlog.history(ctx)["own"]["codex:a"]["week"]
-    assert len(periods) == 13  # fourteen boundaries enclose thirteen weeks
-    assert datetime.fromisoformat(periods[0]["to"]).timestamp() == now.timestamp() + 7 * 86400
-    assert periods[0]["current"] is True
-    assert periods[1]["current"] is False
-    assert periods[0]["approx"] is True
-    assert periods[0]["limit_pct"] == (41 if ahead else None)
+    assert len(periods) == 1
+    assert datetime.fromisoformat(periods[0]["to"]).timestamp() == now.timestamp() + ahead
+    assert datetime.fromisoformat(periods[0]["from"]).timestamp() == now.timestamp() + ahead - tokenlog._WEEK
+    assert periods[0]["current"] is bool(ahead)  # now == start is included; now == end is excluded
+    assert periods[0]["approx"] is False
+    assert periods[0]["limit_pct"] == 41
 
 
 @pytest.mark.parametrize("gap,merged", [(1800, True), (1801, False)])
@@ -486,15 +761,17 @@ def test_own_week_merge_tolerance_keeps_latest_end_and_highest_peak(ctx, gap, me
     with tokenlog._connect(ctx) as db:
         for stamp, peak in [(end - gap, 93), (end, 20), (end - 7 * 86400, 10)]:
             tokenlog._window(db, "codex:a", stamp, peak)
-    period = tokenlog.history(ctx)["own"]["codex:a"]["week"][0]
-    assert datetime.fromisoformat(period["to"]).timestamp() == (end if merged else end - gap)
-    assert datetime.fromisoformat(period["from"]).timestamp() == end - 7 * 86400
-    assert period["limit_pct"] == 93
-    assert period["approx"] is False
+    periods = tokenlog.history(ctx)["own"]["codex:a"]["week"]
+    assert len(periods) == (2 if merged else 3)
+    assert datetime.fromisoformat(periods[0]["to"]).timestamp() == end
+    assert datetime.fromisoformat(periods[0]["from"]).timestamp() == (end - tokenlog._WEEK if merged else end - gap)
+    assert periods[0]["limit_pct"] == (93 if merged else 20)
+    assert all(p["approx"] is False for p in periods)
+    assert [p["limit_pct"] for p in periods] == ([93, 10] if merged else [20, 93, 10])
 
 
-@pytest.mark.parametrize("distance,snapped", [(43200, True), (43201, False), (46800, False)])
-def test_own_week_snap_tolerance_and_approximation(ctx, distance, snapped):
+@pytest.mark.parametrize("distance", [-43200, 0, 43200, 43201, 46800])
+def test_own_week_only_clips_overlaps_never_fills_gaps(ctx, distance):
     end = tokenlog._now().timestamp() + 86400
     previous = end - 7 * 86400 - distance
     seats(ctx, a={})
@@ -502,28 +779,29 @@ def test_own_week_snap_tolerance_and_approximation(ctx, distance, snapped):
         tokenlog._window(db, "codex:a", end, 30)
         tokenlog._window(db, "codex:a", previous, 70)
     periods = tokenlog.history(ctx)["own"]["codex:a"]["week"]
-    assert datetime.fromisoformat(periods[0]["from"]).timestamp() == (
-        previous if snapped else end - 7 * 86400)
-    assert periods[0]["approx"] is (not snapped)
-    assert periods[1]["limit_pct"] == (70 if snapped else None)
-    assert all(p["approx"] for p in periods[1:])
-    assert all(a["from"] == b["to"] for a, b in zip(periods, periods[1:]))
+    assert len(periods) == 2
+    assert datetime.fromisoformat(periods[0]["from"]).timestamp() == max(previous, end - tokenlog._WEEK)
+    assert datetime.fromisoformat(periods[1]["from"]).timestamp() == previous - tokenlog._WEEK
+    assert [p["limit_pct"] for p in periods] == [30, 70]
+    assert all(p["approx"] is False for p in periods)
 
 
-@pytest.mark.parametrize("anchors,expected", [
-    ([(-10, 8), (-2, 99)], 5),  # nearest past observation, not highest peak or first row
-    ([(-20, 99), (8.5, 1)], 1.5),  # nearest may be in the future beyond the next week
-    ([(3, 5), (5, 99)], 3),  # earliest upcoming observation wins
+@pytest.mark.parametrize("anchors", [
+    [(-10, 8), (-2, 99)],
+    [(-20, 99), (8.5, 1)],
+    [(3, 5), (5, 99)],
 ])
-def test_own_week_selects_or_extrapolates_nearest_observed_end(ctx, anchors, expected):
+def test_own_week_keeps_all_observations_even_without_a_current_window(ctx, anchors):
     at = tokenlog._now().timestamp()
     seats(ctx, a={})
     with tokenlog._connect(ctx) as db:
         for days, peak in anchors:
             tokenlog._window(db, "codex:a", at + days * 86400, peak)
-    period = tokenlog.history(ctx)["own"]["codex:a"]["week"][0]
-    assert datetime.fromisoformat(period["to"]).timestamp() == at + expected * 86400
-    assert period["approx"] is True
+    periods = tokenlog.history(ctx)["own"]["codex:a"]["week"]
+    assert [datetime.fromisoformat(p["to"]).timestamp() for p in periods] == [
+        at + days * 86400 for days, _ in reversed(anchors)]
+    assert [p["current"] for p in periods] == ([False, True] if anchors[0][0] == 3 else [False, False])
+    assert all(p["approx"] is False for p in periods)
 
 
 @pytest.mark.parametrize("day", [14, 22])
@@ -886,7 +1164,7 @@ def test_key_snapshot_windows_use_their_own_harness(ctx):
     assert {r[0] for r in rows(ctx, "windows")} == {"codex:codex", "claude:claude"}
 
 
-def test_own_weeks_snap_to_nearest_among_multiple_older_observations(ctx):
+def test_own_weeks_observed_windows_keep_the_existing_label_format(ctx):
     seats(ctx, a={})
     end = tokenlog._now().timestamp() + 86400
     with tokenlog._connect(ctx) as db:

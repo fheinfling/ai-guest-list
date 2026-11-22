@@ -878,6 +878,9 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
                 objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
 
         def applyResult_(self, result):
+            if result.get("ok") and result.get("usage_export"):
+                NSWorkspace.sharedWorkspace().activateFileViewerSelectingURLs_(
+                    [NSURL.fileURLWithPath_(result["usage_export"]["path"])])
             self._pushResult(result)
             self._updateDot(result.get("state"))
             self._notifyAccountWarnings(result)
@@ -1097,6 +1100,10 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
                 self.performSelectorInBackground_withObject_(
                     objc.selector(self.usageHistoryBg_, signature=b"v@:@"), msg)
                 return
+            if action == "usage_export":
+                self.performSelectorInBackground_withObject_(
+                    objc.selector(self.usageExportBg_, signature=b"v@:@"), msg)
+                return
             result = bridge.handle(self.ctx, msg)
             if action == "dot":
                 self._updateDot(result.get("state"))
@@ -1262,6 +1269,15 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
                 result = dict(bridge.handle(self.ctx, msg))
             except Exception:
                 result = {"ok": False, "usage_history_error": "Could not read usage history"}
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
+
+        def usageExportBg_(self, msg):
+            try:
+                result = dict(bridge.handle(self.ctx, {"action": "usage_export",
+                                                     "directory": str(Path.home() / "Downloads")}))
+            except Exception:
+                result = {"ok": False, "usage_export_error": "Could not export usage"}
             self.performSelectorOnMainThread_withObject_waitUntilDone_(
                 objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
 

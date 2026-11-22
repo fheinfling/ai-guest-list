@@ -574,6 +574,10 @@ input:focus-visible ~ .sw { outline:3px solid var(--focus); outline-offset:3px; 
 .usage .u-meter i { display:block; height:100%; background:var(--btn); }
 .usage .u-fallback { color:var(--muted); font-size:11.5px; margin:4px 0; }
 .usage .u-note { padding:10px 16px 14px; font-size:11.5px; line-height:1.5; color:var(--muted); }
+.usage .u-note p { margin:0; }
+.usage .u-export { margin-top:6px; padding:0; border:0; background:none; color:var(--btn); font:inherit; cursor:pointer; }
+.usage .u-export:disabled { color:var(--muted); cursor:default; opacity:.6; }
+.usage .u-note .u-export-message { margin-top:4px; overflow-wrap:anywhere; }
 .usage .u-state { padding:28px 20px 18px; min-height:140px; color:var(--muted); }
 .usage .u-state p + p { margin-top:7px; }
 .usage .u-state p:first-child { font-weight:600; color:var(--ink); }

@@ -107,7 +107,7 @@ connect through the official tools.
   month where the tool reports one (Codex's token, Claude's profile; otherwise weekly). History goes
   back as far as your local Claude and Codex logs do. Older Claude usage, from before the app tracked
   which seat ran a session, shows as unattributed. Indexing runs in the background and reads only
-  local files.
+  local files. Export all indexed usage as CSV to Downloads with one click.
 - **Desktop switching** — the menubar moves a confirmed-limited seat to a verified healthy seat of
   the same tool when auto-switch is enabled. With “restart the Codex app after a swap” enabled, a running
   Codex desktop app quits gracefully and reopens; continue in your existing thread. Supervised
