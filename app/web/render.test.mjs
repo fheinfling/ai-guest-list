@@ -3948,8 +3948,11 @@ test('usage loading, indexing, empty and error states remain readable and escape
   hostile.seats[0].name = '<img src=x>';
   hostile.models[0].label = '<script>bad</script>';
   const html = usageHTML({}, hostile);
-  assert.doesNotMatch(html, /<img|<script>/);
-  assert.match(html, /&lt;img src=x&gt;/);
+  // The hostile strings must only appear escaped (exact substrings, not a tag-matching regex).
+  assert.ok(!html.includes('<img src=x>'), 'seat name rendered as markup');
+  assert.ok(!html.includes('<script>bad</script>'), 'model label rendered as markup');
+  assert.ok(html.includes('&lt;img src=x&gt;'));
+  assert.ok(html.includes('&lt;script&gt;bad&lt;/script&gt;'));
   assert.match(html, /Read from Claude Code and Codex logs on this Mac\. Nothing is sent anywhere\./);
 });
 
