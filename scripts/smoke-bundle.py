@@ -37,8 +37,16 @@ from pathlib import Path
 import acctsw
 from acctsw.install import _wrapper_script
 
+# The usage view's token index needs sqlite3 from the bundle itself (py2app only ships what is
+# imported): prove it loads and runs a query, and that tokenlog comes from the bundle too.
+import sqlite3
+from acctsw import tokenlog
+sqlite_version = sqlite3.connect(":memory:").execute("SELECT sqlite_version()").fetchone()[0]
+
 print(json.dumps({
     "module_file": acctsw.__file__,
+    "sqlite_version": sqlite_version,
+    "tokenlog_file": tokenlog.__file__,
     "version": acctsw.__version__,
     "build": acctsw.build_number(),
     "wrapper": _wrapper_script("acctsw", sys.argv[1], Path(sys.argv[2]), Path(sys.argv[3])),
@@ -231,6 +239,9 @@ def smoke(bundle_arg: Path) -> None:
                f"package version {generated['version']} != Info.plist {plist_version}")
         _check(generated["build"] == plist_build,
                f"package build {generated['build']} != Info.plist {plist_build}")
+        _check(bool(generated["sqlite_version"]), "bundled sqlite3 did not answer a query")
+        _check(_inside(generated["tokenlog_file"], bundle),
+               f"acctsw.tokenlog imported outside the app bundle: {generated['tokenlog_file']}")
 
         wrapper = bindir / "acctsw"
         wrapper_body = generated["wrapper"]

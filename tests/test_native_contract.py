@@ -145,6 +145,7 @@ def test_engine_warnings_dedupe_identities_and_only_toast_hard_notices():
     ("paste", "addBg_"), ("snapshot", "addBg_"), ("import_current", "addBg_"),
     ("adopt_engine", "adoptEngineBg_"), ("update_check", "updateCheckBg_"),
     ("update_install", "updateInstallBg_"), ("switch", "switchBg_"),
+    ("usage_history", "usageHistoryBg_"),
 ])
 def test_script_dispatch_runs_blocking_actions_in_background(action, handler):
     dispatched = []
@@ -203,3 +204,61 @@ def test_script_dispatch_logs_invalid_message_and_returns(monkeypatch):
     call("userContentController_didReceiveScriptMessage_", SimpleNamespace(), None,
          SimpleNamespace(body=lambda: None))
     assert len(errors) == 1 and isinstance(errors[0], TypeError)
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_history_background_returns_on_main_thread(monkeypatch, failure):
+    events = []
+    ctx = object()
+    def handle(context, msg):
+        assert context is ctx and msg == {"action": "usage_history"}
+        if failure:
+            raise OSError("/private/fake-path")
+        return {"ok": True, "usage_history": {"v": 1}}
+    monkeypatch.setattr(menubar.bridge, "handle", handle)
+    target = lambda result: None
+    receiver = SimpleNamespace(ctx=ctx, applyResult_=target,
+        performSelectorOnMainThread_withObject_waitUntilDone_=lambda *args: events.append(args))
+    call("usageHistoryBg_", receiver, {"action": "usage_history"})
+    selector, result, wait = events[0]
+    assert selector.callable is target and wait is False and "state" not in result
+    assert result == ({"ok": False, "usage_history_error": "Could not read usage history"} if failure
+                      else {"ok": True, "usage_history": {"v": 1}})
+
+
+def test_history_timer_dispatch_coalesces_and_clears_on_completion(monkeypatch):
+    events = []
+    timer = SimpleNamespace(invalidate=lambda: events.append("invalidate"))
+    def scheduled(*args):
+        events.append(args)
+        return "repeat-timer"
+    monkeypatch.setattr(menubar, "NSTimer", SimpleNamespace(
+        scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_=scheduled))
+    target = lambda _: None
+    receiver = SimpleNamespace(_history_timer=timer, _history_timer_repeating=False, _history_index_inflight=False,
+        indexHistory_=lambda _: None, indexHistoryBg_=target,
+        performSelectorInBackground_withObject_=lambda *args: events.append(args))
+    call("indexHistory_", receiver, timer)
+    assert events[0] == "invalidate" and events[1][0] == 600.0 and events[1][-1] is True
+    assert events[2][0].callable is target
+    assert receiver._history_index_inflight
+    call("indexHistory_", receiver, None)
+    assert len(events) == 3
+    call("finishIndexHistory_", receiver, None)
+    assert receiver._history_index_inflight is False
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_background_index_budget_and_finally_release(monkeypatch, failure):
+    events = []
+    def refresh(ctx, *, budget_s):
+        assert budget_s == 20.0
+        if failure:
+            raise OSError("fake")
+    monkeypatch.setattr(menubar, "tokenlog", SimpleNamespace(refresh=refresh))
+    monkeypatch.setattr(menubar, "_log_exception", lambda exc: None)
+    target = lambda _: None
+    receiver = SimpleNamespace(ctx=object(), finishIndexHistory_=target,
+        performSelectorOnMainThread_withObject_waitUntilDone_=lambda *args: events.append(args))
+    call("indexHistoryBg_", receiver, None)
+    assert events[0][0].callable is target and events[0][1:] == (None, False)

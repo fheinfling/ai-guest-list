@@ -167,7 +167,7 @@ class FakeSpawn:
         self.stops = 0
         self.ticks = 0
 
-    def __call__(self, argv, on_output, on_tick=None, *, env=None):
+    def __call__(self, argv, on_output, on_tick=None, *, env=None, stdin_null=False):
         script = self.scripts[len(self.calls)]
         out, status = script[0], script[1]
         hooks = list(script[2]) if len(script) > 2 else []
@@ -687,7 +687,7 @@ def test_run_marks_each_launch_and_hop_then_clears_session(ctx, monkeypatch):
     marks = []
     clears = []
     monkeypatch.setattr(L, "mark_session",
-                        lambda data_dir, tool, email: marks.append((data_dir, tool, email)))
+                        lambda data_dir, tool, email, *, thread=None: marks.append((data_dir, tool, email)))
     monkeypatch.setattr(L, "clear_session",
                         lambda data_dir, tool: clears.append((data_dir, tool)))
     spawn = FakeSpawn([
@@ -1761,6 +1761,11 @@ def test_tick_hops_on_rollout_credits_depleted(ctx, monkeypatch, tmp_path):
     assert seat["limited_until"] is not None and seat["limit_source"] == "hard"
     assert seat["limit_detail"] == OUT_OF_CREDITS
     assert gets == [P.CODEX_USAGE_URL]   # pre-flight only: no corroboration probe, no exit fetch
+    from acctsw import seatledger
+    binds = [row for row in seatledger.read(ctx.data_dir) if row["event"] == "bind"]
+    assert binds[0]["email"] == "a@x.com" and binds[0]["thread"] is None
+    assert any(row["email"] == "a@x.com" and row["thread"] == "01a0abcd" for row in binds)
+    assert any(row["email"] == "b@x.com" and row["thread"] == "01a0abcd" for row in binds)
 
 
 def test_tick_rollout_limit_without_landing_seat_keeps_child(ctx, monkeypatch, tmp_path):
@@ -2940,3 +2945,170 @@ def test_idle_codex_resumes_on_updated_cli_through_equal_engine_wrapper(ctx, mon
     assert raised.value.argv == [wrapper, 'run', 'codex', 'resume', '01a0abcd',
                                  '--search', '-m', 'gpt-x',
                                  '-c', 'check_for_update_on_startup=false']
+
+
+def _ledger_binds(ctx):
+    from acctsw import seatledger
+    return [(r["email"], r["thread"]) for r in seatledger.read(ctx.data_dir) if r["event"] == "bind"]
+
+
+def test_ledger_claude_launch_uses_resume_thread(ctx):
+    _two_claude(ctx)
+    spawn = FakeSpawn([(None, 0, [None, None])])
+    assert run(ctx, "claude", ["--resume", "claude-thread"], spawn=spawn,
+               get=fake_get({}), notify=lambda _: None) == 0
+    assert _ledger_binds(ctx) == [("c1@x.com", "claude-thread")]
+
+
+@pytest.mark.parametrize("thread", [None, "", 42, "new-thread"])
+def test_ledger_codex_discovery_claims_only_valid_new_thread_once(ctx, monkeypatch, thread):
+    from types import SimpleNamespace
+    _two_codex(ctx)
+    source = SimpleNamespace(unambiguous=True, meta={}, attached=None,
+        poll=lambda **kw: (), close=lambda: None, other_interactive_logs=lambda: [])
+    monkeypatch.setattr(L.rollout, "RolloutWatcher", lambda *a, **kw: source)
+
+    def discover():
+        source.meta = {"id": thread}
+
+    spawn = FakeSpawn([(None, 0, [None, discover, None, None])])
+    assert run(ctx, "codex", [], spawn=spawn, get=fake_get({}), notify=lambda _: None) == 0
+    assert _ledger_binds(ctx) == [("a@x.com", None)] + (
+        [("a@x.com", thread)] if isinstance(thread, str) and thread else [])
+
+
+def test_ledger_exec_resume_fallback_and_tick_do_not_claim_twice(ctx, monkeypatch):
+    from types import SimpleNamespace
+    _two_codex(ctx)
+    source = SimpleNamespace(unambiguous=False, meta={"id": "foreign-thread"}, attached=None,
+        poll=lambda **kw: (), close=lambda: None, discover=lambda: None,
+        other_interactive_logs=lambda: [])
+    monkeypatch.setattr(L.rollout, "RolloutWatcher", lambda *a, **kw: source)
+    spawn = FakeSpawn([(None, 0, [None, None, None])])
+    assert run(ctx, "codex", ["exec", "resume", "exec-thread", "continue"], spawn=spawn,
+               get=fake_get({}), notify=lambda _: None) == 0
+    assert _ledger_binds(ctx) == [("a@x.com", "exec-thread"), ("a@x.com", "exec-thread")]
+
+
+@pytest.mark.parametrize("session_id", [None, "captured-thread"])
+def test_ledger_captures_claude_continue_thread_before_handoff(ctx, monkeypatch, session_id):
+    _two_claude(ctx)
+    path = ctx._claude_real / "projects" / "fake-project" / "captured-thread.jsonl"
+
+    def transcript():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"cwd": os.getcwd(), "sessionId": session_id}) + "\n")
+
+    reset = iso(now() + timedelta(hours=3))
+    get = fake_get({P.CLAUDE_USAGE_URL: (200, claude_ok_body(five=100, five_reset=reset))})
+    spawn = FakeSpawn([([b"booting\n", b"usage limit reached\n"], 1, [transcript]), (None, 0)])
+    assert run(ctx, "claude", ["--continue"], spawn=spawn, get=get, notify=lambda _: None) == (0 if session_id else 1)
+    binds = _ledger_binds(ctx)
+    # Discovering the transcript appends a bind for the running seat before the next seat starts.
+    assert binds.count(("c1@x.com", session_id)) == 1
+    assert ("c1@x.com", None) in binds
+    assert all(thread == session_id for email, thread in binds if email == "c2@x.com")
+
+
+def test_ledger_manual_switch_records_handoff_and_resumed_child(ctx, monkeypatch, tmp_path):
+    from acctsw.switch import switch
+    monkeypatch.chdir(tmp_path)
+    _two_codex(ctx)
+    path = _rollout_session(ctx, os.getcwd(), thread="manual-ledger")
+
+    def click():
+        _appender(path, token_count_line(primary=window(20), timestamp=_soon()))()
+        switch(ctx, ctx.load_state(), "codex", "b@x.com", manual=True)
+
+    spawn = FakeSpawn([(None, -15, [click]), (None, 0)])
+    assert run(ctx, "codex", [], spawn=spawn, get=fake_get({}), notify=lambda _: None) == 0
+    assert _ledger_binds(ctx) == [("a@x.com", None), ("a@x.com", "manual-ledger"),
+        ("b@x.com", "manual-ledger"), ("b@x.com", "manual-ledger")]
+
+
+def test_ledger_exit_hop_records_seat_and_thread_before_relaunch(ctx):
+    _two_claude(ctx)
+    reset = iso(now() + timedelta(hours=3))
+    get = fake_get({P.CLAUDE_USAGE_URL: (200, claude_ok_body(five=100, five_reset=reset))})
+    spawn = FakeSpawn([(b"plain failure\n", 3), (None, 0)])
+    assert run(ctx, "claude", ["--resume", "exit-thread"], spawn=spawn,
+               get=get, notify=lambda _: None) == 0
+    assert _ledger_binds(ctx) == [("c1@x.com", "exit-thread"), ("c2@x.com", "exit-thread"),
+                                ("c2@x.com", "exit-thread")]
+
+
+def test_ledger_wait_activation_records_selected_seat(ctx, monkeypatch):
+    state = _two_claude(ctx)
+    reset = iso(now() + timedelta(hours=3))
+    for email in state.accounts("claude"):
+        state.set_limited_until("claude", email, reset, source="usage")
+    state.save()
+    monkeypatch.setattr(L, "_wait_for_unlock", lambda *a, **kw: "c2@x.com")
+    spawn = FakeSpawn([(None, 0)])
+    assert run(ctx, "claude", ["--resume", "wait-thread"], spawn=spawn,
+               get=fake_get({}), notify=lambda _: None) == 0
+    assert _ledger_binds(ctx) == [("c2@x.com", "wait-thread"), ("c2@x.com", "wait-thread")]
+
+
+@pytest.mark.parametrize("tool,unambiguous,thread", [("claude", False, None),
+    ("codex", False, "foreign"), ("codex", True, None), ("codex", True, "paid-thread")])
+def test_ledger_paid_thread_claims_once_when_unambiguous(ctx, monkeypatch, tool, unambiguous, thread):
+    from types import SimpleNamespace
+    from tests.test_launcher_keyseats import setup, usage_get, price_get
+    seat, reset = setup(ctx, resting=True, confirm=False, tool=tool)
+    source = SimpleNamespace(unambiguous=unambiguous, meta={"id": thread},
+                             poll=lambda **kw: (), close=lambda: None)
+    monkeypatch.setattr(L.rollout, "RolloutWatcher", lambda *a, **kw: source)
+    spawn = FakeSpawn([(None, 0, [None, None, None])])
+    assert run(ctx, tool, [], spawn=spawn, get=usage_get(reset, tool=tool),
+               price_get=price_get, notify=lambda _: None) == 0
+    binds = _ledger_binds(ctx)
+    assert binds[0][0] == seat["id"]
+    claimed = [(email, tid) for email, tid in binds[1:] if tid is not None]
+    assert claimed == ([(seat["id"], thread)] if tool == "codex" and unambiguous and thread else [])
+    assert len(binds) == 1 + len(claimed)
+
+
+def test_ledger_codex_records_each_new_discovered_thread(ctx, monkeypatch):
+    from types import SimpleNamespace
+    _two_codex(ctx)
+    source = SimpleNamespace(unambiguous=True, meta={}, attached=None,
+        poll=lambda **kw: (), close=lambda: None, other_interactive_logs=lambda: [])
+    monkeypatch.setattr(L.rollout, "RolloutWatcher", lambda *a, **kw: source)
+
+    def discover(thread):
+        source.meta = {"id": thread}
+
+    spawn = FakeSpawn([(None, 0, [lambda: discover("first-thread"), None,
+                                  lambda: discover("second-thread"), None])])
+    assert run(ctx, "codex", [], spawn=spawn, get=fake_get({}), notify=lambda _: None) == 0
+    assert _ledger_binds(ctx) == [("a@x.com", None), ("a@x.com", "first-thread"),
+                                ("a@x.com", "second-thread")]
+
+
+def test_ledger_exec_claim_precedes_hard_limit_landing_probe(ctx, monkeypatch):
+    from types import SimpleNamespace
+    _two_codex(ctx)
+    path = _rollout_session(ctx, os.getcwd(), thread="exec-ledger")
+    signals = [L.rollout.RolloutSignal("limit", hard=True, reset_at=iso(now() + timedelta(hours=3)))]
+
+    def poll(**kw):
+        result = list(signals)
+        signals.clear()
+        return result
+
+    source = SimpleNamespace(unambiguous=True, meta={"id": "exec-ledger"}, attached=path,
+        poll=poll, close=lambda: None, discover=lambda: None, other_interactive_logs=lambda: [])
+    monkeypatch.setattr(L.rollout, "RolloutWatcher", lambda *a, **kw: source)
+    probes = []
+
+    def get(*args, **kwargs):
+        # Another supervisor may inspect claims while this network operation is in flight.
+        probes.append(("a@x.com", "exec-ledger") in _ledger_binds(ctx))
+        return 200, codex_ok_body(primary=10, secondary=10)
+
+    spawn = FakeSpawn([(None, -15, [None]), (None, 0)])
+    assert run(ctx, "codex", ["exec", "do the work"], spawn=spawn,
+               get=get, notify=lambda _: None) == 0
+    assert probes and all(probes)
+    assert ("b@x.com", "exec-ledger") in _ledger_binds(ctx)

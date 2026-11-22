@@ -1,6 +1,6 @@
 // Live glue: render state into the DOM and forward user actions to the Python bridge.
 // All rendering logic lives in render.mjs (pure, unit-tested); this file is the thin wiring.
-import { buildHTML, normalizeSeatName, seatNameError, switchNeedsConfirmation, buildSettings, buildAddSeat, addUsesPaste, reduceReply, updateClockText, buildAddKey, KEY_PROVIDERS, keyRequest, reduceKeyReply, keyConfirmations, buildPaidKeyGate, buildModelResults, updateCanInstall } from "./render.mjs";
+import { buildHTML, normalizeSeatName, seatNameError, switchNeedsConfirmation, buildSettings, buildUsage, buildAddSeat, addUsesPaste, reduceReply, updateClockText, buildAddKey, KEY_PROVIDERS, keyRequest, reduceKeyReply, keyConfirmations, buildPaidKeyGate, buildModelResults, updateCanInstall } from "./render.mjs";
 
 const root = document.getElementById("root");
 const overlay = document.createElement("div");   // toast surface only (siblings of #root)
@@ -58,10 +58,13 @@ window.AGL = {
       // applies its decisions to the module state + DOM. The add sub-view holds unsaved typed input,
       // so a pure state push updates `state` without a DOM swap or focus/caret theft, except when
       // a completed browser sign-in advances the connecting step to done.
-      const out = reduceReply({ screen, add, lastRev, state }, res);
+      const out = reduceReply({ screen, add, lastRev, state, usage, usageError: usageView.error }, res);
       const inKeyFlow = screen === "add-key";
       if (inKeyFlow || screen === "paid-key") out.screen = screen; // keep the current input/confirmation
       screen = out.screen; add = out.add; lastRev = out.lastRev; state = out.state;
+      usage = out.usage; usageView.error = out.usageError;
+      if (res.usage_history || res.usage_history_error != null) usageInflight = false;
+      syncUsagePolling();
       // The click is answered once the engine reports progress (or failure) in a newer snapshot.
       if (installSentAt !== null && (lastRev > installSentAt || res.error || !updateCanInstall(state.update))) {
         installSentAt = null; out.render = true;
@@ -206,10 +209,34 @@ function paintMenus(focus = false) {
   reportHeight();
 }
 
-// which screen occupies the popover: "main", the settings sub-view, or the add-seat sub-view
+// Which screen occupies the popover: main, settings, usage, add, add-key, or paid-key
 // (spec §9 — pushed sub-views on the same surface, never a modal).
 let screen = "main";
 let renderedScreen = null;  // what the last render() actually drew — gates scroll preservation
+let usage = null; // cached across visits; history replies do not carry a state revision
+let usageView = { mode: "week", idx: 0, basis: "all", open: null, error: null };
+let usageTimer = null;
+// At most one history request in flight: each one may spend seconds indexing in the engine, so the
+// next poll is scheduled only after its reply arrives (AGL.result -> syncUsagePolling), never on a clock.
+let usageInflight = false;
+function requestUsage() {
+  if (usageInflight) return;
+  usageInflight = true; send("usage_history");
+}
+function stopUsagePolling() {
+  if (usageTimer !== null) clearTimeout(usageTimer);
+  usageTimer = null;
+}
+function syncUsagePolling() {
+  if (screen !== "usage" || usage?.index?.done !== false || usageView.error) {
+    stopUsagePolling();
+  } else if (usageTimer === null && !usageInflight) {
+    usageTimer = setTimeout(() => {
+      usageTimer = null;
+      if (screen === "usage") requestUsage();
+    }, 2000);
+  }
+}
 // transient add-a-seat flow state; non-null only while screen === "add". Held here (not in `state`,
 // which the poll overwrites) so typed name/token survive a background re-render.
 let add = null;
@@ -252,7 +279,8 @@ function resetTransientUI() {
   pendingSwitch = null;
   openSeatDetails.clear();
   openMenu = null;
-  if (screen === "settings") screen = "main";
+  if (screen === "settings" || screen === "usage") screen = "main";
+  stopUsagePolling();
   // Also when its request is still out: a late "paid use is off" reply must not bring the gate back.
   paidTerminal = null;
   if (screen === "paid-key") screen = "main";
@@ -281,6 +309,7 @@ function render() {
 }
 
 function renderContent() {
+  syncUsagePolling();
   if (screen !== renderedScreen) openMenu = null;
   if (screen !== "main" || (pendingSwitch &&
       !switchNeedsConfirmation(state, pendingSwitch.tool, pendingSwitch.email))) pendingSwitch = null;
@@ -294,6 +323,7 @@ function renderContent() {
   const prevBody = root.querySelector(".body, .set-body");
   const scrollTop = screen === renderedScreen ? prevBody?.scrollTop || 0 : 0;
   root.innerHTML = screen === "settings" ? buildSettings(state)
+    : screen === "usage" ? buildUsage(state, usage, usageView)
     : screen === "add" ? buildAddSeat(state, add)
     : screen === "add-key" ? buildAddKey(state, keyFlow)
     : screen === "paid-key" ? buildPaidKeyGate(state, paidTerminal)
@@ -553,6 +583,27 @@ document.addEventListener("click", (e) => {
       break;
     }
     case "add-reveal": send("reveal"); break;   // native: reveal ~/.codex/auth.json in Finder
+    case "usage":
+      // An explicit open/retry never waits on a reply that may have been lost.
+      screen = "usage"; usageView.error = null; usageInflight = false; render(); requestUsage(); break;
+    case "usage-back": screen = "main"; render(); break;
+    case "usage-retry":
+      usageView.error = null; usageInflight = false; render(); requestUsage(); break;
+    case "usage-mode":
+      if (screen !== "usage" || !["week", "month"].includes(value)) break;
+      usageView.mode = value; usageView.idx = 0; render(); break;
+    case "usage-basis":
+      if (screen !== "usage" || !["all", "fresh", "output"].includes(value)) break;
+      usageView.basis = value; render(); break;
+    case "usage-period": {
+      if (screen !== "usage") break;
+      const idx = Number(el.dataset.idx), periods = usage?.calendar?.[usageView.mode] || [];
+      if (Number.isInteger(idx) && idx >= 0 && idx < periods.length) { usageView.idx = idx; render(); }
+      break;
+    }
+    case "usage-seat":
+      if (screen !== "usage" || !usage?.seats.some((s) => s.key === el.dataset.key)) break;
+      usageView.open = usageView.open === el.dataset.key ? null : el.dataset.key; render(); break;
     case "settings": screen = "settings"; render(); break;
     case "update-install":
       if (installSentAt !== null || !updateCanInstall(state.update)) break;
@@ -650,7 +701,7 @@ document.addEventListener("keydown", (e) => {
     const trigger = root.querySelector(`[data-action="menu"][data-menu="${openMenu}"]`);
     openMenu = null; paintMenus(); trigger?.focus(); return;
   }
-  if (screen === "settings") { screen = "main"; render(); }
+  if (screen === "settings" || screen === "usage") { screen = "main"; render(); }
   else if (screen === "add") addBack();
   else if (screen === "add-key") keyBack();
   else if (screen === "paid-key" && !paidTerminal?.pending) { paidTerminal = null; screen = "main"; render(); }
@@ -659,7 +710,7 @@ document.addEventListener("keydown", (e) => {
 // WKWebView normally reflects popover visibility here; the native shell also calls setVisible()
 // explicitly so transient closes always clear the interval even on macOS versions that do not.
 document.addEventListener("visibilitychange", () => setPopoverVisible(!document.hidden));
-window.addEventListener("pagehide", () => setPopoverVisible(false));
+window.addEventListener("pagehide", () => { setPopoverVisible(false); stopUsagePolling(); });
 
 // Font loading can change intrinsic height without a state push.
 document.fonts?.ready.then(reportHeight);

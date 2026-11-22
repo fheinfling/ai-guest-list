@@ -102,6 +102,12 @@ connect through the official tools.
   rate-limit backoff, so "no reading yet" clears by itself. A seat the provider refused (an ended
   subscription, a revoked login) keeps saying so through network blips and is never offered as
   the next seat until the provider answers differently.
+- **Token usage history** — the **token usage** button in the popover header shows tokens per model and
+  per seat for each calendar week or month, and per seat for its own weekly limit window or billing
+  month where the tool reports one (Codex's token, Claude's profile; otherwise weekly). History goes
+  back as far as your local Claude and Codex logs do. Older Claude usage, from before the app tracked
+  which seat ran a session, shows as unattributed. Indexing runs in the background and reads only
+  local files.
 - **Desktop switching** — the menubar moves a confirmed-limited seat to a verified healthy seat of
   the same tool when auto-switch is enabled. With “restart the Codex app after a swap” enabled, a running
   Codex desktop app quits gracefully and reopens; continue in your existing thread. Supervised
@@ -298,6 +304,11 @@ Build the app locally with `pip install -e ".[build]" && python scripts/build-we
 Claude seat snapshots, API keys and factory credential backups are stored in the Keychain.
 Codex seat snapshots are `0600` files at `~/.account-switcher/ch/<hash>/auth.json`, written atomically.
 The switcher also reads and updates the official tools' live credential stores.
+
+**Usage history.** The usage view reads token counts, model names and timestamps from the local
+Claude (`~/.claude/projects`) and Codex (`~/.codex/sessions`) logs into `~/.account-switcher/usage.sqlite`
+(`0600`). It never stores message content and never sends any of it over the network.
+`seat-ledger.jsonl` (`0600`) records which seat ran which session, so later usage can be attributed.
 
 **API keys.** A pasted key goes to the Keychain and nowhere else; the store keeps the provider, the
 model and the last four characters. It reaches the agent through that child's environment — never a

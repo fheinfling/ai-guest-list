@@ -487,3 +487,15 @@ def test_heartbeat_finds_the_terminal_on_any_standard_stream(ctx, monkeypatch, t
     monkeypatch.setattr(session.os, "ttyname", ttyname)
     session.mark_session(ctx.data_dir, "codex", "a@x.com")
     assert session.active_session(ctx.data_dir, "codex")["tty"] == f"/dev/ttys00{tty_fd}"
+
+
+def test_claim_thread_updates_private_heartbeat_and_ledger(ctx, monkeypatch):
+    from acctsw import seatledger
+    monkeypatch.setattr(session, "_proc_start", lambda pid: "fake-start")
+    session.mark_session(ctx.data_dir, "codex", "fake@example.test")
+    session.claim_thread(ctx.data_dir, "codex", "discovered-thread")
+    path = ctx.data_dir / f"session-codex-{os.getpid()}.json"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert json.loads(path.read_text())["thread"] == "discovered-thread"
+    assert [(r["email"], r["thread"]) for r in seatledger.read(ctx.data_dir)] == [
+        ("fake@example.test", None), ("fake@example.test", "discovered-thread")]

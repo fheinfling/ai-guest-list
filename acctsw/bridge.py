@@ -500,6 +500,14 @@ def _take_signin_notices(ctx: Context) -> list[dict[str, str]]:
 def handle(ctx: Context, message: dict) -> dict[str, Any]:
     action = (message or {}).get("action")
     try:
+        if action == "usage_history":
+            try:
+                from . import tokenlog  # needs sqlite3: a failed import is a view error, not a crash
+                tokenlog.refresh(ctx, budget_s=3.0)
+                return {"ok": True, "usage_history": tokenlog.history(ctx)}
+            except Exception:
+                return {"ok": False, "usage_history_error": "Could not read usage history"}
+
         if action in KEY_ACTIONS:
             result = key_action(ctx, message)
             # The UI correlates asynchronous replies by these two fields: which action came back,

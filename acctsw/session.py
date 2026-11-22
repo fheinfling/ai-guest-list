@@ -16,7 +16,7 @@ import json
 import os
 from pathlib import Path
 
-from . import __version__
+from . import __version__, seatledger
 from .engine import CAPABILITIES, compare
 from .procenv import proc_start, same_proc_start
 from .util import iso, now, write_json
@@ -90,7 +90,8 @@ def _where_am_i() -> dict:
 
 
 def mark_session(data_dir: Path, tool: str, email: str, *, pin: str | None = None,
-                 key_seat: dict | None = None, home: str | None = None) -> None:
+                 key_seat: dict | None = None, home: str | None = None,
+                 thread: str | None = None) -> None:
     """Record this supervisor and its active seat at launch and after every successful hop.
 
     ``email`` is the seat the session is billed to. ``home`` is the seat whose own login (and
@@ -106,6 +107,7 @@ def mark_session(data_dir: Path, tool: str, email: str, *, pin: str | None = Non
         _START_CACHE[pid] = process_start
     data = {
         "email": email,
+        "thread": thread,
         "pid": pid,
         "process_start": process_start,
         "started_at": iso(now()),
@@ -137,6 +139,8 @@ def mark_session(data_dir: Path, tool: str, email: str, *, pin: str | None = Non
         pass
     write_json(_process_file(data_dir, tool, pid), data, mode=0o600)
     write_json(legacy, data, mode=0o600)
+    seatledger.record(data_dir, tool, key_seat["id"] if key_seat else email,
+                      pid=pid, thread=thread)
 
 
 def update_restart_diagnostics(data_dir: Path, tool: str) -> None:
@@ -160,6 +164,12 @@ def update_restart_diagnostics(data_dir: Path, tool: str) -> None:
 
 def clear_session(data_dir: Path, tool: str) -> None:
     """Remove the session heartbeat. Best-effort; any stale file is verified when read."""
+    try:
+        data = json.loads(_process_file(data_dir, tool, os.getpid()).read_bytes())
+        seatledger.record(data_dir, tool, data["email"], pid=os.getpid(),
+                          thread=data.get("thread"), event="end")
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
     try:
         _process_file(data_dir, tool, os.getpid()).unlink()
     except OSError:
@@ -191,6 +201,14 @@ def claim_thread(data_dir: Path, tool: str, thread: str) -> None:
         _START_CACHE[pid] = process_start
     write_json(_thread_file(data_dir, tool, pid),
                {"pid": pid, "process_start": process_start, "thread": thread}, mode=0o600)
+    try:
+        path = _process_file(data_dir, tool, pid)
+        data = json.loads(path.read_bytes())
+        data["thread"] = thread
+        write_json(path, data, mode=0o600)
+        seatledger.record(data_dir, tool, data["email"], pid=pid, thread=thread)
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
 
 
 def release_thread(data_dir: Path, tool: str) -> None:

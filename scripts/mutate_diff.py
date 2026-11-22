@@ -44,13 +44,17 @@ TEST_MAP: dict[str, list[str]] = {
                  "tests/test_seat_env.py"],
     "procenv": ["tests/test_seat_env.py"],
     "usage": ["tests/test_signin.py", "tests/test_usage.py", "tests/test_claude_live_item.py",
-              "tests/test_codex_token_expiry.py"],
+              "tests/test_codex_token_expiry.py", "tests/test_tokenlog.py"],
     "accounts": ["tests/test_signin.py", "tests/test_usage.py", "tests/test_claude_live_item.py"],
     "keychain": ["tests/test_signin.py", "tests/test_usage.py", "tests/test_claude_live_item.py"],
     "selection": ["tests/test_selection.py", "tests/test_seatkind.py"],
     "seatkind": ["tests/test_seatkind.py"],
     "seatproxy": ["tests/test_seatproxy.py"],
     "switch": ["tests/test_switch_safety.py", "tests/test_accounts_switch.py"],
+    "tokenlog": ["tests/test_usage_contract.py", "tests/test_usage_history_native.py"],
+    "seatledger": ["tests/test_tokenlog.py", "tests/test_session.py"],
+    "session": ["tests/test_seatledger.py", "tests/test_launcher.py", "tests/test_paid_kill_switch.py"],
+    "bridge": ["tests/test_usage_history_native.py"],
 }
 SKIP = shutil.ignore_patterns(".venv", ".git", ".wt", "node_modules", "__pycache__", "build", "dist",
                               ".pytest_cache", ".playwright-mcp")

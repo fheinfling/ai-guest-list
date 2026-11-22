@@ -179,6 +179,10 @@ def test_limit_moves_the_live_child_to_a_same_kind_seat(seats, proxies):
     assert proxy.binds[-1] == Seat(C2, f"tok-{C2}")
     assert sum("takes over" in n for n in notes) == 1      # one hop, not a second to repair it
     assert proxy.stopped
+    from acctsw import seatledger
+    thread = _session(spawn)
+    binds = [row for row in seatledger.read(ctx.data_dir) if row["event"] == "bind"]
+    assert [(row["email"], row["thread"]) for row in binds] == [(C1, thread), (C2, thread)]
 
 
 def test_a_crossing_asks_first_and_moves_on_the_tick_after_approval(seats, proxies):

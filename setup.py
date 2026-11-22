@@ -88,6 +88,9 @@ OPTIONS = {
     "argv_emulation": False,            # menubar agent: no CLI args, and avoids the Carbon dependency
     "iconfile": "app/icon.icns",        # the disco-door app icon (source: app/icon.svg)
     "packages": ["acctsw", "app"],      # engine + shell (py2app follows imports, this is belt+braces)
+    # The token index (acctsw.tokenlog) needs sqlite3, and the app loads it lazily: name it so the
+    # bundle can never miss it. scripts/smoke-bundle.py proves it imports from the built app.
+    "includes": ["sqlite3"],
     "excludes": STDLIB_TEST_PACKAGES,
     "plist": {
         "CFBundleName": "AI Guest List",

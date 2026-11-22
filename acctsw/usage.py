@@ -1412,6 +1412,18 @@ def store_fetch(state, tool: str, email: str, u: Usage, at=None, *,
                 seat["plan"] = accounts.plan_of(tool, blob)
                 seat["account_id"] = account_fingerprint(tool, blob)
                 seat["workspace_id"] = new_workspace
+                if tool == "codex":
+                    # The poll already holds this blob. History never reads Keychain.
+                    from .util import jwt_payload, parse_iso
+                    try:
+                        tokens = json.loads(blob).get("tokens") or {}
+                        auth = jwt_payload(tokens.get("id_token", "")).get("https://api.openai.com/auth") or {}
+                        anchor = (auth.get("chatgpt_subscription_active_until")
+                                  or auth.get("chatgpt_subscription_active_start"))
+                        if isinstance(anchor, str) and parse_iso(anchor) is not None:
+                            seat["billing"] = {"renews_at": anchor, "source": "codex_token"}
+                    except (ValueError, TypeError, AttributeError):
+                        pass
                 if old_workspace and new_workspace and old_workspace != new_workspace:
                     # Same email, different provider account means cancellation/re-subscription or
                     # a workspace move. Old rests and auth backoff belong to the old subscription.

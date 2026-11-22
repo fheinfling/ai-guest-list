@@ -283,12 +283,14 @@ function addUsesPaste(add) { return add.method === "token" && add.provider === "
 // PURE reducer for a bridge reply → next UI state + effects. All the async-correlation logic that
 // kept regressing (stale replies, poll ordering, save-in-flight, login-launch failure) lives here so
 // it can be unit-tested without a DOM. app.mjs owns the effects (render/flash/celebrate/timer).
-//   ui  = { screen, add, lastRev, state }   (add may be null; add is mutated in place and returned)
+//   ui  = { screen, add, lastRev, state, usage, usageError }
+//         (add may be null; add is mutated in place and returned)
 //   res = the bridge result object
-// returns { screen, add, lastRev, state, render, flash, celebrate, closeFlow }
+// returns { screen, add, lastRev, state, usage, usageError, render, flash, celebrate, closeFlow }
 //   closeFlow: the add object whose "done" screen should auto-close after a delay, or null.
 function reduceReply(ui, res) {
   let { screen, add, lastRev, state } = ui;
+  let usage = ui.usage ?? null, usageError = ui.usageError ?? null;
   let render = false, flash = null, celebrate = false, closeFlow = null;
 
   // Native "open settings" — but never interrupt an in-flight save (its reply would land off-screen).
@@ -335,6 +337,17 @@ function reduceReply(ui, res) {
   if (screen === "add") render = addChanged;    // else swallow the poll, keep the DOM (and focus)
   else if (res.state || res.settings_panel) render = true;
 
+  // History replies have no state snapshot. Keep their cache independent of state.rev, including
+  // late replies after leaving this screen; they must never navigate or interrupt another flow.
+  if (res.usage_history) {
+    usage = res.usage_history; usageError = null;
+    if (screen === "usage") render = true;
+  }
+  if (res.usage_history_error != null) {
+    usageError = String(res.usage_history_error);
+    if (screen === "usage") render = true;
+  }
+
   // Toast a user-action error, but not a background poll blip, nor an add-op error that isn't for the
   // current flow (a stale/other-tool one would pop over main/settings or the wrong add out of nowhere).
   if (res.error && !res.background && (!res.add_op || forThisFlow)) flash = res.error;
@@ -342,7 +355,7 @@ function reduceReply(ui, res) {
   if (res.update_check && !res.background) flash = updateCheckFlash(res.update_check);
   if (res.celebrate) celebrate = true;
 
-  return { screen, add, lastRev, state, render, flash, celebrate, closeFlow };
+  return { screen, add, lastRev, state, usage, usageError, render, flash, celebrate, closeFlow };
 }
 
 function addProviderStep() {
@@ -488,6 +501,144 @@ function segBlock(label, hint, action, current, options) {
   return `<div class="set-seg-row">
     <div class="set-tx"><span class="set-t">${label}</span>${hint ? `<span class="set-s">${hint}</span>` : ""}</div>
     <div class="set-seg">${segs}</div></div>`;
+}
+
+// Local-log history: the calendar overview and each seat's own windows are deliberately separate.
+// The engine owns boundaries/attribution; this view only sums the four normalised token counts.
+function usageCount(tokens, basis = "all") {
+  const [input = 0, read = 0, write = 0, output = 0] = tokens || [];
+  return basis === "output" ? output : input + write + output + (basis === "fresh" ? 0 : read);
+}
+
+function fmtUsageTokens(n) {
+  for (const [unit, suffix] of [[1e9, "B"], [1e6, "M"], [1e3, "K"]]) {
+    if (n >= unit * .9995) {
+      return new Intl.NumberFormat("en-US", { maximumFractionDigits: n / unit < 10 ? 1 : 0 }).format(n / unit) + suffix;
+    }
+  }
+  return new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).format(n || 0);
+}
+
+function usageModels(by, basis, own = false) {
+  const totals = {};
+  for (const models of own ? [by || {}] : Object.values(by || {})) {
+    for (const [id, tokens] of Object.entries(models)) totals[id] = (totals[id] || 0) + usageCount(tokens, basis);
+  }
+  return totals;
+}
+const usageSum = (models) => Object.values(models).reduce((a, b) => a + b, 0);
+const usageSwatch = (m) => `<i class="u-swatch" style="background:var(--m${m.slot})" aria-hidden="true"></i>`;
+
+function usageBar(models, totals, tall = false, hatch = false) {
+  const total = usageSum(totals);
+  return `<div class="u-bar${tall ? " u-tall" : ""}${hatch ? " u-hatch" : ""}">${models.filter((m) => totals[m.id] > 0).map((m) => {
+    const share = totals[m.id] / total;
+    return `<i${m.slot === 4 ? ' class="u-dark-ink"' : ""} style="flex:${totals[m.id]};background:var(--m${m.slot})" title="${esc(m.label)}: ${fmtUsageTokens(totals[m.id])} tokens">${tall && share >= .12 ? `<span>${Math.round(share * 100)}%</span>` : ""}</i>`;
+  }).join("")}</div>`;
+}
+
+function usageColumns(periods, models, basis, selected, own = false, mode = "week") {
+  const values = periods.map((p) => usageModels(p.by, basis, own));
+  const totals = values.map(usageSum), max = Math.max(1, ...totals);
+  const count = Math.max(1, periods.length);
+  const columns = periods.map((p, idx) => {
+    const untracked = own && p.approx && !usageSum(usageModels(p.by, "all", true));
+    const label = `${p.label}: ${untracked ? "not tracked" : fmtUsageTokens(totals[idx]) + " tokens"}`;
+    const parts = models.filter((m) => values[idx][m.id] > 0).map((m) => `<i style="flex:${values[idx][m.id]};background:var(--m${m.slot})"></i>`).join("");
+    const inner = untracked ? '<span class="u-untracked u-hatch" aria-hidden="true"></span>'
+      : `<span class="u-stack" style="height:${totals[idx] / max * 100}%">${parts}</span>`;
+    return own ? `<div class="u-col${untracked ? " u-not-tracked" : ""}" role="img" aria-label="${esc(label)}" title="${esc(label)}${untracked ? ": extrapolated window before seat tracking" : ""}">${inner}</div>`
+      : `<button class="u-col${idx === selected ? " u-selected" : ""}" data-action="usage-period" data-idx="${idx}" aria-pressed="${idx === selected}" aria-label="${esc(label)}" title="${esc(label)}">${inner}</button>`;
+  }).reverse().join("");
+  const ticks = periods.slice().reverse().map((p, i) => {
+    const date = new Date(p.from);
+    const tick = p.current ? "now" : (mode === "month" || i % 3 === 0)
+      ? date.toLocaleDateString("en-US", { month: "short", ...(mode === "week" ? { day: "numeric" } : {}) }) : "";
+    return `<span>${esc(tick)}</span>`;
+  }).join("");
+  return `<div class="u-chart" style="--columns:${count}"><div class="u-cols">${columns}</div><div class="u-ticks" aria-hidden="true">${ticks}</div></div>`;
+}
+
+function usageOrdinal(n) {
+  return n + ([11, 12, 13].includes(n % 100) ? "th" : ({ 1: "st", 2: "nd", 3: "rd" }[n % 10] || "th"));
+}
+
+function usageSeatPanel(seat, usage, totals, view) {
+  const own = usage.own?.[seat.key];
+  let windows = "";
+  if (own) {
+    const monthly = view.mode === "month" && own.month;
+    const periods = monthly ? own.month.periods : own.week;
+    const current = periods?.find((p) => p.current);
+    let caption = "own weekly windows";
+    if (monthly) caption = own.month.source === "calendar" ? "calendar months"
+      : `billing months${own.month.renews_day ? ` (renews on the ${usageOrdinal(own.month.renews_day)})` : ""}`;
+    else if (current) {
+      const date = new Date(current.to);
+      caption += ` (resets ${date.toLocaleDateString("en-US", { weekday: "short" })} ${date.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })})`;
+    }
+    windows = `<div class="u-own"><p class="u-window-caption">${esc(caption)}</p>
+      ${view.mode === "month" && !monthly ? '<p class="u-fallback">no billing date known: weekly windows</p>' : ""}
+      ${usageColumns(periods || [], usage.models, view.basis, null, true, monthly ? "month" : "week")}
+      ${periods?.some((p) => p.approx && !usageSum(usageModels(p.by, "all", true))) ? '<p class="u-fallback">striped windows: not tracked</p>' : ""}
+      ${current?.limit_pct != null ? `<div class="u-model-row u-current-limit"><span>current window · ${esc(current.label)}</span><b>${Math.round(current.limit_pct)}% of limit</b></div><div class="u-meter" role="meter" aria-label="current window limit used" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.max(0, Math.min(100, current.limit_pct))}"><i style="width:${Math.max(0, Math.min(100, current.limit_pct))}%"></i></div>` : ""}</div>`;
+  }
+  return `<div class="u-panel" id="usage-seat-${esc(encodeURIComponent(seat.key))}">
+    ${usage.models.filter((m) => totals[m.id] > 0).map((m) => `<div class="u-model-row">${usageSwatch(m)}<span>${esc(m.label)}</span><b>${fmtUsageTokens(totals[m.id])}</b></div>`).join("") || '<p class="u-fallback">no tokens in this period</p>'}
+    ${windows}</div>`;
+}
+
+function usageSeat(seat, period, usage, view) {
+  const totals = usageModels(period.by?.[seat.key], view.basis, true), total = usageSum(totals);
+  const open = view.open === seat.key;
+  if (!total && !open) return "";
+  const limits = (usage.own?.[seat.key]?.week || []).filter((w) => w.limit_pct != null
+    && Date.parse(w.from) < Date.parse(period.to) && Date.parse(w.to) > Date.parse(period.from)).map((w) => w.limit_pct);
+  const peak = limits.length ? Math.max(...limits) : null;
+  const sub = seat.kind === "key" ? "paid per token" : seat.kind === "removed" ? "removed seat"
+    : seat.kind === "unattributed" ? seat.note : peak == null ? "weekly limit peak unavailable"
+      : `weekly limit peak ${Math.round(peak)}%${peak >= 100 ? " · ⚠ hit weekly limit" : ""}`;
+  return `<article class="u-seat${seat.kind === "unattributed" ? " u-unattributed" : ""}">
+    <button class="u-seat-toggle" data-action="usage-seat" data-key="${esc(seat.key)}" aria-expanded="${open}"${open ? ` aria-controls="usage-seat-${esc(encodeURIComponent(seat.key))}"` : ""}>
+      <i class="u-dot u-${esc(seat.tool)}" aria-hidden="true"></i><span class="u-who"><b>${esc(seat.name)}</b><small>${esc([seat.tool, seat.plan].filter(Boolean).join(" · "))}</small></span><span class="u-total">${fmtUsageTokens(total)}</span>
+      ${usageBar(usage.models, totals, false, seat.kind === "unattributed")}<span class="u-seat-sub">${esc(sub || "")}</span></button>
+    ${open ? usageSeatPanel(seat, usage, totals, view) : ""}</article>`;
+}
+
+function buildUsage(state, usage, view = {}) {
+  view = { mode: "week", idx: 0, basis: "all", open: null, error: null, ...view };
+  const mode = view.mode === "month" ? "month" : "week";
+  const periods = usage?.calendar?.[mode] || [];
+  const idx = Math.max(0, Math.min(view.idx, periods.length - 1));
+  const period = periods[idx];
+  let content;
+  if (view.error) content = `<div class="u-state" role="alert"><p>couldn't read token usage</p><p>${esc(view.error)}</p><button data-action="usage-retry">try again</button></div>`;
+  else if (!usage) content = '<div class="u-state" role="status"><div class="u-skeleton" aria-hidden="true"><i></i><i></i><i></i></div><p>reading your local logs…</p></div>';
+  else if (!period || !Object.values(usage.calendar).some((ps) => ps.some((p) => usageSum(usageModels(p.by, "all")) > 0))) {
+    content = '<div class="u-state"><p>No token usage found yet.</p><p>This view reads Claude Code and Codex logs on this Mac.</p></div>';
+  } else {
+    const totals = usageModels(period.by, view.basis), total = usageSum(totals);
+    const previous = period.current ? period.prev_same_point : periods[idx + 1]?.by;
+    const prevTotal = previous == null ? null : usageSum(usageModels(previous, view.basis));
+    let delta = "no earlier period to compare";
+    if (prevTotal > 0) {
+      const change = (total - prevTotal) / prevTotal * 100;
+      // Round first: a -0.4% change must not show a down arrow next to "0%".
+      const pct = Math.round(Math.abs(change));
+      delta = pct === 0 ? `about the same as ${period.current ? "the same point " : ""}last ${mode}`
+        : `${change > 0 ? "▲ " : "▼ "}${pct}% vs ${period.current ? "same point " : ""}last ${mode}`;
+    } else if (prevTotal === 0) delta = `no tokens ${period.current ? "at the same point " : ""}last ${mode}`;
+    content = `<section class="u-hero" aria-label="selected period">
+      <div class="u-stepper"><button data-action="usage-period" data-idx="${idx + 1}" aria-label="earlier ${mode}"${idx >= periods.length - 1 ? " disabled" : ""}>‹</button><span class="u-period">${esc(period.label)}${period.current ? " · so far" : ""}<small>${mode === "month" ? "calendar month" : "calendar week, Mon–Sun"} · all seats</small></span><button data-action="usage-period" data-idx="${idx - 1}" aria-label="later ${mode}"${idx === 0 ? " disabled" : ""}>›</button></div>
+      <div class="u-figure"><b>${fmtUsageTokens(total)}</b><span>tokens</span></div>
+      <div class="u-basis" role="group" aria-label="token count">${Object.entries({ all: "all tokens", fresh: "without cache reads", output: "output only" }).map(([basis, label]) => `<button data-action="usage-basis" data-value="${basis}" aria-pressed="${basis === view.basis}">${label}</button>`).join("")}</div>
+      <p class="u-delta">${delta}</p>${usageBar(usage.models, totals, true)}
+      <div class="u-legend">${usage.models.filter((m) => totals[m.id] > 0).map((m) => `<span>${usageSwatch(m)}${esc(m.label)}</span>`).join("")}</div></section>
+      <section class="u-history" aria-label="calendar history"><h2>last ${periods.length} ${mode}s · all seats</h2>${usageColumns(periods, usage.models, view.basis, idx, false, mode)}</section>
+      <section class="u-seats" aria-label="usage by seat"><h2><span>by seat</span><span>tap for history</span></h2>${usage.seats.map((s) => usageSeat(s, period, usage, view)).join("") || '<p class="u-no-seats">no seat tokens for this count</p>'}</section>`;
+  }
+  return `<div class="app set-app usage theme-${state?.settings?.theme === "dark" ? "dark" : "light"}"><header class="set-head"><button class="set-back" data-action="usage-back" aria-label="back">‹</button><h1 class="set-title">usage</h1><div class="u-mode" role="group" aria-label="period">${["week", "month"].map((m) => `<button data-action="usage-mode" data-value="${m}" aria-pressed="${mode === m}">${m}</button>`).join("")}</div></header>
+    <div class="set-body" aria-label="token usage history" tabindex="0">${usage?.index?.done === false && !view.error ? `<p class="u-index" role="status">reading history… ${Math.max(0, Math.min(100, Math.round(usage.index.pct || 0)))}%</p>` : ""}${content}<p class="u-note">Read from Claude Code and Codex logs on this Mac. Nothing is sent anywhere.</p></div></div>`;
 }
 
 // Settings sub-view (spec §9.1) — a full-panel pushed screen, NOT a modal. Renders into #root in
@@ -639,6 +790,7 @@ function seatMetadata(seat) {
 }
 
 const ICON = {
+  usage: '<svg viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M3 12V8m5 4V3m5 9V6"/></svg>',
   alert: '<svg viewBox="0 0 14 14" aria-hidden="true"><circle cx="7" cy="7" r="6.2" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M7 3.6v4.1" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="7" cy="10.2" r=".95" fill="currentColor"/></svg>',
   clock: '<svg viewBox="0 0 14 14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="7" cy="7" r="6.2"/><path d="M7 3.8V7l2.2 1.4" stroke-linecap="round"/></svg>',
   check: '<svg viewBox="0 0 12 12" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2.5 6.2l2.3 2.3 4.7-5" stroke-linecap="round" stroke-linejoin="round"/></svg>',
@@ -867,6 +1019,7 @@ function buildHTML(state, pendingSwitch = null, openDetails = new Set(), nameEdi
   const emptyWithoutWelcome = !seats.length && !state?.keys?.length && (plans.length || asking);
   return `<div class="app ambient-app now-next theme-${theme} mood-${mood}">
     <header class="top"><span class="brand">${appIcon()}</span>${headerVerdict(state)}<div class="top-actions">
+      <button class="ibtn" data-action="usage" aria-label="token usage">${ICON.usage}</button>
       <div class="header-menu"><button class="ibtn" data-action="menu" data-menu="add" aria-label="add a subscription seat or API key" aria-haspopup="menu" aria-expanded="false">${ICON.plus}</button><nav class="menu" role="menu" aria-label="add" hidden><button role="menuitem" data-action="add" data-tool="codex">codex seat <span class="sub">sign in</span></button><button role="menuitem" data-action="add" data-tool="claude">claude seat <span class="sub">sign in</span></button><hr><button role="menuitem" data-action="key-start">api key <span class="sub">paid</span></button><button role="menuitem" data-action="add">a subscription seat</button></nav></div>
       <div class="header-menu"><button class="ibtn" data-action="menu" data-menu="more" aria-label="app menu" aria-haspopup="menu" aria-expanded="false">${ICON.more}</button><nav class="menu" role="menu" aria-label="more" hidden><button role="menuitemcheckbox" aria-checked="${!!state?.settings?.auto_switch}" data-action="toggle" data-key="auto_switch">auto-switch <span class="sub">${state?.settings?.auto_switch ? "on" : "off"}</span></button><hr><button role="menuitem" data-action="update-check">check for updates</button><button role="menuitem" data-action="settings">settings…</button><button role="menuitem" data-action="quit">quit</button></nav></div></div></header>
     <div class="body" aria-label="seat availability" tabindex="0"><div class="content">${problems ? `<div class="app-problems">${problems}</div>` : ""}${update ? `<div class="app-notes">${update}</div>` : ""}${prompts}${paid ? paidUseControl(state) : ""}${plans.length ? `<div class="field">${plans.map((p) => toolBlock(p, state, pendingSwitch, openDetails, nameEdits)).join("")}</div><div class="sheet">${plans.map((p) => listRows(p, state, openDetails, nameEdits)).join("")}</div>` : !asking ? `<div class="field welcome"><p class="welcome-title">no seats yet</p><p>use ＋ above to add a subscription or API key.</p><button class="act act--strong" data-action="add">add a seat</button></div>` : ""}${emptyWithoutWelcome ? `<p class="empty">use ＋ above to add a subscription or API key.</p>` : ""}</div></div>
@@ -1184,10 +1337,13 @@ window.AGL = {
       // applies its decisions to the module state + DOM. The add sub-view holds unsaved typed input,
       // so a pure state push updates `state` without a DOM swap or focus/caret theft, except when
       // a completed browser sign-in advances the connecting step to done.
-      const out = reduceReply({ screen, add, lastRev, state }, res);
+      const out = reduceReply({ screen, add, lastRev, state, usage, usageError: usageView.error }, res);
       const inKeyFlow = screen === "add-key";
       if (inKeyFlow || screen === "paid-key") out.screen = screen; // keep the current input/confirmation
       screen = out.screen; add = out.add; lastRev = out.lastRev; state = out.state;
+      usage = out.usage; usageView.error = out.usageError;
+      if (res.usage_history || res.usage_history_error != null) usageInflight = false;
+      syncUsagePolling();
       // The click is answered once the engine reports progress (or failure) in a newer snapshot.
       if (installSentAt !== null && (lastRev > installSentAt || res.error || !updateCanInstall(state.update))) {
         installSentAt = null; out.render = true;
@@ -1332,10 +1488,34 @@ function paintMenus(focus = false) {
   reportHeight();
 }
 
-// which screen occupies the popover: "main", the settings sub-view, or the add-seat sub-view
+// Which screen occupies the popover: main, settings, usage, add, add-key, or paid-key
 // (spec §9 — pushed sub-views on the same surface, never a modal).
 let screen = "main";
 let renderedScreen = null;  // what the last render() actually drew — gates scroll preservation
+let usage = null; // cached across visits; history replies do not carry a state revision
+let usageView = { mode: "week", idx: 0, basis: "all", open: null, error: null };
+let usageTimer = null;
+// At most one history request in flight: each one may spend seconds indexing in the engine, so the
+// next poll is scheduled only after its reply arrives (AGL.result -> syncUsagePolling), never on a clock.
+let usageInflight = false;
+function requestUsage() {
+  if (usageInflight) return;
+  usageInflight = true; send("usage_history");
+}
+function stopUsagePolling() {
+  if (usageTimer !== null) clearTimeout(usageTimer);
+  usageTimer = null;
+}
+function syncUsagePolling() {
+  if (screen !== "usage" || usage?.index?.done !== false || usageView.error) {
+    stopUsagePolling();
+  } else if (usageTimer === null && !usageInflight) {
+    usageTimer = setTimeout(() => {
+      usageTimer = null;
+      if (screen === "usage") requestUsage();
+    }, 2000);
+  }
+}
 // transient add-a-seat flow state; non-null only while screen === "add". Held here (not in `state`,
 // which the poll overwrites) so typed name/token survive a background re-render.
 let add = null;
@@ -1378,7 +1558,8 @@ function resetTransientUI() {
   pendingSwitch = null;
   openSeatDetails.clear();
   openMenu = null;
-  if (screen === "settings") screen = "main";
+  if (screen === "settings" || screen === "usage") screen = "main";
+  stopUsagePolling();
   // Also when its request is still out: a late "paid use is off" reply must not bring the gate back.
   paidTerminal = null;
   if (screen === "paid-key") screen = "main";
@@ -1407,6 +1588,7 @@ function render() {
 }
 
 function renderContent() {
+  syncUsagePolling();
   if (screen !== renderedScreen) openMenu = null;
   if (screen !== "main" || (pendingSwitch &&
       !switchNeedsConfirmation(state, pendingSwitch.tool, pendingSwitch.email))) pendingSwitch = null;
@@ -1420,6 +1602,7 @@ function renderContent() {
   const prevBody = root.querySelector(".body, .set-body");
   const scrollTop = screen === renderedScreen ? prevBody?.scrollTop || 0 : 0;
   root.innerHTML = screen === "settings" ? buildSettings(state)
+    : screen === "usage" ? buildUsage(state, usage, usageView)
     : screen === "add" ? buildAddSeat(state, add)
     : screen === "add-key" ? buildAddKey(state, keyFlow)
     : screen === "paid-key" ? buildPaidKeyGate(state, paidTerminal)
@@ -1679,6 +1862,27 @@ document.addEventListener("click", (e) => {
       break;
     }
     case "add-reveal": send("reveal"); break;   // native: reveal ~/.codex/auth.json in Finder
+    case "usage":
+      // An explicit open/retry never waits on a reply that may have been lost.
+      screen = "usage"; usageView.error = null; usageInflight = false; render(); requestUsage(); break;
+    case "usage-back": screen = "main"; render(); break;
+    case "usage-retry":
+      usageView.error = null; usageInflight = false; render(); requestUsage(); break;
+    case "usage-mode":
+      if (screen !== "usage" || !["week", "month"].includes(value)) break;
+      usageView.mode = value; usageView.idx = 0; render(); break;
+    case "usage-basis":
+      if (screen !== "usage" || !["all", "fresh", "output"].includes(value)) break;
+      usageView.basis = value; render(); break;
+    case "usage-period": {
+      if (screen !== "usage") break;
+      const idx = Number(el.dataset.idx), periods = usage?.calendar?.[usageView.mode] || [];
+      if (Number.isInteger(idx) && idx >= 0 && idx < periods.length) { usageView.idx = idx; render(); }
+      break;
+    }
+    case "usage-seat":
+      if (screen !== "usage" || !usage?.seats.some((s) => s.key === el.dataset.key)) break;
+      usageView.open = usageView.open === el.dataset.key ? null : el.dataset.key; render(); break;
     case "settings": screen = "settings"; render(); break;
     case "update-install":
       if (installSentAt !== null || !updateCanInstall(state.update)) break;
@@ -1776,7 +1980,7 @@ document.addEventListener("keydown", (e) => {
     const trigger = root.querySelector(`[data-action="menu"][data-menu="${openMenu}"]`);
     openMenu = null; paintMenus(); trigger?.focus(); return;
   }
-  if (screen === "settings") { screen = "main"; render(); }
+  if (screen === "settings" || screen === "usage") { screen = "main"; render(); }
   else if (screen === "add") addBack();
   else if (screen === "add-key") keyBack();
   else if (screen === "paid-key" && !paidTerminal?.pending) { paidTerminal = null; screen = "main"; render(); }
@@ -1785,7 +1989,7 @@ document.addEventListener("keydown", (e) => {
 // WKWebView normally reflects popover visibility here; the native shell also calls setVisible()
 // explicitly so transient closes always clear the interval even on macOS versions that do not.
 document.addEventListener("visibilitychange", () => setPopoverVisible(!document.hidden));
-window.addEventListener("pagehide", () => setPopoverVisible(false));
+window.addEventListener("pagehide", () => { setPopoverVisible(false); stopUsagePolling(); });
 
 // Font loading can change intrinsic height without a state push.
 document.fonts?.ready.then(reportHeight);

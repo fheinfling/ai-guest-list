@@ -2,14 +2,20 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>ai guest list — preview</title>
   <link rel="stylesheet" href="styles.css">
-  <style>body{background:#cdd5e2;padding:30px;display:flex;justify-content:center}</style>
+  <style>
+    body{background:var(--desk,#cdd5e2);padding:30px;display:flex;justify-content:center}
+    #root{width:376px;max-width:100%;flex:none}
+    @media(max-width:436px){body{padding:0}}
+  </style>
 </head>
 <body>
   <div id="root"></div>
   <script src="bundle.js"></script>
   <script>
+    const params = new URLSearchParams(location.search);
     const iso = (m) => new Date(Date.now() + m * 60000).toISOString();
     const usage = (p5, m5, pWeek) => ({
       ok: true,
@@ -56,7 +62,7 @@
     });
     window.AGL.result({ state: {
       settings: {
-        theme: "light",
+        theme: params.get("theme") === "dark" ? "dark" : "light",
         auto_switch: true,
         notify: true,
         restart_app: false,
@@ -116,6 +122,35 @@
       pending_tier_requests: [],
       rev: 1,
     }});
+    // Examples: ?screen=usage&theme=dark, &mode=month, &open=claude:biz@example.com&scroll=seat
+    // Fixture-only history also exercises the shipping action/reply path, without a native bridge.
+    async function previewUsage() {
+      if (params.get("screen") !== "usage") return;
+      document.querySelector('[data-action="usage"]').click();
+      if (params.get("status") !== "loading") {
+        const fixture = params.get("status") === "indexing" ? "usage-history.indexing.json" : "usage-history.sample.json";
+        const payload = await (await fetch(`fixtures/${fixture}`)).json();
+        if (params.get("status") === "empty") {
+          for (const periods of Object.values(payload.calendar)) for (const period of periods) period.by = {};
+        }
+        window.AGL.result(params.get("status") === "error"
+          ? { ok: false, usage_history_error: "couldn't read a local log — try again" }
+          : { ok: true, usage_history: payload });
+      }
+      if (params.get("mode") === "month") document.querySelector('[data-action="usage-mode"][data-value="month"]').click();
+      if (params.get("basis")) document.querySelector(`[data-action="usage-basis"][data-value="${CSS.escape(params.get("basis"))}"]`)?.click();
+      const key = params.get("open");
+      const row = key && [...document.querySelectorAll('[data-action="usage-seat"]')].find((el) => el.dataset.key === key);
+      row?.click();
+      await document.fonts.ready;
+      if (key && params.get("scroll") === "seat") {
+        const currentRow = [...document.querySelectorAll('[data-action="usage-seat"]')].find((el) => el.dataset.key === key);
+        const body = document.querySelector('.set-body');
+        body.scrollTop = currentRow.getBoundingClientRect().top - body.getBoundingClientRect().top - 12;
+      }
+      document.body.dataset.previewReady = "true";
+    }
+    previewUsage();
   </script>
 </body>
 </html>

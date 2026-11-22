@@ -61,6 +61,11 @@ except ImportError:  # allows importing this module's pure helpers without pyobj
 
 from acctsw import TOOLS, appalive, bridge, session
 from acctsw.context import Context, hydrate_path
+
+# The token index (acctsw.tokenlog) needs sqlite3, which the app never imported before. Load it on
+# first use, never at launch: a bundle that lacks sqlite3 must still start, and then only the usage
+# view reports an error. Tests may set this to a stand-in.
+tokenlog = None
 from acctsw.procenv import harden_env, shed_seat_env
 from acctsw.util import now, parse_iso
 
@@ -402,6 +407,9 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
             self._web_reload_times = []
             self._state_timer = None
             self._usage_timer = None
+            self._history_timer = None
+            self._history_timer_repeating = False
+            self._history_index_inflight = False
             self._wake_poll_timer = None
             self._wake_followup_timer = None
             self._usage_interval = None
@@ -437,6 +445,8 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
             self._buildPopover()
             self._startStateTimer()  # consent expires in 2m; the hidden usage poll takes 3m
             self._startUsageTimer()
+            self._history_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                45.0, self, objc.selector(self.indexHistory_, signature=b"v@:@"), None, False)
             self._startUpdateChecks()
             try:
                 NSWorkspace.sharedWorkspace().notificationCenter().addObserver_selector_name_object_(
@@ -602,6 +612,32 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
         def _startUsageTimer(self):
             self._setUsagePollInterval(usage_poll_interval(False))
             self.pollUsage_(None)  # don't wait 180s for the first usage read
+
+        def indexHistory_(self, timer):
+            if not self._history_timer_repeating:
+                self._history_timer.invalidate()
+                self._history_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                    600.0, self, objc.selector(self.indexHistory_, signature=b"v@:@"), None, True)
+                self._history_timer_repeating = True
+            if not self._history_index_inflight:
+                self._history_index_inflight = True
+                self.performSelectorInBackground_withObject_(
+                    objc.selector(self.indexHistoryBg_, signature=b"v@:@"), None)
+
+        def indexHistoryBg_(self, unused):
+            try:
+                index = tokenlog
+                if index is None:
+                    from acctsw import tokenlog as index
+                index.refresh(self.ctx, budget_s=20.0)
+            except Exception as exc:
+                _log_exception(exc)
+            finally:
+                self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                    objc.selector(self.finishIndexHistory_, signature=b"v@:@"), None, False)
+
+        def finishIndexHistory_(self, unused):
+            self._history_index_inflight = False
 
         # --- actions ------------------------------------------------------------------------
         def togglePopover_(self, sender):
@@ -1057,6 +1093,10 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
                 self.performSelectorInBackground_withObject_(
                     objc.selector(self.switchBg_, signature=b"v@:@"), msg)
                 return
+            if action == "usage_history":
+                self.performSelectorInBackground_withObject_(
+                    objc.selector(self.usageHistoryBg_, signature=b"v@:@"), msg)
+                return
             result = bridge.handle(self.ctx, msg)
             if action == "dot":
                 self._updateDot(result.get("state"))
@@ -1214,6 +1254,14 @@ if objc is not None and not (__name__ == "__main__" and "--check-app" in sys.arg
             except Exception as exc:
                 _log_exception(exc)
                 result = {"ok": False, "error": str(exc).strip() or exc.__class__.__name__}
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
+
+        def usageHistoryBg_(self, msg):
+            try:
+                result = dict(bridge.handle(self.ctx, msg))
+            except Exception:
+                result = {"ok": False, "usage_history_error": "Could not read usage history"}
             self.performSelectorOnMainThread_withObject_waitUntilDone_(
                 objc.selector(self.applyResult_, signature=b"v@:@"), result, False)
 
