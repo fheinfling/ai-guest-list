@@ -720,7 +720,7 @@ def test_export_csv_closes_database_and_reserved_file_descriptor(ctx, tmp_path, 
         db = original_connect(context)
         connections.append(db)
         return db
-    def reserve(path, flags, mode=0o777):
+    def reserve(path, flags, mode=0o600):
         fd = original_open(path, flags, mode)
         if Path(path).name.startswith("token-usage-"):
             descriptors.append(fd)

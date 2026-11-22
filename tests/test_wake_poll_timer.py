@@ -232,9 +232,19 @@ def test_launch_registers_for_workspace_wake_notifications(monkeypatch):
         _buildPopover=lambda: None, _startStateTimer=lambda: None,
         _startUsageTimer=lambda: None, _startUpdateChecks=lambda: None,
         systemDidWake_=lambda _: None, recoverBg_=lambda _: None, bootstrapBg_=lambda _: None,
-        performSelectorInBackground_withObject_=lambda *_: None)
+        indexHistory_=lambda _: None, performSelectorInBackground_withObject_=lambda *_: None)
+    timers = []
+    monkeypatch.setattr(menubar, "NSTimer", SimpleNamespace(
+        scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_=lambda *args:
+        timers.append(args) or "history-timer"))
 
     call("applicationDidFinishLaunching_", receiver, None)
+
+    # Token history indexing starts once, 45 s after launch, off the launch path.
+    assert len(timers) == 1 and receiver._history_timer == "history-timer"
+    interval, target, history, info, repeats = timers[0]
+    assert (interval, target, info, repeats) == (45.0, receiver, None, False)
+    assert history.callable is receiver.indexHistory_ and history.signature == b"v@:@"
 
     assert len(observers) == 1
     target, selector, name, obj = observers[0]
