@@ -54,7 +54,9 @@ connect through the official tools.
   <img src="docs/assets/screenshot.png" width="340" alt="The ai guest list popover: a status chip, then one block per tool with the seat on now, how much of its tighter window is left, when it resets and where work goes next; below, one line per other seat with its kind and plan, a resting seat with its return time, and an API-key seat priced per token." />
   &nbsp;
   <img src="docs/assets/screenshot-settings.png" width="340" alt="The settings view in four sections: switching (auto-switch, supervise terminals, restart the Codex app, business and personal seats), tools (keep the Claude Code and Codex CLIs up to date), paid keys set apart on gold, and appearance with the theme picker and the menu-bar icon legend." />
-  <br><sub><i>The shipping popover and settings, with fictional accounts. Views are expanded to show all content.</i></sub>
+  &nbsp;
+  <img src="docs/assets/screenshot-usage.png" width="340" alt="The token usage view for the current calendar week: 1.5B tokens with toggles for all tokens, everything except cache reads, cache reads only and output; a bar split by model; stacked weekly bars for the last 13 weeks; and one row per seat with its tokens by model and its weekly limit peak, or 'paid per token' for the API-key seat." />
+  <br><sub><i>The shipping popover, settings and token usage views, with fictional accounts and usage. Views are expanded to show all content.</i></sub>
 </p>
 
 ## Why
@@ -104,10 +106,13 @@ connect through the official tools.
   the next seat until the provider answers differently.
 - **Token usage history** — the **token usage** button in the popover header shows tokens per model and
   per seat for each calendar week or month, and per seat for its own weekly limit window or billing
-  month where the tool reports one (Codex's token, Claude's profile; otherwise weekly). History goes
-  back as far as your local Claude and Codex logs do. Older Claude usage, from before the app tracked
-  which seat ran a session, shows as unattributed. Indexing runs in the background and reads only
-  local files. Export all indexed usage as CSV to Downloads with one click.
+  month where the tool reports one (Codex's token, Claude's profile; otherwise weekly). Count all
+  tokens, everything except cache reads, cache reads only, or output only. History goes back as far
+  as your local Claude and Codex logs do. A Codex session that moved to another seat is credited by
+  the plan its log records (Team vs Business, say) when exactly one seat has that plan. Older Claude
+  usage, from before the app tracked which seat ran a session, shows as unattributed. Indexing runs
+  in the background and reads only local files. Export all indexed usage as CSV to Downloads with
+  one click.
 - **Desktop switching** — the menubar moves a confirmed-limited seat to a verified healthy seat of
   the same tool when auto-switch is enabled. With “restart the Codex app after a swap” enabled, a running
   Codex desktop app quits gracefully and reopens; continue in your existing thread. Supervised
@@ -297,7 +302,8 @@ bash scripts/smoke.sh               # import check + both test suites
 ```
 Build the app locally with `pip install -e ".[build]" && python scripts/build-web.py && python setup.py py2app`
 (output in `dist/`). Regenerate the README images from the real UI with
-`python scripts/screenshots.py` (requires Google Chrome), then inspect both images in `docs/assets/`.
+`python scripts/screenshots.py` (requires Google Chrome), then inspect all three images in `docs/assets/`.
+The usage image is indexed from synthetic logs written to a throwaway store, never from your own.
 
 ## Safety & security
 
