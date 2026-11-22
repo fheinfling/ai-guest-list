@@ -3944,16 +3944,108 @@ test('usage basis adds normalised input, reads, writes and output exactly once',
     'claude:biz@example.com': { 'claude-opus-5-5': [10, 25, 2, 3] },
   };
   // 770 + 20 + 40 = 830; removing 635 reads leaves 195; output is 58.
-  for (const [basis, total] of [['all', '830'], ['fresh', '195'], ['output', '58']]) {
+  for (const [basis, total] of [['all', '830'], ['fresh', '195'], ['read', '635'], ['output', '58']]) {
     assert.equal(usageFigure(usageHTML({ basis }, payload)), total);
     assert.match(usageHTML({ basis }, payload), new RegExp(`data-value="${basis}" aria-pressed="true"`));
   }
   assert.equal(usageCount([100, 600, 20, 50], 'all'), 770);
   assert.equal(usageCount([100, 600, 20, 50], 'fresh'), 170);
+  assert.equal(usageCount([100, 600, 20, 50], 'read'), 600);
   assert.equal(usageCount([100, 600, 20, 50], 'output'), 50);
   assert.equal(usageFigure(usageHTML()), '2B');
   assert.equal(usageFigure(usageHTML({ basis: 'fresh' })), '415M');
   assert.equal(usageFigure(usageHTML({ basis: 'output' })), '131M');
+});
+
+test('usage basis buttons have compact labels and descriptive titles', () => {
+  const html = usageHTML();
+  assert.match(html, /class="u-basis" role="group" aria-label="token count"/);
+  assert.deepEqual([...html.matchAll(/data-action="usage-basis" data-value="([^"]+)" aria-pressed="([^"]+)" title="([^"]+)">([^<]+)<\/button>/g)]
+    .map((m) => m.slice(1)), [
+    ['all', 'true', 'all tokens', 'all'],
+    ['fresh', 'false', 'everything except cache reads', 'no cache reads'],
+    ['read', 'false', 'cache reads only', 'cache reads'],
+    ['output', 'false', 'output tokens only', 'output'],
+  ]);
+});
+
+test('cache reads drive the headline, delta, history, seat rows and own window panels', () => {
+  for (const mode of ['week', 'month']) {
+    const payload = structuredClone(usageSample), key = 'codex:work@example.com';
+    const by = (read) => ({ [key]: { 'gpt-6.1-sol': [100, read, 20, 50] } });
+    const periods = payload.calendar[mode];
+    for (const period of periods) period.by = {};
+    periods[0].by = by(60);
+    periods[0].by['claude:biz@example.com'] = { 'claude-opus-5-5': [900, 40, 10, 300] };
+    periods[0].prev_same_point = by(50);
+    periods[1].by = by(25);
+    periods[2].by = by(50);
+    const own = mode === 'month' ? payload.own[key].month.periods : payload.own[key].week;
+    for (const period of own) period.by = {};
+    own[0].by = by(9)[key];
+    own[1].by = by(3)[key];
+    const html = usageHTML({ mode, basis: 'read', open: key }, payload);
+    assert.equal(usageFigure(html), '100');
+    assert.match(html, new RegExp(`▲ 100% vs same point last ${mode}`));
+    assert.match(html, /<span>60%<\/span>/);
+    assert.match(html, /<span>40%<\/span>/);
+    const history = html.slice(html.indexOf('class="u-history"'), html.indexOf('class="u-seats"'));
+    assert.ok(history.includes(`${periods[0].label}: 100 tokens`));
+    assert.ok(history.includes(`${periods[1].label}: 25 tokens`));
+    assert.match(history, /height:25%/);
+    assert.match(html, /class="u-total">60<\/span>/);
+    assert.match(html, /class="u-total">40<\/span>/);
+    const panel = html.slice(html.indexOf('class="u-panel"'));
+    assert.match(panel, /<b>60<\/b>/);
+    assert.ok(panel.includes(`${own[0].label}: 9 tokens`));
+    assert.ok(panel.includes(`${own[1].label}: 3 tokens`));
+    assert.match(usageHTML({ mode, idx: 1, basis: 'read' }, payload), new RegExp(`▼ 50% vs last ${mode}`));
+  }
+});
+
+test('cache reads with zero counts render empty bars and finite comparisons', () => {
+  const payload = structuredClone(usageSample), key = 'codex:work@example.com';
+  const noReads = { 'gpt-6.1-sol': [100, 0, 20, 50] };
+  for (const periods of Object.values(payload.calendar)) for (const period of periods) {
+    period.by = { [key]: noReads };
+    period.prev_same_point = { [key]: noReads };
+  }
+  for (const seat of Object.values(payload.own)) {
+    for (const period of [...seat.week, ...(seat.month?.periods || [])]) period.by = noReads;
+  }
+  for (const mode of ['week', 'month']) {
+    const html = usageHTML({ mode, basis: 'read', open: key }, payload);
+    assert.equal(usageFigure(html), '0');
+    assert.match(html, new RegExp(`no tokens at the same point last ${mode}`));
+    assert.match(html, /class="u-bar u-tall"><\/div>/);
+    assert.match(html, /height:0%"><\/span>/);
+    assert.match(html, /class="u-total">0<\/span>/);
+    assert.match(html, /no tokens in this period/);
+    assert.doesNotMatch(html, /NaN|Infinity|style="flex:|not tracked/);
+    assert.match(usageHTML({ mode, basis: 'read' }, payload), /no seat tokens for this count/);
+    payload.calendar[mode][0].prev_same_point[key] = { 'gpt-6.1-sol': [0, 5, 0, 0] };
+    assert.match(usageHTML({ mode, basis: 'read' }, payload), new RegExp(`▼ 100% vs same point last ${mode}`));
+    payload.calendar[mode][0].by = { [key]: { 'gpt-6.1-sol': [0, 5, 0, 0] } };
+    payload.calendar[mode][0].prev_same_point = { [key]: noReads };
+    const fromZero = usageHTML({ mode, basis: 'read' }, payload);
+    assert.equal(usageFigure(fromZero), '5');
+    assert.match(fromZero, new RegExp(`no tokens at the same point last ${mode}`));
+    assert.doesNotMatch(fromZero, /NaN|Infinity/);
+  }
+});
+
+test('usage basis handler accepts cache reads and preserves the selection across updates', () => {
+  const app = keyApp();
+  app.click({ action: 'usage' });
+  app.window.AGL.result({ ok: true, usage_history: usageSample });
+  app.click({ action: 'usage-basis', value: 'read' });
+  const expected = usageFigure(usageHTML({ basis: 'read' }));
+  assert.equal(usageFigure(app.root.innerHTML), expected);
+  assert.match(app.root.innerHTML, /data-value="read" aria-pressed="true"/);
+  app.window.AGL.result({ ok: true, usage_history: usageSample });
+  assert.equal(usageFigure(app.root.innerHTML), expected);
+  app.click({ action: 'usage-mode', value: 'month' });
+  assert.equal(usageFigure(app.root.innerHTML), usageFigure(usageHTML({ mode: 'month', basis: 'read' })));
 });
 
 test('usage number formatting is compact and stable at unit boundaries', () => {
@@ -4193,19 +4285,19 @@ test('usage errors stop polling and retry clears the error and requests history'
 });
 
 test('usage counts missing and short token arrays as zero for every absent component', () => {
-  for (const [tokens, all, fresh, output] of [
-    [undefined, 0, 0, 0], [null, 0, 0, 0], [[], 0, 0, 0],
-    [[7], 7, 7, 0], [[7, 11], 18, 7, 0], [[7, 11, 13], 31, 20, 0],
-    [[0, 0, 0, 17], 17, 17, 17],
+  for (const [tokens, all, fresh, read, output] of [
+    [undefined, 0, 0, 0, 0], [null, 0, 0, 0, 0], [[], 0, 0, 0, 0],
+    [[7], 7, 7, 0, 0], [[7, 11], 18, 7, 11, 0], [[7, 11, 13], 31, 20, 11, 0],
+    [[0, 0, 0, 17], 17, 17, 0, 17],
   ]) {
-    assert.deepEqual(['all', 'fresh', 'output'].map((basis) => usageCount(tokens, basis)),
-      [all, fresh, output]);
+    assert.deepEqual(['all', 'fresh', 'read', 'output'].map((basis) => usageCount(tokens, basis)),
+      [all, fresh, read, output]);
   }
   const payload = structuredClone(usageSample);
   payload.calendar.week[0].by = { 'codex:work@example.com': {
     'gpt-6.1-sol': [7, 11, 13], 'gpt-6.1-mini': null, other: [],
   } };
-  for (const [basis, total] of [['all', '31'], ['fresh', '20'], ['output', '0']]) {
+  for (const [basis, total] of [['all', '31'], ['fresh', '20'], ['read', '11'], ['output', '0']]) {
     assert.equal(usageFigure(usageHTML({ basis }, payload)), total);
   }
 });

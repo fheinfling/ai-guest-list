@@ -22,7 +22,7 @@ from pathlib import Path
 
 from . import rollout, seatledger
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 _LOCK = threading.Lock()
 _CHUNK = 1 << 20
 _WEEK = 7 * 86400
@@ -154,12 +154,17 @@ def _ledger(ctx):
     return lookup, tracking[1] if tracking else None
 
 
-def _seat(tool, thread, at, ledger, creators, user=None, account=None):
+def _seat(tool, thread, at, ledger, creators, plans, user=None, account=None, *, plan=None):
     binds = ledger.get((tool, thread), [])
     # bisect on times only: equal-time binds retain append order (the final hop wins).
     index = bisect.bisect_right(binds, at + 120, key=lambda bind: bind[0]) - 1
     if index >= 0:
         return tool + ":" + binds[index][1]
+    if tool == "codex" and isinstance(plan, str) and plan:
+        candidates = plans.get(plan, [])
+        if len(candidates) == 1:
+            return "codex:" + candidates[0]
+        # Ambiguous plans defer to the creator rule, whether or not it is a candidate.
     if tool == "codex" and user:
         matches = creators.get(user, [])
         if matches:
@@ -196,7 +201,7 @@ def _counts(usage, keys):
     return values
 
 
-def _line(db, raw, file, ledger, creators):
+def _line(db, raw, file, ledger, creators, plans):
     tool = file["tool"]
     if tool == "claude":
         if b'"usage"' not in raw:
@@ -223,7 +228,7 @@ def _line(db, raw, file, ledger, creators):
             h = _hash(mid + "|" + request)
             if not db.execute("INSERT OR IGNORE INTO claude_seen VALUES (?)", (h,)).rowcount:
                 return
-            seat = _seat(tool, obj.get("sessionId"), at, ledger, creators)
+            seat = _seat(tool, obj.get("sessionId"), at, ledger, creators, plans)
             _add(db, at, tool, model, seat, counts)
             return
         payload = obj.get("payload")
@@ -250,9 +255,10 @@ def _line(db, raw, file, ledger, creators):
         thread = file.get("thread")
         if not thread:
             return
-        seat = _seat(tool, thread, at, ledger, creators,
-                     file.get("creator_user"), file.get("creator_account"))
         limits = payload.get("rate_limits")
+        seat = _seat(tool, thread, at, ledger, creators, plans,
+                     file.get("creator_user"), file.get("creator_account"),
+                     plan=limits.get("plan_type") if isinstance(limits, dict) else None)
         if isinstance(limits, dict):
             for window in limits.values():
                 if isinstance(window, dict) and window.get("window_minutes") == 10080:
@@ -291,12 +297,21 @@ def refresh(ctx, *, budget_s: float):
         deadline = time.monotonic() + max(0, budget_s)
         state = ctx.load_state()
         ledger, _ = _ledger(ctx)
-        creators = {}
+        creators, plans = {}, {}
+        # These are CURRENT plans: after a plan change, old turns can be attracted to another
+        # seat that now has the old plan. Historical plan membership is not available.
         for email, seat in sorted(state.accounts("codex").items()):
             user = seat.get("account_id")
             if isinstance(user, str):
                 creators.setdefault(user, []).append((email, seat.get("workspace_id")))
+            plan = (seat.get("usage") or {}).get("plan_type")
+            if not isinstance(plan, str) or not plan:
+                label = seat.get("plan")
+                plan = label.lower() if isinstance(label, str) else None
+            if plan:
+                plans.setdefault(plan, []).append(email)
         db = _connect(ctx)
+        _sync_codex_plans(db, {email: plan for plan, emails in plans.items() for email in emails})
         for tool in ("codex", "claude"):
             seats = list(state.accounts(tool).items()) + [
                 (seat["id"], seat) for seat in state.data.get("keys", {}).values()
@@ -347,7 +362,7 @@ def refresh(ctx, *, budget_s: float):
                             raw += tail
                             cut = len(raw)
                         for line in raw[:cut].splitlines():
-                            _line(db, line, file, ledger, creators)
+                            _line(db, line, file, ledger, creators, plans)
                         file["offset"] += cut
                         stream.seek(file["offset"])
                         _save_file(db, file)
@@ -358,6 +373,34 @@ def refresh(ctx, *, budget_s: float):
         if db is not None:
             db.close()
         _LOCK.release()
+
+
+def _sync_codex_plans(db, current):
+    """Re-read Codex logs when a present seat's plan differs from the one the index was built with.
+
+    Plans arrive after the first index (a new seat's first poll) and Codex rows store their seat, so
+    without this, turns indexed before the plan was known would stay on the creator's seat. Plans of
+    removed seats are kept, so removing a seat never triggers a re-read. Claude rows are untouched.
+    """
+    row = db.execute("SELECT value FROM meta WHERE key='codex_plans'").fetchone()
+    try:
+        known = json.loads(row[0]) if row else None
+    except ValueError:
+        known = None
+    if not isinstance(known, dict):
+        stale = db.execute("SELECT 1 FROM files WHERE tool='codex' LIMIT 1").fetchone() is not None
+        known = {}
+    else:
+        stale = any(known.get(email) != plan for email, plan in current.items())
+    if stale:
+        for statement in ("DELETE FROM files WHERE tool='codex'", "DELETE FROM codex_threads",
+                          "DELETE FROM codex_seen", "DELETE FROM usage WHERE tool='codex'",
+                          "DELETE FROM windows WHERE seat LIKE 'codex:%'",
+                          "DELETE FROM meta WHERE key='tracking_codex'"):
+            db.execute(statement)
+    # Committed by refresh together with the file list, so a failed refresh keeps the old state.
+    db.execute("INSERT OR REPLACE INTO meta VALUES ('codex_plans', ?)",
+               (json.dumps({**known, **current}),))
 
 
 def _save_file(db, file):

@@ -516,6 +516,7 @@ function segBlock(label, hint, action, current, options) {
 // The engine owns boundaries/attribution; this view only sums the four normalised token counts.
 function usageCount(tokens, basis = "all") {
   const [input = 0, read = 0, write = 0, output = 0] = tokens || [];
+  if (basis === "read") return read;
   return basis === "output" ? output : input + write + output + (basis === "fresh" ? 0 : read);
 }
 
@@ -640,7 +641,7 @@ function buildUsage(state, usage, view = {}) {
     content = `<section class="u-hero" aria-label="selected period">
       <div class="u-stepper"><button data-action="usage-period" data-idx="${idx + 1}" aria-label="earlier ${mode}"${idx >= periods.length - 1 ? " disabled" : ""}>‹</button><span class="u-period">${esc(period.label)}${period.current ? " · so far" : ""}<small>${mode === "month" ? "calendar month" : "calendar week, Mon–Sun"} · all seats</small></span><button data-action="usage-period" data-idx="${idx - 1}" aria-label="later ${mode}"${idx === 0 ? " disabled" : ""}>›</button></div>
       <div class="u-figure"><b>${fmtUsageTokens(total)}</b><span>tokens</span></div>
-      <div class="u-basis" role="group" aria-label="token count">${Object.entries({ all: "all tokens", fresh: "without cache reads", output: "output only" }).map(([basis, label]) => `<button data-action="usage-basis" data-value="${basis}" aria-pressed="${basis === view.basis}">${label}</button>`).join("")}</div>
+      <div class="u-basis" role="group" aria-label="token count">${Object.entries({ all: ["all", "all tokens"], fresh: ["no cache reads", "everything except cache reads"], read: ["cache reads", "cache reads only"], output: ["output", "output tokens only"] }).map(([basis, [label, title]]) => `<button data-action="usage-basis" data-value="${basis}" aria-pressed="${basis === view.basis}" title="${title}">${label}</button>`).join("")}</div>
       <p class="u-delta">${delta}</p>${usageBar(usage.models, totals, true)}
       <div class="u-legend">${usage.models.filter((m) => totals[m.id] > 0).map((m) => `<span>${usageSwatch(m)}${esc(m.label)}</span>`).join("")}</div></section>
       <section class="u-history" aria-label="calendar history"><h2>last ${periods.length} ${mode}s · all seats</h2>${usageColumns(periods, usage.models, view.basis, idx, false, mode)}</section>
@@ -1887,7 +1888,7 @@ document.addEventListener("click", (e) => {
       if (screen !== "usage" || !["week", "month"].includes(value)) break;
       usageView.mode = value; usageView.idx = 0; render(); break;
     case "usage-basis":
-      if (screen !== "usage" || !["all", "fresh", "output"].includes(value)) break;
+      if (screen !== "usage" || !["all", "fresh", "read", "output"].includes(value)) break;
       usageView.basis = value; render(); break;
     case "usage-period": {
       if (screen !== "usage") break;

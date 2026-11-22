@@ -597,7 +597,7 @@ document.addEventListener("click", (e) => {
       if (screen !== "usage" || !["week", "month"].includes(value)) break;
       usageView.mode = value; usageView.idx = 0; render(); break;
     case "usage-basis":
-      if (screen !== "usage" || !["all", "fresh", "output"].includes(value)) break;
+      if (screen !== "usage" || !["all", "fresh", "read", "output"].includes(value)) break;
       usageView.basis = value; render(); break;
     case "usage-period": {
       if (screen !== "usage") break;

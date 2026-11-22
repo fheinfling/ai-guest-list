@@ -210,6 +210,164 @@ def test_creator_identity_workspace_tiebreak_and_unknown(ctx):
     assert payload["tracking"]["claude"] is None
 
 
+def plan_count(n=10, *, plan="team", **kwargs):
+    event = count(n, **kwargs)
+    event["payload"]["rate_limits"]["plan_type"] = plan
+    return event
+
+
+def test_codex_moved_thread_plan_beats_creator_and_attributes_window(ctx):
+    seats(ctx, started={"account_id": "starter", "usage": {"plan_type": "team"}},
+          moved={"plan": "Business", "usage": {"plan_type": "business_custom_plan"}})
+    end = datetime.fromisoformat("2026-11-22T10:00:00Z").timestamp()
+    path = write(xp(ctx), meta(user="starter"), turn("gpt-fake"), plan_count(),
+                 plan_count(20, plan="business_custom_plan", output=10,
+                            at="2026-11-21T11:00:00Z", window={"window_minutes": 10080,
+                            "used_percent": 87, "resets_at": end}))
+    refresh(ctx)
+    assert {r[3]: list(r[4:]) for r in rows(ctx)} == {
+        "codex:started": [10, 0, 0, 5], "codex:moved": [10, 0, 0, 5]}
+    assert rows(ctx, "windows") == [("codex:moved", int(end), 87, 1)]
+    assert tokenlog.history(ctx)["own"]["codex:moved"]["week"][0]["limit_pct"] == 87
+    # An appended event still gets its own plan, using the persisted creator context.
+    write(path, plan_count(30, output=15, at="2026-11-21T12:00:00Z"), append=True)
+    refresh(ctx)
+    assert {r[3]: sum(x[4] for x in rows(ctx) if x[3] == r[3]) for r in rows(ctx)} == {
+        "codex:started": 20, "codex:moved": 10}
+
+
+@pytest.mark.parametrize("creator,expected", [("member", "z"), ("outsider", "outside"),
+                                              ("unknown", "?")])
+def test_codex_ambiguous_plan_defers_to_creator_rule(ctx, creator, expected):
+    # Reverse insertion order and a workspace tie exercise the deterministic creator rule.
+    seats(ctx, z={"account_id": "member", "workspace_id": "correct", "plan": "Team"},
+          a={"account_id": "member", "workspace_id": "other", "plan": "Team"},
+          outside={"account_id": "outsider", "plan": "Plus"})
+    write(xp(ctx), meta(user=creator, account="correct"), plan_count())
+    refresh(ctx)
+    assert [r[3] for r in rows(ctx)] == ["codex:" + expected]
+
+
+@pytest.mark.parametrize("limits", [{}, {"plan_type": ""}, {"plan_type": None},
+    {"plan_type": 7}, {"plan_type": True}, {"plan_type": []}, {"plan_type": {}},
+    {"plan_type": "no_match"}, {"plan_type": "Team"}, None, [], "team"])
+def test_codex_missing_invalid_or_unmatched_event_plan_uses_creator(ctx, limits):
+    seats(ctx, creator={"account_id": "starter", "plan": "Plus"}, other={"plan": "Team"})
+    event = count(10)
+    event["payload"]["rate_limits"] = limits
+    write(xp(ctx), meta(user="starter"), event)
+    refresh(ctx)
+    assert [r[3] for r in rows(ctx)] == ["codex:creator"]
+
+
+@pytest.mark.parametrize("user,ledger", [("starter", False), (None, False), ("starter", True)])
+def test_codex_unique_plan_and_ledger_precedence(ctx, user, ledger):
+    seats(ctx, creator={"account_id": "starter", "plan": "Plus"}, other={"plan": "Team"})
+    if ledger:
+        bind(ctx, "codex", "bound")
+    write(xp(ctx), meta(user=user), plan_count())
+    refresh(ctx)
+    assert [r[3] for r in rows(ctx)] == ["codex:bound" if ledger else "codex:other"]
+
+
+@pytest.mark.parametrize("seat_usage", [None, {}, {"plan_type": None}, {"plan_type": ""},
+                                      {"plan_type": 7}])
+def test_codex_plan_label_fallback_without_usage_plan(ctx, seat_usage):
+    seats(ctx, other={"plan": "TeAm", "usage": seat_usage})
+    write(xp(ctx), meta(), plan_count())
+    refresh(ctx)
+    assert [r[3] for r in rows(ctx)] == ["codex:other"]
+
+
+@pytest.mark.parametrize("plan,expected", [("business_custom_plan", "api"), ("team", "label"),
+                                        ("business", "?"), ("Business_custom_plan", "?")])
+def test_codex_usage_plan_preferred_to_label_and_matched_exactly(ctx, plan, expected):
+    seats(ctx, api={"plan": "Business", "usage": {"plan_type": "business_custom_plan"}},
+          label={"plan": "Team"}, mismatch={"plan": "Team", "usage": {"plan_type": "plus"}})
+    seats(ctx, "claude", claude_team={"plan": "Team", "usage": {"plan_type": "team"}})
+    write(xp(ctx), meta(), plan_count(plan=plan))
+    write(cp(ctx), claude())
+    refresh(ctx)
+    assert {r[3] for r in rows(ctx)} == {"codex:" + expected, "claude:?"}
+
+
+def contributions(ctx):
+    result = {}
+    for row in rows(ctx):
+        result[row[3]] = [a + b for a, b in zip(result.get(row[3], [0, 0, 0, 0]), row[4:])]
+    return result
+
+
+PEAK = {"window_minutes": 10080, "used_percent": 87, "resets_at": 1795341600}
+
+
+def test_late_api_plan_reattributes_turns_already_indexed(ctx):
+    seats(ctx, creator={"account_id": "starter", "usage": {"plan_type": "plus"}},
+          moved={"plan": "Business", "usage": None})
+    write(cp(ctx), claude())
+    write(xp(ctx), meta(user="starter"), plan_count(plan="business_custom_plan", window=PEAK))
+    refresh(ctx)
+    assert contributions(ctx)["codex:creator"] == [10, 0, 0, 5]
+    seats(ctx, moved={"plan": "Business", "usage": {"plan_type": "business_custom_plan"}})
+    refresh(ctx)
+    assert contributions(ctx) == {"codex:moved": [10, 0, 0, 5], "claude:?": [10, 4, 3, 5]}
+    assert rows(ctx, "windows") == [("codex:moved", 1795341600, 87, 1)]
+    assert len(rows(ctx, "claude_seen")) == 1
+
+
+def test_failed_poll_keeps_the_plan_and_its_attribution(ctx):
+    seats(ctx, creator={"account_id": "starter", "usage": {"plan_type": "plus"}},
+          moved={"plan": "Business", "usage": {"ok": True, "plan_type": "business_custom_plan"}})
+    path = write(xp(ctx), meta(user="starter"), plan_count(plan="business_custom_plan"))
+    refresh(ctx)
+    state = ctx.load_state()
+    usage.store_fetch(state, "codex", "moved", usage.Usage(ok=False, error="network"))
+    state.save()
+    assert ctx.load_state().get_seat("codex", "moved")["usage"]["plan_type"] == "business_custom_plan"
+    write(path, plan_count(20, output=10, at="2026-11-21T11:00:00Z", plan="business_custom_plan",
+                           window={**PEAK, "used_percent": 88}), append=True)
+    refresh(ctx)
+    assert contributions(ctx) == {"codex:moved": [20, 0, 0, 10]}
+    assert rows(ctx, "windows") == [("codex:moved", 1795341600, 88, 1)]
+
+
+def test_unchanged_or_removed_plans_do_not_reread_codex_logs(ctx):
+    seats(ctx, creator={"account_id": "starter", "usage": {"plan_type": "plus"}},
+          gone={"usage": {"plan_type": "team"}})
+    path = write(xp(ctx), meta(user="starter"), plan_count())
+    refresh(ctx)
+    assert contributions(ctx) == {"codex:gone": [10, 0, 0, 5]}
+    state = ctx.load_state()
+    del state.data["tools"]["codex"]["accounts"]["gone"]
+    state.save()
+    refresh(ctx)
+    # A re-read would move the removed seat's turn to its creator.
+    assert contributions(ctx) == {"codex:gone": [10, 0, 0, 5]}
+    write(path, plan_count(30, output=15, plan="plus", at="2026-11-21T11:00:00Z"), append=True)
+    refresh(ctx)
+    assert contributions(ctx) == {"codex:gone": [10, 0, 0, 5], "codex:creator": [20, 0, 0, 10]}
+    # Re-adding the seat with the plan it had is not a change either.
+    seats(ctx, gone={"usage": {"plan_type": "team"}})
+    refresh(ctx)
+    assert contributions(ctx) == {"codex:gone": [10, 0, 0, 5], "codex:creator": [20, 0, 0, 10]}
+
+
+@pytest.mark.parametrize("stored", [None, "not json", "[]"])
+def test_missing_or_corrupt_plan_record_rereads_codex_once(ctx, stored):
+    seats(ctx, creator={"account_id": "starter"}, other={"usage": {"plan_type": "team"}})
+    write(xp(ctx), meta(user="starter"), plan_count())
+    refresh(ctx)
+    with sqlite3.connect(ctx.data_dir / "usage.sqlite") as db:
+        if stored is None:
+            db.execute("DELETE FROM meta WHERE key='codex_plans'")
+        else:
+            db.execute("UPDATE meta SET value=? WHERE key='codex_plans'", (stored,))
+        db.execute("UPDATE usage SET input=999 WHERE tool='codex'")
+    refresh(ctx)
+    assert contributions(ctx) == {"codex:other": [10, 0, 0, 5]}
+    assert ("codex_plans", '{"other": "team"}') in rows(ctx, "meta")
+
+
 def test_ledger_slack_and_equal_time_last_bind(ctx):
     bind(ctx, "claude", "first", at="2026-11-21T10:02:00Z")
     bind(ctx, "claude", "second", at="2026-11-21T10:02:00Z")
@@ -651,11 +809,13 @@ def test_budget_stops_and_resumes(ctx, monkeypatch):
     assert totals(ctx) == [1000,400,300,500]
 
 
-def test_schema_mismatch_rebuilds(ctx):
+@pytest.mark.parametrize("version", ["1", "obsolete"])
+def test_schema_mismatch_rebuilds(ctx, version):
     write(cp(ctx), claude())
     refresh(ctx)
     db = sqlite3.connect(ctx.data_dir / "usage.sqlite")
-    db.execute("UPDATE meta SET value='obsolete' WHERE key='schema_version'")
+    db.execute("UPDATE meta SET value=? WHERE key='schema_version'", (version,))
+    db.execute("UPDATE usage SET input=999")
     db.commit()
     db.close()
     refresh(ctx)
@@ -1025,14 +1185,14 @@ def test_connect_creates_private_database_and_rebuilds_only_unknown_schema(ctx, 
     tokenlog._connect(fresh).close()
     assert path.stat().st_mode & 0o777 == 0o600
     refresh(ctx)
-    assert ("schema_version", "1") in rows(ctx, "meta")
+    assert ("schema_version", "2") in rows(ctx, "meta")
     # A mismatched cache must be discarded even when no log remains to recreate it.
     with sqlite3.connect(ctx.data_dir / "usage.sqlite") as db:
         db.execute("UPDATE meta SET value='obsolete' WHERE key='schema_version'")
         db.execute("INSERT INTO usage VALUES (1,'claude','old','claude:?',1,0,0,0)")
     refresh(ctx)
     assert rows(ctx) == []
-    assert ("schema_version", "1") in rows(ctx, "meta")
+    assert ("schema_version", "2") in rows(ctx, "meta")
 
 
 def test_default_clock_is_timezone_aware_and_current(clock):

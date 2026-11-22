@@ -1440,6 +1440,8 @@ def store_fetch(state, tool: str, email: str, u: Usage, at=None, *,
         # separate so backoff still works while the renderer can age the data actually on screen.
         d["windows"] = prev_usage.get("windows", d["windows"])
         d["reported_windows"] = prev_usage.get("reported_windows", d["reported_windows"])
+        # The plan is identity, not a live reading: token history attributes Codex turns by it.
+        d["plan_type"] = prev_usage.get("plan_type", d["plan_type"])
         if prev_usage.get("stale") and "last_attempted_at" not in prev_usage:
             # Pre-fix stale records used fetched_at for the failed attempt, not the retained windows;
             # there is no honest success age to recover, so treat them as never successfully fetched.
