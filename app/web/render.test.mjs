@@ -3779,7 +3779,7 @@ test("CLI updates are on by default and can be disabled in settings", () => {
 
 // History is a separate, state-free bridge reply. All identities in these local-log fixtures are fake.
 const usageSample = JSON.parse(readFileSync(new URL('./fixtures/usage-history.sample.json', import.meta.url), 'utf8'));
-const usageIndexing = JSON.parse(readFileSync(new URL('./fixtures/usage-history.indexing.json', import.meta.url), 'utf8'));
+const usageIndexing = { ...structuredClone(usageSample), index: { done: false, pct: 37 } }; // same data, mid-index
 const usageView = (over = {}) => ({ mode: 'week', idx: 0, basis: 'all', open: null, error: null, ...over });
 const usageHTML = (over = {}, payload = usageSample) => buildUsage(state(), payload, usageView(over));
 const usageFigure = (html) => html.match(/class="u-figure"><b>([^<]+)/)?.[1];

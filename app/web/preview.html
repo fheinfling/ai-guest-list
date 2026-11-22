@@ -129,8 +129,8 @@
       if (params.get("screen") !== "usage") return;
       document.querySelector('[data-action="usage"]').click();
       if (params.get("status") !== "loading") {
-        const fixture = params.get("status") === "indexing" ? "usage-history.indexing.json" : "usage-history.sample.json";
-        const payload = await (await fetch(`fixtures/${fixture}`)).json();
+        const payload = await (await fetch("fixtures/usage-history.sample.json")).json();
+        if (params.get("status") === "indexing") payload.index = { done: false, pct: 37 };
         if (params.get("status") === "empty") {
           for (const periods of Object.values(payload.calendar)) for (const period of periods) period.by = {};
         }
