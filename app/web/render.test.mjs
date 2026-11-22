@@ -9,6 +9,10 @@ import {
   buildSettings, buildUsage, usageCount, fmtUsageTokens, buildAddSeat, reduceReply, supervisionBanner, engineBanner, fmtUsageAge, fmtSessionAge, updateClockText,
 } from "./render.mjs";
 
+// The usage fixtures were captured on a Europe/Berlin machine (+01:00/+02:00 offsets) and the UI
+// renders dates in the machine's zone, like the engine that sends them. Pin it so CI (UTC) agrees.
+process.env.TZ = "Europe/Berlin";
+
 const mkAdd = (over = {}) => ({ step: "provider", provider: null, name: "", method: "browser", token: "", ...over });
 
 test("settings shows only the seven user toggles regardless of legacy permanent values", () => {
